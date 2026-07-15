@@ -77,10 +77,11 @@ try {
   const mcpArguments =
     packagedLauncher === undefined
       ? [path.join(desktopRoot, 'dist-electron', 'mcp-cli.js')]
-      : ['/d', '/q', '/s', '/c', `call "${path.resolve(packagedLauncher)}"`];
+      : ['/d', '/q', '/c', `call "${path.resolve(packagedLauncher)}"`];
   mcp = spawn(mcpCommand, mcpArguments, {
     cwd: desktopRoot,
     windowsHide: true,
+    windowsVerbatimArguments: packagedLauncher !== undefined && process.platform === 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
       ...process.env,
