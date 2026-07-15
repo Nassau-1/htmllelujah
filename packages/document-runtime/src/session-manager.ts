@@ -54,6 +54,7 @@ import type {
   RuntimeEvent,
   RuntimeEventListener,
   RuntimeValidationResult,
+  RuntimeAssetBytes,
   SafeDocumentDiff,
   SaveAsOptions,
   SessionDurability,
@@ -286,6 +287,28 @@ export class DocumentSessionManager implements DocumentRuntimeService {
 
   public listSessions(): readonly DocumentSessionSnapshot[] {
     return [...this.#sessions.values()].map((state) => this.#snapshot(state));
+  }
+
+  /** Main-process only. Returns a defensive copy for an opaque asset protocol response. */
+  public getAssetBytesMainOnly(sessionId: string, assetId: string): RuntimeAssetBytes {
+    const state = this.#requireSession(sessionId);
+    const asset = state.assets.get(assetId);
+    if (asset === undefined) {
+      throw new DocumentRuntimeError('ASSET_BYTES_MISSING', 'Document asset does not exist.');
+    }
+    const reference = state.document.assets.find((candidate) => candidate.id === assetId);
+    if (reference === undefined) {
+      throw new DocumentRuntimeError('ASSET_BYTES_MISSING', 'Document asset reference is missing.');
+    }
+    return immutableClone({
+      id: asset.id,
+      hash: reference.hash,
+      bytes: Uint8Array.from(asset.bytes),
+      mediaType: asset.mediaType,
+      fileName: asset.fileName,
+      ...(asset.widthPx === undefined ? {} : { widthPx: asset.widthPx }),
+      ...(asset.heightPx === undefined ? {} : { heightPx: asset.heightPx }),
+    });
   }
 
   #enqueue<T>(state: SessionState, operation: () => Promise<T>): Promise<T> {

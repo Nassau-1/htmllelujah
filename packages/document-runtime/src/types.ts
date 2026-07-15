@@ -75,6 +75,16 @@ export interface AssetBytesInput {
   readonly heightPx?: number | undefined;
 }
 
+export interface RuntimeAssetBytes {
+  readonly id: string;
+  readonly hash: string;
+  readonly bytes: Uint8Array;
+  readonly mediaType: HdeckAssetInput['mediaType'];
+  readonly fileName: string;
+  readonly widthPx?: number | undefined;
+  readonly heightPx?: number | undefined;
+}
+
 export interface StoreAssetRequest extends AssetBytesInput {
   readonly expectedRevision: string;
   readonly metadata: TransactionMetadata;

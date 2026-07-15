@@ -184,6 +184,42 @@ describe('projection and placeholders', () => {
     expect(undoTransaction(reset.document, reset)).toEqual(overridden);
   });
 
+  it('records placeholder overrides automatically when a user moves, styles, or hides bound content', () => {
+    const source = createDefaultDeck({
+      idFactory: idFactory(),
+      now: () => '2026-01-01T00:00:00.000Z',
+    });
+    const slide = source.slides[0];
+    const title = slide?.elements[0];
+    if (slide === undefined || title?.type !== 'text') throw new Error('Missing bound title.');
+    const result = applyTransaction(
+      source,
+      [
+        {
+          type: 'element.transform',
+          slideId: slide.id,
+          transforms: [{ elementId: title.id, frame: { ...title.frame, xPt: 210 } }],
+        },
+        {
+          type: 'element.update-style',
+          slideId: slide.id,
+          elementId: title.id,
+          patch: { kind: 'text', style: { fontFamily: 'Georgia', fontSizePt: 42 } },
+        },
+        { type: 'element.set-visible', slideId: slide.id, elementId: title.id, visible: false },
+      ],
+      metadata(),
+    );
+    const changed = result.document.slides[0]?.elements[0];
+    expect(changed?.placeholderBinding?.overrides).toEqual(['frame', 'style', 'visibility']);
+    const projected = resolveSlide(result.document, slide.id).elements.find(
+      (entry) => entry.element.id === title.id,
+    );
+    expect(projected?.element.frame.xPt).toBe(210);
+    expect(projected?.element.visible).toBe(false);
+    expect(projected?.resolvedTextStyle?.fontFamily).toBe('Georgia');
+  });
+
   it('rejects a binding to a placeholder that does not accept the element type', () => {
     const source = createDefaultDeck({
       idFactory: idFactory(),

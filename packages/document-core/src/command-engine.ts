@@ -193,8 +193,22 @@ const replaceFrames = (
 ): readonly Element[] =>
   elements.map((element) => {
     const frame = frames.get(element.id);
-    return frame === undefined ? element : { ...element, frame };
+    return frame === undefined ? element : withPlaceholderOverride({ ...element, frame }, 'frame');
   });
+
+function withPlaceholderOverride(
+  element: Element,
+  override: 'frame' | 'style' | 'visibility',
+): Element {
+  if (element.placeholderBinding === undefined) return element;
+  return {
+    ...element,
+    placeholderBinding: {
+      ...element.placeholderBinding,
+      overrides: [...new Set([...element.placeholderBinding.overrides, override])],
+    },
+  };
+}
 
 const alignedFrame = (frame: Frame, mode: AlignElementsCommand['mode'], target: Bounds): Frame => {
   switch (mode) {
@@ -405,40 +419,60 @@ const applyStylePatch = (element: Element, patch: ElementStylePatch): Element =>
   switch (patch.kind) {
     case 'text':
       if (element.type !== 'text') return element;
-      return {
-        ...element,
-        ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
-        ...(patch.verticalAlignment === undefined
-          ? {}
-          : { verticalAlignment: patch.verticalAlignment }),
-        ...(patch.styleRole === undefined ? {} : { styleRole: patch.styleRole }),
-        ...(patch.style === undefined
-          ? {}
-          : { style: { ...(element.style ?? {}), ...patch.style } }),
-      };
+      {
+        const updated = withPlaceholderOverride(
+          {
+            ...element,
+            ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
+            ...(patch.verticalAlignment === undefined
+              ? {}
+              : { verticalAlignment: patch.verticalAlignment }),
+            ...(patch.styleRole === undefined ? {} : { styleRole: patch.styleRole }),
+            ...(patch.style === undefined
+              ? {}
+              : { style: { ...(element.style ?? {}), ...patch.style } }),
+          },
+          'style',
+        );
+        return patch.opacity === undefined
+          ? updated
+          : withPlaceholderOverride(updated, 'visibility');
+      }
     case 'shape': {
       if (element.type !== 'shape') return element;
       const { shadow: currentShadow, ...withoutShadow } = element;
       const base = patch.shadow === null ? withoutShadow : element;
-      return {
-        ...base,
-        ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
-        ...(patch.fill === undefined ? {} : { fill: patch.fill }),
-        ...(patch.stroke === undefined ? {} : { stroke: patch.stroke }),
-        ...(patch.cornerRadiusPt === undefined ? {} : { cornerRadiusPt: patch.cornerRadiusPt }),
-        ...(patch.shadow === undefined || patch.shadow === null ? {} : { shadow: patch.shadow }),
-      };
+      const updated = withPlaceholderOverride(
+        {
+          ...base,
+          ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
+          ...(patch.fill === undefined ? {} : { fill: patch.fill }),
+          ...(patch.stroke === undefined ? {} : { stroke: patch.stroke }),
+          ...(patch.cornerRadiusPt === undefined ? {} : { cornerRadiusPt: patch.cornerRadiusPt }),
+          ...(patch.shadow === undefined || patch.shadow === null ? {} : { shadow: patch.shadow }),
+        },
+        'style',
+      );
+      return patch.opacity === undefined ? updated : withPlaceholderOverride(updated, 'visibility');
     }
     case 'table':
       if (element.type !== 'table') return element;
-      return {
-        ...element,
-        ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
-        ...(patch.border === undefined ? {} : { border: patch.border }),
-        ...(patch.style === undefined
-          ? {}
-          : { style: { ...(element.style ?? {}), ...patch.style } }),
-      };
+      {
+        const updated = withPlaceholderOverride(
+          {
+            ...element,
+            ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
+            ...(patch.border === undefined ? {} : { border: patch.border }),
+            ...(patch.style === undefined
+              ? {}
+              : { style: { ...(element.style ?? {}), ...patch.style } }),
+          },
+          'style',
+        );
+        return patch.opacity === undefined
+          ? updated
+          : withPlaceholderOverride(updated, 'visibility');
+      }
   }
 };
 
@@ -891,7 +925,8 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
         command.slideId,
         command.containerId,
         command.elementId,
-        (element) => ({ ...element, visible: command.visible }),
+        (element) =>
+          withPlaceholderOverride({ ...element, visible: command.visible }, 'visibility'),
       );
     case 'element.reorder':
       return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
