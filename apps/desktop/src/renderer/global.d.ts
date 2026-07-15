@@ -1,10 +1,8 @@
-import type { AppInfo } from '../preload/preload';
+import type { HtmllelujahDesktopApi } from '../shared/desktop-api';
 
 declare global {
   interface Window {
-    htmllelujah: {
-      getAppInfo: () => Promise<AppInfo>;
-    };
+    readonly htmllelujah: HtmllelujahDesktopApi;
   }
 }
 
