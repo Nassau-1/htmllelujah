@@ -115,9 +115,12 @@ class CdpSession {
 
 const userData = await mkdtemp(path.join(tmpdir(), 'htmllelujah-ui-smoke-'));
 const executable = process.env.HTMLLELUJAH_EXECUTABLE;
+const openPath = process.env.HTMLLELUJAH_OPEN_PATH;
+const expectedDeckName = process.env.HTMLLELUJAH_EXPECTED_DECK_NAME;
 const launchCommand = executable === undefined ? electronPath : path.resolve(executable);
 const launchArguments = [
   ...(executable === undefined ? ['.'] : []),
+  ...(openPath === undefined ? [] : [path.resolve(openPath)]),
   `--user-data-dir=${userData}`,
   '--remote-debugging-address=127.0.0.1',
   '--remote-debugging-port=0',
@@ -225,6 +228,7 @@ try {
 
   const initial = await evaluate(`(() => ({
     title: document.title,
+    documentName: document.querySelector('.document-title span')?.textContent?.trim() ?? '',
     brand: document.querySelector('[aria-label="HTMLlelujah"]') !== null,
     applicationMenu: document.querySelector('nav[aria-label="Application menu"]') !== null,
     toolbar: document.querySelector('[role="toolbar"][aria-label="Editing tools"]') !== null,
@@ -236,6 +240,9 @@ try {
     elementCount: document.querySelectorAll('[data-canvas-element-id]').length,
   }))()`);
   if (!initial.title.includes('HTMLlelujah')) throw new Error('The renderer title is incorrect.');
+  if (expectedDeckName !== undefined && initial.documentName !== expectedDeckName) {
+    throw new Error('The requested .hdeck did not open in the editor.');
+  }
   for (const surface of [
     'brand',
     'applicationMenu',
