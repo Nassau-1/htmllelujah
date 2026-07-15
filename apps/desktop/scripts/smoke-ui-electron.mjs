@@ -377,6 +377,63 @@ try {
   await click('[aria-labelledby="share-title"] button[aria-label="Close"]', 'Share dialog close');
   await waitForRenderer(`document.querySelector('#share-title') === null`, 'Share dialog closing');
 
+  await clickButtonWithText('Present', 'Presentation window');
+  const presentationTarget = await waitFor(
+    async () => {
+      const response = await fetch(`http://127.0.0.1:${debuggingPort}/json/list`);
+      if (!response.ok) return undefined;
+      const targets = await response.json();
+      return targets.find(
+        (candidate) =>
+          candidate.type === 'page' &&
+          candidate.id !== target.id &&
+          typeof candidate.url === 'string' &&
+          candidate.url.startsWith('htmllelujah-app://app/'),
+      );
+    },
+    10_000,
+    'Presentation renderer target',
+  );
+  const presentationCdp = await CdpSession.connect(presentationTarget.webSocketDebuggerUrl);
+  try {
+    await presentationCdp.send('Runtime.enable');
+    await waitFor(
+      async () => {
+        const response = await presentationCdp.send('Runtime.evaluate', {
+          expression:
+            "document.readyState === 'complete' && document.querySelector('[data-testid=\"presentation-root\"]') !== null",
+          returnByValue: true,
+        });
+        return response.result?.value === true ? true : undefined;
+      },
+      10_000,
+      'Presentation surface',
+    );
+    try {
+      await presentationCdp.send('Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: 'Escape',
+        code: 'Escape',
+        windowsVirtualKeyCode: 27,
+        nativeVirtualKeyCode: 27,
+      });
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('CDP closed')) throw error;
+    }
+  } finally {
+    presentationCdp.close();
+  }
+  await waitFor(
+    async () => {
+      const response = await fetch(`http://127.0.0.1:${debuggingPort}/json/list`);
+      if (!response.ok) return undefined;
+      const targets = await response.json();
+      return targets.some((candidate) => candidate.id === presentationTarget.id) ? undefined : true;
+    },
+    10_000,
+    'Presentation Escape close',
+  );
+
   await click('[role="tab"]:not(.is-active)', 'Design inspector tab');
   await waitForRenderer(
     `document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() === 'Design'`,
