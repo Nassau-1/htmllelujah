@@ -1,0 +1,751 @@
+import { createHash } from 'node:crypto';
+
+import { parseDeck, type DeckDocument } from '@htmllelujah/document-core';
+
+const LOCAL_FILE_SIGNATURE = 0x04034b50;
+const CENTRAL_FILE_SIGNATURE = 0x02014b50;
+const END_SIGNATURE = 0x06054b50;
+const UTF8_FLAG = 0x0800;
+const STORE_METHOD = 0;
+
+export const HDECK_LIMITS = Object.freeze({
+  maxArchiveBytes: 512 * 1024 * 1024,
+  maxEntries: 2048,
+  maxEntryBytes: 256 * 1024 * 1024,
+  maxDocumentBytes: 32 * 1024 * 1024,
+  maxManifestBytes: 2 * 1024 * 1024,
+  maxNameBytes: 240,
+  maxTotalBytes: 512 * 1024 * 1024,
+});
+
+export type HdeckErrorCode =
+  | 'ARCHIVE_INVALID'
+  | 'ARCHIVE_LIMIT_EXCEEDED'
+  | 'UNSUPPORTED_COMPRESSION'
+  | 'UNSUPPORTED_VERSION'
+  | 'HASH_MISMATCH'
+  | 'ENTRY_UNDECLARED'
+  | 'ASSET_MISSING'
+  | 'DOCUMENT_INVALID';
+
+export class HdeckError extends Error {
+  public constructor(
+    public readonly code: HdeckErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'HdeckError';
+  }
+}
+
+export type ApprovedImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp';
+export type ApprovedFontMediaType = 'font/woff2';
+export type ApprovedMediaType = ApprovedImageMediaType | ApprovedFontMediaType;
+
+export interface ManifestAsset {
+  readonly id: string;
+  readonly entry: string;
+  readonly sha256: string;
+  readonly byteLength: number;
+  readonly mediaType: ApprovedMediaType;
+  readonly originalName?: string | undefined;
+  readonly widthPx?: number | undefined;
+  readonly heightPx?: number | undefined;
+}
+
+export interface ManifestOptionalEntry {
+  readonly entry: string;
+  readonly sha256: string;
+  readonly byteLength: number;
+  readonly mediaType: string;
+}
+
+export interface HdeckManifestV1 {
+  readonly format: 'htmllelujah.deck';
+  readonly containerVersion: 1;
+  readonly documentSchemaVersion: number;
+  readonly documentId: string;
+  readonly createdAt: string;
+  readonly modifiedAt: string;
+  readonly documentEntry: 'document.json';
+  readonly documentSha256: string;
+  readonly assets: readonly ManifestAsset[];
+  readonly optionalEntries: readonly ManifestOptionalEntry[];
+}
+
+export interface HdeckAssetInput {
+  readonly id: string;
+  readonly bytes: Uint8Array;
+  readonly mediaType: ApprovedMediaType;
+  readonly originalName?: string | undefined;
+  readonly widthPx?: number | undefined;
+  readonly heightPx?: number | undefined;
+}
+
+export interface CreateHdeckInput {
+  readonly document: DeckDocument;
+  readonly assets?: readonly HdeckAssetInput[] | undefined;
+  readonly createdAt?: string | undefined;
+  readonly modifiedAt?: string | undefined;
+}
+
+export interface ParsedHdeck {
+  readonly manifest: HdeckManifestV1;
+  readonly document: DeckDocument;
+  readonly assets: ReadonlyMap<string, Uint8Array>;
+  readonly archiveSha256: string;
+}
+
+interface ZipEntry {
+  readonly name: string;
+  readonly bytes: Uint8Array;
+}
+
+interface ParsedCentralEntry {
+  readonly name: string;
+  readonly bytes: Uint8Array;
+  readonly crc32: number;
+}
+
+const crcTable = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < table.length; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+export const crc32 = (bytes: Uint8Array): number => {
+  let value = 0xffffffff;
+  for (const byte of bytes) {
+    const tableValue = crcTable[(value ^ byte) & 0xff];
+    if (tableValue === undefined) throw new HdeckError('ARCHIVE_INVALID', 'CRC lookup failed.');
+    value = tableValue ^ (value >>> 8);
+  }
+  return (value ^ 0xffffffff) >>> 0;
+};
+
+export const sha256 = (bytes: Uint8Array): string =>
+  createHash('sha256').update(bytes).digest('hex');
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const canonicalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalize(item)]),
+  );
+};
+
+export const canonicalJson = (value: unknown): string => JSON.stringify(canonicalize(value));
+
+const validateEntryName = (name: string): void => {
+  const bytes = Buffer.byteLength(name, 'utf8');
+  if (bytes === 0 || bytes > HDECK_LIMITS.maxNameBytes) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive entry name is outside limits.');
+  }
+  if (
+    name.includes('\\') ||
+    name.includes('\0') ||
+    /[\u0000-\u001f\u007f]/u.test(name) ||
+    name.startsWith('/') ||
+    /^[a-zA-Z]:/u.test(name) ||
+    name.startsWith('//')
+  ) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Archive entry name is unsafe.');
+  }
+  const segments = name.split('/');
+  if (segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Archive entry name contains traversal.');
+  }
+};
+
+const extensionForMediaType = (mediaType: ApprovedMediaType): string => {
+  switch (mediaType) {
+    case 'image/png':
+      return 'png';
+    case 'image/jpeg':
+      return 'jpg';
+    case 'image/webp':
+      return 'webp';
+    case 'font/woff2':
+      return 'woff2';
+  }
+};
+
+const safeOriginalName = (name: string | undefined): string | undefined => {
+  if (name === undefined) return undefined;
+  const normalized = name
+    .normalize('NFC')
+    .replace(/[\u0000-\u001f\u007f]/gu, '')
+    .trim();
+  if (normalized.length === 0) return undefined;
+  return normalized.slice(0, 160);
+};
+
+const writeUInt16 = (value: number): Buffer => {
+  const buffer = Buffer.allocUnsafe(2);
+  buffer.writeUInt16LE(value, 0);
+  return buffer;
+};
+
+const writeUInt32 = (value: number): Buffer => {
+  const buffer = Buffer.allocUnsafe(4);
+  buffer.writeUInt32LE(value >>> 0, 0);
+  return buffer;
+};
+
+/** Encodes a deterministic STORE-only ZIP. Exposed for bounded adversarial tests. */
+export const encodeStoredZip = (entries: readonly ZipEntry[]): Uint8Array => {
+  if (entries.length === 0 || entries.length > HDECK_LIMITS.maxEntries) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive entry count is outside limits.');
+  }
+
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  const names = new Set<string>();
+  let localOffset = 0;
+  let totalBytes = 0;
+
+  for (const entry of entries) {
+    validateEntryName(entry.name);
+    const collisionKey = entry.name.normalize('NFC').toLocaleLowerCase('en-US');
+    if (names.has(collisionKey)) {
+      throw new HdeckError('ARCHIVE_INVALID', 'Archive contains a duplicate entry name.');
+    }
+    names.add(collisionKey);
+    if (entry.bytes.byteLength > HDECK_LIMITS.maxEntryBytes) {
+      throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive entry is too large.');
+    }
+    totalBytes += entry.bytes.byteLength;
+    if (totalBytes > HDECK_LIMITS.maxTotalBytes) {
+      throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive expanded size is too large.');
+    }
+
+    const name = Buffer.from(entry.name, 'utf8');
+    const data = Buffer.from(entry.bytes);
+    const checksum = crc32(data);
+    const localHeader = Buffer.concat([
+      writeUInt32(LOCAL_FILE_SIGNATURE),
+      writeUInt16(20),
+      writeUInt16(UTF8_FLAG),
+      writeUInt16(STORE_METHOD),
+      writeUInt16(0),
+      writeUInt16(0),
+      writeUInt32(checksum),
+      writeUInt32(data.byteLength),
+      writeUInt32(data.byteLength),
+      writeUInt16(name.byteLength),
+      writeUInt16(0),
+      name,
+    ]);
+    localParts.push(localHeader, data);
+
+    const centralHeader = Buffer.concat([
+      writeUInt32(CENTRAL_FILE_SIGNATURE),
+      writeUInt16(20),
+      writeUInt16(20),
+      writeUInt16(UTF8_FLAG),
+      writeUInt16(STORE_METHOD),
+      writeUInt16(0),
+      writeUInt16(0),
+      writeUInt32(checksum),
+      writeUInt32(data.byteLength),
+      writeUInt32(data.byteLength),
+      writeUInt16(name.byteLength),
+      writeUInt16(0),
+      writeUInt16(0),
+      writeUInt16(0),
+      writeUInt16(0),
+      writeUInt32(0),
+      writeUInt32(localOffset),
+      name,
+    ]);
+    centralParts.push(centralHeader);
+    localOffset += localHeader.byteLength + data.byteLength;
+  }
+
+  const central = Buffer.concat(centralParts);
+  const end = Buffer.concat([
+    writeUInt32(END_SIGNATURE),
+    writeUInt16(0),
+    writeUInt16(0),
+    writeUInt16(entries.length),
+    writeUInt16(entries.length),
+    writeUInt32(central.byteLength),
+    writeUInt32(localOffset),
+    writeUInt16(0),
+  ]);
+  const result = Buffer.concat([...localParts, central, end]);
+  if (result.byteLength > HDECK_LIMITS.maxArchiveBytes) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive is too large.');
+  }
+  return result;
+};
+
+const findEndOffset = (archive: Buffer): number => {
+  const minimum = Math.max(0, archive.byteLength - 65_557);
+  for (let offset = archive.byteLength - 22; offset >= minimum; offset -= 1) {
+    if (archive.readUInt32LE(offset) === END_SIGNATURE) return offset;
+  }
+  throw new HdeckError('ARCHIVE_INVALID', 'ZIP end record is missing.');
+};
+
+const checkedRange = (start: number, length: number, total: number): void => {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(length) || start < 0 || length < 0) {
+    throw new HdeckError('ARCHIVE_INVALID', 'ZIP range is invalid.');
+  }
+  if (start + length > total) {
+    throw new HdeckError('ARCHIVE_INVALID', 'ZIP range is truncated.');
+  }
+};
+
+const decodeStoredZip = (input: Uint8Array): readonly ParsedCentralEntry[] => {
+  if (input.byteLength > HDECK_LIMITS.maxArchiveBytes) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive is too large.');
+  }
+  const archive = Buffer.from(input);
+  if (archive.byteLength < 22) throw new HdeckError('ARCHIVE_INVALID', 'Archive is truncated.');
+  const endOffset = findEndOffset(archive);
+  checkedRange(endOffset, 22, archive.byteLength);
+
+  const disk = archive.readUInt16LE(endOffset + 4);
+  const centralDisk = archive.readUInt16LE(endOffset + 6);
+  const diskEntries = archive.readUInt16LE(endOffset + 8);
+  const totalEntries = archive.readUInt16LE(endOffset + 10);
+  const centralSize = archive.readUInt32LE(endOffset + 12);
+  const centralOffset = archive.readUInt32LE(endOffset + 16);
+  const commentLength = archive.readUInt16LE(endOffset + 20);
+  if (disk !== 0 || centralDisk !== 0 || diskEntries !== totalEntries) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Multi-disk ZIP is unsupported.');
+  }
+  if (totalEntries === 0 || totalEntries > HDECK_LIMITS.maxEntries) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive entry count is outside limits.');
+  }
+  checkedRange(endOffset + 22, commentLength, archive.byteLength);
+  if (endOffset + 22 + commentLength !== archive.byteLength) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Trailing ZIP data is not allowed.');
+  }
+  checkedRange(centralOffset, centralSize, endOffset);
+  if (centralOffset + centralSize !== endOffset) {
+    throw new HdeckError('ARCHIVE_INVALID', 'ZIP central directory is inconsistent.');
+  }
+
+  const result: ParsedCentralEntry[] = [];
+  const seenNames = new Set<string>();
+  let cursor = centralOffset;
+  let totalExpanded = 0;
+  for (let index = 0; index < totalEntries; index += 1) {
+    checkedRange(cursor, 46, endOffset);
+    if (archive.readUInt32LE(cursor) !== CENTRAL_FILE_SIGNATURE) {
+      throw new HdeckError('ARCHIVE_INVALID', 'ZIP central record is invalid.');
+    }
+    const flags = archive.readUInt16LE(cursor + 8);
+    const method = archive.readUInt16LE(cursor + 10);
+    const expectedCrc = archive.readUInt32LE(cursor + 16);
+    const compressedSize = archive.readUInt32LE(cursor + 20);
+    const expandedSize = archive.readUInt32LE(cursor + 24);
+    const nameLength = archive.readUInt16LE(cursor + 28);
+    const extraLength = archive.readUInt16LE(cursor + 30);
+    const entryCommentLength = archive.readUInt16LE(cursor + 32);
+    const diskStart = archive.readUInt16LE(cursor + 34);
+    const externalAttributes = archive.readUInt32LE(cursor + 38);
+    const localHeaderOffset = archive.readUInt32LE(cursor + 42);
+    const recordLength = 46 + nameLength + extraLength + entryCommentLength;
+    checkedRange(cursor, recordLength, endOffset);
+    if ((flags & 0x0001) !== 0 || (flags & 0x0008) !== 0 || diskStart !== 0) {
+      throw new HdeckError(
+        'ARCHIVE_INVALID',
+        'Encrypted or streaming ZIP entries are unsupported.',
+      );
+    }
+    if (method !== STORE_METHOD || compressedSize !== expandedSize) {
+      throw new HdeckError('UNSUPPORTED_COMPRESSION', 'Only stored ZIP entries are supported.');
+    }
+    if (expandedSize > HDECK_LIMITS.maxEntryBytes) {
+      throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive entry is too large.');
+    }
+    totalExpanded += expandedSize;
+    if (totalExpanded > HDECK_LIMITS.maxTotalBytes) {
+      throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Archive expanded size is too large.');
+    }
+    const unixMode = externalAttributes >>> 16;
+    if ((unixMode & 0o170000) === 0o120000) {
+      throw new HdeckError('ARCHIVE_INVALID', 'Symlink archive entries are forbidden.');
+    }
+
+    const nameBytes = archive.subarray(cursor + 46, cursor + 46 + nameLength);
+    const name = nameBytes.toString('utf8');
+    if (!Buffer.from(name, 'utf8').equals(nameBytes)) {
+      throw new HdeckError('ARCHIVE_INVALID', 'Archive entry name is not valid UTF-8.');
+    }
+    validateEntryName(name);
+    const collisionKey = name.normalize('NFC').toLocaleLowerCase('en-US');
+    if (seenNames.has(collisionKey)) {
+      throw new HdeckError('ARCHIVE_INVALID', 'Archive contains duplicate entry names.');
+    }
+    seenNames.add(collisionKey);
+
+    checkedRange(localHeaderOffset, 30, centralOffset);
+    if (archive.readUInt32LE(localHeaderOffset) !== LOCAL_FILE_SIGNATURE) {
+      throw new HdeckError('ARCHIVE_INVALID', 'ZIP local record is invalid.');
+    }
+    const localFlags = archive.readUInt16LE(localHeaderOffset + 6);
+    const localMethod = archive.readUInt16LE(localHeaderOffset + 8);
+    const localCrc = archive.readUInt32LE(localHeaderOffset + 14);
+    const localCompressed = archive.readUInt32LE(localHeaderOffset + 18);
+    const localExpanded = archive.readUInt32LE(localHeaderOffset + 22);
+    const localNameLength = archive.readUInt16LE(localHeaderOffset + 26);
+    const localExtraLength = archive.readUInt16LE(localHeaderOffset + 28);
+    const dataOffset = localHeaderOffset + 30 + localNameLength + localExtraLength;
+    checkedRange(localHeaderOffset + 30, localNameLength + localExtraLength, centralOffset);
+    checkedRange(dataOffset, compressedSize, centralOffset);
+    const localName = archive
+      .subarray(localHeaderOffset + 30, localHeaderOffset + 30 + localNameLength)
+      .toString('utf8');
+    if (
+      localName !== name ||
+      localFlags !== flags ||
+      localMethod !== method ||
+      localCrc !== expectedCrc ||
+      localCompressed !== compressedSize ||
+      localExpanded !== expandedSize
+    ) {
+      throw new HdeckError('ARCHIVE_INVALID', 'ZIP local and central records disagree.');
+    }
+    const bytes = archive.subarray(dataOffset, dataOffset + expandedSize);
+    if (crc32(bytes) !== expectedCrc) {
+      throw new HdeckError('ARCHIVE_INVALID', 'Archive entry checksum is invalid.');
+    }
+    result.push({ name, bytes: Uint8Array.from(bytes), crc32: expectedCrc });
+    cursor += recordLength;
+  }
+  if (cursor !== endOffset) {
+    throw new HdeckError('ARCHIVE_INVALID', 'ZIP central directory has extra records.');
+  }
+  return result;
+};
+
+const requireString = (record: Record<string, unknown>, key: string): string => {
+  const value = record[key];
+  if (typeof value !== 'string')
+    throw new HdeckError('ARCHIVE_INVALID', `Manifest ${key} is invalid.`);
+  return value;
+};
+
+const requireInteger = (record: Record<string, unknown>, key: string): number => {
+  const value = record[key];
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new HdeckError('ARCHIVE_INVALID', `Manifest ${key} is invalid.`);
+  }
+  return value;
+};
+
+const assertExactKeys = (
+  record: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void => {
+  const allowed = new Set([...required, ...optional]);
+  if (Object.keys(record).some((key) => !allowed.has(key))) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest contains an unknown field.');
+  }
+  if (required.some((key) => !(key in record))) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest is missing a required field.');
+  }
+};
+
+const parseManifestAsset = (input: unknown): ManifestAsset => {
+  if (!isRecord(input)) throw new HdeckError('ARCHIVE_INVALID', 'Manifest asset is invalid.');
+  assertExactKeys(
+    input,
+    ['id', 'entry', 'sha256', 'byteLength', 'mediaType'],
+    ['originalName', 'widthPx', 'heightPx'],
+  );
+  const mediaType = requireString(input, 'mediaType');
+  if (!['image/png', 'image/jpeg', 'image/webp', 'font/woff2'].includes(mediaType)) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest asset media type is unsupported.');
+  }
+  const hash = requireString(input, 'sha256');
+  if (!/^[0-9a-f]{64}$/u.test(hash))
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest asset hash is invalid.');
+  const optionalString = input.originalName;
+  const optionalWidth = input.widthPx;
+  const optionalHeight = input.heightPx;
+  if (optionalString !== undefined && typeof optionalString !== 'string') {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest asset name is invalid.');
+  }
+  if (
+    optionalWidth !== undefined &&
+    (!Number.isSafeInteger(optionalWidth) || (optionalWidth as number) <= 0)
+  ) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest asset width is invalid.');
+  }
+  if (
+    optionalHeight !== undefined &&
+    (!Number.isSafeInteger(optionalHeight) || (optionalHeight as number) <= 0)
+  ) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest asset height is invalid.');
+  }
+  const asset: ManifestAsset = {
+    id: requireString(input, 'id'),
+    entry: requireString(input, 'entry'),
+    sha256: hash,
+    byteLength: requireInteger(input, 'byteLength'),
+    mediaType: mediaType as ApprovedMediaType,
+    ...(optionalString === undefined ? {} : { originalName: optionalString }),
+    ...(optionalWidth === undefined ? {} : { widthPx: optionalWidth as number }),
+    ...(optionalHeight === undefined ? {} : { heightPx: optionalHeight as number }),
+  };
+  validateEntryName(asset.entry);
+  return asset;
+};
+
+const parseOptionalEntry = (input: unknown): ManifestOptionalEntry => {
+  if (!isRecord(input)) throw new HdeckError('ARCHIVE_INVALID', 'Optional entry is invalid.');
+  assertExactKeys(input, ['entry', 'sha256', 'byteLength', 'mediaType']);
+  const hash = requireString(input, 'sha256');
+  if (!/^[0-9a-f]{64}$/u.test(hash))
+    throw new HdeckError('ARCHIVE_INVALID', 'Optional entry hash is invalid.');
+  const result: ManifestOptionalEntry = {
+    entry: requireString(input, 'entry'),
+    sha256: hash,
+    byteLength: requireInteger(input, 'byteLength'),
+    mediaType: requireString(input, 'mediaType'),
+  };
+  validateEntryName(result.entry);
+  return result;
+};
+
+const parseManifest = (input: unknown): HdeckManifestV1 => {
+  if (!isRecord(input)) throw new HdeckError('ARCHIVE_INVALID', 'Manifest root is invalid.');
+  assertExactKeys(input, [
+    'format',
+    'containerVersion',
+    'documentSchemaVersion',
+    'documentId',
+    'createdAt',
+    'modifiedAt',
+    'documentEntry',
+    'documentSha256',
+    'assets',
+    'optionalEntries',
+  ]);
+  if (input.format !== 'htmllelujah.deck' || input.documentEntry !== 'document.json') {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest format is invalid.');
+  }
+  if (input.containerVersion !== 1)
+    throw new HdeckError('UNSUPPORTED_VERSION', 'Container version is unsupported.');
+  const documentHash = requireString(input, 'documentSha256');
+  if (!/^[0-9a-f]{64}$/u.test(documentHash))
+    throw new HdeckError('ARCHIVE_INVALID', 'Document hash is invalid.');
+  if (!Array.isArray(input.assets) || !Array.isArray(input.optionalEntries)) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest entry lists are invalid.');
+  }
+  if (input.assets.length > HDECK_LIMITS.maxEntries || input.optionalEntries.length > 32) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Manifest entry lists are too large.');
+  }
+  const createdAt = requireString(input, 'createdAt');
+  const modifiedAt = requireString(input, 'modifiedAt');
+  if (!Number.isFinite(Date.parse(createdAt)) || !Number.isFinite(Date.parse(modifiedAt))) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest timestamp is invalid.');
+  }
+  return {
+    format: 'htmllelujah.deck',
+    containerVersion: 1,
+    documentSchemaVersion: requireInteger(input, 'documentSchemaVersion'),
+    documentId: requireString(input, 'documentId'),
+    createdAt,
+    modifiedAt,
+    documentEntry: 'document.json',
+    documentSha256: documentHash,
+    assets: input.assets.map(parseManifestAsset),
+    optionalEntries: input.optionalEntries.map(parseOptionalEntry),
+  };
+};
+
+export const createHdeckArchive = (input: CreateHdeckInput): Uint8Array => {
+  const document = parseDeck(input.document);
+  const assetInputs = input.assets ?? [];
+  const assetIds = new Set<string>();
+  const assetHashes = new Set<string>();
+  const entries: ZipEntry[] = [];
+  const manifestAssets: ManifestAsset[] = [];
+  for (const asset of assetInputs) {
+    if (assetIds.has(asset.id))
+      throw new HdeckError('ARCHIVE_INVALID', 'Asset identifier is duplicated.');
+    assetIds.add(asset.id);
+    const hash = sha256(asset.bytes);
+    if (assetHashes.has(hash))
+      throw new HdeckError('ARCHIVE_INVALID', 'Asset bytes are duplicated.');
+    assetHashes.add(hash);
+    const entry = `assets/${hash}.${extensionForMediaType(asset.mediaType)}`;
+    entries.push({ name: entry, bytes: asset.bytes });
+    const originalName = safeOriginalName(asset.originalName);
+    manifestAssets.push({
+      id: asset.id,
+      entry,
+      sha256: hash,
+      byteLength: asset.bytes.byteLength,
+      mediaType: asset.mediaType,
+      ...(originalName === undefined ? {} : { originalName }),
+      ...(asset.widthPx === undefined ? {} : { widthPx: asset.widthPx }),
+      ...(asset.heightPx === undefined ? {} : { heightPx: asset.heightPx }),
+    });
+  }
+
+  const declaredAssets = new Map(document.assets.map((asset) => [asset.id, asset]));
+  if (declaredAssets.size !== manifestAssets.length) {
+    throw new HdeckError('ASSET_MISSING', 'Document assets and supplied asset bytes differ.');
+  }
+  for (const asset of manifestAssets) {
+    const declared = declaredAssets.get(asset.id);
+    if (
+      declared === undefined ||
+      declared.hash !== asset.sha256 ||
+      declared.mediaType !== asset.mediaType
+    ) {
+      throw new HdeckError(
+        'HASH_MISMATCH',
+        'Document asset metadata does not match supplied bytes.',
+      );
+    }
+  }
+
+  const documentBytes = Buffer.from(canonicalJson(document), 'utf8');
+  if (documentBytes.byteLength > HDECK_LIMITS.maxDocumentBytes) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Document JSON is too large.');
+  }
+  const now = new Date().toISOString();
+  const manifest: HdeckManifestV1 = {
+    format: 'htmllelujah.deck',
+    containerVersion: 1,
+    documentSchemaVersion: document.schemaVersion,
+    documentId: document.id,
+    createdAt: input.createdAt ?? now,
+    modifiedAt: input.modifiedAt ?? now,
+    documentEntry: 'document.json',
+    documentSha256: sha256(documentBytes),
+    assets: manifestAssets.sort((left, right) => left.entry.localeCompare(right.entry)),
+    optionalEntries: [],
+  };
+  const manifestBytes = Buffer.from(canonicalJson(manifest), 'utf8');
+  if (manifestBytes.byteLength > HDECK_LIMITS.maxManifestBytes) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Manifest is too large.');
+  }
+  return encodeStoredZip([
+    { name: 'manifest.json', bytes: manifestBytes },
+    { name: 'document.json', bytes: documentBytes },
+    ...entries.sort((left, right) => left.name.localeCompare(right.name)),
+  ]);
+};
+
+const parseJsonEntry = (bytes: Uint8Array, maximum: number, label: string): unknown => {
+  if (bytes.byteLength > maximum)
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', `${label} is too large.`);
+  const text = Buffer.from(bytes).toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(Buffer.from(bytes))) {
+    throw new HdeckError('ARCHIVE_INVALID', `${label} is not valid UTF-8.`);
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new HdeckError('ARCHIVE_INVALID', `${label} is not valid JSON.`);
+  }
+};
+
+export const parseHdeckArchive = (archive: Uint8Array): ParsedHdeck => {
+  const decoded = decodeStoredZip(archive);
+  const entries = new Map(decoded.map((entry) => [entry.name, entry.bytes]));
+  const manifestBytes = entries.get('manifest.json');
+  const documentBytes = entries.get('document.json');
+  if (manifestBytes === undefined || documentBytes === undefined) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Archive is missing required entries.');
+  }
+  const manifest = parseManifest(
+    parseJsonEntry(manifestBytes, HDECK_LIMITS.maxManifestBytes, 'Manifest'),
+  );
+  if (manifest.documentSha256 !== sha256(documentBytes)) {
+    throw new HdeckError('HASH_MISMATCH', 'Document hash does not match the manifest.');
+  }
+  let document: DeckDocument;
+  try {
+    document = parseDeck(parseJsonEntry(documentBytes, HDECK_LIMITS.maxDocumentBytes, 'Document'));
+  } catch (error) {
+    if (error instanceof HdeckError) throw error;
+    throw new HdeckError('DOCUMENT_INVALID', 'Document model is invalid.');
+  }
+  if (
+    document.id !== manifest.documentId ||
+    document.schemaVersion !== manifest.documentSchemaVersion
+  ) {
+    throw new HdeckError('ARCHIVE_INVALID', 'Manifest and document identity disagree.');
+  }
+
+  const declaredEntries = new Set(['manifest.json', 'document.json']);
+  const assets = new Map<string, Uint8Array>();
+  const declaredAssetIds = new Set<string>();
+  for (const asset of manifest.assets) {
+    if (declaredAssetIds.has(asset.id) || declaredEntries.has(asset.entry)) {
+      throw new HdeckError('ARCHIVE_INVALID', 'Manifest declares a duplicate asset.');
+    }
+    declaredAssetIds.add(asset.id);
+    declaredEntries.add(asset.entry);
+    const bytes = entries.get(asset.entry);
+    if (bytes === undefined)
+      throw new HdeckError('ASSET_MISSING', 'Declared asset entry is missing.');
+    if (bytes.byteLength !== asset.byteLength || sha256(bytes) !== asset.sha256) {
+      throw new HdeckError('HASH_MISMATCH', 'Asset does not match the manifest.');
+    }
+    const expectedEntry = `assets/${asset.sha256}.${extensionForMediaType(asset.mediaType)}`;
+    if (asset.entry !== expectedEntry) {
+      throw new HdeckError('ARCHIVE_INVALID', 'Asset entry is not content-addressed.');
+    }
+    assets.set(asset.id, bytes);
+  }
+  for (const optional of manifest.optionalEntries) {
+    if (declaredEntries.has(optional.entry)) {
+      throw new HdeckError('ARCHIVE_INVALID', 'Manifest declares a duplicate optional entry.');
+    }
+    declaredEntries.add(optional.entry);
+    const bytes = entries.get(optional.entry);
+    if (
+      bytes === undefined ||
+      bytes.byteLength !== optional.byteLength ||
+      sha256(bytes) !== optional.sha256
+    ) {
+      throw new HdeckError('HASH_MISMATCH', 'Optional entry does not match the manifest.');
+    }
+  }
+  for (const entryName of entries.keys()) {
+    if (!declaredEntries.has(entryName)) {
+      throw new HdeckError('ENTRY_UNDECLARED', 'Archive contains an undeclared entry.');
+    }
+  }
+  const documentAssets = new Map(document.assets.map((asset) => [asset.id, asset]));
+  if (documentAssets.size !== manifest.assets.length) {
+    throw new HdeckError('ASSET_MISSING', 'Document and manifest asset lists differ.');
+  }
+  for (const asset of manifest.assets) {
+    const reference = documentAssets.get(asset.id);
+    if (
+      reference === undefined ||
+      reference.hash !== asset.sha256 ||
+      reference.mediaType !== asset.mediaType
+    ) {
+      throw new HdeckError(
+        'HASH_MISMATCH',
+        'Document asset reference does not match the manifest.',
+      );
+    }
+  }
+  return { manifest, document, assets, archiveSha256: sha256(archive) };
+};

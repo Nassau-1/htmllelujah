@@ -1,0 +1,22 @@
+{
+  "name": "@htmllelujah/geometry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pure deterministic geometry primitives for HTMLlelujah.",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}
