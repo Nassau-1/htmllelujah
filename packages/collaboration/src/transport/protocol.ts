@@ -60,7 +60,14 @@ export const authRejectedSchema = z
   .object({
     type: z.literal('auth.rejected'),
     protocolVersion: z.literal(COLLABORATION_PROTOCOL_VERSION),
-    code: z.enum(['AUTH_FAILED', 'AUTH_EXPIRED', 'AUTH_REPLAY', 'PEER_LIMIT', 'PROTOCOL_ERROR']),
+    code: z.enum([
+      'AUTH_FAILED',
+      'AUTH_EXPIRED',
+      'AUTH_REPLAY',
+      'INVITATION_EXPIRED',
+      'PEER_LIMIT',
+      'PROTOCOL_ERROR',
+    ]),
     message: z.string().trim().min(1).max(300),
   })
   .strict();

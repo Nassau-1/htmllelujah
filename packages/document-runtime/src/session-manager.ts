@@ -975,6 +975,43 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     });
   }
 
+  /**
+   * Main-process collaboration fence. A snapshot reached the shared-file commit boundary but
+   * writer-lease confirmation failed, so the in-memory/recovery copy must remain dirty and must
+   * not retain a path that could be written in the background.
+   */
+  public markDetachedSaveUnconfirmedMainOnly(sessionId: string): Promise<DocumentSessionSnapshot> {
+    const state = this.#requireSession(sessionId);
+    return this.#enqueue(state, async () => {
+      state.targetPath = undefined;
+      state.targetFingerprint = null;
+      state.persisted = false;
+      state.durability = 'save-error';
+      try {
+        await this.#recovery.writeMetadata(this.#recoveryMetadata(state));
+      } catch {
+        this.#emit({
+          type: 'durability-error',
+          sessionId: state.sessionId,
+          documentId: state.documentId,
+          operation: 'recovery',
+        });
+        throw new DocumentRuntimeError(
+          'JOURNAL_FAILED',
+          'The uncertain shared-file save remains open but recovery metadata could not be fenced.',
+          true,
+        );
+      }
+      this.#emit({
+        type: 'durability-error',
+        sessionId: state.sessionId,
+        documentId: state.documentId,
+        operation: 'save',
+      });
+      return this.#snapshot(state);
+    });
+  }
+
   public flush(sessionId: string): Promise<DocumentSessionSnapshot> {
     const state = this.#requireSession(sessionId);
     return this.#enqueue(state, async () => {

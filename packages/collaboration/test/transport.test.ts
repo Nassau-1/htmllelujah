@@ -61,7 +61,11 @@ const createClient = (
   invitation: ManualInvitation,
   engine: AuthoritativeSessionHost,
   clientId: string,
-  options: { readonly secret?: Uint8Array; readonly nonceFactory?: () => string } = {},
+  options: {
+    readonly secret?: Uint8Array;
+    readonly nonceFactory?: () => string;
+    readonly clock?: () => number;
+  } = {},
 ): CollaborationTransportClient =>
   new CollaborationTransportClient({
     invitation,
@@ -69,6 +73,7 @@ const createClient = (
     clientId,
     documentSecret: options.secret ?? SECRET,
     ...(options.nonceFactory === undefined ? {} : { nonceFactory: options.nonceFactory }),
+    ...(options.clock === undefined ? {} : { clock: options.clock }),
   });
 
 const expectRemoteCode = async (operation: Promise<unknown>, code: string): Promise<void> => {
@@ -189,6 +194,71 @@ describe('WSS collaboration transport', () => {
       await replay.close();
       await reconnect.close();
       await server.close();
+      await server.close();
+    }
+  });
+
+  it('signals an authenticated drop and reconnects with a fresh authenticated channel', async () => {
+    const engine = createEngine();
+    const server = new CollaborationTransportServer({ engine, documentSecret: SECRET });
+    const invitation = await server.start();
+    const client = createClient(invitation, engine, 'client-auto-reconnect');
+    try {
+      await client.connect();
+      const disconnected = new Promise<string>((resolve) => {
+        const stop = client.onDisconnect((error) => {
+          stop();
+          resolve(error.code);
+        });
+      });
+      const socket = (client as unknown as { socket: WebSocket }).socket;
+      socket.terminate();
+      expect(await disconnected).toBe('CONNECTION_CLOSED');
+      await waitFor(() => server.connectionCount === 0);
+      await client.connect();
+      expect(client.isConnected).toBe(true);
+      const transaction = await client.submit(
+        createCommandRequest(engine, 'client-auto-reconnect', requestId(77)),
+      );
+      expect(transaction.sessionSeq).toBe(1);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('rejects a replayed invitation at the server after its original expiry', async () => {
+    let now = 10_000;
+    const engine = createEngine();
+    const server = new CollaborationTransportServer({
+      engine,
+      documentSecret: SECRET,
+      invitationTtlMs: 100,
+      clock: () => now,
+    });
+    const invitation = await server.start();
+    const first = createClient(invitation, engine, 'client-before-expiry', { clock: () => now });
+    try {
+      await first.connect();
+      await first.close();
+      await waitFor(() => server.connectionCount === 0);
+      now = invitation.expiresAtMs;
+      // Simulate the former desktop bug that reconstructed a fresh client-side expiry from an
+      // old session code. The authoritative server must still fence the replay.
+      const replay = createClient(
+        { ...invitation, expiresAtMs: now + 60_000 },
+        engine,
+        'client-after-expiry',
+        { clock: () => now },
+      );
+      try {
+        await expectRemoteCode(replay.connect(), 'INVITATION_EXPIRED');
+      } finally {
+        await replay.close();
+      }
+      expect(server.authenticatedPeerCount).toBe(0);
+    } finally {
+      await first.close();
       await server.close();
     }
   });

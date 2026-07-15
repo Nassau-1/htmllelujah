@@ -249,6 +249,18 @@ export class CollaborationTransportServer {
       socket.close(1008, 'Invalid session path');
       return;
     }
+    if (this.invitation === undefined || this.invitation.expiresAtMs <= this.clock()) {
+      socket.send(
+        json({
+          type: 'auth.rejected',
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          code: 'INVITATION_EXPIRED',
+          message: 'The collaboration invitation expired.',
+        }),
+      );
+      socket.close(1008, 'Invitation expired');
+      return;
+    }
     if (this.connections.size >= this.maxPeers) {
       socket.send(
         json({
@@ -326,6 +338,14 @@ export class CollaborationTransportServer {
       return;
     }
     const challenge = state.challenge;
+    if (this.invitation === undefined || this.invitation.expiresAtMs <= this.clock()) {
+      this.rejectAuthentication(
+        state,
+        'INVITATION_EXPIRED',
+        'The collaboration invitation expired.',
+      );
+      return;
+    }
     if (
       response.sessionId !== this.engine.sessionId ||
       response.documentId !== this.engine.documentId ||
@@ -521,7 +541,7 @@ export class CollaborationTransportServer {
 
   private rejectAuthentication(
     state: ConnectionState,
-    code: 'AUTH_FAILED' | 'AUTH_EXPIRED' | 'AUTH_REPLAY' | 'PROTOCOL_ERROR',
+    code: 'AUTH_FAILED' | 'AUTH_EXPIRED' | 'AUTH_REPLAY' | 'INVITATION_EXPIRED' | 'PROTOCOL_ERROR',
     message: string,
   ): void {
     if (state.socket.readyState === WebSocket.OPEN) {

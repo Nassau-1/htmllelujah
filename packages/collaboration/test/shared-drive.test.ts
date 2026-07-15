@@ -8,7 +8,9 @@ import {
   CollaborationError,
   fingerprintSharedTargetBytes,
   NodeSharedDriveFileSystem,
+  signCanonicalPayload,
   WriterLeaseStore,
+  writerLeaseBodySchema,
   type SharedDriveFileSystem,
   type WriterLeaseStoreOptions,
 } from '../src/index.js';
@@ -73,6 +75,56 @@ class TriggerableFileSystem extends NodeSharedDriveFileSystem implements SharedD
   }
 }
 
+class InterleavingFileSystem extends NodeSharedDriveFileSystem {
+  public beforeSwap: (() => Promise<void>) | undefined;
+  public beforeDelete: (() => Promise<void>) | undefined;
+
+  public override async compareAndSwapText(
+    filePath: string,
+    expectedContent: string,
+    replacementContent: string,
+    temporaryId: string,
+  ): Promise<boolean> {
+    const hook = this.beforeSwap;
+    this.beforeSwap = undefined;
+    await hook?.();
+    return super.compareAndSwapText(filePath, expectedContent, replacementContent, temporaryId);
+  }
+
+  public override async compareAndDeleteText(
+    filePath: string,
+    expectedContent: string,
+    temporaryId: string,
+  ): Promise<boolean> {
+    const hook = this.beforeDelete;
+    this.beforeDelete = undefined;
+    await hook?.();
+    return super.compareAndDeleteText(filePath, expectedContent, temporaryId);
+  }
+}
+
+const installCompetingLease = async (
+  fileSystem: NodeSharedDriveFileSystem,
+  target: string,
+  targetFingerprint?: string,
+): Promise<void> => {
+  const sidecar = `${target}.writer.json`;
+  const current = JSON.parse(await readFile(sidecar, 'utf8')) as Record<string, unknown>;
+  const { signature: _signature, ...body } = current;
+  const parsed = writerLeaseBodySchema.parse({
+    ...body,
+    writerInstanceId: 'writer-racer',
+    leaseId: '95900000-0000-4000-8000-000000000099',
+    heartbeatSeq: Number(body.heartbeatSeq) + 1,
+    ...(targetFingerprint === undefined ? {} : { targetFingerprint }),
+  });
+  await fileSystem.writeAtomic(
+    sidecar,
+    JSON.stringify({ ...parsed, signature: signCanonicalPayload(SECRET, parsed) }),
+    '95900000-0000-4000-8000-000000000098',
+  );
+};
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories
@@ -134,6 +186,99 @@ describe('shared-drive writer lease', () => {
     expect((await first.inspect()).state).toBe('split-brain');
     await first.close({ release: false });
     await second.close();
+  });
+
+  it('recognizes a crashed foreign-secret lease and requires stable explicit takeover', async () => {
+    let now = 3_000;
+    const target = await createTarget();
+    const first = createStore(target, {
+      writerInstanceId: 'writer-old-secret',
+      documentSecret: Buffer.alloc(32, 0x31),
+      leaseTtlMs: 20,
+      clock: () => now,
+    });
+    await first.claim();
+    const successor = createStore(target, {
+      writerInstanceId: 'writer-new-secret',
+      sessionId: SESSION_B,
+      documentSecret: Buffer.alloc(32, 0x32),
+      leaseTtlMs: 20,
+      clock: () => now,
+    });
+    expect(await successor.inspect()).toMatchObject({ state: 'active-other', verified: false });
+    await expectCode(successor.claim({ allowExpiredTakeover: true }), 'WRITER_LEASE_ACTIVE');
+    now += 21;
+    expect(await successor.inspect()).toMatchObject({ state: 'stale', verified: false });
+    await expectCode(successor.claim(), 'WRITER_LEASE_STALE');
+    const startedAt = Date.now();
+    await successor.claim({ allowExpiredTakeover: true });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(15);
+    expect((await first.inspect()).state).toBe('split-brain');
+    await first.close({ release: false });
+    await successor.close();
+  });
+
+  it('uses sidecar CAS for heartbeat, snapshot recording, and release interleavings', async () => {
+    const heartbeatTarget = await createTarget();
+    const heartbeatFs = new InterleavingFileSystem();
+    const heartbeatOwner = new WriterLeaseStore({
+      targetPath: heartbeatTarget,
+      documentId: DOCUMENT_ID,
+      sessionId: SESSION_A,
+      writerInstanceId: 'writer-heartbeat',
+      documentSecret: SECRET,
+      fileSystem: heartbeatFs,
+    });
+    await heartbeatOwner.claim();
+    heartbeatFs.beforeSwap = () => installCompetingLease(heartbeatFs, heartbeatTarget);
+    await expectCode(heartbeatOwner.heartbeat(), 'SPLIT_BRAIN');
+    expect(JSON.parse(await readFile(`${heartbeatTarget}.writer.json`, 'utf8'))).toMatchObject({
+      writerInstanceId: 'writer-racer',
+    });
+    await heartbeatOwner.close({ release: false });
+
+    const recordTarget = await createTarget();
+    const recordFs = new InterleavingFileSystem();
+    const recordOwner = new WriterLeaseStore({
+      targetPath: recordTarget,
+      documentId: DOCUMENT_ID,
+      sessionId: SESSION_A,
+      writerInstanceId: 'writer-record',
+      documentSecret: SECRET,
+      fileSystem: recordFs,
+    });
+    const recordedLease = await recordOwner.claim();
+    const nextBytes = Buffer.from('snapshot-after-race');
+    await writeFile(recordTarget, nextBytes);
+    const nextFingerprint = fingerprintSharedTargetBytes(nextBytes);
+    recordFs.beforeSwap = () => installCompetingLease(recordFs, recordTarget, nextFingerprint);
+    await expectCode(
+      recordOwner.recordSnapshot(recordedLease.targetFingerprint, nextFingerprint),
+      'SPLIT_BRAIN',
+    );
+    expect(JSON.parse(await readFile(`${recordTarget}.writer.json`, 'utf8'))).toMatchObject({
+      writerInstanceId: 'writer-racer',
+      targetFingerprint: nextFingerprint,
+    });
+    await recordOwner.close({ release: false });
+
+    const releaseTarget = await createTarget();
+    const releaseFs = new InterleavingFileSystem();
+    const releaseOwner = new WriterLeaseStore({
+      targetPath: releaseTarget,
+      documentId: DOCUMENT_ID,
+      sessionId: SESSION_A,
+      writerInstanceId: 'writer-release',
+      documentSecret: SECRET,
+      fileSystem: releaseFs,
+    });
+    await releaseOwner.claim();
+    releaseFs.beforeDelete = () => installCompetingLease(releaseFs, releaseTarget);
+    await expectCode(releaseOwner.release(), 'SPLIT_BRAIN');
+    expect(JSON.parse(await readFile(`${releaseTarget}.writer.json`, 'utf8'))).toMatchObject({
+      writerInstanceId: 'writer-racer',
+    });
+    await releaseOwner.close({ release: false });
   });
 
   it('rejects tampered sidecars and changed target fingerprints', async () => {

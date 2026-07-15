@@ -19,6 +19,7 @@ const signatureSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 export const writerLeaseBodySchema = z
   .object({
     schemaVersion: z.literal(1),
+    signingKeyId: certificateFingerprintSchema,
     documentId: z.string().uuid(),
     sessionId: z.string().uuid(),
     writerInstanceId: z.string().trim().min(1).max(128),
@@ -41,8 +42,12 @@ export type SignedWriterLease = z.infer<typeof signedWriterLeaseSchema>;
 export type WriterLeaseStatus =
   | { readonly state: 'unclaimed'; readonly targetFingerprint: string }
   | { readonly state: 'active-self'; readonly lease: SignedWriterLease }
-  | { readonly state: 'active-other'; readonly lease: SignedWriterLease }
-  | { readonly state: 'stale'; readonly lease: SignedWriterLease }
+  | {
+      readonly state: 'active-other';
+      readonly lease: SignedWriterLease;
+      readonly verified: boolean;
+    }
+  | { readonly state: 'stale'; readonly lease: SignedWriterLease; readonly verified: boolean }
   | { readonly state: 'tampered' }
   | {
       readonly state: 'target-changed';
@@ -59,6 +64,17 @@ export interface SharedDriveFileSystem {
   readText(filePath: string): Promise<string | undefined>;
   writeExclusive(filePath: string, content: string): Promise<void>;
   writeAtomic(filePath: string, content: string, temporaryId: string): Promise<void>;
+  compareAndSwapText(
+    filePath: string,
+    expectedContent: string,
+    replacementContent: string,
+    temporaryId: string,
+  ): Promise<boolean>;
+  compareAndDeleteText(
+    filePath: string,
+    expectedContent: string,
+    temporaryId: string,
+  ): Promise<boolean>;
   deleteFile(filePath: string): Promise<boolean>;
   fingerprint(filePath: string): Promise<string>;
   watch(directoryPath: string, listener: (fileName: string | undefined) => void): () => void;
@@ -119,6 +135,95 @@ export class NodeSharedDriveFileSystem implements SharedDriveFileSystem {
     }
   }
 
+  public async compareAndSwapText(
+    filePath: string,
+    expectedContent: string,
+    replacementContent: string,
+    temporaryId: string,
+  ): Promise<boolean> {
+    const displacedPath = `${filePath}.${temporaryId}.stale`;
+    try {
+      await rename(filePath, displacedPath);
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
+    }
+    let displaced = true;
+    try {
+      const observed = await readFile(displacedPath, 'utf8');
+      if (observed !== expectedContent) {
+        try {
+          await this.writeExclusive(filePath, observed);
+          displaced = false;
+          await unlink(displacedPath);
+        } catch (error) {
+          if (!isMissing(error) && (error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        return false;
+      }
+      try {
+        await this.writeExclusive(filePath, replacementContent);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+        throw error;
+      }
+      await unlink(displacedPath).catch(() => undefined);
+      displaced = false;
+      return true;
+    } finally {
+      if (displaced) {
+        const observed = await readFile(displacedPath, 'utf8').catch(() => undefined);
+        if (observed !== undefined) {
+          await this.writeExclusive(filePath, observed).catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          });
+          await unlink(displacedPath).catch(() => undefined);
+        }
+      }
+    }
+  }
+
+  public async compareAndDeleteText(
+    filePath: string,
+    expectedContent: string,
+    temporaryId: string,
+  ): Promise<boolean> {
+    const displacedPath = `${filePath}.${temporaryId}.released`;
+    try {
+      await rename(filePath, displacedPath);
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
+    }
+    let displaced = true;
+    try {
+      const observed = await readFile(displacedPath, 'utf8');
+      if (observed !== expectedContent) {
+        try {
+          await this.writeExclusive(filePath, observed);
+          displaced = false;
+          await unlink(displacedPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        return false;
+      }
+      await unlink(displacedPath);
+      displaced = false;
+      return true;
+    } finally {
+      if (displaced) {
+        const observed = await readFile(displacedPath, 'utf8').catch(() => undefined);
+        if (observed !== undefined) {
+          await this.writeExclusive(filePath, observed).catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          });
+          await unlink(displacedPath).catch(() => undefined);
+        }
+      }
+    }
+  }
+
   public async deleteFile(filePath: string): Promise<boolean> {
     try {
       await unlink(filePath);
@@ -173,6 +278,7 @@ export class WriterLeaseStore {
   private readonly sessionId: string;
   private readonly writerInstanceId: string;
   private readonly documentSecret: Buffer;
+  private readonly signingKeyId: string;
   private readonly leaseTtlMs: number;
   private readonly clock: () => number;
   private readonly idFactory: () => string;
@@ -199,6 +305,7 @@ export class WriterLeaseStore {
     this.sessionId = z.string().uuid().parse(options.sessionId);
     this.writerInstanceId = z.string().trim().min(1).max(128).parse(options.writerInstanceId);
     this.documentSecret = normalizeDocumentSecret(options.documentSecret);
+    this.signingKeyId = fingerprintBytes(this.documentSecret);
     this.leaseTtlMs = options.leaseTtlMs ?? 45_000;
     this.clock = options.clock ?? (() => Date.now());
     this.idFactory = options.idFactory ?? (() => globalThis.crypto.randomUUID());
@@ -216,8 +323,17 @@ export class WriterLeaseStore {
     const raw = await this.fileSystem.readText(this.sidecarPath);
     if (raw === undefined)
       return { state: 'unclaimed', targetFingerprint: actualTargetFingerprint };
+    const parsedLease = this.parseLease(raw);
+    if (parsedLease === undefined || parsedLease.documentId !== this.documentId)
+      return { state: 'tampered' };
     const lease = this.parseAndVerify(raw);
-    if (lease === undefined || lease.documentId !== this.documentId) return { state: 'tampered' };
+    if (lease === undefined) {
+      if (this.ownedLease !== undefined) return { state: 'split-brain', lease: parsedLease };
+      if (parsedLease.signingKeyId === this.signingKeyId) return { state: 'tampered' };
+      return parsedLease.expiresAtMs <= this.clock()
+        ? { state: 'stale', lease: parsedLease, verified: false }
+        : { state: 'active-other', lease: parsedLease, verified: false };
+    }
     if (lease.targetFingerprint !== actualTargetFingerprint) {
       if (this.ownedLease !== undefined) return { state: 'split-brain', lease };
       return { state: 'target-changed', lease, actualTargetFingerprint };
@@ -225,10 +341,10 @@ export class WriterLeaseStore {
     if (this.ownedLease !== undefined && lease.leaseId !== this.ownedLease.leaseId) {
       return { state: 'split-brain', lease };
     }
-    if (lease.expiresAtMs <= this.clock()) return { state: 'stale', lease };
+    if (lease.expiresAtMs <= this.clock()) return { state: 'stale', lease, verified: true };
     return lease.writerInstanceId === this.writerInstanceId && lease.sessionId === this.sessionId
       ? { state: 'active-self', lease }
-      : { state: 'active-other', lease };
+      : { state: 'active-other', lease, verified: true };
   }
 
   public async claim(
@@ -258,6 +374,34 @@ export class WriterLeaseStore {
       );
     }
 
+    let expectedStaleContent: string | undefined;
+    if (status.state === 'stale') {
+      expectedStaleContent = await this.fileSystem.readText(this.sidecarPath);
+      if (expectedStaleContent === undefined) {
+        throw new CollaborationError('SPLIT_BRAIN', 'Expired writer sidecar disappeared.');
+      }
+      if (!status.verified) {
+        const expectedTarget = await this.fileSystem.fingerprint(this.targetPath);
+        await new Promise<void>((resolve) => setTimeout(resolve, this.leaseTtlMs));
+        const [afterContent, afterTarget] = await Promise.all([
+          this.fileSystem.readText(this.sidecarPath),
+          this.fileSystem.fingerprint(this.targetPath),
+        ]);
+        const afterLease = afterContent === undefined ? undefined : this.parseLease(afterContent);
+        if (
+          afterContent !== expectedStaleContent ||
+          afterTarget !== expectedTarget ||
+          afterLease === undefined ||
+          afterLease.expiresAtMs > this.clock()
+        ) {
+          throw new CollaborationError(
+            'WRITER_LEASE_ACTIVE',
+            'The prior writer changed during the safe takeover observation window.',
+          );
+        }
+      }
+    }
+
     const now = this.clock();
     const targetFingerprint =
       status.state === 'unclaimed'
@@ -265,6 +409,7 @@ export class WriterLeaseStore {
         : await this.fileSystem.fingerprint(this.targetPath);
     const lease = this.signLease({
       schemaVersion: 1,
+      signingKeyId: this.signingKeyId,
       documentId: this.documentId,
       sessionId: this.sessionId,
       writerInstanceId: this.writerInstanceId,
@@ -279,11 +424,15 @@ export class WriterLeaseStore {
       if (status.state === 'unclaimed') {
         await this.fileSystem.writeExclusive(this.sidecarPath, JSON.stringify(lease));
       } else {
-        await this.fileSystem.writeAtomic(
+        const replaced = await this.fileSystem.compareAndSwapText(
           this.sidecarPath,
+          expectedStaleContent ?? '',
           JSON.stringify(lease),
           this.idFactory(),
         );
+        if (!replaced) {
+          throw new CollaborationError('SPLIT_BRAIN', 'Concurrent writer takeover detected.');
+        }
       }
     } catch (error) {
       const observed = await this.inspect().catch(() => undefined);
@@ -300,12 +449,25 @@ export class WriterLeaseStore {
     return lease;
   }
 
-  public async heartbeat(expectedTargetFingerprint?: string): Promise<SignedWriterLease> {
+  public async heartbeat(
+    expectedTargetFingerprint?: string,
+    extensionMs = this.leaseTtlMs,
+  ): Promise<SignedWriterLease> {
     const owned = this.ownedLease;
     if (owned === undefined) {
       throw new CollaborationError(
         'LEASE_NOT_OWNED',
         'This process does not own the writer lease.',
+      );
+    }
+    if (
+      !Number.isSafeInteger(extensionMs) ||
+      extensionMs < this.leaseTtlMs ||
+      extensionMs > 10 * 60 * 1_000
+    ) {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'Writer lease extension must be bounded and at least the normal lease TTL.',
       );
     }
     const actualTargetFingerprint = await this.fileSystem.fingerprint(this.targetPath);
@@ -339,10 +501,21 @@ export class WriterLeaseStore {
     const renewed = this.signLease({
       ...writerLeaseBodySchema.parse(currentBody),
       heartbeatAtMs: now,
-      expiresAtMs: now + this.leaseTtlMs,
+      expiresAtMs: now + extensionMs,
       heartbeatSeq: current.heartbeatSeq + 1,
     });
-    await this.fileSystem.writeAtomic(this.sidecarPath, JSON.stringify(renewed), this.idFactory());
+    const replaced = await this.fileSystem.compareAndSwapText(
+      this.sidecarPath,
+      currentRaw ?? '',
+      JSON.stringify(renewed),
+      this.idFactory(),
+    );
+    if (!replaced) {
+      throw new CollaborationError(
+        'SPLIT_BRAIN',
+        'Writer heartbeat lost a concurrent sidecar race.',
+      );
+    }
     const verified = this.parseAndVerify((await this.fileSystem.readText(this.sidecarPath)) ?? '');
     if (verified?.leaseId !== renewed.leaseId || verified.heartbeatSeq !== renewed.heartbeatSeq) {
       throw new CollaborationError(
@@ -431,7 +604,18 @@ export class WriterLeaseStore {
       expiresAtMs: now + this.leaseTtlMs,
       heartbeatSeq: current.heartbeatSeq + 1,
     });
-    await this.fileSystem.writeAtomic(this.sidecarPath, JSON.stringify(updated), this.idFactory());
+    const replaced = await this.fileSystem.compareAndSwapText(
+      this.sidecarPath,
+      currentRaw ?? '',
+      JSON.stringify(updated),
+      this.idFactory(),
+    );
+    if (!replaced) {
+      throw new CollaborationError(
+        'SPLIT_BRAIN',
+        'Snapshot fingerprint update lost a sidecar race.',
+      );
+    }
     const verified = this.parseAndVerify((await this.fileSystem.readText(this.sidecarPath)) ?? '');
     if (
       verified?.leaseId !== updated.leaseId ||
@@ -458,7 +642,14 @@ export class WriterLeaseStore {
     if (current?.leaseId !== owned.leaseId || current.writerInstanceId !== this.writerInstanceId) {
       throw new CollaborationError('SPLIT_BRAIN', 'Refusing to release another writer sidecar.');
     }
-    const deleted = await this.fileSystem.deleteFile(this.sidecarPath);
+    const deleted = await this.fileSystem.compareAndDeleteText(
+      this.sidecarPath,
+      raw,
+      this.idFactory(),
+    );
+    if (!deleted) {
+      throw new CollaborationError('SPLIT_BRAIN', 'Writer sidecar changed during release.');
+    }
     this.ownedLease = undefined;
     return deleted;
   }
@@ -556,6 +747,14 @@ export class WriterLeaseStore {
       const { signature, ...body } = parsed;
       const expected = signCanonicalPayload(this.documentSecret, writerLeaseBodySchema.parse(body));
       return constantTimeEqual(signature, expected) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private parseLease(raw: string): SignedWriterLease | undefined {
+    try {
+      return signedWriterLeaseSchema.parse(JSON.parse(raw));
     } catch {
       return undefined;
     }

@@ -1,8 +1,13 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { DocumentSessionManager } from '@htmllelujah/document-runtime';
+import {
+  defaultArchiveDurability,
+  DocumentSessionManager,
+  type ArchiveDurabilityCapability,
+} from '@htmllelujah/document-runtime';
+import { createHdeckArchive, parseHdeckArchive } from '@htmllelujah/hdeck';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { DesktopCollaborationCoordinator } from '../src/main/collaboration-service.js';
@@ -139,5 +144,507 @@ describe('DesktopCollaborationCoordinator', () => {
 
     expect((await guest.leave(joined.snapshot.sessionId))?.mode).toBe('guest');
     expect((await host.leave(hosted.snapshot.sessionId))?.mode).toBe('host');
+  }, 30_000);
+
+  it('does not overwrite a target changed between lease preflight and atomic save', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-save-race-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    let interceptSave = false;
+    let enteredSave: (() => void) | undefined;
+    let releaseSave: (() => void) | undefined;
+    const saveEntered = new Promise<void>((resolve) => {
+      enteredSave = resolve;
+    });
+    const saveGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    const archive: ArchiveDurabilityCapability = {
+      ...defaultArchiveDurability,
+      save: async (target, bytes, options) => {
+        if (interceptSave) {
+          enteredSave?.();
+          await saveGate;
+        }
+        return defaultArchiveDurability.save(target, bytes, options);
+      },
+    };
+    const recoveryDirectory = path.join(directory, 'host-recovery');
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory,
+      autosaveDelayMs: 0,
+      archive,
+    });
+    const recoveredRuntime = new DocumentSessionManager({
+      recoveryDirectory,
+      autosaveDelayMs: 0,
+    });
+    const host = new DesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(recoveredRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(source.sessionId, {
+      targetPath,
+      expectedFingerprint: null,
+    });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    const edited = await host.execute({
+      sessionId: hosted.snapshot.sessionId,
+      expectedRevision: hosted.snapshot.revision,
+      label: 'Unsaved authoritative edit',
+      commands: [{ type: 'deck.rename', name: 'Must remain recoverable' }],
+    });
+    interceptSave = true;
+    const pendingSave = host.saveHost(hosted.snapshot.sessionId);
+    await saveEntered;
+    const external = {
+      ...edited!.document,
+      name: 'External writer won',
+      metadata: { ...edited!.document.metadata, modifiedAt: new Date().toISOString() },
+    };
+    await writeFile(targetPath, createHdeckArchive({ document: external }));
+    releaseSave?.();
+    await expect(pendingSave).rejects.toMatchObject({ code: 'TARGET_CHANGED' });
+    expect(parseHdeckArchive(await readFile(targetPath)).document.name).toBe('External writer won');
+    expect(host.status(hosted.snapshot.sessionId)).toMatchObject({
+      mode: 'host',
+      connectedPeers: 0,
+    });
+    const ended = await host.leave(hosted.snapshot.sessionId);
+    expect(ended).toMatchObject({ mode: 'host', preserveDetached: true });
+    expect(hostRuntime.getSnapshot(hosted.snapshot.sessionId)).toMatchObject({
+      dirty: true,
+      hasSaveTarget: false,
+    });
+    const recovered = await recoveredRuntime.recoverMainOnly(hosted.snapshot.sessionId);
+    expect(recovered.document.name).toBe('Must remain recoverable');
+  }, 30_000);
+
+  it('serializes heartbeat behind the complete target-commit and sidecar-record window', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-save-heartbeat-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    let interceptSave = false;
+    let committedTarget: (() => void) | undefined;
+    let releaseArchive: (() => void) | undefined;
+    const targetCommitted = new Promise<void>((resolve) => {
+      committedTarget = resolve;
+    });
+    const archiveGate = new Promise<void>((resolve) => {
+      releaseArchive = resolve;
+    });
+    const archive: ArchiveDurabilityCapability = {
+      ...defaultArchiveDurability,
+      save: async (target, bytes, options) => {
+        const result = await defaultArchiveDurability.save(target, bytes, options);
+        if (interceptSave) {
+          committedTarget?.();
+          await archiveGate;
+        }
+        return result;
+      },
+    };
+    const runtime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'recovery'),
+      autosaveDelayMs: 0,
+      archive,
+    });
+    const host = new DesktopCollaborationCoordinator(runtime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+      writerLeaseTtlMs: 250,
+      heartbeatIntervalMs: 20,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(runtime));
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await runtime.createMainOnly();
+    await runtime.saveAsMainOnly(source.sessionId, { targetPath, expectedFingerprint: null });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    const edited = await host.execute({
+      sessionId: hosted.snapshot.sessionId,
+      expectedRevision: hosted.snapshot.revision,
+      label: 'Serialized save',
+      commands: [{ type: 'deck.rename', name: 'Serialized heartbeat save' }],
+    });
+    interceptSave = true;
+    const pendingSave = host.saveHost(hosted.snapshot.sessionId);
+    await targetCommitted;
+    // Multiple heartbeat periods elapse while the target contains the new bytes but the
+    // sidecar still names the prior fingerprint. A non-serialized heartbeat would fence host.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(host.status(hosted.snapshot.sessionId).sessionCode).toBeTruthy();
+    releaseArchive?.();
+    const saved = await pendingSave;
+    expect(saved?.revision).toBe(edited?.revision);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(host.status(hosted.snapshot.sessionId).sessionCode).toBeTruthy();
+    expect(parseHdeckArchive(await readFile(targetPath)).document.name).toBe(
+      'Serialized heartbeat save',
+    );
+  }, 30_000);
+
+  it('keeps a post-commit copy dirty when sidecar confirmation is lost', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-unconfirmed-save-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    let interceptSave = false;
+    let committedTarget: (() => void) | undefined;
+    let releaseArchive: (() => void) | undefined;
+    const targetCommitted = new Promise<void>((resolve) => {
+      committedTarget = resolve;
+    });
+    const archiveGate = new Promise<void>((resolve) => {
+      releaseArchive = resolve;
+    });
+    const archive: ArchiveDurabilityCapability = {
+      ...defaultArchiveDurability,
+      save: async (target, bytes, options) => {
+        const result = await defaultArchiveDurability.save(target, bytes, options);
+        if (interceptSave) {
+          committedTarget?.();
+          await archiveGate;
+        }
+        return result;
+      },
+    };
+    const recoveryDirectory = path.join(directory, 'recovery');
+    const runtime = new DocumentSessionManager({
+      recoveryDirectory,
+      autosaveDelayMs: 0,
+      archive,
+    });
+    const recoveredRuntime = new DocumentSessionManager({ recoveryDirectory, autosaveDelayMs: 0 });
+    const host = new DesktopCollaborationCoordinator(runtime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+      writerLeaseTtlMs: 500,
+      heartbeatIntervalMs: 100,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(recoveredRuntime));
+    cleanup.push(() => closeRuntime(runtime));
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await runtime.createMainOnly();
+    await runtime.saveAsMainOnly(source.sessionId, { targetPath, expectedFingerprint: null });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    await host.execute({
+      sessionId: hosted.snapshot.sessionId,
+      expectedRevision: hosted.snapshot.revision,
+      label: 'Unconfirmed save',
+      commands: [{ type: 'deck.rename', name: 'Post-commit recovery copy' }],
+    });
+    interceptSave = true;
+    const pendingSave = host.saveHost(hosted.snapshot.sessionId);
+    await targetCommitted;
+    await writeFile(`${targetPath}.writer.json`, '{"tampered":true}', 'utf8');
+    releaseArchive?.();
+    await expect(pendingSave).rejects.toMatchObject({ code: 'SPLIT_BRAIN' });
+    expect(runtime.getSnapshot(hosted.snapshot.sessionId)).toMatchObject({
+      dirty: true,
+      hasSaveTarget: false,
+      durability: 'save-error',
+    });
+    const ended = await host.leave(hosted.snapshot.sessionId);
+    expect(ended).toMatchObject({ preserveDetached: true });
+    const recovered = await recoveredRuntime.recoverMainOnly(hosted.snapshot.sessionId);
+    expect(recovered.document.name).toBe('Post-commit recovery copy');
+    expect(recovered.dirty).toBe(true);
+  }, 30_000);
+
+  it('fences a host on heartbeat failure and preserves dirty detached recovery on leave', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-heartbeat-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    const recoveryDirectory = path.join(directory, 'host-recovery');
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory,
+      autosaveDelayMs: 0,
+    });
+    const recoveredRuntime = new DocumentSessionManager({
+      recoveryDirectory,
+      autosaveDelayMs: 0,
+    });
+    const host = new DesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+      writerLeaseTtlMs: 200,
+      heartbeatIntervalMs: 20,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(recoveredRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(source.sessionId, {
+      targetPath,
+      expectedFingerprint: null,
+    });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    const local = await host.execute({
+      sessionId: hosted.snapshot.sessionId,
+      expectedRevision: hosted.snapshot.revision,
+      label: 'Local edit before fence',
+      commands: [{ type: 'deck.rename', name: 'Recovered after heartbeat fence' }],
+    });
+    const external = {
+      ...local!.document,
+      name: 'External heartbeat conflict',
+      metadata: { ...local!.document.metadata, modifiedAt: new Date().toISOString() },
+    };
+    await writeFile(targetPath, createHdeckArchive({ document: external }));
+    await waitFor(() =>
+      host.status(hosted.snapshot.sessionId).note.includes('writer lease failed'),
+    );
+    await expect(
+      host.execute({
+        sessionId: hosted.snapshot.sessionId,
+        expectedRevision: local!.revision,
+        label: 'Must be fenced',
+        commands: [{ type: 'deck.rename', name: 'Forbidden after fence' }],
+      }),
+    ).rejects.toMatchObject({ code: 'SPLIT_BRAIN' });
+    const ended = await host.leave(hosted.snapshot.sessionId);
+    expect(ended).toMatchObject({ preserveDetached: true });
+    expect(hostRuntime.getSnapshot(hosted.snapshot.sessionId)).toMatchObject({
+      dirty: true,
+      hasSaveTarget: false,
+    });
+    const recovered = await recoveredRuntime.recoverMainOnly(hosted.snapshot.sessionId);
+    expect(recovered.document.name).toBe('Recovered after heartbeat fence');
+  }, 30_000);
+
+  it('disconnects and fences a guest whose local replica cannot apply the host transaction', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-guest-fence-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'host-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const guestRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'guest-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const recoveredGuestRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'guest-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const host = new DesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+    });
+    const guest = new DesktopCollaborationCoordinator(guestRuntime);
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(recoveredGuestRuntime));
+    cleanup.push(() => closeRuntime(guestRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => guest.shutdownAll());
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(source.sessionId, { targetPath, expectedFingerprint: null });
+    const guestSource = await guestRuntime.openMainOnly({ targetPath });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    const joined = await guest.join({
+      sessionId: guestSource.sessionId,
+      targetPath,
+      endpoint: hosted.status.endpoint!,
+      sessionCode: hosted.status.sessionCode!,
+      expectedFingerprint: hosted.status.hostFingerprint!,
+      displayName: 'Guest',
+    });
+    const guestBefore = guestRuntime.getSnapshot(joined.snapshot.sessionId);
+    await guestRuntime.execute(joined.snapshot.sessionId, {
+      expectedRevision: guestBefore.revision,
+      commands: [{ type: 'deck.rename', name: 'Injected local divergence' }],
+      metadata: {
+        transactionId: '97000000-0000-4000-8000-000000000001',
+        actorId: 'test-divergence',
+        origin: 'user',
+        label: 'Inject divergence',
+        timestamp: new Date().toISOString(),
+      },
+    });
+    await host.execute({
+      sessionId: hosted.snapshot.sessionId,
+      expectedRevision: hosted.snapshot.revision,
+      label: 'Authoritative change',
+      commands: [{ type: 'deck.rename', name: 'Authoritative host value' }],
+    });
+    await waitFor(() => guest.status(joined.snapshot.sessionId).connectedPeers === 0);
+    expect(guest.status(joined.snapshot.sessionId).note).toContain('read-only');
+    const diverged = guestRuntime.getSnapshot(joined.snapshot.sessionId);
+    await expect(
+      guest.execute({
+        sessionId: joined.snapshot.sessionId,
+        expectedRevision: diverged.revision,
+        label: 'Forbidden divergent guest edit',
+        commands: [{ type: 'deck.rename', name: 'Must not submit' }],
+      }),
+    ).rejects.toMatchObject({ code: 'REVISION_CONFLICT' });
+    const ended = await guest.leave(joined.snapshot.sessionId);
+    expect(ended).toMatchObject({
+      mode: 'guest',
+      preserveDetached: true,
+      preservationReason: 'guest-copy',
+    });
+    const recovered = await recoveredGuestRuntime.recoverMainOnly(joined.snapshot.sessionId);
+    expect(recovered.document.name).toBe('Injected local divergence');
+  }, 30_000);
+
+  it('keeps a recoverable guest copy after bounded reconnect fails on host loss', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-host-loss-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'host-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const guestRecoveryDirectory = path.join(directory, 'guest-recovery');
+    const guestRuntime = new DocumentSessionManager({
+      recoveryDirectory: guestRecoveryDirectory,
+      autosaveDelayMs: 0,
+    });
+    const recoveredGuestRuntime = new DocumentSessionManager({
+      recoveryDirectory: guestRecoveryDirectory,
+      autosaveDelayMs: 0,
+    });
+    const host = new DesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+    });
+    const guest = new DesktopCollaborationCoordinator(guestRuntime);
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(recoveredGuestRuntime));
+    cleanup.push(() => closeRuntime(guestRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => guest.shutdownAll());
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(source.sessionId, { targetPath, expectedFingerprint: null });
+    const guestSource = await guestRuntime.openMainOnly({ targetPath });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    const joined = await guest.join({
+      sessionId: guestSource.sessionId,
+      targetPath,
+      endpoint: hosted.status.endpoint!,
+      sessionCode: hosted.status.sessionCode!,
+      expectedFingerprint: hosted.status.hostFingerprint!,
+      displayName: 'Guest',
+    });
+    await host.execute({
+      sessionId: hosted.snapshot.sessionId,
+      expectedRevision: hosted.snapshot.revision,
+      label: 'Accepted before host loss',
+      commands: [{ type: 'deck.rename', name: 'Guest survives host loss' }],
+    });
+    await waitFor(
+      () =>
+        guestRuntime.getSnapshot(joined.snapshot.sessionId).document.name ===
+        'Guest survives host loss',
+    );
+    await host.shutdown(hosted.snapshot.sessionId);
+    await waitFor(() => guest.status(joined.snapshot.sessionId).note.includes('read-only'), 8_000);
+    const ended = await guest.leave(joined.snapshot.sessionId);
+    expect(ended).toMatchObject({
+      mode: 'guest',
+      preserveDetached: true,
+      preservationReason: 'guest-copy',
+    });
+    const recovered = await recoveredGuestRuntime.recoverMainOnly(joined.snapshot.sessionId);
+    expect(recovered.document.name).toBe('Guest survives host loss');
+  }, 30_000);
+
+  it('binds the desktop session code to the server invitation expiry and a bounded format', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-expiry-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    let now = Date.now();
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'host-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const guestRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'guest-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const host = new DesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+      invitationTtlMs: 50,
+      clock: () => now,
+    });
+    const guest = new DesktopCollaborationCoordinator(guestRuntime, { clock: () => now });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(guestRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => guest.shutdownAll());
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(source.sessionId, { targetPath, expectedFingerprint: null });
+    const guestSource = await guestRuntime.openMainOnly({ targetPath });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    expect(hosted.status.sessionCode!.length).toBeLessThanOrEqual(128);
+    now += 51;
+    await expect(
+      guest.join({
+        sessionId: guestSource.sessionId,
+        targetPath,
+        endpoint: hosted.status.endpoint!,
+        sessionCode: hosted.status.sessionCode!,
+        expectedFingerprint: hosted.status.hostFingerprint!,
+        displayName: 'Expired guest',
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(
+      guest.join({
+        sessionId: guestSource.sessionId,
+        targetPath,
+        endpoint: hosted.status.endpoint!,
+        sessionCode: 'x'.repeat(129),
+        expectedFingerprint: hosted.status.hostFingerprint!,
+        displayName: 'Oversized code',
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
   }, 30_000);
 });

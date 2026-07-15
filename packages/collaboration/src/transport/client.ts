@@ -97,6 +97,7 @@ export class CollaborationTransportClient {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly transactionListeners = new Set<(transaction: CommittedTransaction) => void>();
   private readonly presenceListeners = new Set<(presence: PresenceRecord) => void>();
+  private readonly disconnectListeners = new Set<(error: RemoteTransportError) => void>();
   private socket: WebSocket | undefined;
   private connectionPromise: Promise<void> | undefined;
   private connectionResolve: (() => void) | undefined;
@@ -217,6 +218,11 @@ export class CollaborationTransportClient {
   public onPresence(listener: (presence: PresenceRecord) => void): () => void {
     this.presenceListeners.add(listener);
     return () => this.presenceListeners.delete(listener);
+  }
+
+  public onDisconnect(listener: (error: RemoteTransportError) => void): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
   }
 
   public async submit(request: CommandBatchRequest): Promise<CommittedTransaction> {
@@ -458,6 +464,7 @@ export class CollaborationTransportClient {
 
   private handleClose(): void {
     const error = new RemoteTransportError('CONNECTION_CLOSED', 'Collaboration connection closed.');
+    const wasAuthenticated = this.authenticated;
     if (!this.authenticated) this.connectionReject?.(error);
     this.pending.forEach((pending) => {
       clearTimeout(pending.timer);
@@ -473,5 +480,6 @@ export class CollaborationTransportClient {
     this.connectionPromise = undefined;
     this.connectionResolve = undefined;
     this.connectionReject = undefined;
+    if (wasAuthenticated) this.disconnectListeners.forEach((listener) => listener(error));
   }
 }

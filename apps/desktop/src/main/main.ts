@@ -27,6 +27,7 @@ import { z } from 'zod';
 
 import { DesktopCollaborationCoordinator } from './collaboration-service.js';
 import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
+import { resolveSaveTarget } from './save-target.js';
 import {
   DESKTOP_API_VERSION,
   DESKTOP_IPC,
@@ -873,14 +874,39 @@ const saveAs = async (
     properties: ['showOverwriteConfirmation', 'createDirectory'],
   });
   if (result.canceled || result.filePath === undefined) return undefined;
-  const targetPath = result.filePath.toLowerCase().endsWith('.hdeck')
-    ? result.filePath
-    : `${result.filePath}.hdeck`;
+  const approved = await resolveSaveTarget({
+    selectedPath: result.filePath,
+    extension: '.hdeck',
+    inspect: async (targetPath) => {
+      await assertNoWriterSidecar(targetPath);
+      const state = await exportTargetState(targetPath);
+      await assertNoWriterSidecar(targetPath);
+      return state;
+    },
+    confirmAddedExtensionOverwrite: async (targetPath) => {
+      const confirmation = await messageBox(
+        parent ?? BrowserWindow.getFocusedWindow() ?? undefined,
+        {
+          type: 'warning',
+          title: 'Replace presentation?',
+          message: `“${path.basename(targetPath)}” already exists. Replace it?`,
+          buttons: ['Replace', 'Cancel'],
+          defaultId: 1,
+          cancelId: 1,
+          noLink: true,
+        },
+      );
+      return confirmation.response === 0;
+    },
+  });
+  if (approved === undefined) return undefined;
+  const targetPath = approved.path;
   await assertNoWriterSidecar(targetPath);
   const saved = await runtime.saveAsMainOnly(sessionId, {
     targetPath,
-    expectedFingerprint: null,
-    allowOverwrite: true,
+    // The relevant dialog supplied overwrite consent; pin that exact post-dialog file so a
+    // later external change is rejected instead of being mistaken for the approved bytes.
+    expectedFingerprint: approved.state.fingerprint ?? null,
   });
   sessionTargetPaths.set(sessionId, targetPath);
   return saved;
@@ -922,7 +948,23 @@ const confirmReplace = async (event: IpcMainInvokeEvent): Promise<boolean> => {
       noLink: true,
     });
     if (choice.response !== 0) return false;
-    await collaboration.leave(currentId);
+    const ended = await collaboration.leave(currentId);
+    if (ended?.preserveDetached === true) {
+      sessionTargetPaths.delete(currentId);
+      await messageBox(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
+        type: 'warning',
+        title: 'Save a recovery copy first',
+        message:
+          ended.preservationReason === 'guest-copy'
+            ? 'Your detached guest copy contains unsaved work.'
+            : 'Unsaved edits were detached from the unsafe shared-file writer.',
+        detail:
+          'The copy remains open and journaled. Use Save As before replacing this presentation.',
+        buttons: ['OK'],
+        noLink: true,
+      });
+      return false;
+    }
     return true;
   }
   const snapshot = runtime.getSnapshot(currentId);
@@ -1164,7 +1206,29 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
       event.preventDefault();
       void (async () => {
         try {
-          await collaboration.leave(sessionId);
+          const ended = await collaboration.leave(sessionId);
+          if (ended?.preserveDetached === true) {
+            sessionTargetPaths.delete(sessionId);
+            const choice = await dialog.showMessageBox(window, {
+              type: 'warning',
+              title: 'Save detached collaboration copy?',
+              message:
+                ended.preservationReason === 'guest-copy'
+                  ? 'The guest copy is not stored in the shared file.'
+                  : 'The shared-file writer became unsafe, so HTMLlelujah detached your edits.',
+              detail:
+                'Save a separate .hdeck to keep these edits, or explicitly discard them. Cancel keeps the recovery copy open and journaled.',
+              buttons: ['Save Copy', 'Discard', 'Cancel'],
+              defaultId: 0,
+              cancelId: 2,
+              noLink: true,
+            });
+            if (choice.response === 2) return;
+            if (choice.response === 0) {
+              const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
+              if ((await saveAs(syntheticEvent, sessionId)) === undefined) return;
+            }
+          }
         } catch {
           await dialog.showMessageBox(window, {
             type: 'error',
@@ -1424,7 +1488,30 @@ const configureIpc = (): void => {
     }
     const source = runtime.getSnapshot(input.sessionId);
     if (source.dirty) await saveWithTargetFallback(event, input.sessionId);
-    const transition = await collaboration.host({ ...input, targetPath });
+    let transition;
+    try {
+      transition = await collaboration.host({ ...input, targetPath });
+    } catch (error) {
+      if (!(error instanceof CollaborationError) || error.code !== 'WRITER_LEASE_STALE') {
+        throw error;
+      }
+      const parent = findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+      const choice = await messageBox(parent, {
+        type: 'warning',
+        title: 'Take over expired writer lease?',
+        message: 'The previous collaboration host stopped renewing its writer lease.',
+        detail:
+          'Continue only if that host is closed. HTMLlelujah will observe the shared file for a full lease window before taking ownership; any active heartbeat cancels the takeover.',
+        buttons: ['Verify and take over', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      });
+      if (choice.response !== 0) {
+        throw new DesktopMainError('CANCELLED', 'Writer takeover was cancelled.');
+      }
+      transition = await collaboration.host({ ...input, targetPath, allowExpiredTakeover: true });
+    }
     await assignSession(event, transition.snapshot, targetPath);
     return transition.status;
   });
@@ -1451,7 +1538,7 @@ const configureIpc = (): void => {
     assertSessionAccess(event, input.sessionId);
     const ended = await collaboration.leave(input.sessionId);
     if (ended === undefined) return collaboration.status(input.sessionId);
-    if (ended.mode === 'host') {
+    if (ended.mode === 'host' && !ended.preserveDetached) {
       const reopened = await runtime.openMainOnly({ targetPath: ended.targetPath });
       await assignSession(event, reopened, ended.targetPath);
     } else {
