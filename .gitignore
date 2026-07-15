@@ -1,0 +1,33 @@
+# Dependencies and generated output
+node_modules/
+dist/
+out/
+coverage/
+artifacts/
+.vite/
+.turbo/
+*.tsbuildinfo
+
+# Local application state
+.env
+.env.local
+*.log
+*.hdeck
+*.hlock
+
+# Signing and release material
+*.pfx
+*.p12
+*.cer
+*.key
+
+# Editors and operating systems
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.DS_Store
+Thumbs.db
+
+# Spec Kit transient workflow state
+.specify/workflows/runs/

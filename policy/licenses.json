@@ -1,0 +1,30 @@
+{
+  "allowed": [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "OFL-1.1",
+    "Unlicense",
+    "Zlib"
+  ],
+  "reviewedBuildOnly": {
+    "BlueOak-1.0.0": "Permissive build-tool license; not shipped as application code.",
+    "CC-BY-3.0": "SPDX metadata used by SBOM tooling; attribution retained in the dependency graph.",
+    "MPL-2.0": "CSS compiler dependency used at build time only; no MPL source is bundled into the application."
+  },
+  "blocked": [
+    "AGPL",
+    "BUSL",
+    "Commons Clause",
+    "GPL",
+    "LGPL",
+    "MPL",
+    "SSPL",
+    "UNLICENSED",
+    "UNKNOWN"
+  ]
+}

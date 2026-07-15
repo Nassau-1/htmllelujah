@@ -1,0 +1,11 @@
+.agents/
+.specify/templates/
+.specify/integrations/
+.specify/init-options.json
+.specify/integration.json
+.specify/workflows/
+**/dist/
+**/dist-electron/
+**/out/
+**/coverage/
+pnpm-lock.yaml

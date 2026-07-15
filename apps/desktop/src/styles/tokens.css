@@ -1,0 +1,147 @@
+/* ========================================================================== */
+/* Primitive tokens: raw visual values                                        */
+/* ========================================================================== */
+:root {
+  --primitive-white: #ffffff;
+  --primitive-slate-25: #fafbfc;
+  --primitive-slate-50: #f6f7f9;
+  --primitive-slate-75: #f1f3f6;
+  --primitive-slate-100: #eceff3;
+  --primitive-slate-150: #e3e7ed;
+  --primitive-slate-200: #d8dde5;
+  --primitive-slate-300: #bdc5d0;
+  --primitive-slate-400: #8d98a8;
+  --primitive-slate-500: #687486;
+  --primitive-slate-600: #4c5768;
+  --primitive-slate-700: #343d4b;
+  --primitive-slate-800: #242b35;
+  --primitive-slate-900: #171c24;
+  --primitive-cobalt-50: #edf4ff;
+  --primitive-cobalt-100: #dbeafe;
+  --primitive-cobalt-200: #b8d4ff;
+  --primitive-cobalt-500: #2f6feb;
+  --primitive-cobalt-600: #225ed2;
+  --primitive-cobalt-700: #184aa8;
+  --primitive-mint-100: #dff4eb;
+  --primitive-mint-700: #24694f;
+  --primitive-warm-100: #f7ead7;
+  --primitive-warm-700: #7a5226;
+  --primitive-red-50: #fff1f0;
+  --primitive-red-600: #c83e38;
+  --primitive-shadow: #1620331f;
+  --primitive-overlay: #17203312;
+
+  --primitive-space-1: 2px;
+  --primitive-space-2: 4px;
+  --primitive-space-3: 6px;
+  --primitive-space-4: 8px;
+  --primitive-space-5: 10px;
+  --primitive-space-6: 12px;
+  --primitive-space-8: 16px;
+  --primitive-space-10: 20px;
+  --primitive-space-12: 24px;
+
+  --primitive-font-sans: 'Inter', 'Segoe UI Variable', 'Segoe UI', Arial, sans-serif;
+  --primitive-font-mono: 'Cascadia Mono', 'SFMono-Regular', Consolas, monospace;
+  --primitive-font-10: 10px;
+  --primitive-font-11: 11px;
+  --primitive-font-12: 12px;
+  --primitive-font-13: 13px;
+  --primitive-font-14: 14px;
+  --primitive-font-16: 16px;
+  --primitive-font-18: 18px;
+
+  --primitive-radius-2: 2px;
+  --primitive-radius-4: 4px;
+  --primitive-radius-6: 6px;
+  --primitive-radius-round: 999px;
+  --primitive-border-1: 1px;
+  --primitive-shadow-subtle: 0 1px 2px var(--primitive-overlay);
+  --primitive-shadow-canvas: 0 8px 24px var(--primitive-shadow), 0 1px 3px var(--primitive-overlay);
+  --primitive-duration-fast: 110ms;
+  --primitive-duration-normal: 170ms;
+}
+
+/* ========================================================================== */
+/* Semantic tokens: meaning and interaction                                   */
+/* ========================================================================== */
+:root {
+  --color-surface-base: var(--primitive-white);
+  --color-surface-subtle: var(--primitive-slate-25);
+  --color-surface-muted: var(--primitive-slate-50);
+  --color-surface-raised: var(--primitive-white);
+  --color-pasteboard: var(--primitive-slate-100);
+  --color-border-subtle: var(--primitive-slate-150);
+  --color-border-default: var(--primitive-slate-200);
+  --color-border-strong: var(--primitive-slate-300);
+  --color-text-primary: var(--primitive-slate-900);
+  --color-text-secondary: var(--primitive-slate-600);
+  --color-text-muted: var(--primitive-slate-500);
+  --color-text-inverse: var(--primitive-white);
+  --color-accent: var(--primitive-cobalt-500);
+  --color-accent-hover: var(--primitive-cobalt-600);
+  --color-accent-pressed: var(--primitive-cobalt-700);
+  --color-accent-soft: var(--primitive-cobalt-50);
+  --color-accent-border: var(--primitive-cobalt-200);
+  --color-focus: var(--primitive-cobalt-500);
+  --color-danger: var(--primitive-red-600);
+  --color-danger-soft: var(--primitive-red-50);
+  --color-success-soft: var(--primitive-mint-100);
+  --color-warm-soft: var(--primitive-warm-100);
+  --color-ink-fill: var(--primitive-slate-800);
+  --font-ui: var(--primitive-font-sans);
+  --font-code: var(--primitive-font-mono);
+  --focus-ring: 0 0 0 2px var(--color-surface-base), 0 0 0 4px var(--color-focus);
+  --transition-interactive: var(--primitive-duration-fast) ease;
+}
+
+/* ========================================================================== */
+/* Component tokens: editor shell, controls and canvas                        */
+/* ========================================================================== */
+:root {
+  --app-header-bg: var(--color-surface-base);
+  --app-title-height: 42px;
+  --app-menu-height: 29px;
+  --app-toolbar-height: 46px;
+  --app-status-height: 28px;
+  --app-left-panel-width: 214px;
+  --app-inspector-width: 286px;
+  --app-divider: var(--color-border-subtle);
+
+  --button-height: 30px;
+  --button-min-width: 30px;
+  --button-gap: var(--primitive-space-3);
+  --button-padding: 0 var(--primitive-space-4);
+  --button-radius: var(--primitive-radius-4);
+  --button-bg: transparent;
+  --button-bg-hover: var(--color-surface-muted);
+  --button-bg-active: var(--color-accent-soft);
+  --button-text: var(--color-text-secondary);
+  --button-text-active: var(--color-accent-pressed);
+  --button-border-active: var(--color-accent-border);
+
+  --panel-bg: var(--color-surface-base);
+  --panel-heading-padding: var(--primitive-space-8);
+  --panel-section-padding: var(--primitive-space-8);
+  --panel-border: var(--color-border-subtle);
+
+  --canvas-bg: var(--primitive-white);
+  --canvas-grid-minor: var(--primitive-slate-100);
+  --canvas-grid-major: var(--primitive-slate-150);
+  --canvas-selection: var(--color-accent);
+  --canvas-guide: var(--color-accent);
+  --canvas-shadow: var(--primitive-shadow-canvas);
+  --canvas-radius: var(--primitive-radius-2);
+
+  --input-height: 30px;
+  --input-bg: var(--color-surface-base);
+  --input-border: var(--color-border-default);
+  --input-border-focus: var(--color-focus);
+  --input-radius: var(--primitive-radius-4);
+  --input-padding: 0 var(--primitive-space-4);
+
+  --thumbnail-bg: var(--color-surface-base);
+  --thumbnail-border: var(--color-border-default);
+  --thumbnail-border-selected: var(--color-accent);
+  --thumbnail-radius: var(--primitive-radius-4);
+}

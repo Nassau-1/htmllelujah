@@ -1,0 +1,28 @@
+{
+  "name": "@htmllelujah/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HTMLlelujah desktop presentation editor",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "1.24.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "electron": "43.1.1",
+    "vite": "8.1.4",
+    "vite-plugin-electron": "1.1.0"
+  }
+}

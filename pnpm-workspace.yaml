@@ -1,0 +1,11 @@
+packages:
+  - apps/*
+  - packages/*
+
+allowBuilds:
+  electron: true
+  esbuild: true
+  libxmljs2: true
+
+minimumReleaseAgeExclude:
+  - electron@43.1.1

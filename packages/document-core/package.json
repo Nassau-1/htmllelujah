@@ -1,0 +1,28 @@
+{
+  "name": "@htmllelujah/document-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Canonical structured document model and transactional command engine for HTMLlelujah.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
