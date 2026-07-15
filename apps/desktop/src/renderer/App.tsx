@@ -631,17 +631,20 @@ function EditorApp() {
       commands: readonly DocumentCommand[],
       options: { readonly select?: readonly string[]; readonly message?: string } = {},
     ): Promise<boolean> => {
-      if (sessionRef.current === null || commands.length === 0) return Promise.resolve(false);
+      const requestedSession = sessionRef.current;
+      if (requestedSession === null || commands.length === 0) return Promise.resolve(false);
       if (busy && pendingExecuteCountRef.current === 0) return Promise.resolve(false);
+      const requestedSessionId = requestedSession.snapshot.sessionId;
+      const requestedRevision = requestedSession.snapshot.revision;
       pendingExecuteCountRef.current += 1;
       setBusy(true);
       const run = async (): Promise<boolean> => {
         try {
           const current = sessionRef.current;
-          if (current === null) return false;
+          if (current === null || current.snapshot.sessionId !== requestedSessionId) return false;
           const result = await window.htmllelujah.execute({
-            sessionId: current.snapshot.sessionId,
-            expectedRevision: current.snapshot.revision,
+            sessionId: requestedSessionId,
+            expectedRevision: requestedRevision,
             label,
             commands,
           });
