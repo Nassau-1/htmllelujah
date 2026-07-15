@@ -849,6 +849,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     options: {
       readonly expectedFingerprint: string | null | undefined;
       readonly allowOverwrite?: boolean;
+      readonly attachTarget?: boolean;
     },
   ): Promise<DocumentSessionSnapshot> {
     const archive = await this.#archiveFor(state.document, state.assets);
@@ -858,8 +859,10 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         expectedFingerprint: options.expectedFingerprint,
         ...(options.allowOverwrite === undefined ? {} : { allowOverwrite: options.allowOverwrite }),
       });
-      state.targetPath = targetPath;
-      state.targetFingerprint = result.fingerprint;
+      if (options.attachTarget !== false) {
+        state.targetPath = targetPath;
+        state.targetFingerprint = result.fingerprint;
+      }
       state.savedRevision = state.revision;
       state.persisted = true;
       state.durability = 'clean';
@@ -873,8 +876,10 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         );
         state.journalSequence = 0;
       } catch {
-        state.targetPath = targetPath;
-        state.targetFingerprint = result.fingerprint;
+        if (options.attachTarget !== false) {
+          state.targetPath = targetPath;
+          state.targetFingerprint = result.fingerprint;
+        }
         state.durability = 'save-error';
         this.#emit({
           type: 'durability-error',
@@ -942,6 +947,30 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       return this.#saveLocked(state, options.targetPath, {
         expectedFingerprint: options.expectedFingerprint,
         ...(options.allowOverwrite === undefined ? {} : { allowOverwrite: options.allowOverwrite }),
+      });
+    });
+  }
+
+  /**
+   * Main-process collaboration boundary. Commits a durable shared-file snapshot without
+   * attaching the target to this session, so the authoritative writer lease remains the
+   * only path that can update the shared file and background autosave cannot bypass it.
+   */
+  public saveDetachedMainOnly(
+    sessionId: string,
+    options: SaveAsOptions,
+  ): Promise<DocumentSessionSnapshot> {
+    this.#assertMainOnlyPath(options.targetPath);
+    const state = this.#requireSession(sessionId);
+    return this.#enqueue(state, async () => {
+      if (state.autosaveTimer !== undefined) {
+        clearTimeout(state.autosaveTimer);
+        state.autosaveTimer = undefined;
+      }
+      return this.#saveLocked(state, options.targetPath, {
+        expectedFingerprint: options.expectedFingerprint,
+        ...(options.allowOverwrite === undefined ? {} : { allowOverwrite: options.allowOverwrite }),
+        attachTarget: false,
       });
     });
   }

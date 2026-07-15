@@ -232,6 +232,33 @@ describe('save, reopen, assets, and conflicts', () => {
     expect(reopened.dirty).toBe(false);
   });
 
+  it('writes a detached authoritative copy without enabling background target writes', async () => {
+    const directory = await temporaryDirectory();
+    const target = path.join(directory, 'shared-authoritative.hdeck');
+    const manager = managerFor(path.join(directory, 'recovery'), { autosaveDelayMs: 10 });
+    const session = await manager.createMainOnly();
+    const changed = await manager.execute(session.sessionId, {
+      expectedRevision: session.revision,
+      commands: [{ type: 'deck.rename', name: 'Host snapshot' }],
+      metadata: metadata(1),
+    });
+    const saved = await manager.saveDetachedMainOnly(session.sessionId, {
+      targetPath: target,
+      expectedFingerprint: null,
+      allowOverwrite: true,
+    });
+    expect(saved).toMatchObject({ dirty: false, hasSaveTarget: false, durability: 'clean' });
+    const edited = await manager.execute(session.sessionId, {
+      expectedRevision: saved.revision,
+      commands: [{ type: 'deck.rename', name: 'Not automatically shared' }],
+      metadata: metadata(2),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(manager.getSnapshot(session.sessionId).dirty).toBe(true);
+    expect(manager.getSnapshot(session.sessionId).revision).toBe(edited.revision);
+    expect(parseHdeckArchive(await readFile(target)).document.name).toBe(changed.document.name);
+  });
+
   it('detects a target changed outside the runtime', async () => {
     const directory = await temporaryDirectory();
     const target = path.join(directory, 'conflict.hdeck');
