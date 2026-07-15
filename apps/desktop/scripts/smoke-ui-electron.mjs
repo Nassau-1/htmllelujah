@@ -31,6 +31,14 @@ const waitFor = async (operation, timeoutMs, label) => {
 
 const terminate = async (child) => {
   if (child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === 'win32' && child.pid !== undefined) {
+    const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    await Promise.race([new Promise((resolve) => killer.once('exit', resolve)), sleep(5_000)]);
+    if (child.exitCode !== null || child.signalCode !== null) return;
+  }
   child.kill();
   await Promise.race([
     new Promise((resolve) => child.once('exit', resolve)),

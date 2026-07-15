@@ -306,8 +306,8 @@ const isTrustedSender = (event: IpcMainInvokeEvent): boolean => {
   const frame = event.senderFrame;
   if (frame === null || frame !== event.sender.mainFrame) return false;
   const url = frame.url;
-  if (app.isPackaged) return url.startsWith('htmllelujah-app://app/');
-  return url.startsWith('http://127.0.0.1:5173/');
+  if (url.startsWith('htmllelujah-app://app/')) return true;
+  return !app.isPackaged && url.startsWith('http://127.0.0.1:5173/');
 };
 
 const assertSessionAccess = (
