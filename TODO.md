@@ -1,6 +1,6 @@
 # Roadmap and TODO
 
-Status: **V1 release candidate**, last reviewed 2026-07-15.
+Status: **V1 release candidate**, last reviewed 2026-07-16.
 
 The usable V1 implementation is present. Publication remains gated by observed
 release evidence for the exact Windows installer; unchecked items below must not be
@@ -83,6 +83,10 @@ reported as passed until their results are recorded.
 - [ ] Expand templates, themes, layouts, accessibility automation, and licensed local
       asset catalogs without adding remote runtime dependencies.
 - [ ] Evaluate additional desktop platforms after Windows V1 evidence is stable.
+- [ ] Add a preview-only compatibility reader for future unknown document schemas;
+      V1 rejects them safely and leaves the source unchanged.
+- [ ] Add caret-range rich-text formatting and disconnected text merge after a
+      separate editing/undo contract is approved.
 
 ## Explicitly deferred
 

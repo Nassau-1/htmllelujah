@@ -26,7 +26,8 @@ or sanitized into the structured model before persistence.
 
 - Human and agent edits use the same validation, revision, attribution, and undo
   rules.
-- Schema migrations and read-only handling for newer versions are mandatory.
+- Schema migrations and typed safe refusal of newer versions are mandatory. A
+  preview-only reader for future unknown schemas is a post-V1 compatibility feature.
 - The renderer cannot rely on arbitrary document-provided scripts or CSS.
 - Direct editing of exported HTML may change the output but cannot round-trip into
   the authoring file.

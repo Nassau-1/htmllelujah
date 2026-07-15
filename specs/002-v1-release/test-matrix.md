@@ -31,16 +31,16 @@ exercise the packaged Windows application and the exact installer artifact.
 
 ## Document schema, validation, and migration
 
-| ID      | Scenario                             | Oracle                                                          | Edge coverage                                | Gate    |
-| ------- | ------------------------------------ | --------------------------------------------------------------- | -------------------------------------------- | ------- |
-| DOC-001 | Parse every valid V2 entity          | Exact typed round-trip and stable revision                      | All element unions, empty optional fields    | Merge   |
-| DOC-002 | Reject unknown and incomplete fields | Stable validation codes and paths                               | Unknown discriminants, unknown keys          | Merge   |
-| DOC-003 | Reference validation                 | No missing theme/master/layout/asset/connector/placeholder refs | Nested groups and deleted targets            | Merge   |
-| DOC-004 | Limits                               | Reject before expensive traversal or allocation                 | 501 slides, deep group, huge strings/tables  | Release |
-| DOC-005 | V1 → V2 migration                    | Deterministic canonical V2 fixture                              | Empty content, legacy placeholder absence    | Release |
-| DOC-006 | Migration chain repeat               | Same output and report for repeated source                      | Interrupted migration and retry              | Release |
-| DOC-007 | Newer schema                         | Read-only result; original unchanged                            | Missing preview and unknown optional entries | Release |
-| DOC-008 | Canonical serialization              | Identical hash for equivalent object-key order                  | Unicode normalization and array order        | Merge   |
+| ID      | Scenario                             | Oracle                                                          | Edge coverage                               | Gate    |
+| ------- | ------------------------------------ | --------------------------------------------------------------- | ------------------------------------------- | ------- |
+| DOC-001 | Parse every valid V2 entity          | Exact typed round-trip and stable revision                      | All element unions, empty optional fields   | Merge   |
+| DOC-002 | Reject unknown and incomplete fields | Stable validation codes and paths                               | Unknown discriminants, unknown keys         | Merge   |
+| DOC-003 | Reference validation                 | No missing theme/master/layout/asset/connector/placeholder refs | Nested groups and deleted targets           | Merge   |
+| DOC-004 | Limits                               | Reject before expensive traversal or allocation                 | 501 slides, deep group, huge strings/tables | Release |
+| DOC-005 | V1 → V2 migration                    | Deterministic canonical V2 fixture                              | Empty content, legacy placeholder absence   | Release |
+| DOC-006 | Migration chain repeat               | Same output and report for repeated source                      | Interrupted migration and retry             | Release |
+| DOC-007 | Newer schema                         | Typed compatibility refusal; original unchanged                 | Unknown container/document versions         | Release |
+| DOC-008 | Canonical serialization              | Identical hash for equivalent object-key order                  | Unicode normalization and array order       | Merge   |
 
 Property suite generates bounded valid documents, applies arbitrary valid command
 sequences, and asserts: input immutability, output validity, stable unique IDs,
@@ -78,15 +78,15 @@ negative size, spacing collapse, nondeterministic snap, or input mutation.
 
 ## Rich text and clipboard
 
-| ID      | Scenario                   | Oracle                                        | Edge coverage                                 | Gate    |
-| ------- | -------------------------- | --------------------------------------------- | --------------------------------------------- | ------- |
-| TXT-001 | Blocks and marks           | Canonical typed content round-trip            | Mixed marks, H1–H6, nested lists              | Release |
-| TXT-002 | Caret/selection formatting | Correct range only                            | Collapsed caret, boundary, entire element     | Release |
-| TXT-003 | IME                        | No duplicate/lost composition                 | Accents, CJK, emoji, RTL                      | Release |
-| TXT-004 | Undo boundary              | Local edit session becomes one document group | Undo during edit and after blur               | Release |
-| TXT-005 | Rich paste                 | Allowlisted semantics only                    | Scripts, remote images, styles, unknown nodes | Hard    |
-| TXT-006 | Long text                  | Bounded behavior and visible overflow warning | Unbroken string, maximum blocks/runs          | Release |
-| TXT-007 | Font fallback              | Bundled font or explicit warning              | Missing or corrupt font asset                 | Release |
+| ID      | Scenario                 | Oracle                                         | Edge coverage                                 | Gate    |
+| ------- | ------------------------ | ---------------------------------------------- | --------------------------------------------- | ------- |
+| TXT-001 | Blocks and marks         | Canonical typed content round-trip             | Mixed marks, H1–H6, nested lists              | Release |
+| TXT-002 | Element/block formatting | Typed marks apply without flattening structure | Mixed runs, lists, heading, entire element    | Release |
+| TXT-003 | IME                      | No duplicate/lost composition                  | Accents, CJK, emoji, RTL                      | Release |
+| TXT-004 | Undo boundary            | Local edit session becomes one document group  | Undo during edit and after blur               | Release |
+| TXT-005 | Rich paste               | Allowlisted semantics only                     | Scripts, remote images, styles, unknown nodes | Hard    |
+| TXT-006 | Long text                | Bounded behavior and visible overflow warning  | Unbroken string, maximum blocks/runs          | Release |
+| TXT-007 | Font fallback            | Bundled font or explicit warning               | Missing or corrupt font asset                 | Release |
 
 ## Themes, masters, and layouts
 
@@ -177,20 +177,20 @@ negative size, spacing collapse, nondeterministic snap, or input mutation.
 
 ## Authoritative-host LAN collaboration
 
-| ID      | Scenario             | Oracle                                        | Edge coverage                            | Gate    |
-| ------- | -------------------- | --------------------------------------------- | ---------------------------------------- | ------- |
-| LAN-001 | Private discovery    | Ephemeral metadata only                       | Packet inspection and expiry             | Hard    |
-| LAN-002 | Join authentication  | Confirmed actor and encrypted channel         | Invalid/expired/replayed capability      | Hard    |
-| LAN-003 | Ordered commands     | Identical host sequence and revision on peers | Simultaneous independent commands        | Hard    |
-| LAN-004 | Stale peer command   | Atomic rejection and resync                   | Gap, duplicate, reordered frame          | Hard    |
-| LAN-005 | Text lock            | One editor; visible owner; lease expiry       | Race, disconnect, clock skew             | Hard    |
-| LAN-006 | Presence             | Rate-limited and not persisted                | Slow peer and malformed presence         | Release |
-| LAN-007 | Reconnect            | Resume acknowledged sequence within window    | Missed transactions and snapshot refresh | Release |
-| LAN-008 | Reconnect expiry     | Peer becomes read-only; no queued edit merge  | Local draft and active composition       | Hard    |
-| LAN-009 | Host loss            | No election or shared overwrite               | Kill, network loss, sleep                | Hard    |
-| LAN-010 | One file writer      | Only host fingerprint changes shared file     | Peer save attempt and Drive lock         | Hard    |
-| LAN-011 | Independent copy     | New document ID after explicit leave          | Recovery records and embedded assets     | Release |
-| LAN-012 | Network-class change | Hosting stops or requires confirmation        | Private to public transition             | Hard    |
+| ID      | Scenario             | Oracle                                                                  | Edge coverage                            | Gate    |
+| ------- | -------------------- | ----------------------------------------------------------------------- | ---------------------------------------- | ------- |
+| LAN-001 | Private discovery    | Ephemeral metadata only                                                 | Packet inspection and expiry             | Hard    |
+| LAN-002 | Join authentication  | Confirmed actor and encrypted channel                                   | Invalid/expired/replayed capability      | Hard    |
+| LAN-003 | Ordered commands     | Identical host sequence and revision on peers                           | Simultaneous independent commands        | Hard    |
+| LAN-004 | Stale peer command   | Atomic rejection and resync                                             | Gap, duplicate, reordered frame          | Hard    |
+| LAN-005 | Text lock            | One editor; visible owner; lease expiry                                 | Race, disconnect, clock skew             | Hard    |
+| LAN-006 | Presence             | Rate-limited and not persisted                                          | Slow peer and malformed presence         | Release |
+| LAN-007 | Reconnect            | Resume acknowledged sequence within window                              | Missed transactions and snapshot refresh | Release |
+| LAN-008 | Reconnect expiry     | Peer becomes read-only; no queued edit merge                            | Local draft and active composition       | Hard    |
+| LAN-009 | Host loss            | No election or shared overwrite                                         | Kill, network loss, sleep                | Hard    |
+| LAN-010 | One file writer      | Only host writes in-session; coherent-share lease rejects second writer | Peer save, SMB lease, replica warning    | Hard    |
+| LAN-011 | Independent copy     | New document ID after explicit leave                                    | Recovery records and embedded assets     | Release |
+| LAN-012 | Network-class change | Hosting stops or requires confirmation                                  | Private to public transition             | Hard    |
 
 Run at least a thirty-minute three-participant soak with object edits, text lock
 contention, asset insertion, save, reconnect, and host termination. Accepted sequence,

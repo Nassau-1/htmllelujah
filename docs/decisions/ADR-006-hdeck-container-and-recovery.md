@@ -41,7 +41,9 @@ Save writes a unique temporary sibling, flushes it, reopens and validates it, co
 the destination fingerprint with the opened file, and atomically replaces the target.
 External change stops in a conflict state and requires Reload, Save Copy, or Cancel.
 Migration preserves the original before committing an editable migrated snapshot.
-Newer unsupported versions open read-only.
+V1 refuses newer unsupported versions with a typed compatibility error and never
+modifies them. Preview-only opening of a future unknown schema requires a separately
+versioned projection contract and is deferred.
 
 ## Consequences
 

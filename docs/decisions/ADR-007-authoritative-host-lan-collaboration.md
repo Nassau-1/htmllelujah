@@ -30,8 +30,11 @@ slide text, asset, actor name, or reusable secret. Joining uses an authenticated
 encrypted private-network channel, a document-scoped expiring capability, and explicit
 user confirmation. Hosting defaults off on public or unknown networks.
 
-Only the host replaces the shared `.hdeck`. Peers cannot save that target. A peer may
-explicitly leave and save an independent copy with a new document identity.
+Only the host replaces the shared `.hdeck` within the authenticated session. Peers
+cannot save that target. A peer may explicitly leave and save an independent copy
+with a new document identity. Writer-lease enforcement across machines additionally
+requires one coherent filesystem namespace; replicated cloud folders do not supply
+that primitive and therefore require one host to be designated out of band.
 
 A disconnected peer attempts bounded reconnect and does not accept new persistent
 edits. After expiry it becomes read-only. V1 does not queue offline edits, merge

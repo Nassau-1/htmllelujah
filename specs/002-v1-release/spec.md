@@ -138,8 +138,9 @@ state without overwriting a changed source file.
    only the incomplete tail.
 4. If the target fingerprint changed externally, save stops in `conflict` and offers
    Reload, Save Copy, or Cancel.
-5. A newer unsupported container or document version opens read-only with a clear
-   compatibility message; it is never downgraded or overwritten.
+5. A newer unsupported container or document version is refused with a clear
+   compatibility message; the original remains unchanged and can be opened by a
+   compatible future version.
 6. Recovery with a mismatched document identity or base revision opens as an explicit
    recovered copy.
 
@@ -245,8 +246,9 @@ non-administrator accounts.
 - **FR-005**: Undo and redo MUST be actor-aware, origin-aware, grouped by user action,
   bounded by count and memory, and unable to cross an intervening incompatible state.
 - **FR-006**: The document schema MUST have independent container and document
-  versions, deterministic migrations, newer-version read-only behavior, and complete
-  reference validation.
+  versions, deterministic migrations, safe refusal of newer unsupported versions,
+  and complete reference validation. A future preview-only compatibility surface is
+  outside V1.
 - **FR-007**: `.hdeck` archives MUST enforce entry, name, type, expanded-size,
   compression-ratio, model-depth, text-length, image-dimension, and asset-count limits.
 - **FR-008**: Assets MUST be addressed and verified by SHA-256 and served to renderers

@@ -176,7 +176,13 @@ independent copy, or cancel and reconcile deliberately.
 
 Collaboration is intended only for trusted participants on a private LAN. A
 synchronized folder may hold the same `.hdeck`, but the direct WSS session is the
-live command transport and the host is the only shared-file writer.
+live command transport and the host is the only shared-file writer in that session.
+
+Use the lease as an enforcement mechanism only on a coherent shared filesystem such
+as SMB/NAS. With OneDrive, Google Drive, Dropbox, or another replicated local folder,
+designate one host out of band and have everyone else join it. Do not start two host
+sessions: both local replicas can acquire a lease before the sync provider propagates
+either sidecar.
 
 - Share the endpoint, session code, and certificate fingerprint through a trusted
   channel; treat all three as sensitive session data.

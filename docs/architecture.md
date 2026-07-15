@@ -131,8 +131,11 @@ V1 deliberately separates recovery autosave from shared-file replacement: edits 
 journaled immediately, while replacing a user-selected `.hdeck` requires explicit
 Save. Save writes and validates a temporary sibling, checks the expected file
 fingerprint, then atomically replaces the target. An external change produces a
-conflict instead of a silent overwrite. A recovered state opens as an independent
-candidate and requires explicit Save or Save As.
+conflict when it is observed before replacement. The application verifies the written
+snapshot after replacement, but Node and Windows expose no universal conditional
+rename against an arbitrary non-cooperating writer; users must not bypass a reported
+conflict. A recovered state opens as an independent candidate and requires explicit
+Save or Save As.
 
 ## LAN collaboration and synchronized folders
 
@@ -140,7 +143,13 @@ V1 uses an authoritative host rather than a CRDT. A synchronized folder carries 
 last `.hdeck` snapshot, while a direct encrypted LAN session carries live commands.
 The host validates and serializes each command, assigns a total order, journals the
 accepted transaction, broadcasts it, and is the only participant allowed to replace
-the shared file.
+the shared file within that authenticated session.
+
+The writer sidecar is a filesystem lease, not a cloud coordination service. It is
+authoritative only when participants observe one coherent namespace (for example an
+SMB/NAS share). Separate OneDrive/Google Drive/Dropbox replicas may both create a
+local lease before synchronization, so V1 requires one explicitly chosen host and
+does not claim to prevent a second independent host on another replica.
 
 Transport uses WSS with an ephemeral session certificate, displayed fingerprint,
 document-scoped session credential, HMAC-authenticated frames, bounded messages, and

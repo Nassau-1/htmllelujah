@@ -21,11 +21,19 @@ private local network, and joining requires a document-scoped capability. Writer
 transfer is explicit and hash-verified. If no authenticated writer is reachable,
 the file opens read-only or as an explicitly independent copy.
 
+The sidecar is authoritative only on a coherent shared filesystem. A consumer
+cloud-sync folder contains independent local replicas and cannot provide distributed
+compare-and-swap; V1 uses it for snapshot delivery but requires participants to
+designate one host rather than relying on the sidecar to arbitrate two simultaneous
+independent sessions.
+
 ## Consequences
 
 - Folder synchronization transports snapshots, not live operations.
 - Simultaneous edits converge through the collaborative document state.
 - Writer loss preserves peer journals but never triggers an unverified overwrite.
 - Conflict copies with the same document ID require detection and explicit merge.
+- A true SMB/NAS namespace can enforce the writer lease; delayed OneDrive/Drive-style
+  replication cannot.
 - Internet relay collaboration can later implement the same provider contract
   without changing the authoring format.

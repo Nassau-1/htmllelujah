@@ -85,6 +85,14 @@ used as the live-edit protocol.
 5. The host is the only participant that writes the shared `.hdeck`. A guest can
    leave and explicitly save an independent copy.
 
+Start exactly one host session. The writer sidecar is enforceable when every machine
+sees one coherent filesystem namespace, such as an SMB/NAS share. Google Drive,
+OneDrive, Dropbox, and similar tools usually expose separate local replicas; sync
+latency can let two independently started hosts both believe they own the file. V1
+therefore uses those folders only to carry snapshots and cannot make a cross-device
+single-writer guarantee between independent sessions. Participants must join the one
+LAN host instead of starting another host from their replica.
+
 If the host disappears, guests stop editing rather than electing a new file writer or
 overwriting the shared file. Their acknowledged local recovery records remain
 available. Internet relay, remote collaboration outside the private LAN, and offline
@@ -113,6 +121,8 @@ session, or expose the authenticated local MCP bridge. See
   formulas, cloud accounts, hosted templates, or embedded chatbot.
 - Collaboration is private-LAN only, uses one host and one shared-file writer, and
   does not merge edits made while disconnected.
+- Filesystem writer leases require a coherent shared filesystem. Consumer cloud-sync
+  replicas transport snapshots but are not a distributed locking service.
 - Advanced freeform paths, boolean vector operations, and simultaneous editing of one
   text range are outside V1.
 
