@@ -12,6 +12,7 @@ import type {
   TextAlignment,
   TextElement,
   TextMarks,
+  TextRun,
   TextStyleRole,
 } from '@htmllelujah/document-core';
 
@@ -47,6 +48,161 @@ export const contentToPlainText = (content: RichTextDocument): string =>
         : [block.runs.map((run) => run.text).join('')],
     )
     .join('\n');
+
+const marksEqual = (left: TextMarks, right: TextMarks): boolean =>
+  left.bold === right.bold &&
+  left.italic === right.italic &&
+  left.underline === right.underline &&
+  left.strikethrough === right.strikethrough &&
+  left.color === right.color &&
+  left.fontFamily === right.fontFamily &&
+  left.fontSizePt === right.fontSizePt &&
+  left.fontWeight === right.fontWeight;
+
+const mergeAdjacentRuns = (runs: readonly TextRun[]): readonly TextRun[] => {
+  const merged: TextRun[] = [];
+  for (const run of runs) {
+    const previous = merged.at(-1);
+    if (previous !== undefined && marksEqual(previous.marks, run.marks)) {
+      merged[merged.length - 1] = { ...previous, text: previous.text + run.text };
+    } else {
+      merged.push({ text: run.text, marks: { ...run.marks } });
+    }
+  }
+  return merged.length > 0 ? merged : [{ text: '', marks: emptyMarks() }];
+};
+
+/** Preserves marks on unchanged text and gives inserted text its nearest neighbouring marks. */
+const replaceRunsText = (runs: readonly TextRun[], nextText: string): readonly TextRun[] => {
+  const previousText = runs.map((run) => run.text).join('');
+  if (previousText === nextText) return runs.map((run) => ({ ...run, marks: { ...run.marks } }));
+  if (runs.length <= 1) {
+    return [{ text: nextText, marks: { ...(runs[0]?.marks ?? emptyMarks()) } }];
+  }
+
+  const boundaries = [0];
+  let mappedStart = 0;
+  let previousEnd = 0;
+  for (let index = 1; index < runs.length; index += 1) {
+    const previousRun = runs[index - 1]!;
+    const nextRun = runs[index]!;
+    previousEnd += previousRun.text.length;
+    const nextExact = nextRun.text.length === 0 ? -1 : nextText.indexOf(nextRun.text, mappedStart);
+    const previousExact =
+      previousRun.text.length === 0 ? -1 : nextText.indexOf(previousRun.text, mappedStart);
+    const proportional = Math.round(
+      (previousEnd / Math.max(1, previousText.length)) * nextText.length,
+    );
+    const mappedBoundary =
+      nextExact >= mappedStart
+        ? nextExact
+        : previousExact >= mappedStart
+          ? previousExact + previousRun.text.length
+          : proportional;
+    mappedStart = Math.min(nextText.length, Math.max(mappedStart, mappedBoundary));
+    boundaries.push(mappedStart);
+  }
+  boundaries.push(nextText.length);
+  return mergeAdjacentRuns(
+    runs
+      .map((run, index) => ({
+        text: nextText.slice(boundaries[index], boundaries[index + 1]),
+        marks: { ...run.marks },
+      }))
+      .filter((run) => run.text.length > 0),
+  );
+};
+
+/** Edits plain text without flattening existing list/heading structure or mixed inline marks. */
+export const replacePlainTextPreservingStyles = (
+  content: RichTextDocument,
+  text: string,
+): RichTextDocument => {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const onlyBlock = content.blocks.length === 1 ? content.blocks[0] : undefined;
+  if (onlyBlock?.type === 'list') {
+    const fallback = onlyBlock.items.at(-1);
+    return {
+      blocks: [
+        {
+          ...onlyBlock,
+          items: lines.map((line, index) => {
+            const existing = onlyBlock.items[index];
+            return existing === undefined
+              ? {
+                  id: id(),
+                  level: fallback?.level ?? 0,
+                  runs: replaceRunsText(fallback?.runs ?? [], line),
+                }
+              : { ...existing, runs: replaceRunsText(existing.runs, line) };
+          }),
+        },
+      ],
+    };
+  }
+
+  const textBlocks = content.blocks.filter((block) => block.type !== 'list');
+  const fallback = textBlocks.at(-1);
+  if (textBlocks.length !== content.blocks.length || fallback === undefined) {
+    return contentFromPlainText(text, {
+      kind: 'paragraph',
+      alignment: 'left',
+      marks: firstRunMarks(content),
+    });
+  }
+  return {
+    blocks: lines.map((line, index) => {
+      const existing = textBlocks[index];
+      if (existing !== undefined) {
+        return { ...existing, runs: replaceRunsText(existing.runs, line) };
+      }
+      return fallback.type === 'heading'
+        ? {
+            id: id(),
+            type: 'heading' as const,
+            level: fallback.level,
+            alignment: fallback.alignment,
+            runs: replaceRunsText(fallback.runs, line),
+          }
+        : {
+            id: id(),
+            type: 'paragraph' as const,
+            alignment: fallback.alignment,
+            runs: replaceRunsText(fallback.runs, line),
+          };
+    }),
+  };
+};
+
+const firstRunMarks = (content: RichTextDocument): TextMarks => {
+  const block = content.blocks[0];
+  return (block?.type === 'list' ? block.items[0]?.runs[0] : block?.runs[0])?.marks ?? emptyMarks();
+};
+
+export const updateRichTextPresentation = (
+  content: RichTextDocument,
+  options: {
+    readonly alignment?: TextAlignment | undefined;
+    readonly marks?: Partial<TextMarks> | undefined;
+  },
+): RichTextDocument => {
+  const updateRuns = (runs: readonly TextRun[]): readonly TextRun[] =>
+    runs.map((run) => ({ ...run, marks: { ...run.marks, ...options.marks } }));
+  return {
+    blocks: content.blocks.map((block) =>
+      block.type === 'list'
+        ? {
+            ...block,
+            items: block.items.map((item) => ({ ...item, runs: updateRuns(item.runs) })),
+          }
+        : {
+            ...block,
+            ...(options.alignment === undefined ? {} : { alignment: options.alignment }),
+            runs: updateRuns(block.runs),
+          },
+    ),
+  };
+};
 
 export const contentFromPlainText = (
   text: string,

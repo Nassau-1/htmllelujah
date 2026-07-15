@@ -95,12 +95,17 @@ import {
   duplicateElements,
   emptyMarks,
   plainParagraph,
+  replacePlainTextPreservingStyles,
+  updateRichTextPresentation,
 } from './editor/canonical-factories';
 
 const menuItems = ['File', 'Edit', 'View', 'Insert', 'Arrange', 'Help'] as const;
 type MenuItem = (typeof menuItems)[number];
 type InspectorTab = 'properties' | 'design';
 type Toast = { readonly kind: 'success' | 'error' | 'info'; readonly message: string };
+type MutableTextMarksPatch = {
+  -readonly [Key in keyof TextMarks]?: TextMarks[Key];
+};
 
 type TextDraft = {
   readonly text: string;
@@ -832,25 +837,70 @@ function EditorApp() {
   );
 
   const applyTextDraft = useCallback(async (): Promise<void> => {
-    if (activeSlide === undefined || primaryText === undefined || textDraft === null) return;
-    const marks: TextMarks = {
-      bold: textDraft.bold,
-      italic: textDraft.italic,
-      underline: textDraft.underline,
-      strikethrough: false,
-      fontFamily: textDraft.fontFamily,
-      fontSizePt: textDraft.fontSizePt,
-      fontWeight: textDraft.bold ? 700 : 400,
-    };
-    const content = contentFromPlainText(textDraft.text, {
-      kind: textDraft.kind,
-      alignment: textDraft.alignment,
-      marks,
-      headingLevel: 1,
-    });
-    await execute('Edit text', [
-      { type: 'text.replace-content', slideId: activeSlide.id, textId: primaryText.id, content },
-      {
+    if (
+      activeSlide === undefined ||
+      primaryText === undefined ||
+      textDraft === null ||
+      document === undefined
+    )
+      return;
+    const baseline = initialTextDraft(primaryText, document);
+    const markPatch: MutableTextMarksPatch = {};
+    if (textDraft.bold !== baseline.bold) {
+      markPatch.bold = textDraft.bold;
+      markPatch.fontWeight = textDraft.bold ? 700 : 400;
+    }
+    if (textDraft.italic !== baseline.italic) markPatch.italic = textDraft.italic;
+    if (textDraft.underline !== baseline.underline) markPatch.underline = textDraft.underline;
+    if (textDraft.fontFamily !== baseline.fontFamily) markPatch.fontFamily = textDraft.fontFamily;
+    if (textDraft.fontSizePt !== baseline.fontSizePt) markPatch.fontSizePt = textDraft.fontSizePt;
+    const marksChanged = Object.keys(markPatch).length > 0;
+    const alignmentChanged = textDraft.alignment !== baseline.alignment;
+    const kindChanged = textDraft.kind !== baseline.kind;
+    const textChanged = textDraft.text !== baseline.text;
+    let content = primaryText.content;
+    if (kindChanged) {
+      const first = firstMarks(primaryText.content);
+      content = contentFromPlainText(textDraft.text, {
+        kind: textDraft.kind,
+        alignment: textDraft.alignment,
+        marks: {
+          ...first,
+          bold: textDraft.bold,
+          italic: textDraft.italic,
+          underline: textDraft.underline,
+          fontFamily: textDraft.fontFamily,
+          fontSizePt: textDraft.fontSizePt,
+          fontWeight: textDraft.bold ? 700 : 400,
+        },
+        headingLevel: 1,
+      });
+    } else if (textChanged || marksChanged || alignmentChanged) {
+      content = replacePlainTextPreservingStyles(primaryText.content, textDraft.text);
+      content = updateRichTextPresentation(content, {
+        ...(alignmentChanged ? { alignment: textDraft.alignment } : {}),
+        ...(marksChanged ? { marks: markPatch } : {}),
+      });
+    }
+
+    const styleChanged =
+      textDraft.role !== baseline.role ||
+      alignmentChanged ||
+      textDraft.fontFamily !== baseline.fontFamily ||
+      textDraft.fontSizePt !== baseline.fontSizePt ||
+      textDraft.bold !== baseline.bold ||
+      textDraft.italic !== baseline.italic;
+    const commands: DocumentCommand[] = [];
+    if (kindChanged || textChanged || marksChanged || alignmentChanged) {
+      commands.push({
+        type: 'text.replace-content',
+        slideId: activeSlide.id,
+        textId: primaryText.id,
+        content,
+      });
+    }
+    if (styleChanged) {
+      commands.push({
         type: 'element.update-style',
         slideId: activeSlide.id,
         elementId: primaryText.id,
@@ -865,9 +915,10 @@ function EditorApp() {
             italic: textDraft.italic,
           },
         },
-      },
-    ]);
-  }, [activeSlide, execute, primaryText, textDraft]);
+      });
+    }
+    if (commands.length > 0) await execute('Edit text', commands);
+  }, [activeSlide, document, execute, primaryText, textDraft]);
 
   const pasteTable = useCallback(async (): Promise<void> => {
     if (activeSlide === undefined || primaryTable === undefined || tableTsv.trim() === '') return;
@@ -1700,14 +1751,15 @@ function EditorApp() {
                       document.layouts
                         .find((layout) => layout.id === activeSlide.layoutId)
                         ?.elements.filter((element) => element.type === 'placeholder') ?? [];
-                    for (const placeholder of placeholders)
-                      void execute('Reset placeholder', [
-                        {
-                          type: 'slide.reset-placeholder',
+                    if (placeholders.length > 0)
+                      void execute(
+                        'Reset placeholders',
+                        placeholders.map((placeholder) => ({
+                          type: 'slide.reset-placeholder' as const,
                           slideId: activeSlide.id,
                           placeholderId: placeholder.id,
-                        },
-                      ]);
+                        })),
+                      );
                   }}
                 >
                   Reset placeholders to layout
