@@ -39,6 +39,12 @@ No user-facing change is queued after the V1 release candidate.
 
 ### Security
 
+- Made image registration plus insertion or replacement one durable, undoable transaction;
+  bounded image headers are inspected before pixel decoding.
+- Retained the editor session and recovery journal after failed close/save operations, and
+  destroyed half-created hidden windows after failed archive open or renderer load.
+- Added bounded recovery-blob garbage collection and proactive TTL/cap enforcement for pending
+  runtime agent proposals.
 - Kept renderer processes sandboxed and context-isolated with no Node.js integration,
   generic IPC, navigation, popup, permission, or active remote-content capability.
 - Added bounded validation for documents, commands, `.hdeck` ZIP structures,

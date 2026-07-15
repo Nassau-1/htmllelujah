@@ -93,7 +93,6 @@ import {
   createConnectorElement,
   createFlagElement,
   createIconElement,
-  createImageElement,
   createShapeElement,
   createSlide,
   createTableElement,
@@ -813,40 +812,15 @@ function EditorApp() {
         const imported = await window.htmllelujah.importImage({
           sessionId: current.snapshot.sessionId,
           expectedRevision: current.snapshot.revision,
+          slideId: activeSlide.id,
+          ...(replace === undefined ? {} : { replaceElementId: replace.id }),
         });
         if (!imported.ok) {
           showFailure(imported);
           return;
         }
         acceptSession(imported.value.session);
-        const asset = imported.value.session.snapshot.document.assets.find(
-          (candidate) => candidate.id === imported.value.assetId,
-        );
-        const element =
-          replace === undefined
-            ? createImageElement(imported.value.assetId, asset?.widthPx, asset?.heightPx)
-            : { ...replace, assetId: imported.value.assetId };
-        const inserted = await window.htmllelujah.execute({
-          sessionId: imported.value.session.snapshot.sessionId,
-          expectedRevision: imported.value.session.snapshot.revision,
-          label: replace === undefined ? 'Insert image' : 'Replace image',
-          commands: [
-            replace === undefined
-              ? { type: 'element.insert', slideId: activeSlide.id, element }
-              : {
-                  type: 'element.update',
-                  slideId: activeSlide.id,
-                  elementId: replace.id,
-                  replacement: element,
-                },
-          ],
-        });
-        if (!inserted.ok) {
-          showFailure(inserted);
-          return;
-        }
-        acceptSession(inserted.value);
-        setSelectedIds([element.id]);
+        setSelectedIds([imported.value.elementId]);
         notify(replace === undefined ? 'Image added.' : 'Image replaced.', 'success');
       } finally {
         setBusy(false);

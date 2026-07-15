@@ -3,7 +3,12 @@ import { lstat, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { documentCommandSchema, type TransactionMetadata } from '@htmllelujah/document-core';
+import {
+  documentCommandSchema,
+  type Element,
+  type ImageElement,
+  type TransactionMetadata,
+} from '@htmllelujah/document-core';
 import { CollaborationError } from '@htmllelujah/collaboration';
 import {
   DocumentRuntimeError,
@@ -26,8 +31,15 @@ import {
 import { z } from 'zod';
 
 import { DesktopCollaborationCoordinator } from './collaboration-service.js';
+import {
+  assertDecodedDimensions,
+  ImageImportValidationError,
+  imageFrameForPage,
+  inspectImageBeforeDecode,
+} from './image-import-validation.js';
 import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
 import { resolveSaveTarget } from './save-target.js';
+import { initializeWindowSafely, retainWindowOnFailure } from './window-lifecycle.js';
 import {
   DESKTOP_API_VERSION,
   DESKTOP_IPC,
@@ -59,8 +71,6 @@ app.setName('HTMLlelujah');
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
-const MAX_IMAGE_EDGE_PX = 16_384;
-const MAX_IMAGE_AREA_PX = 64 * 1024 * 1024;
 const PDF_READINESS_DEADLINE_MS = 15_000;
 
 const runtime = new DocumentSessionManager({
@@ -82,6 +92,7 @@ const assetTokens = new Map<
 >();
 const tokensByWebContents = new Map<number, Set<string>>();
 const closingWindows = new Set<number>();
+const closingDecisions = new Set<number>();
 let pendingOpenPath: string | undefined;
 
 class DesktopMainError extends Error {
@@ -165,6 +176,7 @@ const failure = (error: unknown): DesktopResult<never> => {
         'The presentation could not be saved. Check the destination and free disk space.',
       DIRTY_DOCUMENT: 'Save or discard your changes before closing the presentation.',
       ASSET_BYTES_MISSING: 'One of the presentation assets is unavailable.',
+      PROPOSAL_CAPACITY: 'Too many pending agent proposals are open. Try again shortly.',
       INVALID_REQUEST: 'That operation is not valid for the current presentation.',
       SESSION_NOT_FOUND: 'This presentation is no longer open.',
     };
@@ -351,6 +363,9 @@ const identifier = z.string().uuid();
 const revision = z.string().min(1).max(160);
 const sessionInputSchema = z.object({ sessionId: identifier }).strict();
 const historyInputSchema = sessionInputSchema.extend({ expectedRevision: revision }).strict();
+const importImageInputSchema = historyInputSchema
+  .extend({ slideId: identifier, replaceElementId: identifier.optional() })
+  .strict();
 const executeInputSchema = historyInputSchema
   .extend({
     label: z.string().trim().min(1).max(160),
@@ -1021,40 +1036,16 @@ const openPathInEditorWindow = async (window: BrowserWindow, targetPath: string)
   await assignSession(syntheticEvent, opened, targetPath);
 };
 
-const imageMediaType = (
-  bytes: Uint8Array,
-): 'image/png' | 'image/jpeg' | 'image/webp' | undefined => {
-  if (
-    bytes.length >= 8 &&
-    bytes[0] === 0x89 &&
-    bytes[1] === 0x50 &&
-    bytes[2] === 0x4e &&
-    bytes[3] === 0x47 &&
-    bytes[4] === 0x0d &&
-    bytes[5] === 0x0a &&
-    bytes[6] === 0x1a &&
-    bytes[7] === 0x0a
-  )
-    return 'image/png';
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
-    return 'image/jpeg';
-  if (
-    bytes.length >= 12 &&
-    Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
-    Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP'
-  )
-    return 'image/webp';
-  return undefined;
-};
+interface SelectedImageFile {
+  readonly bytes: Uint8Array;
+  readonly mediaType: 'image/png' | 'image/jpeg' | 'image/webp';
+  readonly fileName: string;
+  readonly widthPx: number;
+  readonly heightPx: number;
+}
 
-const importImageForSession = async (input: {
-  readonly sessionId: string;
-  readonly expectedRevision: string;
-  readonly parent: BrowserWindow | undefined;
-  readonly metadata: TransactionMetadata;
-}): Promise<{ readonly snapshot: DocumentSessionSnapshot; readonly assetId: string }> => {
-  collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
-  const result = await openDialog(input.parent, {
+const selectImageFile = async (parent: BrowserWindow | undefined): Promise<SelectedImageFile> => {
+  const result = await openDialog(parent, {
     title: 'Insert image',
     filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
     properties: ['openFile'],
@@ -1076,34 +1067,147 @@ const importImageForSession = async (input: {
     );
   }
   const bytes = await readFile(targetPath);
-  const mediaType = imageMediaType(bytes);
-  if (mediaType === undefined) {
-    throw new DesktopMainError('INVALID_ASSET', 'The selected file is not a supported image.');
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_IMAGE_BYTES) {
+    throw new DesktopMainError(
+      'INVALID_ASSET',
+      'Choose a PNG, JPEG, or WebP image smaller than 25 MB.',
+    );
+  }
+  let header;
+  try {
+    // Header parsing is bounded and happens before Chromium is asked to decode any pixels.
+    header = inspectImageBeforeDecode(bytes);
+  } catch (error) {
+    if (error instanceof ImageImportValidationError) {
+      throw new DesktopMainError('INVALID_ASSET', error.message);
+    }
+    throw error;
   }
   const decoded = nativeImage.createFromBuffer(bytes);
   const dimensions = decoded.getSize();
-  if (
-    decoded.isEmpty() ||
-    dimensions.width < 1 ||
-    dimensions.height < 1 ||
-    dimensions.width > MAX_IMAGE_EDGE_PX ||
-    dimensions.height > MAX_IMAGE_EDGE_PX ||
-    dimensions.width * dimensions.height > MAX_IMAGE_AREA_PX
-  ) {
-    throw new DesktopMainError('INVALID_ASSET', 'The image dimensions are unsupported.');
+  try {
+    assertDecodedDimensions(header, {
+      empty: decoded.isEmpty(),
+      widthPx: dimensions.width,
+      heightPx: dimensions.height,
+    });
+  } catch (error) {
+    if (error instanceof ImageImportValidationError) {
+      throw new DesktopMainError('INVALID_ASSET', error.message);
+    }
+    throw error;
   }
+  return {
+    bytes,
+    mediaType: header.mediaType,
+    fileName: path.basename(targetPath).slice(0, 255),
+    widthPx: header.widthPx,
+    heightPx: header.heightPx,
+  };
+};
+
+const findElementById = (elements: readonly Element[], elementId: string): Element | undefined => {
+  for (const element of elements) {
+    if (element.id === elementId) return element;
+    if (element.type === 'group') {
+      const nested = findElementById(element.children, elementId);
+      if (nested !== undefined) return nested;
+    }
+  }
+  return undefined;
+};
+
+const defaultImageElement = (
+  assetId: string,
+  widthPx: number,
+  heightPx: number,
+  page: DocumentSessionSnapshot['document']['page'],
+): ImageElement => {
+  return {
+    id: randomUUID(),
+    type: 'image',
+    name: 'Image',
+    frame: imageFrameForPage(widthPx, heightPx, page),
+    opacity: 1,
+    visible: true,
+    locked: false,
+    assetId,
+    altText: 'Presentation image',
+    fit: 'cover',
+    crop: { top: 0, right: 0, bottom: 0, left: 0 },
+  };
+};
+
+const importImageAssetForSession = async (input: {
+  readonly sessionId: string;
+  readonly expectedRevision: string;
+  readonly parent: BrowserWindow | undefined;
+  readonly metadata: TransactionMetadata;
+}): Promise<{ readonly snapshot: DocumentSessionSnapshot; readonly assetId: string }> => {
+  collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
+  const selected = await selectImageFile(input.parent);
   const assetId = randomUUID();
   const snapshot = await runtime.storeAsset(input.sessionId, {
     id: assetId,
-    bytes,
-    mediaType,
-    fileName: path.basename(targetPath).slice(0, 255),
-    widthPx: dimensions.width,
-    heightPx: dimensions.height,
+    ...selected,
     expectedRevision: input.expectedRevision,
     metadata: input.metadata,
   });
   return { snapshot, assetId };
+};
+
+const importImageForSession = async (input: {
+  readonly sessionId: string;
+  readonly expectedRevision: string;
+  readonly slideId: string;
+  readonly replaceElementId?: string | undefined;
+  readonly parent: BrowserWindow | undefined;
+  readonly metadata: TransactionMetadata;
+}): Promise<{
+  readonly snapshot: DocumentSessionSnapshot;
+  readonly assetId: string;
+  readonly elementId: string;
+}> => {
+  collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
+  const selected = await selectImageFile(input.parent);
+  const current = runtime.getSnapshot(input.sessionId);
+  const slide = current.document.slides.find((candidate) => candidate.id === input.slideId);
+  if (slide === undefined) {
+    throw new DesktopMainError('INVALID_REQUEST', 'The destination slide no longer exists.');
+  }
+  const assetId = randomUUID();
+  let element: ImageElement;
+  if (input.replaceElementId === undefined) {
+    element = defaultImageElement(
+      assetId,
+      selected.widthPx,
+      selected.heightPx,
+      current.document.page,
+    );
+  } else {
+    const existing = findElementById(slide.elements, input.replaceElementId);
+    if (existing?.type !== 'image') {
+      throw new DesktopMainError('INVALID_REQUEST', 'The image to replace no longer exists.');
+    }
+    element = { ...existing, assetId };
+  }
+  const snapshot = await runtime.storeAssetAndExecute(input.sessionId, {
+    id: assetId,
+    ...selected,
+    expectedRevision: input.expectedRevision,
+    metadata: input.metadata,
+    commands: [
+      input.replaceElementId === undefined
+        ? { type: 'element.insert', slideId: slide.id, element }
+        : {
+            type: 'element.update',
+            slideId: slide.id,
+            elementId: input.replaceElementId,
+            replacement: element,
+          },
+    ],
+  });
+  return { snapshot, assetId, elementId: element.id };
 };
 
 const visibleEditorSessionIds = (): readonly string[] => [
@@ -1121,7 +1225,7 @@ const mcpBridge = new DesktopMcpBridge({
   visibleSessionIds: visibleEditorSessionIds,
   collaborationStatus: (sessionId) => collaboration.status(sessionId),
   importAsset: async (sessionId, expectedRevision) => {
-    const imported = await importImageForSession({
+    const imported = await importImageAssetForSession({
       sessionId,
       expectedRevision,
       parent: BrowserWindow.getFocusedWindow() ?? undefined,
@@ -1157,6 +1261,18 @@ const mcpBridge = new DesktopMcpBridge({
 let mcpRpcServer: LocalRpcServerHandle | undefined;
 let gracefulShutdownStarted = false;
 
+const reportCloseFailure = async (window: BrowserWindow): Promise<void> => {
+  await dialog.showMessageBox(window, {
+    type: 'error',
+    title: 'Presentation remains open',
+    message: 'HTMLlelujah could not safely complete the close operation.',
+    detail:
+      'The window, current session, and recovery journal were kept. Resolve the save or collaboration issue and try again.',
+    buttons: ['OK'],
+    noLink: true,
+  });
+};
+
 const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> => {
   const window = new BrowserWindow({
     width: 1540,
@@ -1178,47 +1294,129 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
       navigateOnDragDrop: false,
     },
   });
-  windowModes.set(window.webContents.id, 'editor');
-  const snapshot =
-    initialPath === undefined
-      ? await runtime.createMainOnly()
-      : await runtime.openMainOnly({ targetPath: initialPath });
-  windowSessions.set(window.webContents.id, snapshot.sessionId);
-  if (initialPath !== undefined) sessionTargetPaths.set(snapshot.sessionId, initialPath);
-  window.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
+  const webContentsId = window.webContents.id;
+  let createdSessionId: string | undefined;
+  return initializeWindowSafely(
+    window,
+    async () => {
+      windowModes.set(webContentsId, 'editor');
+      const snapshot =
+        initialPath === undefined
+          ? await runtime.createMainOnly()
+          : await runtime.openMainOnly({ targetPath: initialPath });
+      windowSessions.set(window.webContents.id, snapshot.sessionId);
+      createdSessionId = snapshot.sessionId;
+      if (initialPath !== undefined) sessionTargetPaths.set(snapshot.sessionId, initialPath);
+      window.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
 
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  window.webContents.on('will-navigate', (event) => event.preventDefault());
-  window.webContents.on('will-attach-webview', (event) => event.preventDefault());
-  window.webContents.on('destroyed', () => {
-    revokeWebContentsTokens(window.webContents.id);
-    windowModes.delete(window.webContents.id);
-    windowSessions.delete(window.webContents.id);
-  });
-  window.once('ready-to-show', () => window.show());
-  window.on('close', (event) => {
-    const webContentsId = window.webContents.id;
-    if (closingWindows.has(webContentsId)) return;
-    const sessionId = windowSessions.get(webContentsId);
-    if (sessionId === undefined) return;
-    const collaborationMode = collaboration.mode(sessionId);
-    if (collaborationMode !== 'offline') {
-      event.preventDefault();
-      void (async () => {
-        try {
-          const ended = await collaboration.leave(sessionId);
-          if (ended?.preserveDetached === true) {
-            sessionTargetPaths.delete(sessionId);
+      window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+      window.webContents.on('will-navigate', (event) => event.preventDefault());
+      window.webContents.on('will-attach-webview', (event) => event.preventDefault());
+      window.webContents.on('destroyed', () => {
+        revokeWebContentsTokens(webContentsId);
+        windowModes.delete(webContentsId);
+        windowSessions.delete(webContentsId);
+        closingWindows.delete(webContentsId);
+        closingDecisions.delete(webContentsId);
+      });
+      window.once('ready-to-show', () => window.show());
+      window.on('close', (event) => {
+        const webContentsId = window.webContents.id;
+        if (closingWindows.has(webContentsId)) return;
+        if (closingDecisions.has(webContentsId)) {
+          event.preventDefault();
+          return;
+        }
+        const sessionId = windowSessions.get(webContentsId);
+        if (sessionId === undefined) return;
+        const collaborationMode = collaboration.mode(sessionId);
+        if (collaborationMode !== 'offline') {
+          event.preventDefault();
+          closingDecisions.add(webContentsId);
+          void retainWindowOnFailure(
+            window,
+            async () => {
+              try {
+                const ended = await collaboration.leave(sessionId);
+                if (ended?.preserveDetached === true) {
+                  sessionTargetPaths.delete(sessionId);
+                  const choice = await dialog.showMessageBox(window, {
+                    type: 'warning',
+                    title: 'Save detached collaboration copy?',
+                    message:
+                      ended.preservationReason === 'guest-copy'
+                        ? 'The guest copy is not stored in the shared file.'
+                        : 'The shared-file writer became unsafe, so HTMLlelujah detached your edits.',
+                    detail:
+                      'Save a separate .hdeck to keep these edits, or explicitly discard them. Cancel keeps the recovery copy open and journaled.',
+                    buttons: ['Save Copy', 'Discard', 'Cancel'],
+                    defaultId: 0,
+                    cancelId: 2,
+                    noLink: true,
+                  });
+                  if (choice.response === 2) return;
+                  if (choice.response === 0) {
+                    const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
+                    if ((await saveAs(syntheticEvent, sessionId)) === undefined) return;
+                  }
+                }
+              } catch {
+                await dialog.showMessageBox(window, {
+                  type: 'error',
+                  title: 'Collaboration could not close safely',
+                  message:
+                    collaborationMode === 'host'
+                      ? 'The authoritative presentation could not be saved. Resolve the shared-file issue and try again.'
+                      : 'The guest connection could not be closed cleanly. Try again.',
+                  buttons: ['OK'],
+                  noLink: true,
+                });
+                return;
+              }
+              await runtime.close(sessionId, { discardUnsaved: true });
+              sessionTargetPaths.delete(sessionId);
+              closingWindows.add(webContentsId);
+              for (const candidate of BrowserWindow.getAllWindows()) {
+                if (candidate === window) continue;
+                if (windowSessions.get(candidate.webContents.id) === sessionId) candidate.destroy();
+              }
+              window.destroy();
+            },
+            () => reportCloseFailure(window),
+          ).finally(() => closingDecisions.delete(webContentsId));
+          return;
+        }
+        const snapshot = runtime.getSnapshot(sessionId);
+        if (!snapshot.dirty) {
+          event.preventDefault();
+          closingDecisions.add(webContentsId);
+          void retainWindowOnFailure(
+            window,
+            async () => {
+              await collaboration.shutdown(sessionId);
+              await runtime.close(sessionId, { discardUnsaved: true });
+              sessionTargetPaths.delete(sessionId);
+              closingWindows.add(webContentsId);
+              for (const candidate of BrowserWindow.getAllWindows()) {
+                if (candidate === window) continue;
+                if (windowSessions.get(candidate.webContents.id) === sessionId) candidate.destroy();
+              }
+              window.destroy();
+            },
+            () => reportCloseFailure(window),
+          ).finally(() => closingDecisions.delete(webContentsId));
+          return;
+        }
+        event.preventDefault();
+        closingDecisions.add(webContentsId);
+        void retainWindowOnFailure(
+          window,
+          async () => {
             const choice = await dialog.showMessageBox(window, {
               type: 'warning',
-              title: 'Save detached collaboration copy?',
-              message:
-                ended.preservationReason === 'guest-copy'
-                  ? 'The guest copy is not stored in the shared file.'
-                  : 'The shared-file writer became unsafe, so HTMLlelujah detached your edits.',
-              detail:
-                'Save a separate .hdeck to keep these edits, or explicitly discard them. Cancel keeps the recovery copy open and journaled.',
-              buttons: ['Save Copy', 'Discard', 'Cancel'],
+              title: 'Unsaved changes',
+              message: `Save changes to “${snapshot.document.name}”?`,
+              buttons: ['Save', 'Discard', 'Cancel'],
               defaultId: 0,
               cancelId: 2,
               noLink: true,
@@ -1226,73 +1424,90 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
             if (choice.response === 2) return;
             if (choice.response === 0) {
               const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
-              if ((await saveAs(syntheticEvent, sessionId)) === undefined) return;
+              if ((await saveWithTargetFallback(syntheticEvent, sessionId)) === undefined) return;
             }
-          }
-        } catch {
-          await dialog.showMessageBox(window, {
-            type: 'error',
-            title: 'Collaboration could not close safely',
-            message:
-              collaborationMode === 'host'
-                ? 'The authoritative presentation could not be saved. Resolve the shared-file issue and try again.'
-                : 'The guest connection could not be closed cleanly. Try again.',
-            buttons: ['OK'],
-            noLink: true,
-          });
-          return;
-        }
-        closingWindows.add(webContentsId);
-        for (const candidate of BrowserWindow.getAllWindows()) {
-          if (candidate === window) continue;
-          if (windowSessions.get(candidate.webContents.id) === sessionId) candidate.destroy();
-        }
-        await runtime.close(sessionId, { discardUnsaved: true }).catch(() => undefined);
-        sessionTargetPaths.delete(sessionId);
-        window.destroy();
-      })();
-      return;
-    }
-    const snapshot = runtime.getSnapshot(sessionId);
-    if (!snapshot.dirty) {
-      closingWindows.add(webContentsId);
-      sessionTargetPaths.delete(sessionId);
-      void collaboration
-        .shutdown(sessionId)
-        .then(() => runtime.close(sessionId, { discardUnsaved: true }))
-        .catch(() => undefined);
-      return;
-    }
-    event.preventDefault();
-    void (async () => {
-      const choice = await dialog.showMessageBox(window, {
-        type: 'warning',
-        title: 'Unsaved changes',
-        message: `Save changes to “${snapshot.document.name}”?`,
-        buttons: ['Save', 'Discard', 'Cancel'],
-        defaultId: 0,
-        cancelId: 2,
-        noLink: true,
+            await runtime.close(sessionId, { discardUnsaved: true });
+            sessionTargetPaths.delete(sessionId);
+            closingWindows.add(webContentsId);
+            for (const candidate of BrowserWindow.getAllWindows()) {
+              if (candidate === window) continue;
+              if (windowSessions.get(candidate.webContents.id) === sessionId) candidate.destroy();
+            }
+            window.destroy();
+          },
+          () => reportCloseFailure(window),
+        ).finally(() => closingDecisions.delete(webContentsId));
       });
-      if (choice.response === 2) return;
-      if (choice.response === 0) {
-        const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
-        if ((await saveWithTargetFallback(syntheticEvent, sessionId)) === undefined) return;
-      }
-      closingWindows.add(webContentsId);
-      for (const candidate of BrowserWindow.getAllWindows()) {
-        if (candidate === window) continue;
-        if (windowSessions.get(candidate.webContents.id) === sessionId) candidate.destroy();
-      }
-      await runtime.close(sessionId, { discardUnsaved: true }).catch(() => undefined);
-      sessionTargetPaths.delete(sessionId);
-      window.destroy();
-    })();
-  });
 
-  if (process.env.VITE_DEV_SERVER_URL) await window.loadURL(process.env.VITE_DEV_SERVER_URL);
-  else await window.loadURL('htmllelujah-app://app/index.html');
-  return window;
+      if (process.env.VITE_DEV_SERVER_URL) await window.loadURL(process.env.VITE_DEV_SERVER_URL);
+      else await window.loadURL('htmllelujah-app://app/index.html');
+      return window;
+    },
+    async () => {
+      revokeWebContentsTokens(webContentsId);
+      windowModes.delete(webContentsId);
+      windowSessions.delete(webContentsId);
+      if (createdSessionId !== undefined) {
+        sessionTargetPaths.delete(createdSessionId);
+        await collaboration.shutdown(createdSessionId).catch(() => undefined);
+        await runtime.close(createdSessionId, { discardUnsaved: true }).catch(() => undefined);
+      }
+    },
+  );
+};
+
+const reportOpenFailure = async (parent?: BrowserWindow): Promise<void> => {
+  await messageBox(parent, {
+    type: 'error',
+    title: 'Presentation could not be opened',
+    message: 'The selected .hdeck could not be opened safely.',
+    detail: 'No existing presentation or recovery journal was replaced.',
+    buttons: ['OK'],
+    noLink: true,
+  }).catch(() => undefined);
+};
+
+const openPathInEditorWindowSafely = async (
+  window: BrowserWindow,
+  targetPath: string,
+): Promise<void> => {
+  try {
+    await openPathInEditorWindow(window, targetPath);
+  } catch {
+    if (!window.isDestroyed()) await reportOpenFailure(window);
+  }
+};
+
+const createEditorWindowSafely = async (
+  initialPath?: string,
+): Promise<BrowserWindow | undefined> => {
+  try {
+    return await createEditorWindow(initialPath);
+  } catch {
+    if (initialPath !== undefined) {
+      await reportOpenFailure();
+      try {
+        return await createEditorWindow();
+      } catch {
+        await messageBox(undefined, {
+          type: 'error',
+          title: 'HTMLlelujah could not start',
+          message: 'The editor window could not be initialized safely.',
+          buttons: ['Close'],
+          noLink: true,
+        }).catch(() => undefined);
+      }
+    } else {
+      await messageBox(undefined, {
+        type: 'error',
+        title: 'HTMLlelujah could not start',
+        message: 'The editor window could not be initialized safely.',
+        buttons: ['Close'],
+        noLink: true,
+      }).catch(() => undefined);
+    }
+    return undefined;
+  }
 };
 
 const createPresentationWindow = async (
@@ -1434,17 +1649,20 @@ const configureIpc = (): void => {
     return sessionView(event.sender.id, snapshot);
   });
 
-  handle(DESKTOP_IPC.importImage, historyInputSchema, async (event, input) => {
+  handle(DESKTOP_IPC.importImage, importImageInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
     const imported = await importImageForSession({
       sessionId: input.sessionId,
       expectedRevision: input.expectedRevision,
+      slideId: input.slideId,
+      ...(input.replaceElementId === undefined ? {} : { replaceElementId: input.replaceElementId }),
       parent: findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined,
       metadata: metadataFor(event, 'Import image'),
     });
     return {
       session: sessionView(event.sender.id, imported.snapshot),
       assetId: imported.assetId,
+      elementId: imported.elementId,
     };
   });
 
@@ -1622,18 +1840,10 @@ else {
       editor.show();
       editor.focus();
       if (filePath !== undefined) {
-        void openPathInEditorWindow(editor, filePath).catch(() => {
-          void dialog.showMessageBox(editor, {
-            type: 'error',
-            title: 'Presentation could not be opened',
-            message: 'The selected .hdeck could not be opened safely.',
-            buttons: ['OK'],
-            noLink: true,
-          });
-        });
+        void openPathInEditorWindowSafely(editor, filePath);
       }
     } else {
-      void createEditorWindow(filePath).catch(() => undefined);
+      void createEditorWindowSafely(filePath);
     }
   });
 
@@ -1643,45 +1853,60 @@ else {
       (window) => windowModes.get(window.webContents.id) === 'editor',
     );
     if (!app.isReady() || editor === undefined) pendingOpenPath = filePath;
-    else void openPathInEditorWindow(editor, filePath).catch(() => undefined);
+    else void openPathInEditorWindowSafely(editor, filePath);
   });
 
-  void app.whenReady().then(async () => {
-    registerSecureProtocols();
-    configureIpc();
-    try {
-      mcpRpcServer = await startLocalRpcServer({
-        service: mcpBridge,
-        permissions: mcpBridge,
-        descriptorPath: path.join(app.getPath('userData'), 'mcp', 'endpoint-v1.json'),
+  void app
+    .whenReady()
+    .then(async () => {
+      registerSecureProtocols();
+      configureIpc();
+      try {
+        mcpRpcServer = await startLocalRpcServer({
+          service: mcpBridge,
+          permissions: mcpBridge,
+          descriptorPath: path.join(app.getPath('userData'), 'mcp', 'endpoint-v1.json'),
+        });
+      } catch {
+        // The editor remains usable if local automation cannot start. No path or secret is logged.
+        console.error('[MCP] The authenticated local bridge is unavailable.');
+      }
+      session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
+        callback(false),
+      );
+      session.defaultSession.setPermissionCheckHandler(() => false);
+      session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+        callback({
+          responseHeaders: {
+            ...details.responseHeaders,
+            'X-Content-Type-Options': ['nosniff'],
+            'Cross-Origin-Opener-Policy': ['same-origin'],
+            'Cross-Origin-Resource-Policy': ['same-origin'],
+            'Referrer-Policy': ['no-referrer'],
+          },
+        });
       });
-    } catch {
-      // The editor remains usable if local automation cannot start. No path or secret is logged.
-      console.error('[MCP] The authenticated local bridge is unavailable.');
-    }
-    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
-      callback(false),
-    );
-    session.defaultSession.setPermissionCheckHandler(() => false);
-    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-      callback({
-        responseHeaders: {
-          ...details.responseHeaders,
-          'X-Content-Type-Options': ['nosniff'],
-          'Cross-Origin-Opener-Policy': ['same-origin'],
-          'Cross-Origin-Resource-Policy': ['same-origin'],
-          'Referrer-Policy': ['no-referrer'],
-        },
+      const initialPath = pendingOpenPath ?? hdeckArgument(process.argv);
+      pendingOpenPath = undefined;
+      const created = await createEditorWindowSafely(initialPath);
+      if (created === undefined) {
+        app.quit();
+        return;
+      }
+      app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) void createEditorWindowSafely();
       });
+    })
+    .catch(async () => {
+      await messageBox(undefined, {
+        type: 'error',
+        title: 'HTMLlelujah could not start',
+        message: 'The application could not initialize safely.',
+        buttons: ['Close'],
+        noLink: true,
+      }).catch(() => undefined);
+      app.quit();
     });
-    const initialPath = pendingOpenPath ?? hdeckArgument(process.argv);
-    pendingOpenPath = undefined;
-    await createEditorWindow(initialPath);
-    app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0)
-        void createEditorWindow().catch(() => undefined);
-    });
-  });
 
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();

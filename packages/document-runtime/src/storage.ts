@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rename, rm, stat, truncate } from 'node:fs/promises';
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  truncate,
+} from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -57,6 +67,20 @@ export interface RecoveryPaths {
   readonly base: string;
   readonly journal: string;
   readonly metadata: string;
+}
+
+export interface RecoveryBlobSweepOptions {
+  readonly minimumAgeMs: number;
+  readonly maxEntries: number;
+  readonly maxDeletes: number;
+  readonly nowMs?: number | undefined;
+}
+
+export interface RecoveryBlobSweepResult {
+  readonly scanned: number;
+  readonly deleted: number;
+  readonly retained: number;
+  readonly truncated: boolean;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -239,5 +263,56 @@ export class RuntimeRecoveryStore {
       if (error instanceof DocumentRuntimeError) throw error;
       return undefined;
     }
+  }
+
+  /**
+   * Bounded private-store mark-and-sweep. Only canonical content-addressed regular files can be
+   * removed; unknown files and links are deliberately ignored.
+   */
+  public async sweepBlobs(
+    referencedHashes: ReadonlySet<string>,
+    options: RecoveryBlobSweepOptions,
+  ): Promise<RecoveryBlobSweepResult> {
+    await this.ensure();
+    const blobRoot = path.join(this.root, 'blobs');
+    const entries = (await readdir(blobRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && /^[0-9a-f]{64}$/.test(entry.name))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const limit = Math.max(0, Math.floor(options.maxEntries));
+    const candidates = entries.slice(0, limit);
+    const nowMs = options.nowMs ?? Date.now();
+    const minimumAgeMs = Math.max(0, options.minimumAgeMs);
+    const maxDeletes = Math.max(0, Math.floor(options.maxDeletes));
+    let deleted = 0;
+    let retained = 0;
+    for (const entry of candidates) {
+      if (referencedHashes.has(entry.name) || deleted >= maxDeletes) {
+        retained += 1;
+        continue;
+      }
+      const target = path.join(blobRoot, entry.name);
+      let metadata;
+      try {
+        metadata = await lstat(target);
+      } catch {
+        continue;
+      }
+      if (
+        !metadata.isFile() ||
+        metadata.isSymbolicLink() ||
+        nowMs - metadata.mtimeMs < minimumAgeMs
+      ) {
+        retained += 1;
+        continue;
+      }
+      await rm(target, { force: true });
+      deleted += 1;
+    }
+    return {
+      scanned: candidates.length,
+      deleted,
+      retained,
+      truncated: entries.length > candidates.length,
+    };
   }
 }

@@ -70,6 +70,11 @@ export interface HistoryInput {
   readonly expectedRevision: string;
 }
 
+export interface ImportImageInput extends HistoryInput {
+  readonly slideId: string;
+  readonly replaceElementId?: string | undefined;
+}
+
 export interface SessionInput {
   readonly sessionId: string;
 }
@@ -77,6 +82,7 @@ export interface SessionInput {
 export interface ImportImageResult {
   readonly session: SessionView;
   readonly assetId: string;
+  readonly elementId: string;
 }
 
 export type ExportFormat = 'html' | 'pdf';
@@ -170,7 +176,7 @@ export interface HtmllelujahDesktopApi {
   redo(input: HistoryInput): Promise<DesktopResult<SessionView>>;
   save(input: SessionInput): Promise<DesktopResult<SessionView>>;
   saveAs(input: SessionInput): Promise<DesktopResult<SessionView>>;
-  importImage(input: HistoryInput): Promise<DesktopResult<ImportImageResult>>;
+  importImage(input: ImportImageInput): Promise<DesktopResult<ImportImageResult>>;
   listRecovery(): Promise<DesktopResult<readonly RecoveryCandidate[]>>;
   recover(candidateId: string): Promise<DesktopResult<SessionView>>;
   present(input: PresentationInput): Promise<DesktopResult<null>>;

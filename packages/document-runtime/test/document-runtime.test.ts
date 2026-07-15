@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { createHdeckArchive, parseHdeckArchive, replayJournal } from '@htmllelujah/hdeck';
+import { createHdeckArchive, parseHdeckArchive, replayJournal, sha256 } from '@htmllelujah/hdeck';
 import type { TransactionMetadata } from '@htmllelujah/document-core';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -47,6 +47,12 @@ const metadata = (
   label,
   timestamp: `2026-07-15T12:${String(value).padStart(2, '0')}:00.000Z`,
 });
+
+const onePixelPng = (): Uint8Array =>
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  );
 
 const managerFor = (
   recoveryDirectory: string,
@@ -293,7 +299,7 @@ describe('save, reopen, assets, and conflicts', () => {
     const target = path.join(directory, 'assets.hdeck');
     const manager = managerFor(path.join(directory, 'recovery'));
     const session = await manager.createMainOnly();
-    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+    const bytes = onePixelPng();
     const stored = await manager.storeAsset(session.sessionId, {
       id: 'ffffffff-ffff-4fff-8fff-000000000001',
       bytes,
@@ -309,8 +315,275 @@ describe('save, reopen, assets, and conflicts', () => {
       expectedFingerprint: null,
     });
     const parsed = parseHdeckArchive(await readFile(target));
-    expect(parsed.assets.get('ffffffff-ffff-4fff-8fff-000000000001')).toEqual(bytes);
+    expect(Array.from(parsed.assets.get('ffffffff-ffff-4fff-8fff-000000000001') ?? [])).toEqual(
+      Array.from(bytes),
+    );
     expect(stored.document.assets[0]?.hash).toBe(parsed.manifest.assets[0]?.sha256);
+  });
+
+  it('registers, inserts, and replaces an image with one undo step per user action', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory);
+    const session = await manager.createMainOnly();
+    const slideId = session.document.slides[0]!.id;
+    const assetId = 'ffffffff-ffff-4fff-8fff-000000000011';
+    const elementId = 'ffffffff-ffff-4fff-8fff-000000000012';
+    const inserted = await manager.storeAssetAndExecute(session.sessionId, {
+      id: assetId,
+      bytes: onePixelPng(),
+      mediaType: 'image/png',
+      fileName: 'atomic.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: session.revision,
+      metadata: metadata(11),
+      commands: [
+        {
+          type: 'element.insert',
+          slideId,
+          element: {
+            id: elementId,
+            type: 'image',
+            name: 'Atomic image',
+            frame: { xPt: 10, yPt: 10, widthPt: 100, heightPt: 100, rotationDeg: 0 },
+            opacity: 1,
+            visible: true,
+            locked: false,
+            assetId,
+            altText: 'Atomic image',
+            fit: 'contain',
+            crop: { top: 0, right: 0, bottom: 0, left: 0 },
+          },
+        },
+      ],
+    });
+    expect(inserted.document.assets.map((asset) => asset.id)).toEqual([assetId]);
+    expect(inserted.document.slides[0]!.elements.some((element) => element.id === elementId)).toBe(
+      true,
+    );
+
+    const originalElement = inserted.document.slides[0]!.elements.find(
+      (element) => element.id === elementId,
+    );
+    if (originalElement?.type !== 'image') throw new Error('Inserted image fixture is missing.');
+    const replacementAssetId = 'ffffffff-ffff-4fff-8fff-000000000013';
+    const replaced = await manager.storeAssetAndExecute(session.sessionId, {
+      id: replacementAssetId,
+      bytes: onePixelPng(),
+      mediaType: 'image/png',
+      fileName: 'replacement.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: inserted.revision,
+      metadata: metadata(12),
+      commands: [
+        {
+          type: 'element.update',
+          slideId,
+          elementId,
+          replacement: { ...originalElement, assetId: replacementAssetId },
+        },
+      ],
+    });
+    expect(
+      (
+        replaced.document.slides[0]!.elements.find((element) => element.id === elementId) as {
+          assetId?: string;
+        }
+      ).assetId,
+    ).toBe(replacementAssetId);
+
+    const replacementUndone = await manager.undo(session.sessionId, {
+      expectedRevision: replaced.revision,
+      metadata: metadata(13),
+    });
+    expect(
+      (
+        replacementUndone.document.slides[0]!.elements.find(
+          (element) => element.id === elementId,
+        ) as { assetId?: string }
+      ).assetId,
+    ).toBe(assetId);
+    expect(replacementUndone.document.assets.map((asset) => asset.id)).toEqual([assetId]);
+
+    const undone = await manager.undo(session.sessionId, {
+      expectedRevision: replacementUndone.revision,
+      metadata: metadata(14),
+    });
+    expect(undone.document.assets).toHaveLength(0);
+    expect(undone.document.slides[0]!.elements.some((element) => element.id === elementId)).toBe(
+      false,
+    );
+  });
+
+  it('does not stage a blob or mutate the document for stale or invalid image placement', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory, { recoveryBlobGcMinAgeMs: 0 });
+    const session = await manager.createMainOnly();
+    const bytes = onePixelPng();
+    const hash = sha256(bytes);
+    const request = {
+      id: 'ffffffff-ffff-4fff-8fff-000000000021',
+      bytes,
+      mediaType: 'image/png' as const,
+      fileName: 'rejected.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: 'stale-revision',
+      metadata: metadata(21),
+      commands: [
+        {
+          type: 'element.insert' as const,
+          slideId: 'ffffffff-ffff-4fff-8fff-000000000099',
+          element: {
+            id: 'ffffffff-ffff-4fff-8fff-000000000022',
+            type: 'image' as const,
+            name: 'Rejected image',
+            frame: { xPt: 10, yPt: 10, widthPt: 100, heightPt: 100, rotationDeg: 0 },
+            opacity: 1,
+            visible: true,
+            locked: false,
+            assetId: 'ffffffff-ffff-4fff-8fff-000000000021',
+            altText: 'Rejected',
+            fit: 'contain' as const,
+            crop: { top: 0, right: 0, bottom: 0, left: 0 },
+          },
+        },
+      ],
+    };
+    await expect(manager.storeAssetAndExecute(session.sessionId, request)).rejects.toMatchObject({
+      code: 'REVISION_CONFLICT',
+    });
+    await expect(readFile(path.join(directory, 'blobs', hash))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    await expect(
+      manager.storeAssetAndExecute(session.sessionId, {
+        ...request,
+        expectedRevision: session.revision,
+      }),
+    ).rejects.toBeDefined();
+    expect(manager.getSnapshot(session.sessionId).document.assets).toHaveLength(0);
+    await expect(readFile(path.join(directory, 'blobs', hash))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('keeps a failed asset journal append out of the document and collects its staged blob', async () => {
+    const directory = await temporaryDirectory();
+    const journal: JournalDurabilityCapability = {
+      ...defaultJournalDurability,
+      append: async () => Promise.reject(new Error('injected asset append failure')),
+    };
+    const manager = managerFor(directory, { journal, recoveryBlobGcMinAgeMs: 0 });
+    const session = await manager.createMainOnly();
+    const assetId = 'ffffffff-ffff-4fff-8fff-000000000025';
+    const bytes = onePixelPng();
+    const hash = sha256(bytes);
+    await expect(
+      manager.storeAssetAndExecute(session.sessionId, {
+        id: assetId,
+        bytes,
+        mediaType: 'image/png',
+        fileName: 'journal-failure.png',
+        widthPx: 1,
+        heightPx: 1,
+        expectedRevision: session.revision,
+        metadata: metadata(25),
+        commands: [
+          {
+            type: 'element.insert',
+            slideId: session.document.slides[0]!.id,
+            element: {
+              id: 'ffffffff-ffff-4fff-8fff-000000000026',
+              type: 'image',
+              name: 'Rejected journal image',
+              frame: { xPt: 10, yPt: 10, widthPt: 100, heightPt: 100, rotationDeg: 0 },
+              opacity: 1,
+              visible: true,
+              locked: false,
+              assetId,
+              altText: 'Rejected journal image',
+              fit: 'contain',
+              crop: { top: 0, right: 0, bottom: 0, left: 0 },
+            },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'JOURNAL_FAILED' });
+    expect(manager.getSnapshot(session.sessionId).document.assets).toHaveLength(0);
+    expect(Array.from(await readFile(path.join(directory, 'blobs', hash)))).toEqual(
+      Array.from(bytes),
+    );
+    expect((await manager.collectRecoveryGarbageMainOnly()).deleted).toBe(1);
+    await expect(readFile(path.join(directory, 'blobs', hash))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('collects only unreferenced recovery blobs and removes an imported blob after close', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory, { recoveryBlobGcMinAgeMs: 0 });
+    const session = await manager.createMainOnly();
+    const slideId = session.document.slides[0]!.id;
+    const assetId = 'ffffffff-ffff-4fff-8fff-000000000031';
+    const elementId = 'ffffffff-ffff-4fff-8fff-000000000032';
+    const bytes = onePixelPng();
+    const imported = await manager.storeAssetAndExecute(session.sessionId, {
+      id: assetId,
+      bytes,
+      mediaType: 'image/png',
+      fileName: 'collect.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: session.revision,
+      metadata: metadata(31),
+      commands: [
+        {
+          type: 'element.insert',
+          slideId,
+          element: {
+            id: elementId,
+            type: 'image',
+            name: 'Collected image',
+            frame: { xPt: 10, yPt: 10, widthPt: 100, heightPt: 100, rotationDeg: 0 },
+            opacity: 1,
+            visible: true,
+            locked: false,
+            assetId,
+            altText: 'Collected',
+            fit: 'contain',
+            crop: { top: 0, right: 0, bottom: 0, left: 0 },
+          },
+        },
+      ],
+    });
+    const assetHash = imported.document.assets[0]!.hash;
+    const removed = await manager.execute(session.sessionId, {
+      expectedRevision: imported.revision,
+      metadata: metadata(32),
+      commands: [
+        { type: 'element.delete', slideId, elementIds: [elementId] },
+        { type: 'asset.remove', assetId },
+      ],
+    });
+    const orphanBytes = Buffer.from('old orphan recovery blob', 'utf8');
+    const orphanHash = sha256(orphanBytes);
+    await writeFile(path.join(directory, 'blobs', orphanHash), orphanBytes);
+
+    const swept = await manager.collectRecoveryGarbageMainOnly();
+    expect(swept.deleted).toBe(1);
+    await expect(readFile(path.join(directory, 'blobs', orphanHash))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(await readFile(path.join(directory, 'blobs', assetHash))).toEqual(bytes);
+
+    await manager.close(session.sessionId, { discardUnsaved: true });
+    await expect(readFile(path.join(directory, 'blobs', assetHash))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(removed.document.assets).toHaveLength(0);
   });
 
   it('autosaves a bound target and flush observes the durable result', async () => {
@@ -335,6 +608,23 @@ describe('save, reopen, assets, and conflicts', () => {
 });
 
 describe('recovery and agent proposals', () => {
+  it('hides zero-record persisted sessions but keeps a never-saved new deck recoverable', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory);
+    const persisted = await manager.createMainOnly();
+    const target = path.join(directory, 'persisted.hdeck');
+    await manager.saveAsMainOnly(persisted.sessionId, {
+      targetPath: target,
+      expectedFingerprint: null,
+    });
+    const neverSaved = await manager.createMainOnly();
+
+    const afterCrash = managerFor(directory);
+    const candidates = await afterCrash.listRecoveryCandidatesMainOnly();
+    expect(candidates.map((candidate) => candidate.candidateId)).toEqual([neverSaved.sessionId]);
+    expect(candidates[0]?.recordCount).toBe(0);
+  });
+
   it('surfaces and replays the longest valid prefix of a truncated journal', async () => {
     const directory = await temporaryDirectory();
     const manager = managerFor(directory);
@@ -432,6 +722,26 @@ describe('recovery and agent proposals', () => {
         code: 'PROPOSAL_STALE',
       },
     );
+  });
+
+  it('caps pending proposals and proactively frees expired capacity', async () => {
+    const directory = await temporaryDirectory();
+    let now = Date.parse('2026-07-15T12:00:00.000Z');
+    const manager = managerFor(directory, { now: () => new Date(now).toISOString() });
+    const session = await manager.createMainOnly();
+    const request = {
+      expectedRevision: session.revision,
+      commands: [{ type: 'deck.rename' as const, name: 'Capacity proposal' }],
+      metadata: metadata(40, 'agent'),
+      ttlMs: 1_000,
+    };
+    for (let index = 0; index < 256; index += 1) manager.propose(session.sessionId, request);
+    expect(() => manager.propose(session.sessionId, request)).toThrowError(
+      /Pending proposal capacity/,
+    );
+
+    now += 1_001;
+    expect(manager.propose(session.sessionId, request).proposalId).toBeDefined();
   });
 
   it('simulates safely, commits, audits, and undoes the latest agent transaction', async () => {

@@ -12,6 +12,7 @@ import {
   type ExportInput,
   type ExportResult,
   type HistoryInput,
+  type ImportImageInput,
   type HtmllelujahDesktopApi,
   type ImportImageResult,
   type InitializeResult,
@@ -81,7 +82,7 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
     invoke(DESKTOP_IPC.save, input),
   saveAs: (input: SessionInput): Promise<DesktopResult<SessionView>> =>
     invoke(DESKTOP_IPC.saveAs, input),
-  importImage: (input: HistoryInput): Promise<DesktopResult<ImportImageResult>> =>
+  importImage: (input: ImportImageInput): Promise<DesktopResult<ImportImageResult>> =>
     invoke(DESKTOP_IPC.importImage, input),
   listRecovery: (): Promise<DesktopResult<readonly RecoveryCandidate[]>> =>
     invoke(DESKTOP_IPC.listRecovery),

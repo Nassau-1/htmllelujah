@@ -50,6 +50,7 @@ import type {
   OpenSessionInput,
   ProposalRequest,
   ProposalSummary,
+  RecoveryBlobGcResult,
   RecoveryCandidate,
   RuntimeEvent,
   RuntimeEventListener,
@@ -59,11 +60,16 @@ import type {
   SaveAsOptions,
   SessionDurability,
   StoreAssetRequest,
+  StoreAssetTransactionRequest,
 } from './types.js';
 
 const MAX_COMMANDS_PER_TRANSACTION = 100;
 const MIN_PROPOSAL_TTL_MS = 1_000;
 const MAX_PROPOSAL_TTL_MS = 15 * 60_000;
+const MAX_PROPOSALS_PER_SESSION = 256;
+const DEFAULT_RECOVERY_BLOB_GC_MIN_AGE_MS = 60 * 60_000;
+const MAX_RECOVERY_BLOBS_SCANNED_PER_PASS = 4_096;
+const MAX_RECOVERY_BLOBS_DELETED_PER_PASS = 256;
 
 interface InternalAsset {
   readonly id: string;
@@ -128,6 +134,29 @@ const isRestoreCommand = (command: unknown): command is RuntimeRestoreCommand =>
   'type' in command &&
   (command as { readonly type?: unknown }).type === 'runtime.restore' &&
   'document' in command;
+
+const markDocumentAssetHashes = (document: DeckDocument, hashes: Set<string>): void => {
+  for (const asset of document.assets) hashes.add(asset.hash);
+};
+
+const markCommandAssetHashes = (commands: readonly unknown[], hashes: Set<string>): void => {
+  for (const command of commands) {
+    if (typeof command !== 'object' || command === null || !('type' in command)) continue;
+    if (
+      command.type === 'asset.register' &&
+      'asset' in command &&
+      typeof command.asset === 'object' &&
+      command.asset !== null &&
+      'hash' in command.asset &&
+      typeof command.asset.hash === 'string' &&
+      /^[0-9a-f]{64}$/.test(command.asset.hash)
+    ) {
+      hashes.add(command.asset.hash);
+    } else if (isRestoreCommand(command)) {
+      markDocumentAssetHashes(parseDeck(command.document), hashes);
+    }
+  }
+};
 
 const deepFreeze = <T>(value: T): T => {
   if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
@@ -215,6 +244,8 @@ export class DocumentSessionManager implements DocumentRuntimeService {
   readonly #autosaveDelayMs: number;
   readonly #maxHistoryEntries: number;
   readonly #defaultProposalTtlMs: number;
+  readonly #recoveryBlobGcMinAgeMs: number;
+  readonly #stagedBlobHashes = new Map<string, number>();
 
   public constructor(options: DocumentRuntimeOptions) {
     this.#recovery = new RuntimeRecoveryStore(options.recoveryDirectory);
@@ -225,6 +256,8 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     this.#autosaveDelayMs = options.autosaveDelayMs ?? 1_000;
     this.#maxHistoryEntries = options.maxHistoryEntries ?? 100;
     this.#defaultProposalTtlMs = options.defaultProposalTtlMs ?? 60_000;
+    this.#recoveryBlobGcMinAgeMs =
+      options.recoveryBlobGcMinAgeMs ?? DEFAULT_RECOVERY_BLOB_GC_MIN_AGE_MS;
     if (
       !Number.isSafeInteger(this.#autosaveDelayMs) ||
       this.#autosaveDelayMs < 0 ||
@@ -232,7 +265,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       this.#maxHistoryEntries < 1 ||
       !Number.isSafeInteger(this.#defaultProposalTtlMs) ||
       this.#defaultProposalTtlMs < MIN_PROPOSAL_TTL_MS ||
-      this.#defaultProposalTtlMs > MAX_PROPOSAL_TTL_MS
+      this.#defaultProposalTtlMs > MAX_PROPOSAL_TTL_MS ||
+      !Number.isSafeInteger(this.#recoveryBlobGcMinAgeMs) ||
+      this.#recoveryBlobGcMinAgeMs < 0
     ) {
       throw new DocumentRuntimeError('INVALID_REQUEST', 'Runtime limits are invalid.');
     }
@@ -666,6 +701,13 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       }
       nextAssets.set(reference.id, asset);
     }
+    // Validate the whole transaction before creating blobs, then make every newly referenced
+    // byte payload durable before acknowledging its journal record.
+    for (const [assetId, asset] of stagedAssets) {
+      if (additions.get(assetId) === asset) {
+        await this.#recovery.putBlob(sha256(asset.bytes), asset.bytes);
+      }
+    }
     await this.#appendRecord(
       state,
       transaction.previousRevision,
@@ -707,10 +749,17 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     sessionId: string,
     request: StoreAssetRequest,
   ): Promise<DocumentSessionSnapshot> {
+    return this.storeAssetAndExecute(sessionId, { ...request, commands: [] });
+  }
+
+  /** Registers asset bytes and applies dependent commands as one undoable transaction. */
+  public async storeAssetAndExecute(
+    sessionId: string,
+    request: StoreAssetTransactionRequest,
+  ): Promise<DocumentSessionSnapshot> {
     const state = this.#requireSession(sessionId);
     const bytes = Uint8Array.from(request.bytes);
     const hash = sha256(bytes);
-    await this.#recovery.putBlob(hash, bytes);
     const kind: AssetRef['kind'] = request.mediaType === 'font/woff2' ? 'font' : 'image';
     const asset: InternalAsset = {
       id: request.id,
@@ -720,31 +769,42 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       ...(request.widthPx === undefined ? {} : { widthPx: request.widthPx }),
       ...(request.heightPx === undefined ? {} : { heightPx: request.heightPx }),
     };
-    return this.#enqueue(state, () =>
-      this.#executeLocked(
-        state,
-        {
-          expectedRevision: request.expectedRevision,
-          metadata: request.metadata,
-          commands: [
-            {
-              type: 'asset.register',
-              asset: {
-                id: request.id,
-                kind,
-                hash,
-                mediaType: request.mediaType,
-                fileName: request.fileName,
-                byteLength: bytes.byteLength,
-                ...(request.widthPx === undefined ? {} : { widthPx: request.widthPx }),
-                ...(request.heightPx === undefined ? {} : { heightPx: request.heightPx }),
+    this.#stagedBlobHashes.set(hash, (this.#stagedBlobHashes.get(hash) ?? 0) + 1);
+    try {
+      return await this.#enqueue(state, () =>
+        this.#executeLocked(
+          state,
+          {
+            expectedRevision: request.expectedRevision,
+            metadata: request.metadata,
+            commands: [
+              {
+                type: 'asset.register',
+                asset: {
+                  id: request.id,
+                  kind,
+                  hash,
+                  mediaType: request.mediaType,
+                  fileName: request.fileName,
+                  byteLength: bytes.byteLength,
+                  ...(request.widthPx === undefined ? {} : { widthPx: request.widthPx }),
+                  ...(request.heightPx === undefined ? {} : { heightPx: request.heightPx }),
+                },
               },
-            },
-          ],
-        },
-        new Map([[request.id, asset]]),
-      ),
-    );
+              ...request.commands,
+            ],
+            ...(request.historyGroupId === undefined
+              ? {}
+              : { historyGroupId: request.historyGroupId }),
+          },
+          new Map([[request.id, asset]]),
+        ),
+      );
+    } finally {
+      const retained = (this.#stagedBlobHashes.get(hash) ?? 1) - 1;
+      if (retained <= 0) this.#stagedBlobHashes.delete(hash);
+      else this.#stagedBlobHashes.set(hash, retained);
+    }
   }
 
   async #restoreLocked(
@@ -901,6 +961,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         revision: state.revision,
         dirty: false,
       });
+      await this.collectRecoveryGarbageMainOnly().catch(() => undefined);
       return this.#snapshot(state);
     } catch (error) {
       if (error instanceof DocumentRuntimeError && error.code === 'JOURNAL_FAILED') throw error;
@@ -1047,6 +1108,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         documentId: state.documentId,
         dirtyDiscarded: dirty,
       });
+      await this.collectRecoveryGarbageMainOnly().catch(() => undefined);
     });
   }
 
@@ -1062,8 +1124,25 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     return immutableClone(safeDiff(state.document, transaction.document, transaction.commands));
   }
 
+  #purgeExpiredProposals(state: SessionState, nowMs: number): void {
+    for (const [proposalId, proposal] of state.proposals) {
+      if (nowMs >= proposal.expiresAtMs) state.proposals.delete(proposalId);
+    }
+  }
+
   public propose(sessionId: string, request: ProposalRequest): ProposalSummary {
     const state = this.#requireSession(sessionId);
+    const nowMs = Date.parse(this.#now());
+    if (!Number.isFinite(nowMs)) {
+      throw new DocumentRuntimeError('INVALID_REQUEST', 'Runtime clock is invalid.');
+    }
+    this.#purgeExpiredProposals(state, nowMs);
+    if (state.proposals.size >= MAX_PROPOSALS_PER_SESSION) {
+      throw new DocumentRuntimeError(
+        'PROPOSAL_CAPACITY',
+        'Pending proposal capacity has been reached.',
+      );
+    }
     if (request.metadata.origin !== 'agent') {
       throw new DocumentRuntimeError(
         'INVALID_REQUEST',
@@ -1080,7 +1159,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     }
     const diff = this.simulate(sessionId, request);
     const proposalId = this.#idFactory();
-    const expiresAtMs = Date.parse(this.#now()) + ttlMs;
+    const expiresAtMs = nowMs + ttlMs;
     const summary: ProposalSummary = {
       proposalId,
       sessionId,
@@ -1101,14 +1180,20 @@ export class DocumentSessionManager implements DocumentRuntimeService {
   public commitProposal(sessionId: string, proposalId: string): Promise<DocumentSessionSnapshot> {
     const state = this.#requireSession(sessionId);
     return this.#enqueue(state, async () => {
+      const nowMs = Date.parse(this.#now());
+      if (!Number.isFinite(nowMs)) {
+        throw new DocumentRuntimeError('INVALID_REQUEST', 'Runtime clock is invalid.');
+      }
       const proposal = state.proposals.get(proposalId);
       if (proposal === undefined) {
         throw new DocumentRuntimeError('PROPOSAL_NOT_FOUND', 'Proposal does not exist.');
       }
-      if (Date.parse(this.#now()) >= proposal.expiresAtMs) {
+      if (nowMs >= proposal.expiresAtMs) {
         state.proposals.delete(proposalId);
+        this.#purgeExpiredProposals(state, nowMs);
         throw new DocumentRuntimeError('PROPOSAL_EXPIRED', 'Proposal has expired.');
       }
+      this.#purgeExpiredProposals(state, nowMs);
       if (state.revision !== proposal.summary.baseRevision) {
         throw new DocumentRuntimeError('PROPOSAL_STALE', 'Proposal base revision is stale.');
       }
@@ -1215,6 +1300,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         ) {
           continue;
         }
+        // A clean persisted deck with no post-save journal records has nothing to recover. A new,
+        // never-saved deck remains actionable even at zero records because its base is the only copy.
+        if (metadata.persisted && replay.records.length === 0) continue;
         candidates.push({
           candidateId,
           sessionId: candidateId,
@@ -1228,6 +1316,45 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       }
     }
     return immutableClone(candidates);
+  }
+
+  /** Main-process-only, bounded mark-and-sweep over the private content-addressed blob store. */
+  public async collectRecoveryGarbageMainOnly(): Promise<RecoveryBlobGcResult> {
+    const referenced = new Set<string>(this.#stagedBlobHashes.keys());
+    for (const state of this.#sessions.values()) {
+      markDocumentAssetHashes(state.document, referenced);
+      for (const entry of [...state.undo, ...state.redo]) {
+        markDocumentAssetHashes(entry.before, referenced);
+        markDocumentAssetHashes(entry.after, referenced);
+      }
+      for (const proposal of state.proposals.values()) {
+        markCommandAssetHashes(proposal.commands, referenced);
+      }
+    }
+    for (const candidateId of await this.#recovery.listCandidateIds()) {
+      const metadata = await this.#recovery.readMetadata(candidateId);
+      const base = parseHdeckArchive(await this.#recovery.readBase(candidateId));
+      const replay = await this.#journal.read(this.#recovery.paths(candidateId).journal);
+      if (
+        base.document.id !== metadata.documentId ||
+        replay.header.sessionId !== candidateId ||
+        replay.header.documentId !== metadata.documentId
+      ) {
+        throw new DocumentRuntimeError(
+          'RECOVERY_INVALID',
+          'Recovery artifacts disagree; blob collection was skipped.',
+        );
+      }
+      markDocumentAssetHashes(base.document, referenced);
+      for (const record of replay.records) markCommandAssetHashes(record.commands, referenced);
+    }
+    return immutableClone(
+      await this.#recovery.sweepBlobs(referenced, {
+        minimumAgeMs: this.#recoveryBlobGcMinAgeMs,
+        maxEntries: MAX_RECOVERY_BLOBS_SCANNED_PER_PASS,
+        maxDeletes: MAX_RECOVERY_BLOBS_DELETED_PER_PASS,
+      }),
+    );
   }
 
   /** Main-process-only recovery boundary. Replays the longest checksummed prefix. */

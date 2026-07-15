@@ -90,6 +90,19 @@ export interface StoreAssetRequest extends AssetBytesInput {
   readonly metadata: TransactionMetadata;
 }
 
+/** Registers bytes and applies dependent commands in one journal/history boundary. */
+export interface StoreAssetTransactionRequest extends StoreAssetRequest {
+  readonly commands: readonly DocumentCommand[];
+  readonly historyGroupId?: string | undefined;
+}
+
+export interface RecoveryBlobGcResult {
+  readonly scanned: number;
+  readonly deleted: number;
+  readonly retained: number;
+  readonly truncated: boolean;
+}
+
 export interface RecoveryCandidate {
   readonly candidateId: string;
   readonly sessionId: string;
@@ -183,6 +196,8 @@ export interface DocumentRuntimeOptions {
   readonly autosaveDelayMs?: number | undefined;
   readonly maxHistoryEntries?: number | undefined;
   readonly defaultProposalTtlMs?: number | undefined;
+  /** Keep freshly staged blobs during crash/restart races. Production defaults to one hour. */
+  readonly recoveryBlobGcMinAgeMs?: number | undefined;
 }
 
 export type RuntimeEvent =
