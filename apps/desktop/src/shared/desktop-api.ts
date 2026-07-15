@@ -22,6 +22,10 @@ export const DESKTOP_IPC = Object.freeze({
   collaborationHost: 'htmllelujah:v1:collaboration-host',
   collaborationJoin: 'htmllelujah:v1:collaboration-join',
   collaborationLeave: 'htmllelujah:v1:collaboration-leave',
+  collaborationTextLeaseStatus: 'htmllelujah:v1:collaboration-text-lease-status',
+  collaborationTextLeaseBegin: 'htmllelujah:v1:collaboration-text-lease-begin',
+  collaborationTextLeaseRenew: 'htmllelujah:v1:collaboration-text-lease-renew',
+  collaborationTextLeaseEnd: 'htmllelujah:v1:collaboration-text-lease-end',
   mcpStatus: 'htmllelujah:v1:mcp-status',
   mcpCreateApproval: 'htmllelujah:v1:mcp-create-approval',
   documentChanged: 'htmllelujah:v1:event-document-changed',
@@ -132,6 +136,35 @@ export interface CollaborationJoinInput {
   readonly displayName: string;
 }
 
+export interface CollaborationTextLeaseInput extends SessionInput {
+  readonly slideId: string;
+  readonly elementId: string;
+}
+
+export type CollaborationTextLeaseStatus =
+  | {
+      readonly status: 'available';
+      readonly owner: 'none';
+      readonly slideId: string;
+      readonly elementId: string;
+      readonly expiresAtMs: null;
+    }
+  | {
+      readonly status: 'owned';
+      readonly owner: 'self';
+      readonly slideId: string;
+      readonly elementId: string;
+      readonly expiresAtMs: number;
+    }
+  | {
+      readonly status: 'held';
+      readonly owner: 'peer';
+      readonly ownerClientId: string;
+      readonly slideId: string;
+      readonly elementId: string;
+      readonly expiresAtMs: number;
+    };
+
 export interface McpStatus {
   readonly available: boolean;
   readonly connected: boolean;
@@ -185,6 +218,18 @@ export interface HtmllelujahDesktopApi {
   collaborationHost(input: CollaborationHostInput): Promise<DesktopResult<CollaborationStatus>>;
   collaborationJoin(input: CollaborationJoinInput): Promise<DesktopResult<CollaborationStatus>>;
   collaborationLeave(input: SessionInput): Promise<DesktopResult<CollaborationStatus>>;
+  collaborationTextLeaseStatus(
+    input: CollaborationTextLeaseInput,
+  ): Promise<DesktopResult<CollaborationTextLeaseStatus>>;
+  collaborationTextLeaseBegin(
+    input: CollaborationTextLeaseInput,
+  ): Promise<DesktopResult<CollaborationTextLeaseStatus>>;
+  collaborationTextLeaseRenew(
+    input: CollaborationTextLeaseInput,
+  ): Promise<DesktopResult<CollaborationTextLeaseStatus>>;
+  collaborationTextLeaseEnd(
+    input: CollaborationTextLeaseInput,
+  ): Promise<DesktopResult<CollaborationTextLeaseStatus>>;
   mcpStatus(): Promise<DesktopResult<McpStatus>>;
   mcpCreateApproval(input: McpApprovalInput): Promise<DesktopResult<McpApproval>>;
   onDocumentChanged(listener: (event: SafeDocumentChangedEvent) => void): () => void;

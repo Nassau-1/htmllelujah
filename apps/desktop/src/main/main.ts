@@ -45,6 +45,7 @@ import {
   DESKTOP_IPC,
   type AppInfo,
   type CollaborationStatus,
+  type CollaborationTextLeaseStatus,
   type DesktopResult,
   type ExportResult,
   type InitializeResult,
@@ -363,6 +364,9 @@ const identifier = z.string().uuid();
 const revision = z.string().min(1).max(160);
 const sessionInputSchema = z.object({ sessionId: identifier }).strict();
 const historyInputSchema = sessionInputSchema.extend({ expectedRevision: revision }).strict();
+const collaborationTextLeaseInputSchema = sessionInputSchema
+  .extend({ slideId: identifier, elementId: identifier })
+  .strict();
 const importImageInputSchema = historyInputSchema
   .extend({ slideId: identifier, replaceElementId: identifier.optional() })
   .strict();
@@ -1695,6 +1699,44 @@ const configureIpc = (): void => {
     assertSessionAccess(event, input.sessionId, false);
     return collaboration.status(input.sessionId);
   });
+  handle(
+    DESKTOP_IPC.collaborationTextLeaseStatus,
+    collaborationTextLeaseInputSchema,
+    (event, input): CollaborationTextLeaseStatus => {
+      assertSessionAccess(event, input.sessionId, false);
+      return collaboration.textLeaseStatus(input);
+    },
+  );
+  handle(
+    DESKTOP_IPC.collaborationTextLeaseBegin,
+    collaborationTextLeaseInputSchema,
+    async (event, input): Promise<CollaborationTextLeaseStatus> => {
+      assertSessionAccess(event, input.sessionId);
+      if (collaboration.mode(input.sessionId) === 'offline') {
+        return collaboration.textLeaseStatus(input);
+      }
+      return collaboration.beginTextLease(input);
+    },
+  );
+  handle(
+    DESKTOP_IPC.collaborationTextLeaseRenew,
+    collaborationTextLeaseInputSchema,
+    async (event, input): Promise<CollaborationTextLeaseStatus> => {
+      assertSessionAccess(event, input.sessionId);
+      if (collaboration.mode(input.sessionId) === 'offline') {
+        return collaboration.textLeaseStatus(input);
+      }
+      return collaboration.renewTextLease(input);
+    },
+  );
+  handle(
+    DESKTOP_IPC.collaborationTextLeaseEnd,
+    collaborationTextLeaseInputSchema,
+    async (event, input): Promise<CollaborationTextLeaseStatus> => {
+      assertSessionAccess(event, input.sessionId, false);
+      return collaboration.endTextLease(input);
+    },
+  );
   handle(DESKTOP_IPC.collaborationHost, hostInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
     const targetPath = sessionTargetPaths.get(input.sessionId);

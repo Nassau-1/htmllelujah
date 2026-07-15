@@ -7,6 +7,8 @@ import {
   type CollaborationHostInput,
   type CollaborationJoinInput,
   type CollaborationStatus,
+  type CollaborationTextLeaseInput,
+  type CollaborationTextLeaseStatus,
   type DesktopResult,
   type ExecuteInput,
   type ExportInput,
@@ -100,6 +102,22 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
     invoke(DESKTOP_IPC.collaborationJoin, input),
   collaborationLeave: (input: SessionInput): Promise<DesktopResult<CollaborationStatus>> =>
     invoke(DESKTOP_IPC.collaborationLeave, input),
+  collaborationTextLeaseStatus: (
+    input: CollaborationTextLeaseInput,
+  ): Promise<DesktopResult<CollaborationTextLeaseStatus>> =>
+    invoke(DESKTOP_IPC.collaborationTextLeaseStatus, input),
+  collaborationTextLeaseBegin: (
+    input: CollaborationTextLeaseInput,
+  ): Promise<DesktopResult<CollaborationTextLeaseStatus>> =>
+    invoke(DESKTOP_IPC.collaborationTextLeaseBegin, input),
+  collaborationTextLeaseRenew: (
+    input: CollaborationTextLeaseInput,
+  ): Promise<DesktopResult<CollaborationTextLeaseStatus>> =>
+    invoke(DESKTOP_IPC.collaborationTextLeaseRenew, input),
+  collaborationTextLeaseEnd: (
+    input: CollaborationTextLeaseInput,
+  ): Promise<DesktopResult<CollaborationTextLeaseStatus>> =>
+    invoke(DESKTOP_IPC.collaborationTextLeaseEnd, input),
   mcpStatus: (): Promise<DesktopResult<McpStatus>> => invoke(DESKTOP_IPC.mcpStatus),
   mcpCreateApproval: (input: McpApprovalInput): Promise<DesktopResult<McpApproval>> =>
     invoke(DESKTOP_IPC.mcpCreateApproval, input),

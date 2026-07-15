@@ -75,10 +75,20 @@ import {
 } from '@htmllelujah/document-core';
 import { LOCAL_ICON_PATHS, SlideSurface } from '@htmllelujah/renderer';
 import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from 'react';
 
 import type {
   CollaborationStatus,
+  CollaborationTextLeaseInput,
+  CollaborationTextLeaseStatus,
   DesktopResult,
   McpApproval,
   McpApprovalAction,
@@ -142,6 +152,16 @@ type Toast = { readonly kind: 'success' | 'error' | 'info'; readonly message: st
 type MutableTextMarksPatch = {
   -readonly [Key in keyof TextMarks]?: TextMarks[Key];
 };
+
+const sameTextLeaseRequest = (
+  left: CollaborationTextLeaseInput | null,
+  right: CollaborationTextLeaseInput | null,
+): boolean =>
+  left !== null &&
+  right !== null &&
+  left.sessionId === right.sessionId &&
+  left.slideId === right.slideId &&
+  left.elementId === right.elementId;
 
 type TextDraft = {
   readonly text: string;
@@ -399,11 +419,30 @@ function SlideThumbnail({
   readonly selected: boolean;
   readonly onSelect: () => void;
 }) {
-  const width = 174;
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [width, setWidth] = useState(128);
+  useLayoutEffect(() => {
+    const button = buttonRef.current;
+    if (button === null) return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry === undefined) return;
+      const style = window.getComputedStyle(button);
+      const firstColumnWidth = Number.parseFloat(style.gridTemplateColumns) || 20;
+      const columnGap = Number.parseFloat(style.columnGap) || 5;
+      const available = Math.floor(entry.contentRect.width - firstColumnWidth - columnGap);
+      setWidth((current) => {
+        const next = clamp(available, 96, 174);
+        return Math.abs(current - next) >= 1 ? next : current;
+      });
+    });
+    observer.observe(button);
+    return () => observer.disconnect();
+  }, []);
   const scale = width / (document.page.widthPt * (4 / 3));
   const height = document.page.heightPt * (4 / 3) * scale;
   return (
     <button
+      ref={buttonRef}
       type="button"
       className={`canonical-thumbnail${selected ? ' is-selected' : ''}${slide.hidden ? ' is-hidden' : ''}`}
       onClick={onSelect}
@@ -474,8 +513,13 @@ function EditorApp() {
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
   const [textDraftDirty, setTextDraftDirty] = useState(false);
   const [textDraftConflict, setTextDraftConflict] = useState(false);
+  const [textLeaseStatus, setTextLeaseStatus] = useState<CollaborationTextLeaseStatus | null>(null);
+  const [textLeasePending, setTextLeasePending] = useState(false);
   const textBaselineRef = useRef<{ readonly id: string; readonly value: string } | null>(null);
   const textApplyInFlightRef = useRef(false);
+  const textLeasePendingRef = useRef(false);
+  const textLeaseRequestRef = useRef<CollaborationTextLeaseInput | null>(null);
+  const textEditorFocusedRef = useRef(false);
   const [tableTsv, setTableTsv] = useState('');
   const [selectedTableCellId, setSelectedTableCellId] = useState('');
   const [designMasterId, setDesignMasterId] = useState('');
@@ -527,6 +571,12 @@ function EditorApp() {
         return;
       }
       acceptSession(result.value.session);
+      void window.htmllelujah
+        .collaborationStatus({ sessionId: result.value.session.snapshot.sessionId })
+        .then((status) => {
+          if (active && status.ok) setShareStatus(status.value);
+        })
+        .catch(() => undefined);
       setRecoveryCandidates(result.value.recoveryCandidates);
       if (result.value.recoveryCandidates.length > 0) {
         notify(
@@ -656,6 +706,129 @@ function EditorApp() {
     },
     [acceptSession, notify],
   );
+
+  const releaseTextLease = useCallback(
+    async (
+      requested: CollaborationTextLeaseInput | null = textLeaseRequestRef.current,
+      reportFailure = false,
+    ): Promise<void> => {
+      if (requested === null) return;
+      if (sameTextLeaseRequest(textLeaseRequestRef.current, requested)) {
+        textLeaseRequestRef.current = null;
+        textLeasePendingRef.current = false;
+        setTextLeaseStatus(null);
+        setTextLeasePending(false);
+      }
+      await executeQueueRef.current.catch(() => undefined);
+      const result = await window.htmllelujah
+        .collaborationTextLeaseEnd(requested)
+        .catch(() => undefined);
+      if (
+        reportFailure &&
+        result !== undefined &&
+        !result.ok &&
+        !['INVALID_LOCK_TOKEN', 'INVALID_REQUEST', 'NOT_FOUND'].includes(result.error.code)
+      ) {
+        showFailure(result);
+      }
+    },
+    [showFailure],
+  );
+
+  const beginTextLease = useCallback(async (): Promise<void> => {
+    if (textLeasePendingRef.current) return;
+    const current = sessionRef.current;
+    if (
+      current === null ||
+      activeSlide === undefined ||
+      primaryText === undefined ||
+      shareStatus?.mode === undefined ||
+      shareStatus.mode === 'offline'
+    ) {
+      textLeasePendingRef.current = false;
+      setTextLeasePending(false);
+      setTextLeaseStatus(null);
+      return;
+    }
+    const requested: CollaborationTextLeaseInput = {
+      sessionId: current.snapshot.sessionId,
+      slideId: activeSlide.id,
+      elementId: primaryText.id,
+    };
+    if (
+      sameTextLeaseRequest(textLeaseRequestRef.current, requested) &&
+      textLeaseStatus?.status === 'owned' &&
+      textLeaseStatus.expiresAtMs > Date.now() + 1_000
+    ) {
+      return;
+    }
+    textLeasePendingRef.current = true;
+    setTextLeasePending(true);
+    const previous = textLeaseRequestRef.current;
+    if (previous !== null && !sameTextLeaseRequest(previous, requested)) {
+      const releasingPrevious = releaseTextLease(previous);
+      textLeasePendingRef.current = true;
+      setTextLeasePending(true);
+      await releasingPrevious;
+    }
+    textLeaseRequestRef.current = requested;
+    textLeasePendingRef.current = true;
+    setTextLeasePending(true);
+    const result = await window.htmllelujah
+      .collaborationTextLeaseBegin(requested)
+      .catch(() => undefined);
+    const stillCurrent = sameTextLeaseRequest(textLeaseRequestRef.current, requested);
+    if (result === undefined) {
+      if (stillCurrent) textLeaseRequestRef.current = null;
+      textLeasePendingRef.current = false;
+      setTextLeasePending(false);
+      setTextLeaseStatus(null);
+      notify('The text editing reservation could not be reached.', 'error');
+      return;
+    }
+    if (!stillCurrent || !textEditorFocusedRef.current) {
+      if (result.ok && result.value.status === 'owned') {
+        await window.htmllelujah.collaborationTextLeaseEnd(requested).catch(() => undefined);
+      }
+      if (stillCurrent) {
+        textLeaseRequestRef.current = null;
+        textLeasePendingRef.current = false;
+        setTextLeasePending(false);
+        setTextLeaseStatus(null);
+      }
+      return;
+    }
+    textLeasePendingRef.current = false;
+    setTextLeasePending(false);
+    if (!result.ok) {
+      textLeaseRequestRef.current = null;
+      setTextLeaseStatus(null);
+      showFailure(result);
+      return;
+    }
+    setTextLeaseStatus(result.value);
+    if (result.value.status === 'available') {
+      const refreshed = await window.htmllelujah
+        .collaborationStatus({ sessionId: requested.sessionId })
+        .catch(() => undefined);
+      if (refreshed?.ok) setShareStatus(refreshed.value);
+    }
+    if (
+      result.value.status === 'owned' &&
+      window.document.activeElement instanceof HTMLElement &&
+      window.document.activeElement.classList.contains('text-lease-gate')
+    ) {
+      window.setTimeout(() => textAreaRef.current?.focus(), 0);
+    }
+  }, [
+    activeSlide,
+    notify,
+    primaryText,
+    releaseTextLease,
+    shareStatus?.mode,
+    showFailure,
+    textLeaseStatus,
+  ]);
 
   const execute = useCallback(
     (
@@ -1133,6 +1306,88 @@ function EditorApp() {
     return () => window.clearTimeout(timer);
   }, [applyTextDraft, primaryText, textDraftConflict, textDraftDirty]);
 
+  useEffect(() => {
+    const requested = textLeaseRequestRef.current;
+    if (
+      requested === null ||
+      textLeaseStatus?.status !== 'owned' ||
+      shareStatus?.mode === undefined ||
+      shareStatus.mode === 'offline'
+    ) {
+      return;
+    }
+    const delayMs = clamp(textLeaseStatus.expiresAtMs - Date.now() - 5_000, 1_000, 5_000);
+    const timer = window.setTimeout(() => {
+      if (!textEditorFocusedRef.current) return;
+      void window.htmllelujah
+        .collaborationTextLeaseRenew(requested)
+        .then((result) => {
+          if (!sameTextLeaseRequest(textLeaseRequestRef.current, requested)) return;
+          if (!result.ok) {
+            textLeaseRequestRef.current = null;
+            setTextLeaseStatus(null);
+            showFailure(result);
+            return;
+          }
+          setTextLeaseStatus(result.value);
+          if (result.value.status === 'available') {
+            void window.htmllelujah
+              .collaborationStatus({ sessionId: requested.sessionId })
+              .then((status) => {
+                if (status.ok) setShareStatus(status.value);
+              })
+              .catch(() => undefined);
+          }
+        })
+        .catch(() => {
+          if (!sameTextLeaseRequest(textLeaseRequestRef.current, requested)) return;
+          textLeaseRequestRef.current = null;
+          setTextLeaseStatus(null);
+          notify('The text editing reservation could not be renewed.', 'error');
+        });
+    }, delayMs);
+    return () => window.clearTimeout(timer);
+  }, [notify, shareStatus?.mode, showFailure, textLeaseStatus]);
+
+  useEffect(() => {
+    if (
+      textLeaseStatus?.status !== 'held' ||
+      !textEditorFocusedRef.current ||
+      shareStatus?.mode === undefined ||
+      shareStatus.mode === 'offline'
+    ) {
+      return;
+    }
+    const timer = window.setTimeout(
+      () => void beginTextLease(),
+      clamp(textLeaseStatus.expiresAtMs - Date.now() + 75, 250, 15_250),
+    );
+    return () => window.clearTimeout(timer);
+  }, [beginTextLease, shareStatus?.mode, textLeaseStatus]);
+
+  useEffect(() => {
+    const requested = textLeaseRequestRef.current;
+    const current = sessionRef.current;
+    if (
+      requested !== null &&
+      (current === null ||
+        current.snapshot.sessionId !== requested.sessionId ||
+        activeSlide?.id !== requested.slideId ||
+        primaryText?.id !== requested.elementId)
+    ) {
+      textEditorFocusedRef.current = false;
+      void releaseTextLease(requested);
+    }
+  }, [activeSlide?.id, primaryText?.id, releaseTextLease, session?.snapshot.sessionId]);
+
+  useEffect(() => {
+    if (shareStatus?.mode === 'offline' && textLeaseRequestRef.current !== null) {
+      const requested = textLeaseRequestRef.current;
+      textEditorFocusedRef.current = false;
+      void releaseTextLease(requested);
+    }
+  }, [releaseTextLease, shareStatus?.mode]);
+
   const pasteTable = useCallback(async (): Promise<void> => {
     if (activeSlide === undefined || primaryTable === undefined || tableTsv.trim() === '') return;
     if (
@@ -1539,6 +1794,35 @@ function EditorApp() {
   if (fatalError !== null) return <LoadingScreen message={fatalError} />;
   if (session === null || document === undefined || activeSlide === undefined)
     return <LoadingScreen message="Opening your local workspace…" />;
+
+  const collaborationTextActive = shareStatus?.mode === 'host' || shareStatus?.mode === 'guest';
+  const currentTextLeaseRequest: CollaborationTextLeaseInput | null =
+    primaryText === undefined
+      ? null
+      : {
+          sessionId: session.snapshot.sessionId,
+          slideId: activeSlide.id,
+          elementId: primaryText.id,
+        };
+  const currentTextLeaseOwned =
+    textLeaseStatus?.status === 'owned' &&
+    sameTextLeaseRequest(textLeaseRequestRef.current, currentTextLeaseRequest) &&
+    textLeaseStatus.expiresAtMs > Date.now();
+  const textLeaseBlocked = collaborationTextActive && (!currentTextLeaseOwned || textLeasePending);
+  const textDraftLabel = textDraftConflict
+    ? 'Conflict — draft preserved'
+    : textDraftDirty
+      ? 'Draft not applied'
+      : 'Up to date';
+  const textLeaseLabel = textLeasePending
+    ? 'Reserving text…'
+    : textLeaseStatus?.status === 'held'
+      ? `Editing by participant ${textLeaseStatus.ownerClientId.slice(0, 8)}`
+      : currentTextLeaseOwned
+        ? `Reserved for you · ${textDraftLabel}`
+        : collaborationTextActive
+          ? 'Reserve this text to edit'
+          : textDraftLabel;
 
   const renderMenu = (): React.ReactNode => {
     if (activeMenu === null) return null;
@@ -2857,269 +3141,287 @@ function EditorApp() {
               {primaryText !== undefined && textDraft !== null ? (
                 <section
                   className="inspector-section text-editor-section"
+                  onFocusCapture={() => {
+                    textEditorFocusedRef.current = true;
+                    if (collaborationTextActive) void beginTextLease();
+                  }}
                   onBlurCapture={(event) => {
-                    if (
-                      textDraftDirty &&
-                      !textDraftConflict &&
-                      !event.currentTarget.contains(event.relatedTarget)
-                    )
-                      void applyTextDraft();
+                    if (event.currentTarget.contains(event.relatedTarget)) return;
+                    textEditorFocusedRef.current = false;
+                    const applied =
+                      textDraftDirty && !textDraftConflict ? applyTextDraft() : Promise.resolve();
+                    void applied.finally(() => releaseTextLease());
                   }}
                 >
                   <div className="section-heading-row">
                     <h3>Text</h3>
-                    <span className="section-status">
-                      {textDraftConflict
-                        ? 'Conflict — draft preserved'
-                        : textDraftDirty
-                          ? 'Draft not applied'
-                          : 'Up to date'}
+                    <span className="section-status" aria-live="polite">
+                      {textLeaseLabel}
                     </span>
                   </div>
-                  {textDraftConflict ? (
-                    <div className="draft-conflict" role="alert">
-                      <span>The same text changed elsewhere. Your draft has not been lost.</span>
+                  {textLeaseBlocked ? (
+                    <button
+                      type="button"
+                      className="text-lease-gate"
+                      aria-busy={textLeasePending}
+                      onClick={() => void beginTextLease()}
+                    >
+                      <Lock size={13} aria-hidden="true" />
+                      <span>
+                        {textLeaseStatus?.status === 'held'
+                          ? 'Retry when available'
+                          : 'Start editing text'}
+                      </span>
+                    </button>
+                  ) : null}
+                  <fieldset className="text-editor-controls" disabled={textLeaseBlocked}>
+                    {textDraftConflict ? (
+                      <div className="draft-conflict" role="alert">
+                        <span>The same text changed elsewhere. Your draft has not been lost.</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTextDraft(initialTextDraft(primaryText, document));
+                            setTextDraftDirty(false);
+                            setTextDraftConflict(false);
+                            textBaselineRef.current = {
+                              id: primaryText.id,
+                              value: textEditingFingerprint(primaryText),
+                            };
+                          }}
+                        >
+                          Use latest
+                        </button>
+                      </div>
+                    ) : null}
+                    <div className="rich-toolbar" role="toolbar" aria-label="Text formatting">
                       <button
                         type="button"
-                        onClick={() => {
-                          setTextDraft(initialTextDraft(primaryText, document));
-                          setTextDraftDirty(false);
-                          setTextDraftConflict(false);
-                          textBaselineRef.current = {
-                            id: primaryText.id,
-                            value: textEditingFingerprint(primaryText),
-                          };
-                        }}
+                        className={textDraft.bold ? 'is-active' : ''}
+                        aria-pressed={textDraft.bold}
+                        onClick={() => editTextDraft({ ...textDraft, bold: !textDraft.bold })}
                       >
-                        Use latest
+                        <Bold size={14} />
+                        <span className="sr-only">Bold</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={textDraft.italic ? 'is-active' : ''}
+                        aria-pressed={textDraft.italic}
+                        onClick={() => editTextDraft({ ...textDraft, italic: !textDraft.italic })}
+                      >
+                        <Italic size={14} />
+                        <span className="sr-only">Italic</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={textDraft.underline ? 'is-active' : ''}
+                        aria-pressed={textDraft.underline}
+                        onClick={() =>
+                          editTextDraft({ ...textDraft, underline: !textDraft.underline })
+                        }
+                      >
+                        <Underline size={14} />
+                        <span className="sr-only">Underline</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={textDraft.strikethrough ? 'is-active' : ''}
+                        aria-pressed={textDraft.strikethrough}
+                        onClick={() =>
+                          editTextDraft({
+                            ...textDraft,
+                            strikethrough: !textDraft.strikethrough,
+                          })
+                        }
+                      >
+                        <span aria-hidden="true" className="strikethrough-glyph">
+                          S
+                        </span>
+                        <span className="sr-only">Strikethrough</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={textDraft.kind === 'bullets' ? 'is-active' : ''}
+                        aria-pressed={textDraft.kind === 'bullets'}
+                        onClick={() =>
+                          editTextDraft({
+                            ...textDraft,
+                            kind: textDraft.kind === 'bullets' ? 'paragraph' : 'bullets',
+                          })
+                        }
+                      >
+                        <List size={14} />
+                        <span className="sr-only">Bullets</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={textDraft.kind === 'numbered' ? 'is-active' : ''}
+                        aria-pressed={textDraft.kind === 'numbered'}
+                        onClick={() =>
+                          editTextDraft({
+                            ...textDraft,
+                            kind: textDraft.kind === 'numbered' ? 'paragraph' : 'numbered',
+                          })
+                        }
+                      >
+                        <ListOrdered size={14} />
+                        <span className="sr-only">Numbered list</span>
                       </button>
                     </div>
-                  ) : null}
-                  <div className="rich-toolbar" role="toolbar" aria-label="Text formatting">
-                    <button
-                      type="button"
-                      className={textDraft.bold ? 'is-active' : ''}
-                      aria-pressed={textDraft.bold}
-                      onClick={() => editTextDraft({ ...textDraft, bold: !textDraft.bold })}
-                    >
-                      <Bold size={14} />
-                      <span className="sr-only">Bold</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={textDraft.italic ? 'is-active' : ''}
-                      aria-pressed={textDraft.italic}
-                      onClick={() => editTextDraft({ ...textDraft, italic: !textDraft.italic })}
-                    >
-                      <Italic size={14} />
-                      <span className="sr-only">Italic</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={textDraft.underline ? 'is-active' : ''}
-                      aria-pressed={textDraft.underline}
-                      onClick={() =>
-                        editTextDraft({ ...textDraft, underline: !textDraft.underline })
-                      }
-                    >
-                      <Underline size={14} />
-                      <span className="sr-only">Underline</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={textDraft.strikethrough ? 'is-active' : ''}
-                      aria-pressed={textDraft.strikethrough}
-                      onClick={() =>
-                        editTextDraft({
-                          ...textDraft,
-                          strikethrough: !textDraft.strikethrough,
-                        })
-                      }
-                    >
-                      <span aria-hidden="true" className="strikethrough-glyph">
-                        S
-                      </span>
-                      <span className="sr-only">Strikethrough</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={textDraft.kind === 'bullets' ? 'is-active' : ''}
-                      aria-pressed={textDraft.kind === 'bullets'}
-                      onClick={() =>
-                        editTextDraft({
-                          ...textDraft,
-                          kind: textDraft.kind === 'bullets' ? 'paragraph' : 'bullets',
-                        })
-                      }
-                    >
-                      <List size={14} />
-                      <span className="sr-only">Bullets</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={textDraft.kind === 'numbered' ? 'is-active' : ''}
-                      aria-pressed={textDraft.kind === 'numbered'}
-                      onClick={() =>
-                        editTextDraft({
-                          ...textDraft,
-                          kind: textDraft.kind === 'numbered' ? 'paragraph' : 'numbered',
-                        })
-                      }
-                    >
-                      <ListOrdered size={14} />
-                      <span className="sr-only">Numbered list</span>
-                    </button>
-                  </div>
-                  <textarea
-                    ref={textAreaRef}
-                    className="text-content-editor"
-                    value={textDraft.text}
-                    spellCheck
-                    onChange={(event) =>
-                      editTextDraft({ ...textDraft, text: event.currentTarget.value })
-                    }
-                    onKeyDown={(event) => {
-                      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-                        event.preventDefault();
-                        void applyTextDraft();
-                      }
-                    }}
-                  />
-                  <label className="stacked-field">
-                    <span>Style role</span>
-                    <select
-                      value={textDraft.role}
+                    <textarea
+                      ref={textAreaRef}
+                      className="text-content-editor"
+                      aria-label="Text content"
+                      value={textDraft.text}
+                      spellCheck
                       onChange={(event) =>
-                        editTextDraft({
-                          ...textDraft,
-                          role: event.currentTarget.value as TextStyleRole,
-                          kind: event.currentTarget.value === 'title' ? 'heading' : textDraft.kind,
-                        })
+                        editTextDraft({ ...textDraft, text: event.currentTarget.value })
                       }
-                    >
-                      <option value="title">Title</option>
-                      <option value="subtitle">Subtitle</option>
-                      <option value="body">Body</option>
-                      <option value="caption">Caption</option>
-                      <option value="label">Label</option>
-                      <option value="quote">Quote</option>
-                    </select>
-                  </label>
-                  <div className="font-controls">
-                    <label className="stacked-field font-family">
-                      <span>Font</span>
+                      onKeyDown={(event) => {
+                        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                          event.preventDefault();
+                          void applyTextDraft();
+                        }
+                      }}
+                    />
+                    <label className="stacked-field">
+                      <span>Style role</span>
                       <select
-                        value={textDraft.fontFamily}
+                        value={textDraft.role}
                         onChange={(event) =>
-                          editTextDraft({ ...textDraft, fontFamily: event.currentTarget.value })
+                          editTextDraft({
+                            ...textDraft,
+                            role: event.currentTarget.value as TextStyleRole,
+                            kind:
+                              event.currentTarget.value === 'title' ? 'heading' : textDraft.kind,
+                          })
                         }
                       >
-                        <option value="Arial">Arial</option>
-                        <option value="Aptos">Aptos</option>
-                        <option value="Calibri">Calibri</option>
-                        <option value="Georgia">Georgia</option>
-                        <option value="Times New Roman">Times New Roman</option>
-                        <option value="Verdana">Verdana</option>
+                        <option value="title">Title</option>
+                        <option value="subtitle">Subtitle</option>
+                        <option value="body">Body</option>
+                        <option value="caption">Caption</option>
+                        <option value="label">Label</option>
+                        <option value="quote">Quote</option>
                       </select>
                     </label>
-                    <label className="stacked-field font-size">
-                      <span>Size</span>
-                      <input
-                        type="number"
-                        min="6"
-                        max="240"
-                        value={textDraft.fontSizePt}
-                        onChange={(event) =>
-                          editTextDraft({
-                            ...textDraft,
-                            fontSizePt: clamp(Number(event.currentTarget.value), 6, 240),
-                          })
-                        }
-                      />
-                    </label>
-                  </div>
-                  <div className="text-detail-controls">
-                    <label className="color-field">
-                      Text color
-                      <input
-                        type="color"
-                        value={textDraft.color}
-                        onChange={(event) =>
-                          editTextDraft({ ...textDraft, color: event.currentTarget.value })
-                        }
-                      />
-                    </label>
-                    <label className="stacked-field">
-                      <span>Line spacing</span>
-                      <input
-                        type="number"
-                        min="0.5"
-                        max="4"
-                        step="0.05"
-                        value={textDraft.lineHeight}
-                        onChange={(event) =>
-                          editTextDraft({
-                            ...textDraft,
-                            lineHeight: clamp(Number(event.currentTarget.value), 0.5, 4),
-                          })
-                        }
-                      />
-                    </label>
-                    <label className="stacked-field">
-                      <span>Letter spacing</span>
-                      <input
-                        type="number"
-                        min="-10"
-                        max="50"
-                        step="0.1"
-                        value={textDraft.letterSpacingPt}
-                        onChange={(event) =>
-                          editTextDraft({
-                            ...textDraft,
-                            letterSpacingPt: clamp(Number(event.currentTarget.value), -10, 50),
-                          })
-                        }
-                      />
-                    </label>
-                    <label className="stacked-field">
-                      <span>List level</span>
-                      <input
-                        type="number"
-                        min="0"
-                        max="8"
-                        step="1"
-                        disabled={textDraft.kind !== 'bullets' && textDraft.kind !== 'numbered'}
-                        value={textDraft.listLevel}
-                        onChange={(event) =>
-                          editTextDraft({
-                            ...textDraft,
-                            listLevel: Math.round(clamp(Number(event.currentTarget.value), 0, 8)),
-                          })
-                        }
-                      />
-                    </label>
-                  </div>
-                  <div className="segmented-control" role="group" aria-label="Text alignment">
-                    {(['left', 'center', 'right', 'justify'] as const).map((alignment) => (
-                      <button
-                        type="button"
-                        key={alignment}
-                        className={textDraft.alignment === alignment ? 'is-active' : ''}
-                        aria-pressed={textDraft.alignment === alignment}
-                        onClick={() => editTextDraft({ ...textDraft, alignment })}
-                      >
-                        {alignment.slice(0, 1).toUpperCase()}
-                        <span className="sr-only">Align {alignment}</span>
-                      </button>
-                    ))}
-                  </div>
-                  <button
-                    type="button"
-                    className="primary-inspector-action"
-                    onClick={() => void applyTextDraft()}
-                  >
-                    Apply text <kbd>Ctrl Enter</kbd>
-                  </button>
+                    <div className="font-controls">
+                      <label className="stacked-field font-family">
+                        <span>Font</span>
+                        <select
+                          value={textDraft.fontFamily}
+                          onChange={(event) =>
+                            editTextDraft({ ...textDraft, fontFamily: event.currentTarget.value })
+                          }
+                        >
+                          <option value="Arial">Arial</option>
+                          <option value="Aptos">Aptos</option>
+                          <option value="Calibri">Calibri</option>
+                          <option value="Georgia">Georgia</option>
+                          <option value="Times New Roman">Times New Roman</option>
+                          <option value="Verdana">Verdana</option>
+                        </select>
+                      </label>
+                      <label className="stacked-field font-size">
+                        <span>Size</span>
+                        <input
+                          type="number"
+                          min="6"
+                          max="240"
+                          value={textDraft.fontSizePt}
+                          onChange={(event) =>
+                            editTextDraft({
+                              ...textDraft,
+                              fontSizePt: clamp(Number(event.currentTarget.value), 6, 240),
+                            })
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="text-detail-controls">
+                      <label className="color-field">
+                        Text color
+                        <input
+                          type="color"
+                          value={textDraft.color}
+                          onChange={(event) =>
+                            editTextDraft({ ...textDraft, color: event.currentTarget.value })
+                          }
+                        />
+                      </label>
+                      <label className="stacked-field">
+                        <span>Line spacing</span>
+                        <input
+                          type="number"
+                          min="0.5"
+                          max="4"
+                          step="0.05"
+                          value={textDraft.lineHeight}
+                          onChange={(event) =>
+                            editTextDraft({
+                              ...textDraft,
+                              lineHeight: clamp(Number(event.currentTarget.value), 0.5, 4),
+                            })
+                          }
+                        />
+                      </label>
+                      <label className="stacked-field">
+                        <span>Letter spacing</span>
+                        <input
+                          type="number"
+                          min="-10"
+                          max="50"
+                          step="0.1"
+                          value={textDraft.letterSpacingPt}
+                          onChange={(event) =>
+                            editTextDraft({
+                              ...textDraft,
+                              letterSpacingPt: clamp(Number(event.currentTarget.value), -10, 50),
+                            })
+                          }
+                        />
+                      </label>
+                      <label className="stacked-field">
+                        <span>List level</span>
+                        <input
+                          type="number"
+                          min="0"
+                          max="8"
+                          step="1"
+                          disabled={textDraft.kind !== 'bullets' && textDraft.kind !== 'numbered'}
+                          value={textDraft.listLevel}
+                          onChange={(event) =>
+                            editTextDraft({
+                              ...textDraft,
+                              listLevel: Math.round(clamp(Number(event.currentTarget.value), 0, 8)),
+                            })
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="segmented-control" role="group" aria-label="Text alignment">
+                      {(['left', 'center', 'right', 'justify'] as const).map((alignment) => (
+                        <button
+                          type="button"
+                          key={alignment}
+                          className={textDraft.alignment === alignment ? 'is-active' : ''}
+                          aria-pressed={textDraft.alignment === alignment}
+                          onClick={() => editTextDraft({ ...textDraft, alignment })}
+                        >
+                          {alignment.slice(0, 1).toUpperCase()}
+                          <span className="sr-only">Align {alignment}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      className="primary-inspector-action"
+                      onClick={() => void applyTextDraft()}
+                    >
+                      Apply text <kbd>Ctrl Enter</kbd>
+                    </button>
+                  </fieldset>
                 </section>
               ) : null}
               {primaryImage !== undefined ? (
@@ -3703,6 +4005,7 @@ function EditorApp() {
                   ) : null}
                   <textarea
                     className="tsv-editor"
+                    aria-label="Table cells (tab-separated values)"
                     value={tableTsv}
                     placeholder={'Paste tab-separated cells\nName\tValue'}
                     onChange={(event) => setTableTsv(event.currentTarget.value)}
