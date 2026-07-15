@@ -7,6 +7,7 @@ import {
   COLLABORATION_PROTOCOL_VERSION,
   type AcquireTextLeaseRequest,
   type CommandBatchRequest,
+  type CommittedTransaction,
   type PresenceUpdate,
   type ReleaseTextLeaseRequest,
   type RenewTextLeaseRequest,
@@ -207,6 +208,17 @@ export class CollaborationTransportServer {
     return this.closing;
   }
 
+  /** Commits a trusted host-side command and publishes it to every authenticated replica. */
+  public async submitAndBroadcast(request: CommandBatchRequest): Promise<CommittedTransaction> {
+    const transaction = await this.engine.submitAsync(request);
+    this.broadcast({
+      type: 'transaction.committed',
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      payload: transaction,
+    });
+    return transaction;
+  }
+
   private async closeInternal(): Promise<void> {
     await this.startPromise?.catch(() => undefined);
     const webSocketServer = this.webSocketServer;
@@ -382,7 +394,7 @@ export class CollaborationTransportServer {
     try {
       switch (message.type) {
         case 'command.submit': {
-          const transaction = await this.engine.submitAsync(message.payload as CommandBatchRequest);
+          const transaction = await this.submitAndBroadcast(message.payload as CommandBatchRequest);
           state.socket.send(
             json({
               type: 'command.result',
@@ -391,11 +403,6 @@ export class CollaborationTransportServer {
               payload: transaction,
             }),
           );
-          this.broadcast({
-            type: 'transaction.committed',
-            protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-            payload: transaction,
-          });
           break;
         }
         case 'resync.request': {

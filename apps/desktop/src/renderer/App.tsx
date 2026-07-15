@@ -938,9 +938,15 @@ function EditorApp() {
       displayName,
       enableDiscovery: discovery,
     });
-    if (result.ok) setShareStatus(result.value);
-    else showFailure(result);
-  }, [discovery, displayName, showFailure]);
+    if (!result.ok) {
+      showFailure(result);
+      return;
+    }
+    setShareStatus(result.value);
+    const refresh = await window.htmllelujah.initialize();
+    if (refresh.ok) acceptSession(refresh.value.session);
+    else showFailure(refresh);
+  }, [acceptSession, discovery, displayName, showFailure]);
 
   const joinCollaboration = useCallback(async (): Promise<void> => {
     const current = sessionRef.current;
@@ -952,9 +958,32 @@ function EditorApp() {
       expectedFingerprint: joinFingerprint,
       displayName,
     });
-    if (result.ok) setShareStatus(result.value);
-    else showFailure(result);
-  }, [displayName, joinCode, joinEndpoint, joinFingerprint, showFailure]);
+    if (!result.ok) {
+      showFailure(result);
+      return;
+    }
+    setShareStatus(result.value);
+    const refresh = await window.htmllelujah.initialize();
+    if (refresh.ok) acceptSession(refresh.value.session);
+    else showFailure(refresh);
+  }, [acceptSession, displayName, joinCode, joinEndpoint, joinFingerprint, showFailure]);
+
+  const leaveCollaboration = useCallback(async (): Promise<void> => {
+    const current = sessionRef.current;
+    if (current === null) return;
+    const result = await window.htmllelujah.collaborationLeave({
+      sessionId: current.snapshot.sessionId,
+    });
+    if (!result.ok) {
+      showFailure(result);
+      return;
+    }
+    setShareStatus(result.value);
+    const refresh = await window.htmllelujah.initialize();
+    if (refresh.ok) acceptSession(refresh.value.session);
+    else showFailure(refresh);
+    notify('LAN session ended safely.', 'success');
+  }, [acceptSession, notify, showFailure]);
 
   const nudge = useCallback(
     (dxPt: number, dyPt: number): void => {
@@ -2349,12 +2378,15 @@ function EditorApp() {
                 <button
                   type="button"
                   className="primary-inspector-action"
+                  disabled={shareStatus?.mode !== 'offline'}
                   onClick={() => void hostCollaboration()}
                 >
                   Start LAN session
                 </button>
                 {shareStatus?.sessionCode !== undefined ? (
                   <div className="session-secret">
+                    <span>Host address</span>
+                    <code>{shareStatus.endpoint}</code>
                     <span>Session code</span>
                     <code>{shareStatus.sessionCode}</code>
                     <span>Fingerprint</span>
@@ -2389,13 +2421,27 @@ function EditorApp() {
                 <button
                   type="button"
                   className="secondary-action"
-                  disabled={!joinEndpoint || !joinCode || !joinFingerprint}
+                  disabled={
+                    shareStatus?.mode !== 'offline' ||
+                    !joinEndpoint ||
+                    !joinCode ||
+                    !joinFingerprint
+                  }
                   onClick={() => void joinCollaboration()}
                 >
                   Join session
                 </button>
               </div>
             </div>
+            {shareStatus?.mode !== undefined && shareStatus.mode !== 'offline' ? (
+              <button
+                type="button"
+                className="secondary-action end-session-action"
+                onClick={() => void leaveCollaboration()}
+              >
+                End LAN session on this device
+              </button>
+            ) : null}
           </section>
         </div>
       ) : null}

@@ -14,6 +14,7 @@
     "make": "pnpm build && electron-builder --win nsis --x64",
     "package": "pnpm build && electron-builder --dir --win --x64",
     "preview": "vite preview",
+    "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit"
   },
   "dependencies": {

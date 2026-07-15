@@ -106,6 +106,7 @@ export interface CollaborationStatus {
   readonly connectedPeers: number;
   readonly sessionCode?: string | undefined;
   readonly hostFingerprint?: string | undefined;
+  readonly endpoint?: string | undefined;
   readonly discoveryEnabled: boolean;
   readonly note: string;
 }

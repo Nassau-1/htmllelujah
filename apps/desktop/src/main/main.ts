@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { documentCommandSchema, type TransactionMetadata } from '@htmllelujah/document-core';
+import { CollaborationError } from '@htmllelujah/collaboration';
 import {
   DocumentRuntimeError,
   DocumentSessionManager,
@@ -23,6 +24,7 @@ import {
 } from 'electron';
 import { z } from 'zod';
 
+import { DesktopCollaborationCoordinator } from './collaboration-service.js';
 import {
   DESKTOP_API_VERSION,
   DESKTOP_IPC,
@@ -58,13 +60,17 @@ const PDF_READINESS_DEADLINE_MS = 15_000;
 
 const runtime = new DocumentSessionManager({
   recoveryDirectory: path.join(app.getPath('userData'), 'recovery'),
-  autosaveDelayMs: 1_000,
+  // Every edit is journaled immediately. User-file writes remain explicit so a guest that
+  // opens the same Drive file cannot race the authoritative LAN writer in the background.
+  autosaveDelayMs: 0,
 });
+const collaboration = new DesktopCollaborationCoordinator(runtime);
 
 type WindowMode = 'editor' | 'presentation';
 
 const windowSessions = new Map<number, string>();
 const windowModes = new Map<number, WindowMode>();
+const sessionTargetPaths = new Map<string, string>();
 const assetTokens = new Map<
   string,
   { readonly sessionId: string; readonly webContentsId: number }
@@ -107,6 +113,40 @@ const failure = (error: unknown): DesktopResult<never> => {
       error: {
         code: error.code,
         message: safeMessages[error.code] ?? 'The presentation could not be exported.',
+        recoverable: true,
+      },
+    };
+  }
+  if (error instanceof CollaborationError) {
+    const safeMessages: Partial<Record<CollaborationError['code'], string>> = {
+      INVALID_REQUEST: 'That collaboration action is not valid right now.',
+      PAYLOAD_TOO_LARGE: 'The collaboration update is too large.',
+      SESSION_MISMATCH: 'The collaboration invitation belongs to another session.',
+      DOCUMENT_MISMATCH: 'Both devices must open the same .hdeck presentation.',
+      FUTURE_BASE: 'The host is still synchronizing. Try the edit again.',
+      REVISION_CONFLICT: 'The shared presentation changed. Rejoin the session to resynchronize.',
+      IDEMPOTENCY_KEY_REUSE: 'A collaboration request could not be safely replayed.',
+      IDEMPOTENCY_CAPACITY: 'This collaboration session has reached its request limit.',
+      TEXT_LEASE_HELD: 'Another participant is editing this text block.',
+      LOCK_TOKEN_REQUIRED: 'This text block must be reserved before editing.',
+      INVALID_LOCK_TOKEN: 'The text editing reservation has expired.',
+      NOT_TEXT_ELEMENT: 'The selected element is not editable text.',
+      NOT_FOUND: 'The collaboration session is no longer available.',
+      PRESENCE_CAPACITY: 'This collaboration session is full.',
+      RESYNC_RANGE: 'The collaboration history is no longer available; rejoin the session.',
+      SIDECAR_TAMPERED: 'The shared-file writer lease is invalid. Reopen the presentation.',
+      WRITER_LEASE_ACTIVE: 'Another device is already the writer for this shared file.',
+      WRITER_LEASE_STALE: 'The previous writer lease must expire before hosting again.',
+      SPLIT_BRAIN: 'Two writers were detected. Editing stopped to protect the shared file.',
+      TARGET_CHANGED: 'The shared file changed outside the host. Reopen it before continuing.',
+      LEASE_NOT_OWNED: 'This device no longer owns the shared-file writer lease.',
+      PATH_NOT_ALLOWED: 'Collaboration is restricted to private local-network addresses.',
+    };
+    return {
+      ok: false,
+      error: {
+        code: error.code,
+        message: safeMessages[error.code] ?? 'The collaboration action could not be completed.',
         recoverable: true,
       },
     };
@@ -744,10 +784,24 @@ const createPdfBytesIsolated = async (printHtml: string): Promise<Uint8Array> =>
 const createPdfBytes = (printHtml: string): Promise<Uint8Array> =>
   enqueuePdfExport(() => createPdfBytesIsolated(printHtml));
 
+const assertNoWriterSidecar = async (targetPath: string): Promise<void> => {
+  try {
+    await lstat(`${targetPath}.writer.json`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  throw new CollaborationError(
+    'WRITER_LEASE_ACTIVE',
+    'A collaboration host currently owns this shared file.',
+  );
+};
+
 const saveAs = async (
   event: IpcMainInvokeEvent,
   sessionId: string,
 ): Promise<DocumentSessionSnapshot | undefined> => {
+  collaboration.assertStandaloneOperation(sessionId, 'Save As');
   const parent = findWindow(event.sender);
   const snapshot = runtime.getSnapshot(sessionId);
   const safeName =
@@ -762,24 +816,55 @@ const saveAs = async (
   const targetPath = result.filePath.toLowerCase().endsWith('.hdeck')
     ? result.filePath
     : `${result.filePath}.hdeck`;
-  return runtime.saveAsMainOnly(sessionId, {
+  await assertNoWriterSidecar(targetPath);
+  const saved = await runtime.saveAsMainOnly(sessionId, {
     targetPath,
     expectedFingerprint: null,
     allowOverwrite: true,
   });
+  sessionTargetPaths.set(sessionId, targetPath);
+  return saved;
 };
 
 const saveWithTargetFallback = async (
   event: IpcMainInvokeEvent,
   sessionId: string,
 ): Promise<DocumentSessionSnapshot | undefined> => {
+  const collaborative = await collaboration.saveHost(sessionId);
+  if (collaborative !== undefined) return collaborative;
   const snapshot = runtime.getSnapshot(sessionId);
-  return snapshot.hasSaveTarget ? runtime.save(sessionId) : saveAs(event, sessionId);
+  if (!snapshot.hasSaveTarget) return saveAs(event, sessionId);
+  const targetPath = sessionTargetPaths.get(sessionId);
+  if (targetPath === undefined) {
+    throw new DesktopMainError('NO_SAVE_TARGET', 'Choose where to save this presentation.');
+  }
+  await assertNoWriterSidecar(targetPath);
+  return runtime.save(sessionId);
 };
 
 const confirmReplace = async (event: IpcMainInvokeEvent): Promise<boolean> => {
   const currentId = windowSessions.get(event.sender.id);
   if (currentId === undefined) return true;
+  const collaborationMode = collaboration.mode(currentId);
+  if (collaborationMode !== 'offline') {
+    const parent = findWindow(event.sender);
+    const choice = await messageBox(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
+      type: 'warning',
+      title: 'End collaboration session?',
+      message: 'This action will end the live LAN session on this device.',
+      detail:
+        collaborationMode === 'host'
+          ? 'HTMLlelujah will save the authoritative presentation before continuing.'
+          : 'All accepted edits are already held by the host. This guest never writes the shared file.',
+      buttons: ['End session', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (choice.response !== 0) return false;
+    await collaboration.leave(currentId);
+    return true;
+  }
   const snapshot = runtime.getSnapshot(currentId);
   if (!snapshot.dirty) return true;
   const parent = findWindow(event.sender);
@@ -803,12 +888,19 @@ const confirmReplace = async (event: IpcMainInvokeEvent): Promise<boolean> => {
 const assignSession = async (
   event: IpcMainInvokeEvent,
   snapshot: DocumentSessionSnapshot,
+  targetPath?: string,
 ): Promise<SessionView> => {
   const previous = windowSessions.get(event.sender.id);
   windowSessions.set(event.sender.id, snapshot.sessionId);
+  if (targetPath === undefined) sessionTargetPaths.delete(snapshot.sessionId);
+  else sessionTargetPaths.set(snapshot.sessionId, targetPath);
   if (previous !== undefined && previous !== snapshot.sessionId) {
     const stillUsed = [...windowSessions.values()].includes(previous);
-    if (!stillUsed) await runtime.close(previous, { discardUnsaved: true });
+    if (!stillUsed) {
+      await collaboration.shutdown(previous);
+      await runtime.close(previous, { discardUnsaved: true });
+      sessionTargetPaths.delete(previous);
+    }
   }
   const window = findWindow(event.sender);
   window?.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
@@ -868,6 +960,7 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
       ? await runtime.createMainOnly()
       : await runtime.openMainOnly({ targetPath: initialPath });
   windowSessions.set(window.webContents.id, snapshot.sessionId);
+  if (initialPath !== undefined) sessionTargetPaths.set(snapshot.sessionId, initialPath);
   window.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
 
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -884,10 +977,44 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
     if (closingWindows.has(webContentsId)) return;
     const sessionId = windowSessions.get(webContentsId);
     if (sessionId === undefined) return;
+    const collaborationMode = collaboration.mode(sessionId);
+    if (collaborationMode !== 'offline') {
+      event.preventDefault();
+      void (async () => {
+        try {
+          await collaboration.leave(sessionId);
+        } catch {
+          await dialog.showMessageBox(window, {
+            type: 'error',
+            title: 'Collaboration could not close safely',
+            message:
+              collaborationMode === 'host'
+                ? 'The authoritative presentation could not be saved. Resolve the shared-file issue and try again.'
+                : 'The guest connection could not be closed cleanly. Try again.',
+            buttons: ['OK'],
+            noLink: true,
+          });
+          return;
+        }
+        closingWindows.add(webContentsId);
+        for (const candidate of BrowserWindow.getAllWindows()) {
+          if (candidate === window) continue;
+          if (windowSessions.get(candidate.webContents.id) === sessionId) candidate.destroy();
+        }
+        await runtime.close(sessionId, { discardUnsaved: true }).catch(() => undefined);
+        sessionTargetPaths.delete(sessionId);
+        window.destroy();
+      })();
+      return;
+    }
     const snapshot = runtime.getSnapshot(sessionId);
     if (!snapshot.dirty) {
       closingWindows.add(webContentsId);
-      void runtime.close(sessionId, { discardUnsaved: true }).catch(() => undefined);
+      sessionTargetPaths.delete(sessionId);
+      void collaboration
+        .shutdown(sessionId)
+        .then(() => runtime.close(sessionId, { discardUnsaved: true }))
+        .catch(() => undefined);
       return;
     }
     event.preventDefault();
@@ -912,6 +1039,7 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
         if (windowSessions.get(candidate.webContents.id) === sessionId) candidate.destroy();
       }
       await runtime.close(sessionId, { discardUnsaved: true }).catch(() => undefined);
+      sessionTargetPaths.delete(sessionId);
       window.destroy();
     })();
   });
@@ -1006,22 +1134,26 @@ const configureIpc = (): void => {
       throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
     if (!(await confirmReplace(event)))
       throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-    return assignSession(event, await runtime.openMainOnly({ targetPath }));
+    return assignSession(event, await runtime.openMainOnly({ targetPath }), targetPath);
   });
 
   handle(DESKTOP_IPC.execute, executeInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
-    const snapshot = await runtime.execute(input.sessionId, {
-      expectedRevision: input.expectedRevision,
-      commands: input.commands,
-      metadata: metadataFor(event, input.label),
-      ...(input.historyGroupId === undefined ? {} : { historyGroupId: input.historyGroupId }),
-    });
+    const collaborative = await collaboration.execute(input);
+    const snapshot =
+      collaborative ??
+      (await runtime.execute(input.sessionId, {
+        expectedRevision: input.expectedRevision,
+        commands: input.commands,
+        metadata: metadataFor(event, input.label),
+        ...(input.historyGroupId === undefined ? {} : { historyGroupId: input.historyGroupId }),
+      }));
     return sessionView(event.sender.id, snapshot);
   });
 
   handle(DESKTOP_IPC.undo, historyInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
+    collaboration.assertStandaloneOperation(input.sessionId, 'Undo');
     const snapshot = await runtime.undo(input.sessionId, {
       expectedRevision: input.expectedRevision,
       metadata: metadataFor(event, 'Undo'),
@@ -1031,6 +1163,7 @@ const configureIpc = (): void => {
 
   handle(DESKTOP_IPC.redo, historyInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
+    collaboration.assertStandaloneOperation(input.sessionId, 'Redo');
     const snapshot = await runtime.redo(input.sessionId, {
       expectedRevision: input.expectedRevision,
       metadata: metadataFor(event, 'Redo'),
@@ -1048,6 +1181,7 @@ const configureIpc = (): void => {
 
   handle(DESKTOP_IPC.saveAs, sessionInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
+    collaboration.assertStandaloneOperation(input.sessionId, 'Save As');
     const snapshot = await saveAs(event, input.sessionId);
     if (snapshot === undefined)
       throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
@@ -1056,6 +1190,7 @@ const configureIpc = (): void => {
 
   handle(DESKTOP_IPC.importImage, historyInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
+    collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
     const parent = findWindow(event.sender);
     const result = await openDialog(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
       title: 'Insert image',
@@ -1166,27 +1301,57 @@ const configureIpc = (): void => {
     },
   );
 
-  const offlineStatus = (): CollaborationStatus => ({
-    mode: 'offline',
-    connectedPeers: 0,
-    discoveryEnabled: false,
-    note: 'Open the same .hdeck from your shared drive, then host or join a LAN editing session.',
-  });
   handle(DESKTOP_IPC.collaborationStatus, sessionInputSchema, (event, input) => {
     assertSessionAccess(event, input.sessionId, false);
-    return offlineStatus();
+    return collaboration.status(input.sessionId);
   });
-  handle(DESKTOP_IPC.collaborationHost, hostInputSchema, (event, input) => {
+  handle(DESKTOP_IPC.collaborationHost, hostInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
-    throw new DesktopMainError('COLLABORATION_UNAVAILABLE', 'LAN collaboration is not active yet.');
+    const targetPath = sessionTargetPaths.get(input.sessionId);
+    if (targetPath === undefined) {
+      throw new DesktopMainError(
+        'COLLABORATION_REQUIRES_SAVED_FILE',
+        'Save this presentation as a .hdeck before hosting.',
+      );
+    }
+    const source = runtime.getSnapshot(input.sessionId);
+    if (source.dirty) await saveWithTargetFallback(event, input.sessionId);
+    const transition = await collaboration.host({ ...input, targetPath });
+    await assignSession(event, transition.snapshot, targetPath);
+    return transition.status;
   });
-  handle(DESKTOP_IPC.collaborationJoin, joinInputSchema, (event, input) => {
+  handle(DESKTOP_IPC.collaborationJoin, joinInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
-    throw new DesktopMainError('COLLABORATION_UNAVAILABLE', 'LAN collaboration is not active yet.');
+    const targetPath = sessionTargetPaths.get(input.sessionId);
+    if (targetPath === undefined) {
+      throw new DesktopMainError(
+        'COLLABORATION_REQUIRES_SAVED_FILE',
+        "Open the host's shared .hdeck before joining.",
+      );
+    }
+    if (runtime.getSnapshot(input.sessionId).dirty) {
+      throw new DesktopMainError(
+        'DIRTY_DOCUMENT',
+        'Reopen the shared .hdeck before joining so local unsaved edits are not discarded.',
+      );
+    }
+    const transition = await collaboration.join({ ...input, targetPath });
+    await assignSession(event, transition.snapshot, targetPath);
+    return transition.status;
   });
-  handle(DESKTOP_IPC.collaborationLeave, sessionInputSchema, (event, input) => {
+  handle(DESKTOP_IPC.collaborationLeave, sessionInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
-    return offlineStatus();
+    const ended = await collaboration.leave(input.sessionId);
+    if (ended === undefined) return collaboration.status(input.sessionId);
+    if (ended.mode === 'host') {
+      const reopened = await runtime.openMainOnly({ targetPath: ended.targetPath });
+      await assignSession(event, reopened, ended.targetPath);
+    } else {
+      // Keep the converged guest snapshot open as an unsaved local copy. Reopening the shared
+      // target here could regress to the host's last explicit save.
+      sessionTargetPaths.delete(input.sessionId);
+    }
+    return collaboration.status(windowSessions.get(event.sender.id) ?? input.sessionId);
   });
 
   handle(DESKTOP_IPC.mcpStatus, z.undefined(), (): McpStatus => ({
