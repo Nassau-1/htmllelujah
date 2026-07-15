@@ -1,0 +1,35 @@
+{
+  "name": "@htmllelujah/exporter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Offline standalone HTML and exact-page print exports for HTMLlelujah.",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@htmllelujah/document-core": "workspace:*",
+    "@htmllelujah/renderer": "workspace:*",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
