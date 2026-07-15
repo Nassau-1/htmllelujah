@@ -1,11 +1,847 @@
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { lstat, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { app, BrowserWindow, ipcMain, session } from 'electron';
+import { documentCommandSchema, type TransactionMetadata } from '@htmllelujah/document-core';
+import {
+  DocumentRuntimeError,
+  DocumentSessionManager,
+  type DocumentSessionSnapshot,
+} from '@htmllelujah/document-runtime';
+import { createPrintHtml, createStandaloneHtml, ExporterError } from '@htmllelujah/exporter';
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  nativeImage,
+  protocol,
+  session,
+  type IpcMainInvokeEvent,
+  type WebContents,
+} from 'electron';
+import { z } from 'zod';
+
+import {
+  DESKTOP_API_VERSION,
+  DESKTOP_IPC,
+  type AppInfo,
+  type CollaborationStatus,
+  type DesktopResult,
+  type ExportResult,
+  type InitializeResult,
+  type McpStatus,
+  type SessionView,
+} from '../shared/desktop-api.js';
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'htmllelujah-app',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: false },
+  },
+  {
+    scheme: 'htmllelujah-asset',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: false },
+  },
+  {
+    scheme: 'htmllelujah-export',
+    privileges: { standard: true, secure: true, supportFetchAPI: false, corsEnabled: false },
+  },
+]);
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_IMAGE_EDGE_PX = 16_384;
+const MAX_IMAGE_AREA_PX = 64 * 1024 * 1024;
+const PDF_READINESS_DEADLINE_MS = 15_000;
 
-function createWindow(): BrowserWindow {
+const runtime = new DocumentSessionManager({
+  recoveryDirectory: path.join(app.getPath('userData'), 'recovery'),
+  autosaveDelayMs: 1_000,
+});
+
+type WindowMode = 'editor' | 'presentation';
+
+const windowSessions = new Map<number, string>();
+const windowModes = new Map<number, WindowMode>();
+const assetTokens = new Map<
+  string,
+  { readonly sessionId: string; readonly webContentsId: number }
+>();
+const tokensByWebContents = new Map<number, Set<string>>();
+const closingWindows = new Set<number>();
+let pendingOpenPath: string | undefined;
+
+class DesktopMainError extends Error {
+  public constructor(
+    public readonly code: string,
+    message: string,
+    public readonly recoverable = true,
+  ) {
+    super(message);
+    this.name = 'DesktopMainError';
+  }
+}
+
+const success = <T>(value: T): DesktopResult<T> => ({ ok: true, value });
+
+const failure = (error: unknown): DesktopResult<never> => {
+  if (error instanceof DesktopMainError) {
+    return {
+      ok: false,
+      error: { code: error.code, message: error.message, recoverable: error.recoverable },
+    };
+  }
+  if (error instanceof ExporterError) {
+    const safeMessages: Partial<Record<ExporterError['code'], string>> = {
+      INVALID_REQUEST: 'This presentation cannot be exported.',
+      NOT_FOUND: 'One of the presentation resources is unavailable.',
+      ASSET_INVALID: 'One of the presentation images is invalid.',
+      ASSET_LIMIT_EXCEEDED: 'The presentation images are too large to export safely.',
+      RENDER_NOT_READY: 'The presentation did not become ready for export.',
+      EXPORT_FAILED: 'The presentation could not be exported.',
+    };
+    return {
+      ok: false,
+      error: {
+        code: error.code,
+        message: safeMessages[error.code] ?? 'The presentation could not be exported.',
+        recoverable: true,
+      },
+    };
+  }
+  if (error instanceof DocumentRuntimeError) {
+    const safeMessages: Partial<Record<DocumentRuntimeError['code'], string>> = {
+      REVISION_CONFLICT: 'The presentation changed. Your view has been refreshed; try again.',
+      NO_SAVE_TARGET: 'Choose where to save this presentation.',
+      TARGET_CHANGED: 'The file changed outside HTMLlelujah. Save a copy or reopen it.',
+      SAVE_FAILED:
+        'The presentation could not be saved. Check the destination and free disk space.',
+      DIRTY_DOCUMENT: 'Save or discard your changes before closing the presentation.',
+      ASSET_BYTES_MISSING: 'One of the presentation assets is unavailable.',
+      INVALID_REQUEST: 'That operation is not valid for the current presentation.',
+      SESSION_NOT_FOUND: 'This presentation is no longer open.',
+    };
+    return {
+      ok: false,
+      error: {
+        code: error.code,
+        message: safeMessages[error.code] ?? 'The presentation operation could not be completed.',
+        recoverable: error.retryable,
+      },
+    };
+  }
+  return {
+    ok: false,
+    error: {
+      code: 'INTERNAL_ERROR',
+      message: 'HTMLlelujah could not complete the operation.',
+      recoverable: true,
+    },
+  };
+};
+
+const mimeForAppPath = (filePath: string): string => {
+  switch (path.extname(filePath).toLowerCase()) {
+    case '.html':
+      return 'text/html; charset=utf-8';
+    case '.js':
+    case '.mjs':
+      return 'text/javascript; charset=utf-8';
+    case '.css':
+      return 'text/css; charset=utf-8';
+    case '.png':
+      return 'image/png';
+    case '.ico':
+      return 'image/x-icon';
+    case '.woff2':
+      return 'font/woff2';
+    default:
+      return 'application/octet-stream';
+  }
+};
+
+const notFound = (): Response =>
+  new Response('Not found', {
+    status: 404,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+  });
+
+const registerSecureProtocols = (): void => {
+  protocol.handle('htmllelujah-app', async (request) => {
+    try {
+      const requestUrl = new URL(request.url);
+      if (requestUrl.hostname !== 'app' || request.method !== 'GET') return notFound();
+      const decoded = decodeURIComponent(requestUrl.pathname);
+      const requested = decoded === '/' ? '/index.html' : decoded;
+      if (requested.includes('\0') || requested.includes('\\')) return notFound();
+      const root = path.resolve(app.getAppPath(), 'dist');
+      const target = path.resolve(root, `.${requested}`);
+      if (target !== root && !target.startsWith(`${root}${path.sep}`)) return notFound();
+      let bytes = await readFile(target);
+      if (path.extname(target).toLowerCase() === '.html') {
+        const html = bytes
+          .toString('utf8')
+          .replace(/\s+ws:\/\/127\.0\.0\.1:5173/g, '')
+          .replace(/\s+ws:\/\/127\.0\.0\.1:\*/g, '');
+        bytes = Buffer.from(html, 'utf8');
+      }
+      return new Response(bytes, {
+        status: 200,
+        headers: {
+          'Content-Type': mimeForAppPath(target),
+          'Cache-Control':
+            path.extname(target) === '.html' ? 'no-store' : 'public, max-age=31536000, immutable',
+          'X-Content-Type-Options': 'nosniff',
+          'Cross-Origin-Resource-Policy': 'same-origin',
+        },
+      });
+    } catch {
+      return notFound();
+    }
+  });
+
+  protocol.handle('htmllelujah-asset', async (request) => {
+    try {
+      if (request.method !== 'GET') return notFound();
+      const requestUrl = new URL(request.url);
+      if (requestUrl.hostname !== 'asset') return notFound();
+      const segments = requestUrl.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+      if (segments.length !== 3) return notFound();
+      const [token, assetId, expectedHash] = segments;
+      if (token === undefined || assetId === undefined || expectedHash === undefined)
+        return notFound();
+      const capability = assetTokens.get(token);
+      if (capability === undefined) return notFound();
+      const asset = runtime.getAssetBytesMainOnly(capability.sessionId, assetId);
+      if (asset.hash !== expectedHash) return notFound();
+      return new Response(asset.bytes, {
+        status: 200,
+        headers: {
+          'Content-Type': asset.mediaType,
+          'Content-Length': String(asset.bytes.byteLength),
+          'Cache-Control': 'private, max-age=31536000, immutable',
+          'X-Content-Type-Options': 'nosniff',
+          'Content-Security-Policy': "default-src 'none'; sandbox",
+        },
+      });
+    } catch {
+      return notFound();
+    }
+  });
+};
+
+const revokeWebContentsTokens = (webContentsId: number): void => {
+  for (const token of tokensByWebContents.get(webContentsId) ?? []) assetTokens.delete(token);
+  tokensByWebContents.delete(webContentsId);
+};
+
+const mintAssetToken = (webContentsId: number, sessionId: string): string => {
+  revokeWebContentsTokens(webContentsId);
+  const token = randomBytes(24).toString('base64url');
+  assetTokens.set(token, { sessionId, webContentsId });
+  tokensByWebContents.set(webContentsId, new Set([token]));
+  return token;
+};
+
+const sessionView = (webContentsId: number, snapshot: DocumentSessionSnapshot): SessionView => {
+  const token = mintAssetToken(webContentsId, snapshot.sessionId);
+  return {
+    snapshot,
+    assetUrls: Object.fromEntries(
+      snapshot.document.assets.map((asset) => [
+        asset.id,
+        `htmllelujah-asset://asset/${token}/${asset.id}/${asset.hash}`,
+      ]),
+    ),
+  };
+};
+
+const isTrustedSender = (event: IpcMainInvokeEvent): boolean => {
+  const frame = event.senderFrame;
+  if (frame === null || frame !== event.sender.mainFrame) return false;
+  const url = frame.url;
+  if (app.isPackaged) return url.startsWith('htmllelujah-app://app/');
+  return url.startsWith('http://127.0.0.1:5173/');
+};
+
+const assertSessionAccess = (
+  event: IpcMainInvokeEvent,
+  sessionId: string,
+  editorOnly = true,
+): void => {
+  if (windowSessions.get(event.sender.id) !== sessionId) {
+    throw new DesktopMainError(
+      'UNAUTHORIZED',
+      'This window cannot access that presentation.',
+      false,
+    );
+  }
+  if (editorOnly && windowModes.get(event.sender.id) !== 'editor') {
+    throw new DesktopMainError('READ_ONLY', 'Presentation windows are read-only.');
+  }
+};
+
+const handle = <TInput, TOutput>(
+  channel: string,
+  schema: z.ZodType<TInput>,
+  operation: (event: IpcMainInvokeEvent, input: TInput) => Promise<TOutput> | TOutput,
+): void => {
+  ipcMain.handle(channel, async (event, raw: unknown): Promise<DesktopResult<TOutput>> => {
+    if (!isTrustedSender(event))
+      return failure(new DesktopMainError('UNAUTHORIZED', 'Untrusted application window.', false));
+    const parsed = schema.safeParse(raw);
+    if (!parsed.success)
+      return failure(new DesktopMainError('INVALID_REQUEST', 'The request is invalid.'));
+    try {
+      return success(await operation(event, parsed.data));
+    } catch (error) {
+      return failure(error);
+    }
+  });
+};
+
+const identifier = z.string().uuid();
+const revision = z.string().min(1).max(160);
+const sessionInputSchema = z.object({ sessionId: identifier }).strict();
+const historyInputSchema = sessionInputSchema.extend({ expectedRevision: revision }).strict();
+const executeInputSchema = historyInputSchema
+  .extend({
+    label: z.string().trim().min(1).max(160),
+    commands: z.array(documentCommandSchema).min(1).max(100),
+    historyGroupId: z.string().uuid().optional(),
+  })
+  .strict();
+const presentationInputSchema = sessionInputSchema
+  .extend({ startSlideId: identifier.optional() })
+  .strict();
+const exportInputSchema = historyInputSchema
+  .extend({ format: z.enum(['html', 'pdf']), includeHidden: z.boolean() })
+  .strict();
+const hostInputSchema = sessionInputSchema
+  .extend({ displayName: z.string().trim().min(1).max(80), enableDiscovery: z.boolean() })
+  .strict();
+const joinInputSchema = sessionInputSchema
+  .extend({
+    endpoint: z.string().trim().min(1).max(512),
+    sessionCode: z.string().trim().min(4).max(128),
+    expectedFingerprint: z.string().trim().min(32).max(256),
+    displayName: z.string().trim().min(1).max(80),
+  })
+  .strict();
+
+const metadataFor = (event: IpcMainInvokeEvent, label: string): TransactionMetadata => ({
+  transactionId: randomUUID(),
+  actorId: `desktop-${event.sender.id}`,
+  origin: 'user',
+  label,
+  timestamp: new Date().toISOString(),
+});
+
+const findWindow = (webContents: WebContents): BrowserWindow | undefined =>
+  BrowserWindow.fromWebContents(webContents) ?? undefined;
+
+const saveDialog = (
+  parent: BrowserWindow | undefined,
+  options: Electron.SaveDialogOptions,
+): Promise<Electron.SaveDialogReturnValue> =>
+  parent === undefined ? dialog.showSaveDialog(options) : dialog.showSaveDialog(parent, options);
+
+const openDialog = (
+  parent: BrowserWindow | undefined,
+  options: Electron.OpenDialogOptions,
+): Promise<Electron.OpenDialogReturnValue> =>
+  parent === undefined ? dialog.showOpenDialog(options) : dialog.showOpenDialog(parent, options);
+
+const messageBox = (
+  parent: BrowserWindow | undefined,
+  options: Electron.MessageBoxOptions,
+): Promise<Electron.MessageBoxReturnValue> =>
+  parent === undefined ? dialog.showMessageBox(options) : dialog.showMessageBox(parent, options);
+
+interface ExportTargetState {
+  readonly exists: boolean;
+  readonly device?: number | undefined;
+  readonly inode?: number | undefined;
+  readonly size?: number | undefined;
+  readonly modifiedMs?: number | undefined;
+  readonly changedMs?: number | undefined;
+  readonly fingerprint?: string | undefined;
+}
+
+interface ApprovedExportTarget {
+  readonly path: string;
+  readonly state: ExportTargetState;
+}
+
+const exportTargetState = async (targetPath: string): Promise<ExportTargetState> => {
+  try {
+    const metadata = await lstat(targetPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new DesktopMainError(
+        'TARGET_UNAVAILABLE',
+        'The export destination must be a regular file.',
+      );
+    }
+    return {
+      exists: true,
+      device: metadata.dev,
+      inode: metadata.ino,
+      size: metadata.size,
+      modifiedMs: metadata.mtimeMs,
+      changedMs: metadata.ctimeMs,
+      fingerprint: await sha256File(targetPath),
+    };
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { exists: false };
+    throw error;
+  }
+};
+
+const sameExportTargetState = (left: ExportTargetState, right: ExportTargetState): boolean =>
+  left.exists === right.exists &&
+  left.device === right.device &&
+  left.inode === right.inode &&
+  left.size === right.size &&
+  left.modifiedMs === right.modifiedMs &&
+  left.changedMs === right.changedMs &&
+  left.fingerprint === right.fingerprint;
+
+const sha256Bytes = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
+
+const sha256File = async (filePath: string): Promise<string> => {
+  const handle = await open(filePath, 'r');
+  const digest = createHash('sha256');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, null);
+      if (bytesRead === 0) break;
+      digest.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
+  return digest.digest('hex');
+};
+
+const mapExportFilesystemError = (error: unknown): DesktopMainError => {
+  if (error instanceof DesktopMainError) return error;
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === 'ENOSPC' || code === 'EDQUOT') {
+    return new DesktopMainError('DISK_FULL', 'There is not enough free space for this export.');
+  }
+  if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
+    return new DesktopMainError('TARGET_UNAVAILABLE', 'The export destination is not writable.');
+  }
+  return new DesktopMainError('EXPORT_FAILED', 'The export could not be written.');
+};
+
+const syncDirectoryBestEffort = async (directory: string): Promise<void> => {
+  const handle = await open(directory, 'r').catch(() => undefined);
+  if (handle === undefined) return;
+  try {
+    await handle.sync().catch(() => undefined);
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+};
+
+const writeExportAtomically = async (
+  target: ApprovedExportTarget,
+  bytes: Uint8Array,
+): Promise<number> => {
+  const targetPath = target.path;
+  const temporaryPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.${randomUUID()}.tmp`,
+  );
+  let temporaryExists = false;
+  try {
+    const observedTarget = await exportTargetState(targetPath);
+    if (!sameExportTargetState(target.state, observedTarget)) {
+      throw new DesktopMainError(
+        'TARGET_CHANGED',
+        'The export destination changed. Choose it again.',
+      );
+    }
+    const expectedHash = sha256Bytes(bytes);
+    const handle = await open(temporaryPath, 'wx', 0o600);
+    temporaryExists = true;
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    const stagedMetadata = await stat(temporaryPath);
+    if (!stagedMetadata.isFile() || stagedMetadata.size !== bytes.byteLength) {
+      throw new DesktopMainError('EXPORT_FAILED', 'The staged export failed validation.');
+    }
+    if ((await sha256File(temporaryPath)) !== expectedHash) {
+      throw new DesktopMainError('EXPORT_FAILED', 'The staged export failed validation.');
+    }
+    const currentTarget = await exportTargetState(targetPath);
+    if (!sameExportTargetState(observedTarget, currentTarget)) {
+      throw new DesktopMainError(
+        'TARGET_CHANGED',
+        'The export destination changed. Choose it again.',
+      );
+    }
+    await rename(temporaryPath, targetPath);
+    temporaryExists = false;
+    await syncDirectoryBestEffort(path.dirname(targetPath));
+    if ((await sha256File(targetPath)) !== expectedHash) {
+      throw new DesktopMainError('EXPORT_FAILED', 'The committed export failed validation.');
+    }
+    return bytes.byteLength;
+  } catch (error: unknown) {
+    throw mapExportFilesystemError(error);
+  } finally {
+    if (temporaryExists) await rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+};
+
+const safeExportBaseName = (name: string): string =>
+  name
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .trim()
+    .slice(0, 100) || 'Untitled';
+
+const chooseExportPath = async (
+  event: IpcMainInvokeEvent,
+  documentName: string,
+  format: 'html' | 'pdf',
+): Promise<ApprovedExportTarget> => {
+  const parent = findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+  const extension = format === 'html' ? 'html' : 'pdf';
+  const result = await saveDialog(parent, {
+    title: format === 'html' ? 'Export standalone HTML' : 'Export PDF',
+    defaultPath: `${safeExportBaseName(documentName)}.${extension}`,
+    filters: [
+      format === 'html'
+        ? { name: 'Standalone HTML', extensions: ['html'] }
+        : { name: 'PDF document', extensions: ['pdf'] },
+    ],
+    properties: ['showOverwriteConfirmation', 'createDirectory'],
+  });
+  if (result.canceled || result.filePath === undefined) {
+    throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+  }
+  if (!path.isAbsolute(result.filePath)) {
+    throw new DesktopMainError('TARGET_UNAVAILABLE', 'The export destination is invalid.');
+  }
+  const targetPath = result.filePath.toLowerCase().endsWith(`.${extension}`)
+    ? result.filePath
+    : `${result.filePath}.${extension}`;
+  const state = await exportTargetState(targetPath);
+  if (targetPath !== result.filePath && state.exists) {
+    const confirmation = await messageBox(parent, {
+      type: 'warning',
+      title: 'Replace export?',
+      message: `“${path.basename(targetPath)}” already exists. Replace it?`,
+      buttons: ['Replace', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (confirmation.response !== 0) {
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    }
+  }
+  return { path: targetPath, state };
+};
+
+const collectExportAssets = (
+  sessionId: string,
+  snapshot: DocumentSessionSnapshot,
+): ReadonlyMap<string, Uint8Array> => {
+  const assets = new Map<string, Uint8Array>();
+  for (const asset of snapshot.document.assets) {
+    try {
+      assets.set(asset.id, runtime.getAssetBytesMainOnly(sessionId, asset.id).bytes);
+    } catch (error: unknown) {
+      if (!(error instanceof DocumentRuntimeError) || error.code !== 'ASSET_BYTES_MISSING') {
+        throw error;
+      }
+    }
+  }
+  return assets;
+};
+
+const exportWarnings = (html: string): readonly string[] =>
+  [...html.matchAll(/data-render-warning="([A-Z0-9_]+)"/g)]
+    .map((match) => match[1])
+    .filter((warning): warning is string => warning !== undefined)
+    .filter((warning, index, warnings) => warnings.indexOf(warning) === index)
+    .sort();
+
+const PRINT_READY_WAIT_SCRIPT = `new Promise((resolve) => {
+  const root = document.documentElement;
+  const current = () => root.dataset.renderReady || "pending";
+  if (current() !== "pending") { resolve(current()); return; }
+  const done = () => {
+    root.removeEventListener("htmllelujah:render-ready", done);
+    root.removeEventListener("htmllelujah:render-failed", done);
+    resolve(current());
+  };
+  root.addEventListener("htmllelujah:render-ready", done, { once: true });
+  root.addEventListener("htmllelujah:render-failed", done, { once: true });
+  const requested = Number(root.dataset.readinessDeadlineMs);
+  const deadline = Number.isFinite(requested) ? Math.min(60000, Math.max(100, requested)) : 10000;
+  setTimeout(() => resolve(current()), deadline + 1000);
+})`;
+
+const withTimeout = async <T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  error: DesktopMainError,
+): Promise<T> => {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(error), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+};
+
+const assertPdfBytes = (bytes: Uint8Array): void => {
+  const prefix = Buffer.from(bytes.subarray(0, 5)).toString('ascii');
+  const trailer = Buffer.from(bytes.subarray(Math.max(0, bytes.byteLength - 1024))).toString(
+    'ascii',
+  );
+  if (bytes.byteLength < 64 || prefix !== '%PDF-' || !trailer.includes('%%EOF')) {
+    throw new DesktopMainError('EXPORT_FAILED', 'The generated PDF failed validation.');
+  }
+};
+
+const printDocuments = new Map<string, string>();
+let sharedPrintSession: Electron.Session | undefined;
+let pdfExportQueue: Promise<void> = Promise.resolve();
+
+const printTokenFromUrl = (rawUrl: string): string | undefined => {
+  try {
+    const url = new URL(rawUrl);
+    if (
+      url.protocol !== 'htmllelujah-export:' ||
+      url.hostname !== 'print' ||
+      url.search !== '' ||
+      url.hash !== ''
+    ) {
+      return undefined;
+    }
+    const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+    return segments.length === 1 ? segments[0] : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const getPrintSession = (): Electron.Session => {
+  if (sharedPrintSession !== undefined) return sharedPrintSession;
+  const isolated = session.fromPartition('htmllelujah-export', { cache: false });
+  isolated.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  isolated.setPermissionCheckHandler(() => false);
+  isolated.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
+    const token = printTokenFromUrl(details.url);
+    const allowed =
+      (token !== undefined && printDocuments.has(token)) || details.url.startsWith('data:image/');
+    callback({ cancel: !allowed });
+  });
+  isolated.protocol.handle('htmllelujah-export', (request) => {
+    const token = request.method === 'GET' ? printTokenFromUrl(request.url) : undefined;
+    const printHtml = token === undefined ? undefined : printDocuments.get(token);
+    if (printHtml === undefined) return notFound();
+    return new Response(printHtml, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Cross-Origin-Resource-Policy': 'same-origin',
+        'Referrer-Policy': 'no-referrer',
+      },
+    });
+  });
+  sharedPrintSession = isolated;
+  return isolated;
+};
+
+const enqueuePdfExport = <T>(operation: () => Promise<T>): Promise<T> => {
+  const result = pdfExportQueue.then(operation, operation);
+  pdfExportQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+};
+
+const createPdfBytesIsolated = async (printHtml: string): Promise<Uint8Array> => {
+  const token = randomBytes(24).toString('base64url');
+  const printUrl = `htmllelujah-export://print/${token}`;
+  const printSession = getPrintSession();
+  printDocuments.set(token, printHtml);
+  let printWindow: BrowserWindow | undefined;
+  try {
+    printWindow = new BrowserWindow({
+      show: false,
+      backgroundColor: '#ffffff',
+      webPreferences: {
+        session: printSession,
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        webSecurity: true,
+        spellcheck: false,
+        navigateOnDragDrop: false,
+      },
+    });
+    printWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    printWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+      if (navigationUrl !== printUrl) event.preventDefault();
+    });
+    printWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
+    await withTimeout(
+      printWindow.loadURL(printUrl),
+      PDF_READINESS_DEADLINE_MS,
+      new DesktopMainError('RENDER_NOT_READY', 'The PDF render surface did not load.'),
+    );
+    const readiness = await withTimeout(
+      printWindow.webContents.executeJavaScript(PRINT_READY_WAIT_SCRIPT, true) as Promise<unknown>,
+      PDF_READINESS_DEADLINE_MS + 2_000,
+      new DesktopMainError('RENDER_NOT_READY', 'The PDF render surface timed out.'),
+    );
+    if (readiness !== 'ready') {
+      throw new DesktopMainError('RENDER_NOT_READY', 'The PDF render surface is not ready.');
+    }
+    const pdf = await withTimeout(
+      printWindow.webContents.printToPDF({
+        displayHeaderFooter: false,
+        printBackground: true,
+        scale: 1,
+        margins: { top: 0, bottom: 0, left: 0, right: 0 },
+        preferCSSPageSize: true,
+        generateTaggedPDF: true,
+        generateDocumentOutline: false,
+      }),
+      30_000,
+      new DesktopMainError('EXPORT_FAILED', 'PDF generation timed out.'),
+    );
+    assertPdfBytes(pdf);
+    return Uint8Array.from(pdf);
+  } finally {
+    if (printWindow !== undefined && !printWindow.isDestroyed()) printWindow.destroy();
+    printDocuments.delete(token);
+  }
+};
+
+const createPdfBytes = (printHtml: string): Promise<Uint8Array> =>
+  enqueuePdfExport(() => createPdfBytesIsolated(printHtml));
+
+const saveAs = async (
+  event: IpcMainInvokeEvent,
+  sessionId: string,
+): Promise<DocumentSessionSnapshot | undefined> => {
+  const parent = findWindow(event.sender);
+  const snapshot = runtime.getSnapshot(sessionId);
+  const safeName =
+    snapshot.document.name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').slice(0, 100) || 'Untitled';
+  const result = await saveDialog(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
+    title: 'Save presentation',
+    defaultPath: `${safeName}.hdeck`,
+    filters: [{ name: 'HTMLlelujah presentation', extensions: ['hdeck'] }],
+    properties: ['showOverwriteConfirmation', 'createDirectory'],
+  });
+  if (result.canceled || result.filePath === undefined) return undefined;
+  const targetPath = result.filePath.toLowerCase().endsWith('.hdeck')
+    ? result.filePath
+    : `${result.filePath}.hdeck`;
+  return runtime.saveAsMainOnly(sessionId, {
+    targetPath,
+    expectedFingerprint: null,
+    allowOverwrite: true,
+  });
+};
+
+const saveWithTargetFallback = async (
+  event: IpcMainInvokeEvent,
+  sessionId: string,
+): Promise<DocumentSessionSnapshot | undefined> => {
+  const snapshot = runtime.getSnapshot(sessionId);
+  return snapshot.hasSaveTarget ? runtime.save(sessionId) : saveAs(event, sessionId);
+};
+
+const confirmReplace = async (event: IpcMainInvokeEvent): Promise<boolean> => {
+  const currentId = windowSessions.get(event.sender.id);
+  if (currentId === undefined) return true;
+  const snapshot = runtime.getSnapshot(currentId);
+  if (!snapshot.dirty) return true;
+  const parent = findWindow(event.sender);
+  const choice = await messageBox(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
+    type: 'warning',
+    title: 'Unsaved changes',
+    message: `Save changes to “${snapshot.document.name}”?`,
+    detail:
+      'Your recovery journal remains available until you explicitly discard this presentation.',
+    buttons: ['Save', 'Discard', 'Cancel'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  });
+  if (choice.response === 2) return false;
+  if (choice.response === 0 && (await saveWithTargetFallback(event, currentId)) === undefined)
+    return false;
+  return true;
+};
+
+const assignSession = async (
+  event: IpcMainInvokeEvent,
+  snapshot: DocumentSessionSnapshot,
+): Promise<SessionView> => {
+  const previous = windowSessions.get(event.sender.id);
+  windowSessions.set(event.sender.id, snapshot.sessionId);
+  if (previous !== undefined && previous !== snapshot.sessionId) {
+    const stillUsed = [...windowSessions.values()].includes(previous);
+    if (!stillUsed) await runtime.close(previous, { discardUnsaved: true });
+  }
+  const window = findWindow(event.sender);
+  window?.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
+  return sessionView(event.sender.id, snapshot);
+};
+
+const imageMediaType = (
+  bytes: Uint8Array,
+): 'image/png' | 'image/jpeg' | 'image/webp' | undefined => {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  )
+    return 'image/png';
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
+    return 'image/jpeg';
+  if (
+    bytes.length >= 12 &&
+    Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
+    Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP'
+  )
+    return 'image/webp';
+  return undefined;
+};
+
+const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> => {
   const window = new BrowserWindow({
     width: 1540,
     height: 970,
@@ -14,6 +850,8 @@ function createWindow(): BrowserWindow {
     show: false,
     title: 'HTMLlelujah',
     autoHideMenuBar: true,
+    backgroundColor: '#f5f3ee',
+    icon: path.join(app.getAppPath(), 'assets', 'icon.png'),
     webPreferences: {
       preload: path.join(currentDirectory, 'preload.mjs'),
       contextIsolation: true,
@@ -21,39 +859,432 @@ function createWindow(): BrowserWindow {
       sandbox: true,
       webSecurity: true,
       spellcheck: true,
+      navigateOnDragDrop: false,
     },
   });
+  windowModes.set(window.webContents.id, 'editor');
+  const snapshot =
+    initialPath === undefined
+      ? await runtime.createMainOnly()
+      : await runtime.openMainOnly({ targetPath: initialPath });
+  windowSessions.set(window.webContents.id, snapshot.sessionId);
+  window.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
 
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', (event) => event.preventDefault());
+  window.webContents.on('will-attach-webview', (event) => event.preventDefault());
+  window.webContents.on('destroyed', () => {
+    revokeWebContentsTokens(window.webContents.id);
+    windowModes.delete(window.webContents.id);
+    windowSessions.delete(window.webContents.id);
+  });
   window.once('ready-to-show', () => window.show());
-
-  if (process.env.VITE_DEV_SERVER_URL) {
-    void window.loadURL(process.env.VITE_DEV_SERVER_URL);
-  } else {
-    void window.loadFile(path.join(currentDirectory, '../dist/index.html'));
-  }
-
-  return window;
-}
-
-app.whenReady().then(() => {
-  session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
-    callback(false);
+  window.on('close', (event) => {
+    const webContentsId = window.webContents.id;
+    if (closingWindows.has(webContentsId)) return;
+    const sessionId = windowSessions.get(webContentsId);
+    if (sessionId === undefined) return;
+    const snapshot = runtime.getSnapshot(sessionId);
+    if (!snapshot.dirty) {
+      closingWindows.add(webContentsId);
+      void runtime.close(sessionId, { discardUnsaved: true }).catch(() => undefined);
+      return;
+    }
+    event.preventDefault();
+    void (async () => {
+      const choice = await dialog.showMessageBox(window, {
+        type: 'warning',
+        title: 'Unsaved changes',
+        message: `Save changes to “${snapshot.document.name}”?`,
+        buttons: ['Save', 'Discard', 'Cancel'],
+        defaultId: 0,
+        cancelId: 2,
+        noLink: true,
+      });
+      if (choice.response === 2) return;
+      if (choice.response === 0) {
+        const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
+        if ((await saveWithTargetFallback(syntheticEvent, sessionId)) === undefined) return;
+      }
+      closingWindows.add(webContentsId);
+      for (const candidate of BrowserWindow.getAllWindows()) {
+        if (candidate === window) continue;
+        if (windowSessions.get(candidate.webContents.id) === sessionId) candidate.destroy();
+      }
+      await runtime.close(sessionId, { discardUnsaved: true }).catch(() => undefined);
+      window.destroy();
+    })();
   });
 
-  ipcMain.handle('app:get-info', () => ({
+  if (process.env.VITE_DEV_SERVER_URL) await window.loadURL(process.env.VITE_DEV_SERVER_URL);
+  else await window.loadURL('htmllelujah-app://app/index.html');
+  return window;
+};
+
+const createPresentationWindow = async (
+  sessionId: string,
+  startSlideId?: string,
+): Promise<BrowserWindow> => {
+  const source = runtime.getSnapshot(sessionId);
+  const window = new BrowserWindow({
+    show: false,
+    fullscreen: true,
+    backgroundColor: '#000000',
+    autoHideMenuBar: true,
+    title: `${source.document.name} — Presentation`,
+    webPreferences: {
+      preload: path.join(currentDirectory, 'preload.mjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      spellcheck: false,
+      navigateOnDragDrop: false,
+    },
+  });
+  windowModes.set(window.webContents.id, 'presentation');
+  windowSessions.set(window.webContents.id, sessionId);
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.on('will-navigate', (event) => event.preventDefault());
+  window.webContents.on('will-attach-webview', (event) => event.preventDefault());
+  window.webContents.on('destroyed', () => {
+    revokeWebContentsTokens(window.webContents.id);
+    windowModes.delete(window.webContents.id);
+    windowSessions.delete(window.webContents.id);
+  });
+  window.once('ready-to-show', () => window.show());
+  const query = new URLSearchParams({ mode: 'presentation' });
+  if (startSlideId !== undefined) query.set('startSlideId', startSlideId);
+  if (process.env.VITE_DEV_SERVER_URL) {
+    await window.loadURL(`${process.env.VITE_DEV_SERVER_URL}?${query.toString()}`);
+  } else {
+    await window.loadURL(`htmllelujah-app://app/index.html?${query.toString()}`);
+  }
+  return window;
+};
+
+const configureIpc = (): void => {
+  handle(DESKTOP_IPC.getAppInfo, z.undefined(), (): AppInfo => ({
+    apiVersion: DESKTOP_API_VERSION,
     name: app.getName(),
     version: app.getVersion(),
     platform: process.platform,
+    packaged: app.isPackaged,
   }));
 
-  createWindow();
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  handle(DESKTOP_IPC.initialize, z.undefined(), async (event): Promise<InitializeResult> => {
+    const sessionId = windowSessions.get(event.sender.id);
+    const mode = windowModes.get(event.sender.id);
+    if (sessionId === undefined || mode === undefined)
+      throw new DesktopMainError('SESSION_NOT_FOUND', 'This window has no presentation.');
+    return {
+      session: sessionView(event.sender.id, runtime.getSnapshot(sessionId)),
+      recoveryCandidates: mode === 'editor' ? await runtime.listRecoveryCandidatesMainOnly() : [],
+      mode,
+    };
   });
+
+  handle(DESKTOP_IPC.createDocument, z.undefined(), async (event) => {
+    if (windowModes.get(event.sender.id) !== 'editor')
+      throw new DesktopMainError('READ_ONLY', 'Presentation windows are read-only.');
+    if (!(await confirmReplace(event)))
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    return assignSession(event, await runtime.createMainOnly());
+  });
+
+  handle(DESKTOP_IPC.openDocument, z.undefined(), async (event) => {
+    if (windowModes.get(event.sender.id) !== 'editor')
+      throw new DesktopMainError('READ_ONLY', 'Presentation windows are read-only.');
+    const parent = findWindow(event.sender);
+    const result = await openDialog(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
+      title: 'Open presentation',
+      filters: [{ name: 'HTMLlelujah presentation', extensions: ['hdeck'] }],
+      properties: ['openFile'],
+    });
+    const targetPath = result.filePaths[0];
+    if (result.canceled || targetPath === undefined)
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    if (!(await confirmReplace(event)))
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    return assignSession(event, await runtime.openMainOnly({ targetPath }));
+  });
+
+  handle(DESKTOP_IPC.execute, executeInputSchema, async (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    const snapshot = await runtime.execute(input.sessionId, {
+      expectedRevision: input.expectedRevision,
+      commands: input.commands,
+      metadata: metadataFor(event, input.label),
+      ...(input.historyGroupId === undefined ? {} : { historyGroupId: input.historyGroupId }),
+    });
+    return sessionView(event.sender.id, snapshot);
+  });
+
+  handle(DESKTOP_IPC.undo, historyInputSchema, async (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    const snapshot = await runtime.undo(input.sessionId, {
+      expectedRevision: input.expectedRevision,
+      metadata: metadataFor(event, 'Undo'),
+    });
+    return sessionView(event.sender.id, snapshot);
+  });
+
+  handle(DESKTOP_IPC.redo, historyInputSchema, async (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    const snapshot = await runtime.redo(input.sessionId, {
+      expectedRevision: input.expectedRevision,
+      metadata: metadataFor(event, 'Redo'),
+    });
+    return sessionView(event.sender.id, snapshot);
+  });
+
+  handle(DESKTOP_IPC.save, sessionInputSchema, async (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    const snapshot = await saveWithTargetFallback(event, input.sessionId);
+    if (snapshot === undefined)
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    return sessionView(event.sender.id, snapshot);
+  });
+
+  handle(DESKTOP_IPC.saveAs, sessionInputSchema, async (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    const snapshot = await saveAs(event, input.sessionId);
+    if (snapshot === undefined)
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    return sessionView(event.sender.id, snapshot);
+  });
+
+  handle(DESKTOP_IPC.importImage, historyInputSchema, async (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    const parent = findWindow(event.sender);
+    const result = await openDialog(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
+      title: 'Insert image',
+      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+      properties: ['openFile'],
+    });
+    const targetPath = result.filePaths[0];
+    if (result.canceled || targetPath === undefined)
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    const stat = await lstat(targetPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > MAX_IMAGE_BYTES) {
+      throw new DesktopMainError(
+        'INVALID_ASSET',
+        'Choose a PNG, JPEG, or WebP image smaller than 25 MB.',
+      );
+    }
+    const bytes = await readFile(targetPath);
+    const mediaType = imageMediaType(bytes);
+    if (mediaType === undefined)
+      throw new DesktopMainError('INVALID_ASSET', 'The selected file is not a supported image.');
+    const decoded = nativeImage.createFromBuffer(bytes);
+    const dimensions = decoded.getSize();
+    if (
+      decoded.isEmpty() ||
+      dimensions.width < 1 ||
+      dimensions.height < 1 ||
+      dimensions.width > MAX_IMAGE_EDGE_PX ||
+      dimensions.height > MAX_IMAGE_EDGE_PX ||
+      dimensions.width * dimensions.height > MAX_IMAGE_AREA_PX
+    )
+      throw new DesktopMainError('INVALID_ASSET', 'The image dimensions are unsupported.');
+    const assetId = randomUUID();
+    const snapshot = await runtime.storeAsset(input.sessionId, {
+      id: assetId,
+      bytes,
+      mediaType,
+      fileName: path.basename(targetPath).slice(0, 255),
+      widthPx: dimensions.width,
+      heightPx: dimensions.height,
+      expectedRevision: input.expectedRevision,
+      metadata: metadataFor(event, 'Import image'),
+    });
+    return { session: sessionView(event.sender.id, snapshot), assetId };
+  });
+
+  handle(DESKTOP_IPC.listRecovery, z.undefined(), () => runtime.listRecoveryCandidatesMainOnly());
+
+  handle(DESKTOP_IPC.recover, identifier, async (event, candidateId) => {
+    if (windowModes.get(event.sender.id) !== 'editor')
+      throw new DesktopMainError('READ_ONLY', 'Presentation windows are read-only.');
+    if (!(await confirmReplace(event)))
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    return assignSession(event, await runtime.recoverMainOnly(candidateId));
+  });
+
+  handle(DESKTOP_IPC.present, presentationInputSchema, async (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    await createPresentationWindow(input.sessionId, input.startSlideId);
+    return null;
+  });
+
+  handle(
+    DESKTOP_IPC.exportDocument,
+    exportInputSchema,
+    async (event, input): Promise<ExportResult> => {
+      assertSessionAccess(event, input.sessionId);
+      const initialSnapshot = runtime.getSnapshot(input.sessionId);
+      if (initialSnapshot.revision !== input.expectedRevision) {
+        throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
+      }
+      const target = await chooseExportPath(event, initialSnapshot.document.name, input.format);
+      const snapshot = runtime.getSnapshot(input.sessionId);
+      if (snapshot.revision !== input.expectedRevision) {
+        throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
+      }
+      const startedAt = Date.now();
+      const assets = collectExportAssets(input.sessionId, snapshot);
+      const hiddenSlides = input.includeHidden ? 'include' : 'exclude';
+      const pageCount = snapshot.document.slides.filter(
+        (slide) => input.includeHidden || !slide.hidden,
+      ).length;
+      let html: string;
+      let bytesWritten: number;
+      if (input.format === 'html') {
+        html = createStandaloneHtml(snapshot.document, assets, {
+          hiddenSlides,
+          title: snapshot.document.name,
+          clickNavigation: true,
+        });
+        bytesWritten = await writeExportAtomically(target, Buffer.from(html, 'utf8'));
+      } else {
+        html = createPrintHtml(snapshot.document, assets, {
+          hiddenSlides,
+          title: snapshot.document.name,
+          readinessDeadlineMs: PDF_READINESS_DEADLINE_MS,
+        });
+        const pdf = await createPdfBytes(html);
+        bytesWritten = await writeExportAtomically(target, pdf);
+      }
+      return {
+        format: input.format,
+        pageCount,
+        page: snapshot.document.page,
+        bytesWritten,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        warnings: exportWarnings(html),
+      };
+    },
+  );
+
+  const offlineStatus = (): CollaborationStatus => ({
+    mode: 'offline',
+    connectedPeers: 0,
+    discoveryEnabled: false,
+    note: 'Open the same .hdeck from your shared drive, then host or join a LAN editing session.',
+  });
+  handle(DESKTOP_IPC.collaborationStatus, sessionInputSchema, (event, input) => {
+    assertSessionAccess(event, input.sessionId, false);
+    return offlineStatus();
+  });
+  handle(DESKTOP_IPC.collaborationHost, hostInputSchema, (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    throw new DesktopMainError('COLLABORATION_UNAVAILABLE', 'LAN collaboration is not active yet.');
+  });
+  handle(DESKTOP_IPC.collaborationJoin, joinInputSchema, (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    throw new DesktopMainError('COLLABORATION_UNAVAILABLE', 'LAN collaboration is not active yet.');
+  });
+  handle(DESKTOP_IPC.collaborationLeave, sessionInputSchema, (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    return offlineStatus();
+  });
+
+  handle(DESKTOP_IPC.mcpStatus, z.undefined(), (): McpStatus => ({
+    available: true,
+    connected: false,
+    visibleDocuments: runtime.listSessions().length,
+    transport: 'local-stdio',
+  }));
+};
+
+runtime.subscribe((event) => {
+  if (
+    event.type === 'document-changed' ||
+    event.type === 'document-saved' ||
+    event.type === 'session-opened'
+  ) {
+    const reason =
+      event.type === 'document-saved'
+        ? 'saved'
+        : event.type === 'session-opened'
+          ? event.recovered
+            ? 'recovered'
+            : 'opened'
+          : 'changed';
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (
+        windowSessions.get(window.webContents.id) !== event.sessionId ||
+        window.webContents.isDestroyed()
+      )
+        continue;
+      window.webContents.send(DESKTOP_IPC.documentChanged, {
+        sessionId: event.sessionId,
+        revision: event.revision,
+        reason,
+      });
+      if (windowModes.get(window.webContents.id) === 'editor') {
+        const snapshot = runtime.getSnapshot(event.sessionId);
+        window.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
+      }
+    }
+  }
 });
+
+const hdeckArgument = (arguments_: readonly string[]): string | undefined =>
+  arguments_.find(
+    (argument) => path.isAbsolute(argument) && path.extname(argument).toLowerCase() === '.hdeck',
+  );
+
+const singleInstance = app.requestSingleInstanceLock();
+if (!singleInstance) app.quit();
+else {
+  app.on('second-instance', (_event, commandLine) => {
+    const filePath = hdeckArgument(commandLine);
+    const editor = BrowserWindow.getAllWindows().find(
+      (window) => windowModes.get(window.webContents.id) === 'editor',
+    );
+    if (editor !== undefined) {
+      if (editor.isMinimized()) editor.restore();
+      editor.show();
+      editor.focus();
+      if (filePath !== undefined) pendingOpenPath = filePath;
+    } else {
+      void createEditorWindow(filePath).catch(() => undefined);
+    }
+  });
+
+  app.on('open-file', (event, filePath) => {
+    event.preventDefault();
+    pendingOpenPath = filePath;
+  });
+
+  void app.whenReady().then(async () => {
+    registerSecureProtocols();
+    configureIpc();
+    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
+      callback(false),
+    );
+    session.defaultSession.setPermissionCheckHandler(() => false);
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'X-Content-Type-Options': ['nosniff'],
+          'Cross-Origin-Opener-Policy': ['same-origin'],
+          'Cross-Origin-Resource-Policy': ['same-origin'],
+          'Referrer-Policy': ['no-referrer'],
+        },
+      });
+    });
+    const initialPath = pendingOpenPath ?? hdeckArgument(process.argv);
+    pendingOpenPath = undefined;
+    await createEditorWindow(initialPath);
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0)
+        void createEditorWindow().catch(() => undefined);
+    });
+  });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
