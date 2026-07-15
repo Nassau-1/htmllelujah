@@ -20,6 +20,7 @@ import {
   HdeckError,
   initializeJournalFile,
   JournalError,
+  parseImageHeader,
   parseHdeckArchive,
   PersistenceError,
   replayJournal,
@@ -28,6 +29,166 @@ import {
   type HdeckManifestV1,
   type JournalHeader,
 } from '../src/index.js';
+
+const imageId = '40000000-0000-4000-8000-000000000001';
+
+const pngHeader = (widthPx: number, heightPx: number): Uint8Array => {
+  const bytes = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes);
+  bytes.writeUInt32BE(13, 8);
+  bytes.write('IHDR', 12, 'ascii');
+  bytes.writeUInt32BE(widthPx, 16);
+  bytes.writeUInt32BE(heightPx, 20);
+  bytes[24] = 8;
+  bytes[25] = 6;
+  return Uint8Array.from(bytes);
+};
+
+const jpegHeader = (widthPx: number, heightPx: number): Uint8Array => {
+  const bytes = Buffer.alloc(17);
+  bytes.set([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08], 0);
+  bytes.writeUInt16BE(heightPx, 7);
+  bytes.writeUInt16BE(widthPx, 9);
+  bytes.set([0x01, 0x01, 0x11, 0x00, 0xff, 0xd9], 11);
+  return Uint8Array.from(bytes);
+};
+
+const webpExtendedHeader = (widthPx: number, heightPx: number): Uint8Array => {
+  const bytes = Buffer.alloc(30);
+  bytes.write('RIFF', 0, 'ascii');
+  bytes.writeUInt32LE(bytes.byteLength - 8, 4);
+  bytes.write('WEBP', 8, 'ascii');
+  bytes.write('VP8X', 12, 'ascii');
+  bytes.writeUInt32LE(10, 16);
+  bytes.writeUIntLE(widthPx - 1, 24, 3);
+  bytes.writeUIntLE(heightPx - 1, 27, 3);
+  return Uint8Array.from(bytes);
+};
+
+const webpLossyHeader = (widthPx: number, heightPx: number): Uint8Array => {
+  const bytes = Buffer.alloc(30);
+  bytes.write('RIFF', 0, 'ascii');
+  bytes.writeUInt32LE(bytes.byteLength - 8, 4);
+  bytes.write('WEBP', 8, 'ascii');
+  bytes.write('VP8 ', 12, 'ascii');
+  bytes.writeUInt32LE(10, 16);
+  bytes.set([0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a], 20);
+  bytes.writeUInt16LE(widthPx, 26);
+  bytes.writeUInt16LE(heightPx, 28);
+  return Uint8Array.from(bytes);
+};
+
+const webpLosslessHeader = (widthPx: number, heightPx: number): Uint8Array => {
+  const widthMinusOne = widthPx - 1;
+  const heightMinusOne = heightPx - 1;
+  const bytes = Buffer.alloc(26);
+  bytes.write('RIFF', 0, 'ascii');
+  bytes.writeUInt32LE(bytes.byteLength - 8, 4);
+  bytes.write('WEBP', 8, 'ascii');
+  bytes.write('VP8L', 12, 'ascii');
+  bytes.writeUInt32LE(5, 16);
+  bytes[20] = 0x2f;
+  bytes[21] = widthMinusOne & 0xff;
+  bytes[22] = ((widthMinusOne >>> 8) & 0x3f) | ((heightMinusOne & 0x03) << 6);
+  bytes[23] = (heightMinusOne >>> 2) & 0xff;
+  bytes[24] = (heightMinusOne >>> 10) & 0x0f;
+  return Uint8Array.from(bytes);
+};
+
+interface SyntheticAssetArchiveOptions {
+  readonly bytes: Uint8Array;
+  readonly manifestMediaType?: 'image/png' | 'image/jpeg' | 'image/webp' | 'font/woff2';
+  readonly documentMediaType?: 'image/png' | 'image/jpeg' | 'image/webp' | 'font/woff2';
+  readonly kind?: 'image' | 'font';
+  readonly manifestWidthPx?: number | undefined;
+  readonly manifestHeightPx?: number | undefined;
+  readonly documentWidthPx?: number | undefined;
+  readonly documentHeightPx?: number | undefined;
+}
+
+const syntheticAssetArchive = (options: SyntheticAssetArchiveOptions): Uint8Array => {
+  const manifestMediaType = options.manifestMediaType ?? 'image/png';
+  const documentMediaType = options.documentMediaType ?? manifestMediaType;
+  const kind = options.kind ?? (manifestMediaType === 'font/woff2' ? 'font' : 'image');
+  const hash = sha256(options.bytes);
+  const extension =
+    manifestMediaType === 'image/png'
+      ? 'png'
+      : manifestMediaType === 'image/jpeg'
+        ? 'jpg'
+        : manifestMediaType === 'image/webp'
+          ? 'webp'
+          : 'woff2';
+  const document = {
+    ...createNeutralDemoDeck(),
+    assets: [
+      {
+        id: imageId,
+        kind,
+        hash,
+        mediaType: documentMediaType,
+        fileName: `fixture.${extension}`,
+        byteLength: options.bytes.byteLength,
+        ...(options.documentWidthPx === undefined ? {} : { widthPx: options.documentWidthPx }),
+        ...(options.documentHeightPx === undefined ? {} : { heightPx: options.documentHeightPx }),
+      },
+    ],
+  } as DeckDocument;
+  const documentBytes = Buffer.from(canonicalJson(document));
+  const entry = `assets/${hash}.${extension}`;
+  const manifest: HdeckManifestV1 = {
+    format: 'htmllelujah.deck',
+    containerVersion: 1,
+    documentSchemaVersion: document.schemaVersion,
+    documentId: document.id,
+    createdAt: '2026-07-15T12:00:00.000Z',
+    modifiedAt: '2026-07-15T12:00:00.000Z',
+    documentEntry: 'document.json',
+    documentSha256: sha256(documentBytes),
+    assets: [
+      {
+        id: imageId,
+        entry,
+        sha256: hash,
+        byteLength: options.bytes.byteLength,
+        mediaType: manifestMediaType,
+        ...(options.manifestWidthPx === undefined ? {} : { widthPx: options.manifestWidthPx }),
+        ...(options.manifestHeightPx === undefined ? {} : { heightPx: options.manifestHeightPx }),
+      },
+    ],
+    optionalEntries: [],
+  };
+  return encodeStoredZip([
+    { name: 'manifest.json', bytes: Buffer.from(canonicalJson(manifest)) },
+    { name: 'document.json', bytes: documentBytes },
+    { name: entry, bytes: options.bytes },
+  ]);
+};
+
+const syntheticVersionArchive = (
+  containerVersion: number,
+  manifestSchemaVersion: number,
+  documentSchemaVersion: number,
+): Uint8Array => {
+  const document = { ...createNeutralDemoDeck(), schemaVersion: documentSchemaVersion };
+  const documentBytes = Buffer.from(canonicalJson(document));
+  const manifest = {
+    format: 'htmllelujah.deck',
+    containerVersion,
+    documentSchemaVersion: manifestSchemaVersion,
+    documentId: document.id,
+    createdAt: '2026-07-15T12:00:00.000Z',
+    modifiedAt: '2026-07-15T12:00:00.000Z',
+    documentEntry: 'document.json',
+    documentSha256: sha256(documentBytes),
+    assets: [],
+    optionalEntries: [],
+  };
+  return encodeStoredZip([
+    { name: 'manifest.json', bytes: Buffer.from(canonicalJson(manifest)) },
+    { name: 'document.json', bytes: documentBytes },
+  ]);
+};
 
 const directories: string[] = [];
 
@@ -75,6 +236,60 @@ const metadata: TransactionMetadata = {
   timestamp: '2026-07-15T12:00:00.000Z',
 };
 
+describe('bounded image header parser', () => {
+  it('detects PNG, JPEG, and WebP dimensions without decoding pixels', () => {
+    expect(parseImageHeader(pngHeader(640, 480))).toEqual({
+      mediaType: 'image/png',
+      widthPx: 640,
+      heightPx: 480,
+    });
+    expect(parseImageHeader(jpegHeader(1_920, 1_080))).toEqual({
+      mediaType: 'image/jpeg',
+      widthPx: 1_920,
+      heightPx: 1_080,
+    });
+    expect(parseImageHeader(webpExtendedHeader(800, 600))).toEqual({
+      mediaType: 'image/webp',
+      widthPx: 800,
+      heightPx: 600,
+    });
+    expect(parseImageHeader(webpLossyHeader(320, 240))).toEqual({
+      mediaType: 'image/webp',
+      widthPx: 320,
+      heightPx: 240,
+    });
+    expect(parseImageHeader(webpLosslessHeader(1_024, 768))).toEqual({
+      mediaType: 'image/webp',
+      widthPx: 1_024,
+      heightPx: 768,
+    });
+    expect(parseImageHeader(webpExtendedHeader(8_192, 8_192))).toMatchObject({
+      widthPx: 8_192,
+      heightPx: 8_192,
+    });
+  });
+
+  it('rejects malformed headers, oversized edges, and excessive pixel area', () => {
+    expect(() => parseImageHeader(pngHeader(16_385, 1))).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_LIMIT_EXCEEDED' }),
+    );
+    expect(() => parseImageHeader(webpExtendedHeader(10_000, 10_000))).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_LIMIT_EXCEEDED' }),
+    );
+    expect(() => parseImageHeader(Buffer.from([0x89, 0x50, 0x4e, 0x47]))).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+    expect(() => parseImageHeader(Buffer.from('not an image'))).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+    const invalidRiffLength = Uint8Array.from(webpExtendedHeader(320, 240));
+    invalidRiffLength[4] = 0;
+    expect(() => parseImageHeader(invalidRiffLength)).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+  });
+});
+
 describe('.hdeck archive', () => {
   it('round-trips a canonical deck deterministically', () => {
     const document = createNeutralDemoDeck();
@@ -94,8 +309,20 @@ describe('.hdeck archive', () => {
     expect(parsed.archiveSha256).toBe(sha256(first));
   });
 
+  it('distinguishes future container and document schema versions', () => {
+    expect(() => parseHdeckArchive(syntheticVersionArchive(2, 2, 2))).toThrowError(
+      expect.objectContaining({ code: 'UNSUPPORTED_VERSION' }),
+    );
+    expect(() => parseHdeckArchive(syntheticVersionArchive(1, 3, 3))).toThrowError(
+      expect.objectContaining({ code: 'UNSUPPORTED_VERSION' }),
+    );
+    expect(() => parseHdeckArchive(syntheticVersionArchive(1, 2, 3))).toThrowError(
+      expect.objectContaining({ code: 'UNSUPPORTED_VERSION' }),
+    );
+  });
+
   it('stores content-addressed assets and validates document references', () => {
-    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+    const bytes = pngHeader(1, 1);
     const hash = sha256(bytes);
     const document = {
       ...createNeutralDemoDeck(),
@@ -106,6 +333,9 @@ describe('.hdeck archive', () => {
           hash,
           mediaType: 'image/png',
           fileName: 'graph.png',
+          byteLength: bytes.byteLength,
+          widthPx: 1,
+          heightPx: 1,
         },
       ],
     } as DeckDocument;
@@ -125,6 +355,125 @@ describe('.hdeck archive', () => {
     const parsed = parseHdeckArchive(archive);
     expect(parsed.assets.get('40000000-0000-4000-8000-000000000001')).toEqual(bytes);
     expect(parsed.manifest.assets[0]?.entry).toBe(`assets/${hash}.png`);
+  });
+
+  it('does not generate an archive with mislabeled asset input', () => {
+    const bytes = pngHeader(2, 3);
+    const document = {
+      ...createNeutralDemoDeck(),
+      assets: [
+        {
+          id: imageId,
+          kind: 'image',
+          hash: sha256(bytes),
+          mediaType: 'image/jpeg',
+          fileName: 'mislabeled.jpg',
+          byteLength: bytes.byteLength,
+          widthPx: 2,
+          heightPx: 3,
+        },
+      ],
+    } as DeckDocument;
+    expect(() =>
+      createHdeckArchive({
+        document,
+        assets: [
+          {
+            id: imageId,
+            bytes,
+            mediaType: 'image/jpeg',
+            widthPx: 2,
+            heightPx: 3,
+          },
+        ],
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_INVALID' }));
+  });
+
+  it('rejects mislabeled image bytes before exposing an asset', () => {
+    const archive = syntheticAssetArchive({
+      bytes: pngHeader(2, 3),
+      manifestMediaType: 'image/jpeg',
+      documentMediaType: 'image/jpeg',
+      manifestWidthPx: 2,
+      manifestHeightPx: 3,
+      documentWidthPx: 2,
+      documentHeightPx: 3,
+    });
+    expect(() => parseHdeckArchive(archive)).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+  });
+
+  it('rejects manifest dimensions that disagree with image bytes', () => {
+    const archive = syntheticAssetArchive({
+      bytes: pngHeader(2, 3),
+      manifestWidthPx: 2,
+      manifestHeightPx: 4,
+      documentWidthPx: 2,
+      documentHeightPx: 4,
+    });
+    expect(() => parseHdeckArchive(archive)).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+  });
+
+  it('rejects document dimensions that disagree with the manifest and bytes', () => {
+    const archive = syntheticAssetArchive({
+      bytes: pngHeader(2, 3),
+      manifestWidthPx: 2,
+      manifestHeightPx: 3,
+      documentWidthPx: 2,
+      documentHeightPx: 4,
+    });
+    expect(() => parseHdeckArchive(archive)).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+  });
+
+  it('requires both image metadata sources and preserves font assets unchanged', () => {
+    const missingDimensions = syntheticAssetArchive({
+      bytes: pngHeader(2, 3),
+      manifestWidthPx: 2,
+      manifestHeightPx: 3,
+    });
+    expect(() => parseHdeckArchive(missingDimensions)).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+
+    const fontBytes = Buffer.from([0x77, 0x4f, 0x46, 0x32, 0, 0, 0, 0]);
+    const fontArchive = syntheticAssetArchive({
+      bytes: fontBytes,
+      manifestMediaType: 'font/woff2',
+      documentMediaType: 'font/woff2',
+      kind: 'font',
+    });
+    expect(parseHdeckArchive(fontArchive).assets.get(imageId)).toEqual(Uint8Array.from(fontBytes));
+
+    const mislabeledFont = syntheticAssetArchive({
+      bytes: pngHeader(2, 3),
+      manifestMediaType: 'font/woff2',
+      documentMediaType: 'font/woff2',
+      kind: 'font',
+    });
+    expect(() => parseHdeckArchive(mislabeledFont)).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+  });
+
+  it('rejects image bombs even when every declared dimension matches', () => {
+    const archive = syntheticAssetArchive({
+      bytes: webpExtendedHeader(10_000, 10_000),
+      manifestMediaType: 'image/webp',
+      documentMediaType: 'image/webp',
+      manifestWidthPx: 10_000,
+      manifestHeightPx: 10_000,
+      documentWidthPx: 10_000,
+      documentHeightPx: 10_000,
+    });
+    expect(() => parseHdeckArchive(archive)).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_LIMIT_EXCEEDED' }),
+    );
   });
 
   it('rejects traversal names before parsing any document content', () => {

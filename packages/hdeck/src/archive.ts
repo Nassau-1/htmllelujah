@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 
-import { parseDeck, type DeckDocument } from '@htmllelujah/document-core';
+import {
+  CURRENT_DOCUMENT_SCHEMA_VERSION,
+  parseDeck,
+  type DeckDocument,
+} from '@htmllelujah/document-core';
 
 const LOCAL_FILE_SIGNATURE = 0x04034b50;
 const CENTRAL_FILE_SIGNATURE = 0x02014b50;
@@ -41,6 +45,261 @@ export class HdeckError extends Error {
 export type ApprovedImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp';
 export type ApprovedFontMediaType = 'font/woff2';
 export type ApprovedMediaType = ApprovedImageMediaType | ApprovedFontMediaType;
+
+export const IMAGE_HEADER_LIMITS = Object.freeze({
+  maxEdgePx: 16_384,
+  maxPixelArea: 64 * 1024 * 1024,
+  maxHeaderBytes: 1024 * 1024,
+  maxJpegSegments: 4_096,
+});
+
+export interface ParsedImageHeader {
+  readonly mediaType: ApprovedImageMediaType;
+  readonly widthPx: number;
+  readonly heightPx: number;
+}
+
+const imageHeaderInvalid = (message: string): never => {
+  throw new HdeckError('ARCHIVE_INVALID', message);
+};
+
+const requireImageHeaderRange = (
+  bytes: Uint8Array,
+  offset: number,
+  length: number,
+  label: string,
+): void => {
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(length) ||
+    offset < 0 ||
+    length < 0 ||
+    offset + length > bytes.byteLength
+  ) {
+    imageHeaderInvalid(`${label} image header is truncated.`);
+  }
+};
+
+const readUint16BigEndian = (bytes: Uint8Array, offset: number, label: string): number => {
+  requireImageHeaderRange(bytes, offset, 2, label);
+  return ((bytes[offset] ?? 0) << 8) | (bytes[offset + 1] ?? 0);
+};
+
+const readUint16LittleEndian = (bytes: Uint8Array, offset: number, label: string): number => {
+  requireImageHeaderRange(bytes, offset, 2, label);
+  return (bytes[offset] ?? 0) | ((bytes[offset + 1] ?? 0) << 8);
+};
+
+const readUint24LittleEndian = (bytes: Uint8Array, offset: number, label: string): number => {
+  requireImageHeaderRange(bytes, offset, 3, label);
+  return (bytes[offset] ?? 0) | ((bytes[offset + 1] ?? 0) << 8) | ((bytes[offset + 2] ?? 0) << 16);
+};
+
+const readUint32BigEndian = (bytes: Uint8Array, offset: number, label: string): number => {
+  requireImageHeaderRange(bytes, offset, 4, label);
+  return (
+    ((bytes[offset] ?? 0) * 0x1000000 +
+      ((bytes[offset + 1] ?? 0) << 16) +
+      ((bytes[offset + 2] ?? 0) << 8) +
+      (bytes[offset + 3] ?? 0)) >>>
+    0
+  );
+};
+
+const readUint32LittleEndian = (bytes: Uint8Array, offset: number, label: string): number => {
+  requireImageHeaderRange(bytes, offset, 4, label);
+  return (
+    ((bytes[offset] ?? 0) +
+      ((bytes[offset + 1] ?? 0) << 8) +
+      ((bytes[offset + 2] ?? 0) << 16) +
+      (bytes[offset + 3] ?? 0) * 0x1000000) >>>
+    0
+  );
+};
+
+const bytesEqual = (bytes: Uint8Array, offset: number, expected: readonly number[]): boolean =>
+  offset >= 0 &&
+  offset + expected.length <= bytes.byteLength &&
+  expected.every((value, index) => bytes[offset + index] === value);
+
+const asciiEquals = (bytes: Uint8Array, offset: number, value: string): boolean =>
+  bytesEqual(
+    bytes,
+    offset,
+    [...value].map((character) => character.charCodeAt(0)),
+  );
+
+const boundedImageDimensions = (
+  mediaType: ApprovedImageMediaType,
+  widthPx: number,
+  heightPx: number,
+): ParsedImageHeader => {
+  if (
+    !Number.isSafeInteger(widthPx) ||
+    !Number.isSafeInteger(heightPx) ||
+    widthPx < 1 ||
+    heightPx < 1
+  ) {
+    imageHeaderInvalid('Image dimensions are invalid.');
+  }
+  if (
+    widthPx > IMAGE_HEADER_LIMITS.maxEdgePx ||
+    heightPx > IMAGE_HEADER_LIMITS.maxEdgePx ||
+    widthPx * heightPx > IMAGE_HEADER_LIMITS.maxPixelArea
+  ) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'Image dimensions exceed safe limits.');
+  }
+  return { mediaType, widthPx, heightPx };
+};
+
+const parsePngHeader = (bytes: Uint8Array): ParsedImageHeader => {
+  requireImageHeaderRange(bytes, 0, 29, 'PNG');
+  if (readUint32BigEndian(bytes, 8, 'PNG') !== 13 || !asciiEquals(bytes, 12, 'IHDR')) {
+    imageHeaderInvalid('PNG image does not start with a canonical IHDR chunk.');
+  }
+  if ((bytes[26] ?? -1) !== 0 || (bytes[27] ?? -1) !== 0 || (bytes[28] ?? -1) > 1) {
+    imageHeaderInvalid('PNG IHDR encoding fields are invalid.');
+  }
+  const bitDepth = bytes[24] ?? 0;
+  const colorType = bytes[25] ?? -1;
+  const permittedBitDepths =
+    colorType === 0
+      ? [1, 2, 4, 8, 16]
+      : colorType === 2 || colorType === 4 || colorType === 6
+        ? [8, 16]
+        : colorType === 3
+          ? [1, 2, 4, 8]
+          : [];
+  if (!permittedBitDepths.includes(bitDepth)) {
+    imageHeaderInvalid('PNG IHDR color type or bit depth is invalid.');
+  }
+  return boundedImageDimensions(
+    'image/png',
+    readUint32BigEndian(bytes, 16, 'PNG'),
+    readUint32BigEndian(bytes, 20, 'PNG'),
+  );
+};
+
+const JPEG_START_OF_FRAME_MARKERS = new Set([
+  0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+]);
+
+const parseJpegHeader = (bytes: Uint8Array): ParsedImageHeader => {
+  let cursor = 2;
+  let segments = 0;
+  while (cursor < bytes.byteLength && cursor < IMAGE_HEADER_LIMITS.maxHeaderBytes) {
+    if ((bytes[cursor] ?? -1) !== 0xff) {
+      imageHeaderInvalid('JPEG marker stream is invalid.');
+    }
+    while (cursor < bytes.byteLength && bytes[cursor] === 0xff) cursor += 1;
+    if (cursor >= bytes.byteLength) imageHeaderInvalid('JPEG marker is truncated.');
+    const marker = bytes[cursor] ?? 0;
+    cursor += 1;
+    segments += 1;
+    if (segments > IMAGE_HEADER_LIMITS.maxJpegSegments) {
+      throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'JPEG header has too many segments.');
+    }
+    if (marker === 0x00) imageHeaderInvalid('JPEG contains an escaped byte before scan data.');
+    if (marker === 0xd9 || marker === 0xda) {
+      imageHeaderInvalid('JPEG is missing a start-of-frame header.');
+    }
+    if (marker === 0x01 || marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+
+    const segmentLength = readUint16BigEndian(bytes, cursor, 'JPEG');
+    if (segmentLength < 2) imageHeaderInvalid('JPEG segment length is invalid.');
+    const segmentEnd = cursor + segmentLength;
+    requireImageHeaderRange(bytes, cursor, segmentLength, 'JPEG');
+    if (segmentEnd > IMAGE_HEADER_LIMITS.maxHeaderBytes) {
+      throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'JPEG dimensions are too deep in the file.');
+    }
+    if (JPEG_START_OF_FRAME_MARKERS.has(marker)) {
+      if (segmentLength < 8) imageHeaderInvalid('JPEG start-of-frame header is truncated.');
+      const componentCount = bytes[cursor + 7] ?? 0;
+      if (componentCount < 1 || segmentLength !== 8 + componentCount * 3) {
+        imageHeaderInvalid('JPEG start-of-frame component table is invalid.');
+      }
+      return boundedImageDimensions(
+        'image/jpeg',
+        readUint16BigEndian(bytes, cursor + 5, 'JPEG'),
+        readUint16BigEndian(bytes, cursor + 3, 'JPEG'),
+      );
+    }
+    cursor = segmentEnd;
+  }
+  if (cursor >= IMAGE_HEADER_LIMITS.maxHeaderBytes) {
+    throw new HdeckError('ARCHIVE_LIMIT_EXCEEDED', 'JPEG dimensions are too deep in the file.');
+  }
+  return imageHeaderInvalid('JPEG is missing a start-of-frame header.');
+};
+
+const parseWebpHeader = (bytes: Uint8Array): ParsedImageHeader => {
+  requireImageHeaderRange(bytes, 0, 20, 'WebP');
+  const riffLength = readUint32LittleEndian(bytes, 4, 'WebP') + 8;
+  if (riffLength !== bytes.byteLength) {
+    imageHeaderInvalid('WebP RIFF length does not match the asset bytes.');
+  }
+  const chunkLength = readUint32LittleEndian(bytes, 16, 'WebP');
+  if (20 + chunkLength > bytes.byteLength) {
+    imageHeaderInvalid('WebP image chunk is truncated.');
+  }
+  if (asciiEquals(bytes, 12, 'VP8X')) {
+    if (chunkLength !== 10) imageHeaderInvalid('WebP VP8X header length is invalid.');
+    if (((bytes[20] ?? 0) & 0xc1) !== 0 || bytes[21] !== 0 || bytes[22] !== 0 || bytes[23] !== 0) {
+      imageHeaderInvalid('WebP VP8X reserved fields are invalid.');
+    }
+    return boundedImageDimensions(
+      'image/webp',
+      readUint24LittleEndian(bytes, 24, 'WebP') + 1,
+      readUint24LittleEndian(bytes, 27, 'WebP') + 1,
+    );
+  }
+  if (asciiEquals(bytes, 12, 'VP8 ')) {
+    if (
+      chunkLength < 10 ||
+      ((bytes[20] ?? 1) & 1) !== 0 ||
+      !bytesEqual(bytes, 23, [0x9d, 0x01, 0x2a])
+    ) {
+      imageHeaderInvalid('WebP VP8 frame header is invalid.');
+    }
+    return boundedImageDimensions(
+      'image/webp',
+      readUint16LittleEndian(bytes, 26, 'WebP') & 0x3fff,
+      readUint16LittleEndian(bytes, 28, 'WebP') & 0x3fff,
+    );
+  }
+  if (asciiEquals(bytes, 12, 'VP8L')) {
+    if (chunkLength < 5 || bytes[20] !== 0x2f || ((bytes[24] ?? 0) & 0xe0) !== 0) {
+      imageHeaderInvalid('WebP VP8L frame header is invalid.');
+    }
+    const byteOne = bytes[21] ?? 0;
+    const byteTwo = bytes[22] ?? 0;
+    const byteThree = bytes[23] ?? 0;
+    const byteFour = bytes[24] ?? 0;
+    return boundedImageDimensions(
+      'image/webp',
+      1 + byteOne + ((byteTwo & 0x3f) << 8),
+      1 + (byteTwo >>> 6) + (byteThree << 2) + ((byteFour & 0x0f) << 10),
+    );
+  }
+  return imageHeaderInvalid('WebP first image chunk is unsupported.');
+};
+
+/**
+ * Reads only bounded container/frame headers and never decodes image pixels.
+ * The returned dimensions are safe to allocate or hand to a renderer under the V1 limits.
+ */
+export const parseImageHeader = (bytes: Uint8Array): ParsedImageHeader => {
+  if (bytesEqual(bytes, 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) {
+    return parsePngHeader(bytes);
+  }
+  if (bytesEqual(bytes, 0, [0xff, 0xd8])) return parseJpegHeader(bytes);
+  if (asciiEquals(bytes, 0, 'RIFF') && asciiEquals(bytes, 8, 'WEBP')) {
+    return parseWebpHeader(bytes);
+  }
+  return imageHeaderInvalid('Image signature is unsupported or truncated.');
+};
+
+const hasWoff2Signature = (bytes: Uint8Array): boolean => asciiEquals(bytes, 0, 'wOF2');
 
 export interface ManifestAsset {
   readonly id: string;
@@ -587,6 +846,29 @@ export const createHdeckArchive = (input: CreateHdeckInput): Uint8Array => {
     if (assetHashes.has(hash))
       throw new HdeckError('ARCHIVE_INVALID', 'Asset bytes are duplicated.');
     assetHashes.add(hash);
+    if (asset.mediaType === 'font/woff2') {
+      if (
+        !hasWoff2Signature(asset.bytes) ||
+        asset.widthPx !== undefined ||
+        asset.heightPx !== undefined
+      ) {
+        throw new HdeckError('ARCHIVE_INVALID', 'Font asset metadata is invalid.');
+      }
+    } else {
+      const parsedImage = parseImageHeader(asset.bytes);
+      if (
+        parsedImage.mediaType !== asset.mediaType ||
+        asset.widthPx === undefined ||
+        asset.heightPx === undefined ||
+        asset.widthPx !== parsedImage.widthPx ||
+        asset.heightPx !== parsedImage.heightPx
+      ) {
+        throw new HdeckError(
+          'ARCHIVE_INVALID',
+          'Image signature or dimensions do not match supplied metadata.',
+        );
+      }
+    }
     const entry = `assets/${hash}.${extensionForMediaType(asset.mediaType)}`;
     entries.push({ name: entry, bytes: asset.bytes });
     const originalName = safeOriginalName(asset.originalName);
@@ -611,7 +893,14 @@ export const createHdeckArchive = (input: CreateHdeckInput): Uint8Array => {
     if (
       declared === undefined ||
       declared.hash !== asset.sha256 ||
-      declared.mediaType !== asset.mediaType
+      declared.mediaType !== asset.mediaType ||
+      (asset.mediaType === 'font/woff2'
+        ? declared.kind !== 'font' ||
+          declared.widthPx !== undefined ||
+          declared.heightPx !== undefined
+        : declared.kind !== 'image' ||
+          declared.widthPx !== asset.widthPx ||
+          declared.heightPx !== asset.heightPx)
     ) {
       throw new HdeckError(
         'HASH_MISMATCH',
@@ -673,12 +962,24 @@ export const parseHdeckArchive = (archive: Uint8Array): ParsedHdeck => {
   const manifest = parseManifest(
     parseJsonEntry(manifestBytes, HDECK_LIMITS.maxManifestBytes, 'Manifest'),
   );
+  if (manifest.documentSchemaVersion > CURRENT_DOCUMENT_SCHEMA_VERSION) {
+    throw new HdeckError('UNSUPPORTED_VERSION', 'Document schema version is unsupported.');
+  }
   if (manifest.documentSha256 !== sha256(documentBytes)) {
     throw new HdeckError('HASH_MISMATCH', 'Document hash does not match the manifest.');
   }
   let document: DeckDocument;
   try {
-    document = parseDeck(parseJsonEntry(documentBytes, HDECK_LIMITS.maxDocumentBytes, 'Document'));
+    const documentInput = parseJsonEntry(documentBytes, HDECK_LIMITS.maxDocumentBytes, 'Document');
+    if (
+      isRecord(documentInput) &&
+      typeof documentInput.schemaVersion === 'number' &&
+      Number.isSafeInteger(documentInput.schemaVersion) &&
+      documentInput.schemaVersion > CURRENT_DOCUMENT_SCHEMA_VERSION
+    ) {
+      throw new HdeckError('UNSUPPORTED_VERSION', 'Document schema version is unsupported.');
+    }
+    document = parseDeck(documentInput);
   } catch (error) {
     if (error instanceof HdeckError) throw error;
     throw new HdeckError('DOCUMENT_INVALID', 'Document model is invalid.');
@@ -693,6 +994,10 @@ export const parseHdeckArchive = (archive: Uint8Array): ParsedHdeck => {
   const declaredEntries = new Set(['manifest.json', 'document.json']);
   const assets = new Map<string, Uint8Array>();
   const declaredAssetIds = new Set<string>();
+  const documentAssets = new Map(document.assets.map((asset) => [asset.id, asset]));
+  if (documentAssets.size !== manifest.assets.length) {
+    throw new HdeckError('ASSET_MISSING', 'Document and manifest asset lists differ.');
+  }
   for (const asset of manifest.assets) {
     if (declaredAssetIds.has(asset.id) || declaredEntries.has(asset.entry)) {
       throw new HdeckError('ARCHIVE_INVALID', 'Manifest declares a duplicate asset.');
@@ -708,6 +1013,50 @@ export const parseHdeckArchive = (archive: Uint8Array): ParsedHdeck => {
     const expectedEntry = `assets/${asset.sha256}.${extensionForMediaType(asset.mediaType)}`;
     if (asset.entry !== expectedEntry) {
       throw new HdeckError('ARCHIVE_INVALID', 'Asset entry is not content-addressed.');
+    }
+    const reference = documentAssets.get(asset.id);
+    if (
+      reference === undefined ||
+      reference.hash !== asset.sha256 ||
+      reference.mediaType !== asset.mediaType
+    ) {
+      throw new HdeckError(
+        'HASH_MISMATCH',
+        'Document asset reference does not match the manifest.',
+      );
+    }
+    if (asset.mediaType === 'font/woff2') {
+      if (
+        !hasWoff2Signature(bytes) ||
+        reference.kind !== 'font' ||
+        asset.widthPx !== undefined ||
+        asset.heightPx !== undefined ||
+        reference.widthPx !== undefined ||
+        reference.heightPx !== undefined
+      ) {
+        throw new HdeckError('ARCHIVE_INVALID', 'Font asset metadata is invalid.');
+      }
+    } else {
+      if (reference.kind !== 'image') {
+        throw new HdeckError('ARCHIVE_INVALID', 'Image asset kind is invalid.');
+      }
+      const parsedImage = parseImageHeader(bytes);
+      if (
+        parsedImage.mediaType !== asset.mediaType ||
+        asset.widthPx === undefined ||
+        asset.heightPx === undefined ||
+        reference.widthPx === undefined ||
+        reference.heightPx === undefined ||
+        asset.widthPx !== parsedImage.widthPx ||
+        asset.heightPx !== parsedImage.heightPx ||
+        reference.widthPx !== parsedImage.widthPx ||
+        reference.heightPx !== parsedImage.heightPx
+      ) {
+        throw new HdeckError(
+          'ARCHIVE_INVALID',
+          'Image signature or dimensions do not match declared metadata.',
+        );
+      }
     }
     assets.set(asset.id, bytes);
   }
@@ -728,23 +1077,6 @@ export const parseHdeckArchive = (archive: Uint8Array): ParsedHdeck => {
   for (const entryName of entries.keys()) {
     if (!declaredEntries.has(entryName)) {
       throw new HdeckError('ENTRY_UNDECLARED', 'Archive contains an undeclared entry.');
-    }
-  }
-  const documentAssets = new Map(document.assets.map((asset) => [asset.id, asset]));
-  if (documentAssets.size !== manifest.assets.length) {
-    throw new HdeckError('ASSET_MISSING', 'Document and manifest asset lists differ.');
-  }
-  for (const asset of manifest.assets) {
-    const reference = documentAssets.get(asset.id);
-    if (
-      reference === undefined ||
-      reference.hash !== asset.sha256 ||
-      reference.mediaType !== asset.mediaType
-    ) {
-      throw new HdeckError(
-        'HASH_MISMATCH',
-        'Document asset reference does not match the manifest.',
-      );
     }
   }
   return { manifest, document, assets, archiveSha256: sha256(archive) };
