@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import type { DocumentCommand } from '@htmllelujah/document-core';
+import { createDefaultDeck, type DocumentCommand } from '@htmllelujah/document-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -65,6 +65,56 @@ describe('MCP destructive command classification', () => {
       expect(commandsRequireApproval([command]), command.type).toBe(true);
     }
     expect(commandsRequireApproval([{ type: 'deck.rename', name: 'Safe rename' }])).toBe(false);
+  });
+
+  it('fails closed for complete replacements that can silently remove nested content', () => {
+    const deck = createDefaultDeck();
+    const master = deck.masters[0];
+    const layout = deck.layouts[0];
+    if (master === undefined || layout === undefined) throw new Error('Missing default styles.');
+
+    const replacementCommands: readonly DocumentCommand[] = [
+      {
+        type: 'master.update',
+        masterId: master.id,
+        replacement: { ...master, elements: [] },
+      },
+      {
+        type: 'layout.update',
+        layoutId: layout.id,
+        replacement: { ...layout, elements: [] },
+      },
+      {
+        type: 'element.update',
+        slideId,
+        elementId: proposalId,
+        replacement: {
+          type: 'group',
+          id: proposalId,
+          name: 'Replacement group',
+          frame: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 100, rotationDeg: 0 },
+          opacity: 1,
+          visible: true,
+          locked: false,
+          coordinateSpace: { widthPt: 200, heightPt: 100 },
+          children: [],
+        },
+      },
+    ];
+
+    for (const command of replacementCommands) {
+      expect(commandsRequireApproval([command]), command.type).toBe(true);
+    }
+    expect(
+      commandsRequireApproval([
+        {
+          type: 'element.update-style',
+          slideId,
+          elementId: proposalId,
+          patch: { kind: 'text', opacity: 0.8 },
+        },
+      ]),
+    ).toBe(false);
   });
 });
 
@@ -293,6 +343,77 @@ describe('authenticated local RPC', () => {
     await expect(new LocalRpcClient(descriptorPath).appStatus()).rejects.toMatchObject({
       code: 'SERVICE_UNAVAILABLE',
     });
+  });
+
+  it('rotates an expiring descriptor and secret while preserving established clients', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v1.json');
+    const staleDescriptorPath = path.join(directory, 'expired-endpoint-v1.json');
+    const server = await startLocalRpcServer({
+      service: createService(),
+      descriptorPath,
+      lifetimeMs: 300,
+      rotationLeadMs: 150,
+    });
+    const firstDescriptor = JSON.parse(await readFile(descriptorPath, 'utf8')) as {
+      readonly instanceId: string;
+      readonly secret: string;
+      readonly pipeName: string;
+      readonly createdAt: string;
+      readonly expiresAt: string;
+    };
+    await writeFile(staleDescriptorPath, JSON.stringify(firstDescriptor), 'utf8');
+    const establishedClient = new LocalRpcClient(descriptorPath);
+    let freshClient: LocalRpcClient | undefined;
+    try {
+      await expect(establishedClient.appStatus()).resolves.toMatchObject({ running: true });
+      await vi.waitFor(
+        async () => {
+          const current = JSON.parse(await readFile(descriptorPath, 'utf8')) as {
+            readonly instanceId: string;
+          };
+          expect(current.instanceId).not.toBe(firstDescriptor.instanceId);
+        },
+        { timeout: 3_000, interval: 20 },
+      );
+      await vi.waitFor(
+        () => expect(Date.now()).toBeGreaterThan(Date.parse(firstDescriptor.expiresAt)),
+        {
+          timeout: 3_000,
+          interval: 20,
+        },
+      );
+
+      const currentDescriptor = JSON.parse(await readFile(descriptorPath, 'utf8')) as {
+        readonly instanceId: string;
+        readonly secret: string;
+        readonly pipeName: string;
+        readonly createdAt: string;
+        readonly expiresAt: string;
+      };
+      expect(currentDescriptor).toMatchObject({ pipeName: firstDescriptor.pipeName });
+      expect(currentDescriptor.instanceId).not.toBe(firstDescriptor.instanceId);
+      expect(currentDescriptor.secret).not.toBe(firstDescriptor.secret);
+      expect(Date.parse(currentDescriptor.createdAt)).toBeGreaterThan(
+        Date.parse(firstDescriptor.createdAt),
+      );
+      expect(Date.parse(currentDescriptor.expiresAt)).toBeGreaterThan(Date.now());
+      expect(server.descriptor).toMatchObject({
+        instanceId: currentDescriptor.instanceId,
+        secret: currentDescriptor.secret,
+      });
+
+      await expect(establishedClient.appStatus()).resolves.toMatchObject({ running: true });
+      freshClient = new LocalRpcClient(descriptorPath);
+      await expect(freshClient.appStatus()).resolves.toMatchObject({ running: true });
+      await expect(new LocalRpcClient(staleDescriptorPath).appStatus()).rejects.toMatchObject({
+        code: 'SERVICE_UNAVAILABLE',
+      });
+    } finally {
+      await establishedClient.close();
+      await freshClient?.close();
+      await server.close();
+    }
   });
 
   it('routes permission decisions and consumes approvals exactly once', async () => {

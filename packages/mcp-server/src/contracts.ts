@@ -95,6 +95,12 @@ const APPROVAL_REQUIRED_COMMANDS = new Set<DocumentCommand['type']>([
   'slide.set-layout',
   'slide.reset-placeholder',
   'deck.set-page',
+  // These commands carry complete replacement values. Without the previous
+  // document, this boundary cannot prove that nested elements or group
+  // children were preserved, so MCP must classify them as destructive.
+  'master.update',
+  'layout.update',
+  'element.update',
 ]);
 
 export const commandsRequireApproval = (commands: readonly DocumentCommand[]): boolean =>

@@ -90,6 +90,29 @@ describe('DesktopMcpBridge', () => {
       expect.objectContaining({ actorId: 'mcp-local-agent', transactionId: renamed.transactionId }),
     ]);
 
+    const beforeReplacement = runtime.getSnapshot(source.sessionId);
+    const layout = beforeReplacement.document.layouts[0];
+    if (layout === undefined) throw new Error('Missing default layout.');
+    const replacementProposal = await bridge.proposeCommands({
+      documentId: source.documentId,
+      expectedRevision: beforeReplacement.revision,
+      label: 'Submit complete layout replacement',
+      commands: [
+        {
+          type: 'layout.update',
+          layoutId: layout.id,
+          replacement: layout,
+        },
+      ],
+    });
+    expect(replacementProposal.requiresApproval).toBe(true);
+    await expect(
+      bridge.commitProposal({ proposalId: replacementProposal.proposalId }),
+    ).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
+    expect(runtime.getSnapshot(source.sessionId).document.layouts[0]?.elements).toHaveLength(
+      layout.elements.length,
+    );
+
     const beforePage = runtime.getSnapshot(source.sessionId);
     const destructive = await bridge.proposeCommands({
       documentId: source.documentId,

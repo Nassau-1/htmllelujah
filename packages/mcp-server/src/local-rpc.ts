@@ -38,6 +38,9 @@ const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 const AUTH_TIMEOUT_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_REQUESTS_PER_MINUTE = 120;
+const DEFAULT_DESCRIPTOR_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_ROTATION_LEAD_MS = 5 * 60 * 1000;
+const MIN_DESCRIPTOR_LIFETIME_MS = 100;
 
 export interface LocalRpcEndpointDescriptor {
   readonly protocolVersion: 1;
@@ -296,7 +299,7 @@ const handleServerSocket = (
   socket: Socket,
   service: HtmllelujahMcpService,
   permissions: McpPermissionGate,
-  secret: string,
+  resolveSecret: (instanceId: string) => string | undefined,
   usedNonces: Set<string>,
 ): void => {
   socket.setNoDelay(true);
@@ -304,6 +307,7 @@ const handleServerSocket = (
   let state: 'hello' | 'authenticate' | 'ready' = 'hello';
   let clientNonce = '';
   let serverNonce = '';
+  let connectionSecret: string | undefined;
   let requestWindowStarted = Date.now();
   let requestCount = 0;
 
@@ -311,12 +315,19 @@ const handleServerSocket = (
     if (state === 'hello') {
       if (
         !isRecord(value) ||
-        Object.keys(value).some((key) => !['type', 'clientNonce'].includes(key)) ||
+        Object.keys(value).length !== 3 ||
+        Object.keys(value).some((key) => !['type', 'clientNonce', 'instanceId'].includes(key)) ||
         value.type !== 'hello' ||
         typeof value.clientNonce !== 'string' ||
         !/^[0-9a-f]{64}$/u.test(value.clientNonce) ||
+        typeof value.instanceId !== 'string' ||
         usedNonces.has(value.clientNonce)
       ) {
+        socket.destroy();
+        return;
+      }
+      connectionSecret = resolveSecret(value.instanceId);
+      if (connectionSecret === undefined) {
         socket.destroy();
         return;
       }
@@ -324,13 +335,17 @@ const handleServerSocket = (
       usedNonces.add(clientNonce);
       if (usedNonces.size > 4096) usedNonces.delete(usedNonces.values().next().value ?? '');
       serverNonce = randomBytes(32).toString('hex');
-      const proof = hmac(secret, `server|${transcript(clientNonce, serverNonce)}`);
+      const proof = hmac(connectionSecret, `server|${transcript(clientNonce, serverNonce)}`);
       writeFrame(socket, { type: 'challenge', serverNonce, proof });
       state = 'authenticate';
       return;
     }
     if (state === 'authenticate') {
-      const expected = hmac(secret, `client|${transcript(clientNonce, serverNonce)}`);
+      if (connectionSecret === undefined) {
+        socket.destroy();
+        return;
+      }
+      const expected = hmac(connectionSecret, `client|${transcript(clientNonce, serverNonce)}`);
       if (
         !isRecord(value) ||
         Object.keys(value).some((key) => !['type', 'proof'].includes(key)) ||
@@ -456,23 +471,49 @@ export const startLocalRpcServer = async (input: {
   readonly permissions?: McpPermissionGate | undefined;
   readonly descriptorPath: string;
   readonly lifetimeMs?: number | undefined;
+  readonly rotationLeadMs?: number | undefined;
 }): Promise<LocalRpcServerHandle> => {
   if (!path.isAbsolute(input.descriptorPath)) {
     throw new McpSafeError('INVALID_REQUEST', 'Endpoint descriptor path must be absolute.');
   }
-  const secret = randomBytes(32).toString('hex');
+  const lifetimeMs = input.lifetimeMs ?? DEFAULT_DESCRIPTOR_LIFETIME_MS;
+  const rotationLeadMs =
+    input.rotationLeadMs ?? Math.min(DEFAULT_ROTATION_LEAD_MS, Math.floor(lifetimeMs / 2));
+  if (
+    !Number.isSafeInteger(lifetimeMs) ||
+    lifetimeMs < MIN_DESCRIPTOR_LIFETIME_MS ||
+    !Number.isSafeInteger(rotationLeadMs) ||
+    rotationLeadMs <= 0 ||
+    rotationLeadMs >= lifetimeMs
+  ) {
+    throw new McpSafeError('INVALID_REQUEST', 'Endpoint rotation timing is invalid.');
+  }
   const pipeName = endpointPath();
-  const createdAt = new Date();
-  const descriptor: LocalRpcEndpointDescriptor = {
-    protocolVersion: 1,
-    pipeName,
-    secret,
-    instanceId: randomUUID(),
-    pid: process.pid,
-    createdAt: createdAt.toISOString(),
-    expiresAt: new Date(
-      createdAt.getTime() + (input.lifetimeMs ?? 24 * 60 * 60 * 1000),
-    ).toISOString(),
+  const createDescriptor = (): LocalRpcEndpointDescriptor => {
+    const createdAtMs = Date.now();
+    return {
+      protocolVersion: 1,
+      pipeName,
+      secret: randomBytes(32).toString('hex'),
+      instanceId: randomUUID(),
+      pid: process.pid,
+      createdAt: new Date(createdAtMs).toISOString(),
+      expiresAt: new Date(createdAtMs + lifetimeMs).toISOString(),
+    };
+  };
+  let descriptor = createDescriptor();
+  const credentials = new Map<string, { readonly secret: string; readonly expiresAtMs: number }>([
+    [
+      descriptor.instanceId,
+      { secret: descriptor.secret, expiresAtMs: Date.parse(descriptor.expiresAt) },
+    ],
+  ]);
+  const resolveSecret = (instanceId: string): string | undefined => {
+    const now = Date.now();
+    for (const [candidateId, credential] of credentials) {
+      if (credential.expiresAtMs <= now) credentials.delete(candidateId);
+    }
+    return credentials.get(instanceId)?.secret;
   };
   const usedNonces = new Set<string>();
   const sockets = new Set<Socket>();
@@ -480,7 +521,7 @@ export const startLocalRpcServer = async (input: {
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
-    handleServerSocket(socket, input.service, permissions, secret, usedNonces);
+    handleServerSocket(socket, input.service, permissions, resolveSecret, usedNonces);
   });
   await listen(server, pipeName);
   try {
@@ -491,14 +532,54 @@ export const startLocalRpcServer = async (input: {
     throw error;
   }
   let closed = false;
+  let rotationTimer: ReturnType<typeof setTimeout> | undefined;
+  let rotationTask: Promise<void> | undefined;
+  const rotationDelayMs = lifetimeMs - rotationLeadMs;
+  const scheduleRotation = (delayMs: number): void => {
+    if (closed) return;
+    rotationTimer = setTimeout(() => {
+      rotationTimer = undefined;
+      const task = (async () => {
+        const replacement = createDescriptor();
+        credentials.set(replacement.instanceId, {
+          secret: replacement.secret,
+          expiresAtMs: Date.parse(replacement.expiresAt),
+        });
+        try {
+          await writeDescriptorAtomic(input.descriptorPath, replacement);
+        } catch (error) {
+          credentials.delete(replacement.instanceId);
+          throw error;
+        }
+        descriptor = replacement;
+      })();
+      rotationTask = task;
+      void task
+        .then(() => scheduleRotation(rotationDelayMs))
+        .catch(() => {
+          const remainingMs = Date.parse(descriptor.expiresAt) - Date.now();
+          const retryMs = Math.max(50, Math.min(1_000, Math.floor(remainingMs / 2)));
+          scheduleRotation(retryMs);
+        })
+        .finally(() => {
+          if (rotationTask === task) rotationTask = undefined;
+        });
+    }, delayMs);
+    rotationTimer.unref?.();
+  };
+  scheduleRotation(rotationDelayMs);
   return {
-    descriptor,
+    get descriptor() {
+      return descriptor;
+    },
     get connectionCount() {
       return sockets.size;
     },
     async close() {
       if (closed) return;
       closed = true;
+      if (rotationTimer !== undefined) clearTimeout(rotationTimer);
+      await rotationTask?.catch(() => undefined);
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await removeDescriptorIfOwned(input.descriptorPath, descriptor);
@@ -689,7 +770,7 @@ export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate 
           socket.destroy();
         }
       });
-      writeFrame(socket, { type: 'hello', clientNonce });
+      writeFrame(socket, { type: 'hello', clientNonce, instanceId: descriptor.instanceId });
     });
     socket.once('close', () => this.rejectAll());
     socket.once('error', () => this.rejectAll());
