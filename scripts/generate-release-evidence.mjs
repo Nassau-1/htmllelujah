@@ -245,7 +245,6 @@ async function latestSourceInput() {
   const roots = [
     path.join(REPO_ROOT, 'apps', 'desktop', 'src'),
     path.join(REPO_ROOT, 'apps', 'desktop', 'assets'),
-    path.join(REPO_ROOT, 'apps', 'desktop', 'scripts'),
     path.join(REPO_ROOT, 'apps', 'desktop', 'dist'),
     path.join(REPO_ROOT, 'apps', 'desktop', 'dist-electron'),
     path.join(REPO_ROOT, 'packages'),
@@ -255,6 +254,7 @@ async function latestSourceInput() {
     path.join(REPO_ROOT, 'pnpm-lock.yaml'),
     path.join(REPO_ROOT, 'pnpm-workspace.yaml'),
     path.join(REPO_ROOT, 'apps', 'desktop', 'package.json'),
+    path.join(REPO_ROOT, 'apps', 'desktop', 'scripts', 'apply-fuses.mjs'),
     path.join(REPO_ROOT, 'apps', 'desktop', 'vite.config.ts'),
   ];
   let newest = { mtimeMs: 0, path: null };
