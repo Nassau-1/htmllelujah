@@ -61,8 +61,8 @@ importers:
   packages/document-core:
     dependencies:
       zod:
-        specifier: 4.1.12
-        version: 4.1.12
+        specifier: 4.4.3
+        version: 4.4.3
     devDependencies:
       typescript:
         specifier: 7.0.2
@@ -1414,8 +1414,8 @@ packages:
     resolution: {integrity: sha512-YgvUTfwqyc7UXVMrB+SImsVYSmTS8X/tSrtdNZMImM+n7+QTriRXyXim0mBrTXNeqzVF0KWGgHPeiyViFFrNDw==}
     engines: {node: '>=18'}
 
-  zod@4.1.12:
-    resolution: {integrity: sha512-JInaHOamG8pt5+Ey8kGmdcAcg3OL9reK8ltczgHTAwNhMys/6ThXHityHxVV2p3fkw/c+MAvBHFVYHFZDmjMCQ==}
+  zod@4.4.3:
+    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
 
 snapshots:
 
@@ -2642,4 +2642,4 @@ snapshots:
 
   yallist@5.0.0: {}
 
-  zod@4.1.12: {}
+  zod@4.4.3: {}

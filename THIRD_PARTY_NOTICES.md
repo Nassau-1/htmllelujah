@@ -23,7 +23,7 @@ remain governed by their own licenses.
 | `vite`                        |          8.1.4 | MIT          | Development and production builds          |
 | `vite-plugin-electron`        |          1.1.0 | MIT          | Desktop-process build integration          |
 | `vitest`                      |         4.1.10 | MIT          | Automated testing                          |
-| `zod`                         |         4.1.12 | MIT          | Runtime validation for structured data     |
+| `zod`                         |          4.4.3 | MIT          | Runtime validation for structured data     |
 
 Canonical license texts are distributed with installed packages. Release builds
 must include all notices required by their resolved dependency graph.
