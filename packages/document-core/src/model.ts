@@ -20,6 +20,16 @@ export interface ColorTokens {
   readonly accent: string;
 }
 
+export type BackgroundStyle =
+  | Readonly<{ type: 'theme' }>
+  | Readonly<{ type: 'solid'; color: string }>
+  | Readonly<{
+      type: 'image';
+      assetId: string;
+      fit: 'contain' | 'cover' | 'fill';
+      opacity: number;
+    }>;
+
 export type TextStyleRole = 'title' | 'subtitle' | 'body' | 'caption' | 'label' | 'quote';
 
 export type TextAlignment = 'left' | 'center' | 'right' | 'justify';
@@ -57,6 +67,9 @@ export interface TextMarks {
   readonly underline: boolean;
   readonly strikethrough: boolean;
   readonly color?: string | undefined;
+  readonly fontFamily?: string | undefined;
+  readonly fontSizePt?: number | undefined;
+  readonly fontWeight?: number | undefined;
 }
 
 export interface TextRun {
@@ -98,6 +111,24 @@ export interface RichTextDocument {
   readonly blocks: readonly TextBlock[];
 }
 
+export interface TextStyleOverrides {
+  readonly fontFamily?: string | undefined;
+  readonly fontSizePt?: number | undefined;
+  readonly fontWeight?: number | undefined;
+  readonly italic?: boolean | undefined;
+  readonly color?: string | undefined;
+  readonly alignment?: TextAlignment | undefined;
+  readonly lineHeight?: number | undefined;
+  readonly letterSpacingPt?: number | undefined;
+}
+
+export type PlaceholderOverride = 'frame' | 'style' | 'visibility';
+
+export interface PlaceholderBinding {
+  readonly placeholderId: string;
+  readonly overrides: readonly PlaceholderOverride[];
+}
+
 export interface BaseElement {
   readonly id: string;
   readonly name: string;
@@ -105,6 +136,7 @@ export interface BaseElement {
   readonly opacity: number;
   readonly visible: boolean;
   readonly locked: boolean;
+  readonly placeholderBinding?: PlaceholderBinding | undefined;
 }
 
 export interface TextElement extends BaseElement {
@@ -112,6 +144,7 @@ export interface TextElement extends BaseElement {
   readonly styleRole: TextStyleRole;
   readonly verticalAlignment: 'top' | 'middle' | 'bottom';
   readonly content: RichTextDocument;
+  readonly style?: TextStyleOverrides | undefined;
 }
 
 export interface ImageCrop {
@@ -134,6 +167,7 @@ export interface TableCellStyle {
   readonly textColor: string;
   readonly horizontalAlignment: TextAlignment;
   readonly verticalAlignment: 'top' | 'middle' | 'bottom';
+  readonly paddingPt?: number | undefined;
 }
 
 export interface TableCell {
@@ -151,6 +185,13 @@ export interface TableBorder {
   readonly widthPt: number;
 }
 
+export interface TableStyle {
+  readonly fill?: string | null | undefined;
+  readonly headerFill?: string | null | undefined;
+  readonly bandedRows?: boolean | undefined;
+  readonly cellPaddingPt?: number | undefined;
+}
+
 export interface TableElement extends BaseElement {
   readonly type: 'table';
   readonly rowCount: number;
@@ -159,6 +200,7 @@ export interface TableElement extends BaseElement {
   readonly columnWidthsPt: readonly number[];
   readonly cells: readonly TableCell[];
   readonly border: TableBorder;
+  readonly style?: TableStyle | undefined;
 }
 
 export type ShapeKind =
@@ -170,12 +212,21 @@ export interface StrokeStyle {
   readonly dash: 'solid' | 'dash' | 'dot';
 }
 
+export interface ShadowStyle {
+  readonly color: string;
+  readonly blurPt: number;
+  readonly offsetXPt: number;
+  readonly offsetYPt: number;
+  readonly opacity: number;
+}
+
 export interface ShapeElement extends BaseElement {
   readonly type: 'shape';
   readonly shape: ShapeKind;
   readonly fill: string | null;
   readonly stroke: StrokeStyle;
   readonly cornerRadiusPt: number;
+  readonly shadow?: ShadowStyle | undefined;
 }
 
 export interface ConnectorBinding {
@@ -214,6 +265,7 @@ export interface PlaceholderElement extends BaseElement {
   readonly role: PlaceholderRole;
   readonly accepts: readonly ('text' | 'image' | 'table' | 'shape' | 'icon')[];
   readonly prompt: string;
+  readonly defaultTextStyle?: TextStyleOverrides | undefined;
 }
 
 export interface GroupElement extends BaseElement {
@@ -242,6 +294,7 @@ export interface Master {
   readonly themeId: string;
   readonly elements: readonly Element[];
   readonly guides: readonly Guide[];
+  readonly background?: BackgroundStyle | undefined;
 }
 
 export interface Layout {
@@ -250,6 +303,7 @@ export interface Layout {
   readonly masterId: string;
   readonly elements: readonly Element[];
   readonly guides: readonly Guide[];
+  readonly background?: BackgroundStyle | undefined;
 }
 
 export interface Slide {
@@ -257,6 +311,7 @@ export interface Slide {
   readonly name: string;
   readonly layoutId: string;
   readonly hidden: boolean;
+  readonly background?: BackgroundStyle | undefined;
   /** Array order is the canonical back-to-front stacking order. */
   readonly elements: readonly Element[];
 }
@@ -269,10 +324,34 @@ export interface AssetRef {
   readonly hash: string;
   readonly mediaType: string;
   readonly fileName: string;
+  readonly byteLength?: number | undefined;
+  readonly widthPx?: number | undefined;
+  readonly heightPx?: number | undefined;
 }
 
-export interface DeckDocument {
-  readonly schemaVersion: 1;
+export interface DocumentMetadata {
+  readonly createdAt: string;
+  readonly modifiedAt: string;
+  readonly locale: string;
+  readonly creator?: string | undefined;
+  readonly iconCatalogVersion: string;
+  readonly flagCatalogVersion: string;
+}
+
+export interface GridSettings {
+  readonly enabled: boolean;
+  readonly spacingPt: number;
+  readonly snapToGrid: boolean;
+  readonly snapToObjects: boolean;
+}
+
+export interface DocumentSettings {
+  readonly grid: GridSettings;
+  readonly defaultBackground: BackgroundStyle;
+  readonly includeHiddenSlidesInExport: boolean;
+}
+
+interface DeckDocumentBase {
   readonly id: string;
   readonly name: string;
   readonly page: PageSize;
@@ -282,6 +361,46 @@ export interface DeckDocument {
   readonly slides: readonly Slide[];
   readonly assets: readonly AssetRef[];
 }
+
+export interface DeckDocumentV1 extends DeckDocumentBase {
+  readonly schemaVersion: 1;
+}
+
+export interface DeckDocument extends DeckDocumentBase {
+  readonly schemaVersion: 2;
+  readonly metadata: DocumentMetadata;
+  readonly settings: DocumentSettings;
+}
+
+export type DeckDocumentInput = DeckDocumentV1 | DeckDocument;
+
+export interface CommonElementStylePatch {
+  readonly opacity?: number | undefined;
+}
+
+export interface TextElementStylePatch extends CommonElementStylePatch {
+  readonly kind: 'text';
+  readonly style?: TextStyleOverrides | undefined;
+  readonly verticalAlignment?: TextElement['verticalAlignment'] | undefined;
+  readonly styleRole?: TextStyleRole | undefined;
+}
+
+export interface ShapeElementStylePatch extends CommonElementStylePatch {
+  readonly kind: 'shape';
+  readonly fill?: string | null | undefined;
+  readonly stroke?: StrokeStyle | undefined;
+  readonly cornerRadiusPt?: number | undefined;
+  readonly shadow?: ShadowStyle | null | undefined;
+}
+
+export interface TableElementStylePatch extends CommonElementStylePatch {
+  readonly kind: 'table';
+  readonly border?: TableBorder | undefined;
+  readonly style?: TableStyle | undefined;
+}
+
+export type ElementStylePatch =
+  TextElementStylePatch | ShapeElementStylePatch | TableElementStylePatch;
 
 export const STANDARD_PAGE_SIZES = {
   widescreen: { widthPt: 960, heightPt: 540 },

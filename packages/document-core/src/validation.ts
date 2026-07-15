@@ -1,7 +1,17 @@
 import { ZodError } from 'zod';
 
-import type { DeckDocument, Element, RichTextDocument, TableElement } from './model.js';
-import { deckDocumentSchema } from './schemas.js';
+import { DOCUMENT_LIMITS } from './limits.js';
+import { migrateParsedDeckToCurrent } from './migrations/index.js';
+import type {
+  BackgroundStyle,
+  DeckDocument,
+  DeckDocumentV1,
+  Element,
+  PlaceholderElement,
+  RichTextDocument,
+  TableElement,
+} from './model.js';
+import { deckDocumentSchema, deckDocumentV1Schema } from './schemas.js';
 
 export type ValidationIssueCode =
   | 'SCHEMA_INVALID'
@@ -11,7 +21,10 @@ export type ValidationIssueCode =
   | 'TABLE_DIMENSION_MISMATCH'
   | 'TABLE_CELL_OUT_OF_BOUNDS'
   | 'TABLE_CELL_OVERLAP'
-  | 'TABLE_CELL_MISSING';
+  | 'TABLE_CELL_MISSING'
+  | 'PLACEHOLDER_BINDING_INVALID'
+  | 'LIMIT_EXCEEDED'
+  | 'ASSET_DIMENSION_INVALID';
 
 export interface ValidationIssue {
   readonly code: ValidationIssueCode;
@@ -43,6 +56,7 @@ const zodIssues = (error: ZodError): readonly ValidationIssue[] =>
 interface StructuralValidationContext {
   readonly issues: ValidationIssue[];
   readonly ids: Map<string, string>;
+  elementCount: number;
 }
 
 const registerId = (context: StructuralValidationContext, id: string, path: string): void => {
@@ -143,7 +157,23 @@ const registerElements = (
 ): ReadonlySet<string> => {
   const elementIds = new Set<string>();
 
-  const visit = (element: Element, elementPath: string): void => {
+  const visit = (element: Element, elementPath: string, depth: number): void => {
+    context.elementCount += 1;
+    if (context.elementCount === DOCUMENT_LIMITS.maxElements + 1) {
+      context.issues.push({
+        code: 'LIMIT_EXCEEDED',
+        path: elementPath,
+        message: `Document contains more than ${DOCUMENT_LIMITS.maxElements} elements.`,
+      });
+    }
+    if (depth > DOCUMENT_LIMITS.maxGroupDepth) {
+      context.issues.push({
+        code: 'LIMIT_EXCEEDED',
+        path: elementPath,
+        message: `Group nesting exceeds ${DOCUMENT_LIMITS.maxGroupDepth}.`,
+      });
+      return;
+    }
     registerId(context, element.id, `${elementPath}.id`);
     elementIds.add(element.id);
 
@@ -156,7 +186,7 @@ const registerElements = (
         break;
       case 'group':
         element.children.forEach((child, childIndex) =>
-          visit(child, `${elementPath}.children.${childIndex}`),
+          visit(child, `${elementPath}.children.${childIndex}`, depth + 1),
         );
         break;
       case 'image':
@@ -168,7 +198,7 @@ const registerElements = (
     }
   };
 
-  elements.forEach((element, index) => visit(element, `${path}.${index}`));
+  elements.forEach((element, index) => visit(element, `${path}.${index}`, 1));
   return elementIds;
 };
 
@@ -230,9 +260,109 @@ const validateImageReferences = (
   elements.forEach((element, index) => visit(element, `${path}.${index}`));
 };
 
+const validateBackgroundReference = (
+  context: StructuralValidationContext,
+  background: BackgroundStyle | undefined,
+  imageAssetIds: ReadonlySet<string>,
+  path: string,
+): void => {
+  if (background?.type === 'image' && !imageAssetIds.has(background.assetId)) {
+    context.issues.push({
+      code: 'REFERENCE_MISSING',
+      path: `${path}.assetId`,
+      message: `Background image asset ${background.assetId} does not exist or is not an image.`,
+    });
+  }
+};
+
+const collectPlaceholders = (
+  elements: readonly Element[],
+  output = new Map<string, PlaceholderElement>(),
+): ReadonlyMap<string, PlaceholderElement> => {
+  for (const element of elements) {
+    if (element.type === 'placeholder') output.set(element.id, element);
+    if (element.type === 'group') collectPlaceholders(element.children, output);
+  }
+  return output;
+};
+
+const validatePlaceholderBindings = (
+  context: StructuralValidationContext,
+  elements: readonly Element[],
+  placeholders: ReadonlyMap<string, PlaceholderElement>,
+  path: string,
+): void => {
+  const bound = new Set<string>();
+  const visit = (element: Element, elementPath: string): void => {
+    const binding = element.placeholderBinding;
+    if (binding !== undefined) {
+      const placeholder = placeholders.get(binding.placeholderId);
+      if (placeholder === undefined) {
+        context.issues.push({
+          code: 'PLACEHOLDER_BINDING_INVALID',
+          path: `${elementPath}.placeholderBinding.placeholderId`,
+          message: `Placeholder ${binding.placeholderId} is unavailable for this slide.`,
+        });
+      } else if (
+        element.type === 'connector' ||
+        element.type === 'group' ||
+        element.type === 'placeholder' ||
+        !placeholder.accepts.includes(element.type)
+      ) {
+        context.issues.push({
+          code: 'PLACEHOLDER_BINDING_INVALID',
+          path: `${elementPath}.placeholderBinding.placeholderId`,
+          message: `Placeholder ${binding.placeholderId} does not accept ${element.type}.`,
+        });
+      }
+      if (bound.has(binding.placeholderId)) {
+        context.issues.push({
+          code: 'PLACEHOLDER_BINDING_INVALID',
+          path: `${elementPath}.placeholderBinding.placeholderId`,
+          message: `Placeholder ${binding.placeholderId} is bound more than once on this slide.`,
+        });
+      }
+      bound.add(binding.placeholderId);
+    }
+    if (element.type === 'group') {
+      element.children.forEach((child, index) => visit(child, `${elementPath}.children.${index}`));
+    }
+  };
+  elements.forEach((element, index) => visit(element, `${path}.${index}`));
+};
+
 const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] => {
-  const context: StructuralValidationContext = { issues: [], ids: new Map() };
+  const context: StructuralValidationContext = { issues: [], ids: new Map(), elementCount: 0 };
   registerId(context, document.id, '$.id');
+
+  const imageAssetIds = new Set<string>();
+  document.assets.forEach((asset, assetIndex) => {
+    const assetPath = `$.assets.${assetIndex}`;
+    registerId(context, asset.id, `${assetPath}.id`);
+    if (asset.kind === 'image') {
+      imageAssetIds.add(asset.id);
+      const dimensionsArePaired = (asset.widthPx === undefined) === (asset.heightPx === undefined);
+      if (!dimensionsArePaired) {
+        context.issues.push({
+          code: 'ASSET_DIMENSION_INVALID',
+          path: assetPath,
+          message: 'Image widthPx and heightPx must either both be present or both be omitted.',
+        });
+      }
+    } else if (asset.widthPx !== undefined || asset.heightPx !== undefined) {
+      context.issues.push({
+        code: 'ASSET_DIMENSION_INVALID',
+        path: assetPath,
+        message: 'Only image assets may declare pixel dimensions.',
+      });
+    }
+  });
+  validateBackgroundReference(
+    context,
+    document.settings.defaultBackground,
+    imageAssetIds,
+    '$.settings.defaultBackground',
+  );
 
   const themeIds = new Set<string>();
   document.themes.forEach((theme, themeIndex) => {
@@ -270,6 +400,13 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
     );
     const elementIds = registerElements(context, master.elements, `${masterPath}.elements`);
     validateConnectorReferences(context, master.elements, elementIds, `${masterPath}.elements`);
+    validateImageReferences(context, master.elements, imageAssetIds, `${masterPath}.elements`);
+    validateBackgroundReference(
+      context,
+      master.background,
+      imageAssetIds,
+      `${masterPath}.background`,
+    );
   });
 
   const layoutIds = new Set<string>();
@@ -289,12 +426,13 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
     );
     const elementIds = registerElements(context, layout.elements, `${layoutPath}.elements`);
     validateConnectorReferences(context, layout.elements, elementIds, `${layoutPath}.elements`);
-  });
-
-  const imageAssetIds = new Set<string>();
-  document.assets.forEach((asset, assetIndex) => {
-    registerId(context, asset.id, `$.assets.${assetIndex}.id`);
-    if (asset.kind === 'image') imageAssetIds.add(asset.id);
+    validateImageReferences(context, layout.elements, imageAssetIds, `${layoutPath}.elements`);
+    validateBackgroundReference(
+      context,
+      layout.background,
+      imageAssetIds,
+      `${layoutPath}.background`,
+    );
   });
 
   document.slides.forEach((slide, slideIndex) => {
@@ -310,20 +448,50 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
     const elementIds = registerElements(context, slide.elements, `${slidePath}.elements`);
     validateConnectorReferences(context, slide.elements, elementIds, `${slidePath}.elements`);
     validateImageReferences(context, slide.elements, imageAssetIds, `${slidePath}.elements`);
+    validateBackgroundReference(
+      context,
+      slide.background,
+      imageAssetIds,
+      `${slidePath}.background`,
+    );
+    const layout = document.layouts.find((candidate) => candidate.id === slide.layoutId);
+    const master =
+      layout === undefined
+        ? undefined
+        : document.masters.find((candidate) => candidate.id === layout.masterId);
+    if (layout !== undefined) {
+      const placeholders = new Map<string, PlaceholderElement>();
+      if (master !== undefined) collectPlaceholders(master.elements, placeholders);
+      collectPlaceholders(layout.elements, placeholders);
+      validatePlaceholderBindings(context, slide.elements, placeholders, `${slidePath}.elements`);
+    }
   });
 
   return context.issues;
 };
 
 export const validateDeck = (input: unknown): ValidationResult => {
-  const parsed = deckDocumentSchema.safeParse(input);
-  if (!parsed.success) {
-    return { success: false, issues: zodIssues(parsed.error) };
+  const parsedV2 = deckDocumentSchema.safeParse(input);
+  let document: DeckDocument;
+  if (parsedV2.success) document = parsedV2.data;
+  else {
+    const parsedV1 = deckDocumentV1Schema.safeParse(input);
+    if (!parsedV1.success) {
+      const legacyCandidate =
+        typeof input === 'object' && input !== null && 'schemaVersion' in input
+          ? (input as { readonly schemaVersion?: unknown }).schemaVersion === 1
+          : false;
+      return {
+        success: false,
+        issues: zodIssues(legacyCandidate ? parsedV1.error : parsedV2.error),
+      };
+    }
+    document = migrateParsedDeckToCurrent(parsedV1.data).document;
   }
 
-  const issues = structuralIssues(parsed.data);
+  const issues = structuralIssues(document);
   if (issues.length > 0) return { success: false, issues };
-  return { success: true, document: parsed.data, issues: [] };
+  return { success: true, document, issues: [] };
 };
 
 export class DocumentValidationError extends Error {
@@ -336,7 +504,7 @@ export class DocumentValidationError extends Error {
   }
 }
 
-export function assertValidDeck(input: unknown): asserts input is DeckDocument {
+export function assertValidDeck(input: unknown): asserts input is DeckDocument | DeckDocumentV1 {
   const result = validateDeck(input);
   if (!result.success) throw new DocumentValidationError(result.issues);
 }

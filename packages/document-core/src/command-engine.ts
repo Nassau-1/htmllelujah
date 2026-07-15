@@ -8,8 +8,22 @@ import type {
   UngroupElementsCommand,
 } from './commands.js';
 import { documentCommandSchema, transactionMetadataSchema } from './commands.js';
-import type { DeckDocument, Element, Frame, GroupElement, PageSize, Slide } from './model.js';
+import { DOCUMENT_LIMITS } from './limits.js';
+import type {
+  DeckDocument,
+  Element,
+  ElementStylePatch,
+  Frame,
+  GroupElement,
+  PageSize,
+  PlaceholderElement,
+  RichTextDocument,
+  TableCell,
+  TableElement,
+  Slide,
+} from './model.js';
 import { createRevisionToken } from './revision.js';
+import { parseTsv, TsvParseError } from './tsv.js';
 import { DocumentValidationError, parseDeck, validateDeck } from './validation.js';
 
 export type DocumentCommandErrorCode =
@@ -20,7 +34,12 @@ export type DocumentCommandErrorCode =
   | 'INVALID_SELECTION'
   | 'ID_MISMATCH'
   | 'EMPTY_TRANSACTION'
-  | 'LAST_SLIDE';
+  | 'LAST_SLIDE'
+  | 'LAST_RESOURCE'
+  | 'DEPENDENCY_IN_USE'
+  | 'TYPE_MISMATCH'
+  | 'UNSUPPORTED_OPERATION'
+  | 'LIMIT_EXCEEDED';
 
 export class DocumentCommandError extends Error {
   public readonly code: DocumentCommandErrorCode;
@@ -346,8 +365,842 @@ const ungroupElements = (document: DeckDocument, command: UngroupElementsCommand
     return [...elements.slice(0, groupIndex), ...children, ...elements.slice(groupIndex + 1)];
   });
 
+const insertAt = <T>(
+  items: readonly T[],
+  item: T,
+  index: number | undefined,
+  label: string,
+): readonly T[] => {
+  const insertionIndex = index ?? items.length;
+  if (insertionIndex > items.length) {
+    throw new DocumentCommandError(
+      'INVALID_INDEX',
+      `${label} insertion index ${insertionIndex} exceeds ${items.length}.`,
+    );
+  }
+  return [...items.slice(0, insertionIndex), item, ...items.slice(insertionIndex)];
+};
+
+const updateTargetElement = (
+  document: DeckDocument,
+  slideId: string,
+  containerId: string | undefined,
+  elementId: string,
+  update: (element: Element) => Element,
+  options: Readonly<{ permitLocked?: boolean }> = {},
+): DeckDocument =>
+  updateSlideContainer(document, slideId, containerId, (elements) => {
+    const selected = requireElements(elements, [elementId]);
+    if (!options.permitLocked) requireEditable(selected);
+    return elements.map((element) => (element.id === elementId ? update(element) : element));
+  });
+
+const applyStylePatch = (element: Element, patch: ElementStylePatch): Element => {
+  if (element.type !== patch.kind) {
+    throw new DocumentCommandError(
+      'TYPE_MISMATCH',
+      `A ${patch.kind} style patch cannot be applied to a ${element.type} element.`,
+    );
+  }
+  switch (patch.kind) {
+    case 'text':
+      if (element.type !== 'text') return element;
+      return {
+        ...element,
+        ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
+        ...(patch.verticalAlignment === undefined
+          ? {}
+          : { verticalAlignment: patch.verticalAlignment }),
+        ...(patch.styleRole === undefined ? {} : { styleRole: patch.styleRole }),
+        ...(patch.style === undefined
+          ? {}
+          : { style: { ...(element.style ?? {}), ...patch.style } }),
+      };
+    case 'shape': {
+      if (element.type !== 'shape') return element;
+      const { shadow: currentShadow, ...withoutShadow } = element;
+      const base = patch.shadow === null ? withoutShadow : element;
+      return {
+        ...base,
+        ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
+        ...(patch.fill === undefined ? {} : { fill: patch.fill }),
+        ...(patch.stroke === undefined ? {} : { stroke: patch.stroke }),
+        ...(patch.cornerRadiusPt === undefined ? {} : { cornerRadiusPt: patch.cornerRadiusPt }),
+        ...(patch.shadow === undefined || patch.shadow === null ? {} : { shadow: patch.shadow }),
+      };
+    }
+    case 'table':
+      if (element.type !== 'table') return element;
+      return {
+        ...element,
+        ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
+        ...(patch.border === undefined ? {} : { border: patch.border }),
+        ...(patch.style === undefined
+          ? {}
+          : { style: { ...(element.style ?? {}), ...patch.style } }),
+      };
+  }
+};
+
+const updateTable = (
+  document: DeckDocument,
+  slideId: string,
+  containerId: string | undefined,
+  tableId: string,
+  update: (table: TableElement) => TableElement,
+): DeckDocument =>
+  updateTargetElement(document, slideId, containerId, tableId, (element) => {
+    if (element.type !== 'table') {
+      throw new DocumentCommandError('TYPE_MISMATCH', `Element ${tableId} is not a table.`);
+    }
+    return update(element);
+  });
+
+const requireSimpleTable = (table: TableElement): void => {
+  if (table.cells.some((cell) => cell.rowSpan !== 1 || cell.columnSpan !== 1)) {
+    throw new DocumentCommandError(
+      'UNSUPPORTED_OPERATION',
+      'Row and column operations require a table without merged cells.',
+    );
+  }
+};
+
+const validateInsertedCells = (
+  cells: readonly TableCell[],
+  count: number,
+  coordinate: 'row' | 'column',
+  index: number,
+): void => {
+  if (cells.length !== count) {
+    throw new DocumentCommandError(
+      'INVALID_SELECTION',
+      `Insertion requires exactly ${count} fresh cells.`,
+    );
+  }
+  const opposite = coordinate === 'row' ? 'column' : 'row';
+  const positions = new Set<number>();
+  for (const cell of cells) {
+    if (
+      cell[coordinate] !== index ||
+      cell.rowSpan !== 1 ||
+      cell.columnSpan !== 1 ||
+      cell[opposite] < 0 ||
+      cell[opposite] >= count
+    ) {
+      throw new DocumentCommandError(
+        'INVALID_SELECTION',
+        'Inserted cells must be single-span and exactly cover the new row or column.',
+      );
+    }
+    positions.add(cell[opposite]);
+  }
+  if (positions.size !== count) {
+    throw new DocumentCommandError(
+      'INVALID_SELECTION',
+      'Inserted cells must occupy unique coordinates.',
+    );
+  }
+};
+
+const replaceRichTextWithPlainText = (
+  content: RichTextDocument,
+  text: string,
+): RichTextDocument => {
+  const first = content.blocks[0];
+  if (first === undefined) return content;
+  if (first.type === 'list') {
+    const item = first.items[0];
+    if (item === undefined) return content;
+    const marks = item.runs[0]?.marks ?? {
+      bold: false,
+      italic: false,
+      underline: false,
+      strikethrough: false,
+    };
+    return {
+      blocks: [
+        {
+          ...first,
+          items: [{ ...item, runs: [{ text, marks }] }],
+        },
+      ],
+    };
+  }
+  const marks = first.runs[0]?.marks ?? {
+    bold: false,
+    italic: false,
+    underline: false,
+    strikethrough: false,
+  };
+  return { blocks: [{ ...first, runs: [{ text, marks }] }] };
+};
+
+const placeholdersForSlide = (
+  document: DeckDocument,
+  slide: Slide,
+): ReadonlyMap<string, PlaceholderElement> => {
+  const output = new Map<string, PlaceholderElement>();
+  const visit = (elements: readonly Element[]): void => {
+    for (const element of elements) {
+      if (element.type === 'placeholder') output.set(element.id, element);
+      if (element.type === 'group') visit(element.children);
+    }
+  };
+  const layout = document.layouts.find((candidate) => candidate.id === slide.layoutId);
+  const master =
+    layout === undefined
+      ? undefined
+      : document.masters.find((candidate) => candidate.id === layout.masterId);
+  if (master !== undefined) visit(master.elements);
+  if (layout !== undefined) visit(layout.elements);
+  return output;
+};
+
+const resetPlaceholderElements = (
+  elements: readonly Element[],
+  placeholder: PlaceholderElement,
+): readonly Element[] => {
+  let found = false;
+  const containsBinding = (element: Element): boolean =>
+    element.placeholderBinding?.placeholderId === placeholder.id ||
+    (element.type === 'group' && element.children.some(containsBinding));
+  const visit = (element: Element): Element => {
+    if (element.type === 'group') {
+      if (element.locked && element.children.some(containsBinding)) {
+        throw new DocumentCommandError('LOCKED', `Group ${element.id} is locked.`);
+      }
+      return { ...element, children: element.children.map(visit) };
+    }
+    if (element.placeholderBinding?.placeholderId !== placeholder.id) return element;
+    found = true;
+    if (element.locked) {
+      throw new DocumentCommandError('LOCKED', `Element ${element.id} is locked.`);
+    }
+    const common = {
+      ...element,
+      frame: placeholder.frame,
+      visible: placeholder.visible,
+      opacity: placeholder.opacity,
+      placeholderBinding: { placeholderId: placeholder.id, overrides: [] },
+    };
+    if (common.type !== 'text') return common;
+    const { style: _style, ...withoutStyle } = common;
+    return withoutStyle;
+  };
+  const result = elements.map(visit);
+  if (!found) {
+    throw new DocumentCommandError(
+      'NOT_FOUND',
+      `No slide element is bound to placeholder ${placeholder.id}.`,
+    );
+  }
+  return result;
+};
+
+const elementReferencesAsset = (element: Element, assetId: string): boolean => {
+  if (element.type === 'image' && element.assetId === assetId) return true;
+  return (
+    element.type === 'group' &&
+    element.children.some((child) => elementReferencesAsset(child, assetId))
+  );
+};
+
+const backgroundReferencesAsset = (
+  background: DeckDocument['settings']['defaultBackground'] | undefined,
+  assetId: string,
+): boolean => background?.type === 'image' && background.assetId === assetId;
+
+const documentReferencesAsset = (document: DeckDocument, assetId: string): boolean =>
+  backgroundReferencesAsset(document.settings.defaultBackground, assetId) ||
+  document.masters.some(
+    (master) =>
+      backgroundReferencesAsset(master.background, assetId) ||
+      master.elements.some((element) => elementReferencesAsset(element, assetId)),
+  ) ||
+  document.layouts.some(
+    (layout) =>
+      backgroundReferencesAsset(layout.background, assetId) ||
+      layout.elements.some((element) => elementReferencesAsset(element, assetId)),
+  ) ||
+  document.slides.some(
+    (slide) =>
+      backgroundReferencesAsset(slide.background, assetId) ||
+      slide.elements.some((element) => elementReferencesAsset(element, assetId)),
+  );
+
+const sortedTableCells = (cells: readonly TableCell[]): readonly TableCell[] =>
+  [...cells].sort((left, right) => left.row - right.row || left.column - right.column);
+
 const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckDocument => {
   switch (command.type) {
+    case 'deck.rename':
+      return { ...document, name: command.name };
+    case 'deck.set-page':
+      return { ...document, page: command.page };
+    case 'theme.create':
+      return {
+        ...document,
+        themes: insertAt(document.themes, command.theme, command.index, 'Theme'),
+      };
+    case 'theme.update': {
+      if (command.themeId !== command.replacement.id) {
+        throw new DocumentCommandError(
+          'ID_MISMATCH',
+          'A theme replacement must retain its identifier.',
+        );
+      }
+      if (!document.themes.some((theme) => theme.id === command.themeId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Theme ${command.themeId} does not exist.`);
+      }
+      return {
+        ...document,
+        themes: document.themes.map((theme) =>
+          theme.id === command.themeId ? command.replacement : theme,
+        ),
+      };
+    }
+    case 'theme.delete': {
+      if (document.themes.length === 1) {
+        throw new DocumentCommandError('LAST_RESOURCE', 'A deck must retain at least one theme.');
+      }
+      if (!document.themes.some((theme) => theme.id === command.themeId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Theme ${command.themeId} does not exist.`);
+      }
+      const used = document.masters.some((master) => master.themeId === command.themeId);
+      if (used && command.replacementThemeId === undefined) {
+        throw new DocumentCommandError(
+          'DEPENDENCY_IN_USE',
+          `Theme ${command.themeId} is still used by a master.`,
+        );
+      }
+      if (
+        command.replacementThemeId !== undefined &&
+        (command.replacementThemeId === command.themeId ||
+          !document.themes.some((theme) => theme.id === command.replacementThemeId))
+      ) {
+        throw new DocumentCommandError('NOT_FOUND', 'Replacement theme does not exist.');
+      }
+      return {
+        ...document,
+        themes: document.themes.filter((theme) => theme.id !== command.themeId),
+        masters:
+          command.replacementThemeId === undefined
+            ? document.masters
+            : document.masters.map((master) =>
+                master.themeId === command.themeId
+                  ? { ...master, themeId: command.replacementThemeId as string }
+                  : master,
+              ),
+      };
+    }
+    case 'master.create':
+      return {
+        ...document,
+        masters: insertAt(document.masters, command.master, command.index, 'Master'),
+      };
+    case 'master.update': {
+      if (command.masterId !== command.replacement.id) {
+        throw new DocumentCommandError(
+          'ID_MISMATCH',
+          'A master replacement must retain its identifier.',
+        );
+      }
+      if (!document.masters.some((master) => master.id === command.masterId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Master ${command.masterId} does not exist.`);
+      }
+      return {
+        ...document,
+        masters: document.masters.map((master) =>
+          master.id === command.masterId ? command.replacement : master,
+        ),
+      };
+    }
+    case 'master.delete': {
+      if (document.masters.length === 1) {
+        throw new DocumentCommandError('LAST_RESOURCE', 'A deck must retain at least one master.');
+      }
+      if (!document.masters.some((master) => master.id === command.masterId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Master ${command.masterId} does not exist.`);
+      }
+      const used = document.layouts.some((layout) => layout.masterId === command.masterId);
+      if (used && command.replacementMasterId === undefined) {
+        throw new DocumentCommandError(
+          'DEPENDENCY_IN_USE',
+          `Master ${command.masterId} is still used by a layout.`,
+        );
+      }
+      if (
+        command.replacementMasterId !== undefined &&
+        (command.replacementMasterId === command.masterId ||
+          !document.masters.some((master) => master.id === command.replacementMasterId))
+      ) {
+        throw new DocumentCommandError('NOT_FOUND', 'Replacement master does not exist.');
+      }
+      return {
+        ...document,
+        masters: document.masters.filter((master) => master.id !== command.masterId),
+        layouts:
+          command.replacementMasterId === undefined
+            ? document.layouts
+            : document.layouts.map((layout) =>
+                layout.masterId === command.masterId
+                  ? { ...layout, masterId: command.replacementMasterId as string }
+                  : layout,
+              ),
+      };
+    }
+    case 'layout.create':
+      return {
+        ...document,
+        layouts: insertAt(document.layouts, command.layout, command.index, 'Layout'),
+      };
+    case 'layout.update': {
+      if (command.layoutId !== command.replacement.id) {
+        throw new DocumentCommandError(
+          'ID_MISMATCH',
+          'A layout replacement must retain its identifier.',
+        );
+      }
+      if (!document.layouts.some((layout) => layout.id === command.layoutId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Layout ${command.layoutId} does not exist.`);
+      }
+      return {
+        ...document,
+        layouts: document.layouts.map((layout) =>
+          layout.id === command.layoutId ? command.replacement : layout,
+        ),
+      };
+    }
+    case 'layout.delete': {
+      if (document.layouts.length === 1) {
+        throw new DocumentCommandError('LAST_RESOURCE', 'A deck must retain at least one layout.');
+      }
+      if (!document.layouts.some((layout) => layout.id === command.layoutId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Layout ${command.layoutId} does not exist.`);
+      }
+      const used = document.slides.some((slide) => slide.layoutId === command.layoutId);
+      if (used && command.replacementLayoutId === undefined) {
+        throw new DocumentCommandError(
+          'DEPENDENCY_IN_USE',
+          `Layout ${command.layoutId} is still used by a slide.`,
+        );
+      }
+      if (
+        command.replacementLayoutId !== undefined &&
+        (command.replacementLayoutId === command.layoutId ||
+          !document.layouts.some((layout) => layout.id === command.replacementLayoutId))
+      ) {
+        throw new DocumentCommandError('NOT_FOUND', 'Replacement layout does not exist.');
+      }
+      return {
+        ...document,
+        layouts: document.layouts.filter((layout) => layout.id !== command.layoutId),
+        slides:
+          command.replacementLayoutId === undefined
+            ? document.slides
+            : document.slides.map((slide) =>
+                slide.layoutId === command.layoutId
+                  ? { ...slide, layoutId: command.replacementLayoutId as string }
+                  : slide,
+              ),
+      };
+    }
+    case 'slide.duplicate': {
+      const sourceIndex = document.slides.findIndex((slide) => slide.id === command.slideId);
+      if (sourceIndex < 0) {
+        throw new DocumentCommandError('NOT_FOUND', `Slide ${command.slideId} does not exist.`);
+      }
+      if (command.duplicate.id === command.slideId) {
+        throw new DocumentCommandError(
+          'ID_MISMATCH',
+          'A duplicated slide needs a fresh identifier.',
+        );
+      }
+      return {
+        ...document,
+        slides: insertAt(
+          document.slides,
+          command.duplicate,
+          command.index ?? sourceIndex + 1,
+          'Slide',
+        ),
+      };
+    }
+    case 'slide.update':
+      return replaceSlide(document, command.slideId, (slide) => {
+        if (command.background === null) {
+          const { background: _background, ...withoutBackground } = slide;
+          return {
+            ...withoutBackground,
+            ...(command.name === undefined ? {} : { name: command.name }),
+          };
+        }
+        return {
+          ...slide,
+          ...(command.name === undefined ? {} : { name: command.name }),
+          ...(command.background === undefined ? {} : { background: command.background }),
+        };
+      });
+    case 'slide.set-layout':
+      if (!document.layouts.some((layout) => layout.id === command.layoutId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Layout ${command.layoutId} does not exist.`);
+      }
+      return replaceSlide(document, command.slideId, (slide) => ({
+        ...slide,
+        layoutId: command.layoutId,
+      }));
+    case 'slide.reset-placeholder':
+      return replaceSlide(document, command.slideId, (slide) => {
+        const placeholder = placeholdersForSlide(document, slide).get(command.placeholderId);
+        if (placeholder === undefined) {
+          throw new DocumentCommandError(
+            'NOT_FOUND',
+            `Placeholder ${command.placeholderId} is unavailable for slide ${slide.id}.`,
+          );
+        }
+        return {
+          ...slide,
+          elements: resetPlaceholderElements(slide.elements, placeholder),
+        };
+      });
+    case 'slide.set-hidden':
+      return replaceSlide(document, command.slideId, (slide) => ({
+        ...slide,
+        hidden: command.hidden,
+      }));
+    case 'element.update-style':
+      return updateTargetElement(
+        document,
+        command.slideId,
+        command.containerId,
+        command.elementId,
+        (element) => applyStylePatch(element, command.patch),
+      );
+    case 'element.set-locked':
+      return updateTargetElement(
+        document,
+        command.slideId,
+        command.containerId,
+        command.elementId,
+        (element) => ({ ...element, locked: command.locked }),
+        { permitLocked: true },
+      );
+    case 'element.set-visible':
+      return updateTargetElement(
+        document,
+        command.slideId,
+        command.containerId,
+        command.elementId,
+        (element) => ({ ...element, visible: command.visible }),
+      );
+    case 'element.reorder':
+      return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
+        if (command.toIndex >= elements.length) {
+          throw new DocumentCommandError(
+            'INVALID_INDEX',
+            `Element target index ${command.toIndex} is outside the container.`,
+          );
+        }
+        const selected = requireElements(elements, [command.elementId]);
+        requireEditable(selected);
+        const fromIndex = elements.findIndex((element) => element.id === command.elementId);
+        const reordered = [...elements];
+        const removed = reordered.splice(fromIndex, 1)[0];
+        if (removed === undefined) {
+          throw new DocumentCommandError(
+            'NOT_FOUND',
+            `Element ${command.elementId} does not exist.`,
+          );
+        }
+        reordered.splice(command.toIndex, 0, removed);
+        return reordered;
+      });
+    case 'text.replace-content':
+      return updateTargetElement(
+        document,
+        command.slideId,
+        command.containerId,
+        command.textId,
+        (element) => {
+          if (element.type !== 'text') {
+            throw new DocumentCommandError(
+              'TYPE_MISMATCH',
+              `Element ${command.textId} is not text.`,
+            );
+          }
+          return { ...element, content: command.content };
+        },
+      );
+    case 'table.insert-row':
+      return updateTable(
+        document,
+        command.slideId,
+        command.containerId,
+        command.tableId,
+        (table) => {
+          requireSimpleTable(table);
+          if (command.index > table.rowCount) {
+            throw new DocumentCommandError(
+              'INVALID_INDEX',
+              'Row insertion index is outside the table.',
+            );
+          }
+          if (table.rowCount >= DOCUMENT_LIMITS.maxTableRows) {
+            throw new DocumentCommandError(
+              'LIMIT_EXCEEDED',
+              'The table has reached the row limit.',
+            );
+          }
+          validateInsertedCells(command.cells, table.columnCount, 'row', command.index);
+          return {
+            ...table,
+            rowCount: table.rowCount + 1,
+            rowHeightsPt: insertAt(table.rowHeightsPt, command.heightPt, command.index, 'Row'),
+            cells: sortedTableCells([
+              ...table.cells.map((cell) =>
+                cell.row >= command.index ? { ...cell, row: cell.row + 1 } : cell,
+              ),
+              ...command.cells,
+            ]),
+          };
+        },
+      );
+    case 'table.delete-row':
+      return updateTable(
+        document,
+        command.slideId,
+        command.containerId,
+        command.tableId,
+        (table) => {
+          requireSimpleTable(table);
+          if (table.rowCount === 1) {
+            throw new DocumentCommandError(
+              'LAST_RESOURCE',
+              'A table must retain at least one row.',
+            );
+          }
+          if (command.index >= table.rowCount) {
+            throw new DocumentCommandError(
+              'INVALID_INDEX',
+              'Row deletion index is outside the table.',
+            );
+          }
+          return {
+            ...table,
+            rowCount: table.rowCount - 1,
+            rowHeightsPt: table.rowHeightsPt.filter((_, index) => index !== command.index),
+            cells: table.cells
+              .filter((cell) => cell.row !== command.index)
+              .map((cell) => (cell.row > command.index ? { ...cell, row: cell.row - 1 } : cell)),
+          };
+        },
+      );
+    case 'table.insert-column':
+      return updateTable(
+        document,
+        command.slideId,
+        command.containerId,
+        command.tableId,
+        (table) => {
+          requireSimpleTable(table);
+          if (command.index > table.columnCount) {
+            throw new DocumentCommandError(
+              'INVALID_INDEX',
+              'Column insertion index is outside the table.',
+            );
+          }
+          if (table.columnCount >= DOCUMENT_LIMITS.maxTableColumns) {
+            throw new DocumentCommandError(
+              'LIMIT_EXCEEDED',
+              'The table has reached the column limit.',
+            );
+          }
+          validateInsertedCells(command.cells, table.rowCount, 'column', command.index);
+          return {
+            ...table,
+            columnCount: table.columnCount + 1,
+            columnWidthsPt: insertAt(
+              table.columnWidthsPt,
+              command.widthPt,
+              command.index,
+              'Column',
+            ),
+            cells: sortedTableCells([
+              ...table.cells.map((cell) =>
+                cell.column >= command.index ? { ...cell, column: cell.column + 1 } : cell,
+              ),
+              ...command.cells,
+            ]),
+          };
+        },
+      );
+    case 'table.delete-column':
+      return updateTable(
+        document,
+        command.slideId,
+        command.containerId,
+        command.tableId,
+        (table) => {
+          requireSimpleTable(table);
+          if (table.columnCount === 1) {
+            throw new DocumentCommandError(
+              'LAST_RESOURCE',
+              'A table must retain at least one column.',
+            );
+          }
+          if (command.index >= table.columnCount) {
+            throw new DocumentCommandError(
+              'INVALID_INDEX',
+              'Column deletion index is outside the table.',
+            );
+          }
+          return {
+            ...table,
+            columnCount: table.columnCount - 1,
+            columnWidthsPt: table.columnWidthsPt.filter((_, index) => index !== command.index),
+            cells: table.cells
+              .filter((cell) => cell.column !== command.index)
+              .map((cell) =>
+                cell.column > command.index ? { ...cell, column: cell.column - 1 } : cell,
+              ),
+          };
+        },
+      );
+    case 'table.update-cell':
+      return updateTable(
+        document,
+        command.slideId,
+        command.containerId,
+        command.tableId,
+        (table) => {
+          if (!table.cells.some((cell) => cell.id === command.cellId)) {
+            throw new DocumentCommandError('NOT_FOUND', `Cell ${command.cellId} does not exist.`);
+          }
+          return {
+            ...table,
+            cells: table.cells.map((cell) =>
+              cell.id === command.cellId
+                ? {
+                    ...cell,
+                    ...(command.content === undefined ? {} : { content: command.content }),
+                    ...(command.style === undefined ? {} : { style: command.style }),
+                  }
+                : cell,
+            ),
+          };
+        },
+      );
+    case 'table.update-style':
+      return updateTable(
+        document,
+        command.slideId,
+        command.containerId,
+        command.tableId,
+        (table) => {
+          if (command.style === null) {
+            const { style: _style, ...withoutStyle } = table;
+            return {
+              ...withoutStyle,
+              ...(command.border === undefined ? {} : { border: command.border }),
+            };
+          }
+          return {
+            ...table,
+            ...(command.border === undefined ? {} : { border: command.border }),
+            ...(command.style === undefined
+              ? {}
+              : { style: { ...(table.style ?? {}), ...command.style } }),
+          };
+        },
+      );
+    case 'table.paste-tsv':
+      return updateTable(
+        document,
+        command.slideId,
+        command.containerId,
+        command.tableId,
+        (table) => {
+          requireSimpleTable(table);
+          let matrix: readonly (readonly string[])[];
+          try {
+            matrix = parseTsv(command.tsv);
+          } catch (error) {
+            if (error instanceof TsvParseError) {
+              throw new DocumentCommandError('INVALID_SELECTION', error.message);
+            }
+            throw error;
+          }
+          const width = matrix[0]?.length ?? 0;
+          if (
+            command.startRow + matrix.length > table.rowCount ||
+            command.startColumn + width > table.columnCount
+          ) {
+            throw new DocumentCommandError(
+              'INVALID_SELECTION',
+              'Pasted TSV does not fit inside the selected table range.',
+            );
+          }
+          const values = new Map<string, string>();
+          matrix.forEach((row, rowOffset) =>
+            row.forEach((value, columnOffset) =>
+              values.set(
+                `${command.startRow + rowOffset}:${command.startColumn + columnOffset}`,
+                value,
+              ),
+            ),
+          );
+          return {
+            ...table,
+            cells: table.cells.map((cell) => {
+              const value = values.get(`${cell.row}:${cell.column}`);
+              return value === undefined
+                ? cell
+                : { ...cell, content: replaceRichTextWithPlainText(cell.content, value) };
+            }),
+          };
+        },
+      );
+    case 'asset.register':
+      if (
+        command.asset.kind === 'image' &&
+        (command.asset.widthPx === undefined || command.asset.heightPx === undefined)
+      ) {
+        throw new DocumentCommandError(
+          'INVALID_SELECTION',
+          'Registered image assets require widthPx and heightPx.',
+        );
+      }
+      return { ...document, assets: [...document.assets, command.asset] };
+    case 'asset.remove':
+      if (!document.assets.some((asset) => asset.id === command.assetId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Asset ${command.assetId} does not exist.`);
+      }
+      if (documentReferencesAsset(document, command.assetId)) {
+        throw new DocumentCommandError(
+          'DEPENDENCY_IN_USE',
+          `Asset ${command.assetId} is still referenced by the document.`,
+        );
+      }
+      return {
+        ...document,
+        assets: document.assets.filter((asset) => asset.id !== command.assetId),
+      };
+    case 'connector.update-endpoint':
+      return updateTargetElement(
+        document,
+        command.slideId,
+        command.containerId,
+        command.connectorId,
+        (element) => {
+          if (element.type !== 'connector') {
+            throw new DocumentCommandError(
+              'TYPE_MISMATCH',
+              `Element ${command.connectorId} is not a connector.`,
+            );
+          }
+          return { ...element, [command.endpoint]: command.value };
+        },
+      );
     case 'slide.create': {
       const index = command.index ?? document.slides.length;
       if (index > document.slides.length) {
@@ -474,6 +1327,10 @@ export const applyTransaction = (
   for (const command of parsedCommands) {
     workingDocument = executeCommand(workingDocument, command);
   }
+  workingDocument = {
+    ...workingDocument,
+    metadata: { ...workingDocument.metadata, modifiedAt: metadata.timestamp },
+  };
 
   const validation = validateDeck(workingDocument);
   if (!validation.success) throw new DocumentValidationError(validation.issues);

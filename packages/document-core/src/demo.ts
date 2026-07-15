@@ -243,10 +243,22 @@ const createSlides = (): readonly Slide[] => [
 /** Creates a deterministic, neutral deck suitable for examples and golden tests. */
 export const createNeutralDemoDeck = (): DeckDocument => {
   const deck: DeckDocument = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: ids.deck,
     name: 'Neutral demonstration',
     page: { ...STANDARD_PAGE_SIZES.widescreen },
+    metadata: {
+      createdAt: '2026-01-01T00:00:00.000Z',
+      modifiedAt: '2026-01-01T00:00:00.000Z',
+      locale: 'en-US',
+      iconCatalogVersion: 'lucide-v1',
+      flagCatalogVersion: 'round-flags-v1',
+    },
+    settings: {
+      grid: { enabled: true, spacingPt: 12, snapToGrid: true, snapToObjects: true },
+      defaultBackground: { type: 'theme' },
+      includeHiddenSlidesInExport: false,
+    },
     themes: [
       {
         id: ids.theme,

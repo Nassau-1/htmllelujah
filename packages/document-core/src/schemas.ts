@@ -1,19 +1,27 @@
 import { z } from 'zod';
 
-import type { DeckDocument, Element, Frame, Slide } from './model.js';
+import type { DeckDocument, DeckDocumentV1, Element, Frame, Slide } from './model.js';
+import { DOCUMENT_LIMITS } from './limits.js';
 
 const identifierSchema = z.string().uuid();
-const nonEmptyStringSchema = z.string().trim().min(1);
+const nonEmptyStringSchema = z.string().trim().min(1).max(DOCUMENT_LIMITS.maxNameLength);
 const colorSchema = z.string().regex(/^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$/);
 const nonNegativeFiniteSchema = z.number().finite().min(0);
 const positiveFiniteSchema = z.number().finite().positive();
+const boundedFontFamilySchema = z.string().trim().min(1).max(DOCUMENT_LIMITS.maxFontFamilyLength);
+const frameCoordinateSchema = z
+  .number()
+  .finite()
+  .min(-DOCUMENT_LIMITS.maxFrameCoordinatePt)
+  .max(DOCUMENT_LIMITS.maxFrameCoordinatePt);
+const frameDimensionSchema = positiveFiniteSchema.max(DOCUMENT_LIMITS.maxFrameDimensionPt);
 
 export const frameSchema: z.ZodType<Frame> = z
   .object({
-    xPt: z.number().finite(),
-    yPt: z.number().finite(),
-    widthPt: positiveFiniteSchema,
-    heightPt: positiveFiniteSchema,
+    xPt: frameCoordinateSchema,
+    yPt: frameCoordinateSchema,
+    widthPt: frameDimensionSchema,
+    heightPt: frameDimensionSchema,
     rotationDeg: z.number().finite(),
   })
   .strict();
@@ -28,12 +36,15 @@ const textMarksSchema = z
     underline: z.boolean(),
     strikethrough: z.boolean(),
     color: colorSchema.optional(),
+    fontFamily: boundedFontFamilySchema.optional(),
+    fontSizePt: positiveFiniteSchema.max(1_000).optional(),
+    fontWeight: z.number().int().min(1).max(1_000).optional(),
   })
   .strict();
 
 const textRunSchema = z
   .object({
-    text: z.string(),
+    text: z.string().max(DOCUMENT_LIMITS.maxTextRunLength),
     marks: textMarksSchema,
   })
   .strict();
@@ -43,7 +54,7 @@ const paragraphBlockSchema = z
     id: identifierSchema,
     type: z.literal('paragraph'),
     alignment: textAlignmentSchema,
-    runs: z.array(textRunSchema),
+    runs: z.array(textRunSchema).max(DOCUMENT_LIMITS.maxTextRunsPerBlock),
   })
   .strict();
 
@@ -60,15 +71,15 @@ const headingBlockSchema = z
       z.literal(6),
     ]),
     alignment: textAlignmentSchema,
-    runs: z.array(textRunSchema),
+    runs: z.array(textRunSchema).max(DOCUMENT_LIMITS.maxTextRunsPerBlock),
   })
   .strict();
 
 const listItemSchema = z
   .object({
     id: identifierSchema,
-    level: z.number().int().min(0).max(8),
-    runs: z.array(textRunSchema),
+    level: z.number().int().min(0).max(DOCUMENT_LIMITS.maxListLevel),
+    runs: z.array(textRunSchema).max(DOCUMENT_LIMITS.maxTextRunsPerBlock),
   })
   .strict();
 
@@ -77,17 +88,42 @@ const listBlockSchema = z
     id: identifierSchema,
     type: z.literal('list'),
     ordered: z.boolean(),
-    items: z.array(listItemSchema).min(1),
+    items: z.array(listItemSchema).min(1).max(DOCUMENT_LIMITS.maxListItems),
   })
   .strict();
 
 const richTextDocumentSchema = z
   .object({
-    blocks: z.array(
-      z.discriminatedUnion('type', [paragraphBlockSchema, headingBlockSchema, listBlockSchema]),
-    ),
+    blocks: z
+      .array(
+        z.discriminatedUnion('type', [paragraphBlockSchema, headingBlockSchema, listBlockSchema]),
+      )
+      .max(DOCUMENT_LIMITS.maxRichTextBlocks),
   })
   .strict();
+
+const textStyleOverridesSchema = z
+  .object({
+    fontFamily: boundedFontFamilySchema.optional(),
+    fontSizePt: positiveFiniteSchema.max(1_000).optional(),
+    fontWeight: z.number().int().min(1).max(1_000).optional(),
+    italic: z.boolean().optional(),
+    color: colorSchema.optional(),
+    alignment: textAlignmentSchema.optional(),
+    lineHeight: positiveFiniteSchema.max(20).optional(),
+    letterSpacingPt: z.number().finite().min(-100).max(1_000).optional(),
+  })
+  .strict();
+
+const placeholderBindingSchema = z
+  .object({
+    placeholderId: identifierSchema,
+    overrides: z.array(z.enum(['frame', 'style', 'visibility'])).max(3),
+  })
+  .strict()
+  .refine((binding) => new Set(binding.overrides).size === binding.overrides.length, {
+    message: 'Placeholder overrides must be unique.',
+  });
 
 const baseElementShape = {
   id: identifierSchema,
@@ -96,6 +132,7 @@ const baseElementShape = {
   opacity: z.number().finite().min(0).max(1),
   visible: z.boolean(),
   locked: z.boolean(),
+  placeholderBinding: placeholderBindingSchema.optional(),
 } as const;
 
 const textElementSchema = z
@@ -105,6 +142,7 @@ const textElementSchema = z
     styleRole: textStyleRoleSchema,
     verticalAlignment: z.enum(['top', 'middle', 'bottom']),
     content: richTextDocumentSchema,
+    style: textStyleOverridesSchema.optional(),
   })
   .strict();
 
@@ -138,6 +176,7 @@ const tableCellStyleSchema = z
     textColor: colorSchema,
     horizontalAlignment: textAlignmentSchema,
     verticalAlignment: z.enum(['top', 'middle', 'bottom']),
+    paddingPt: nonNegativeFiniteSchema.max(100).optional(),
   })
   .strict();
 
@@ -165,17 +204,32 @@ const tableElementSchema = z
   .object({
     ...baseElementShape,
     type: z.literal('table'),
-    rowCount: z.number().int().positive(),
-    columnCount: z.number().int().positive(),
-    rowHeightsPt: z.array(positiveFiniteSchema).min(1),
-    columnWidthsPt: z.array(positiveFiniteSchema).min(1),
-    cells: z.array(tableCellSchema).min(1),
+    rowCount: z.number().int().positive().max(DOCUMENT_LIMITS.maxTableRows),
+    columnCount: z.number().int().positive().max(DOCUMENT_LIMITS.maxTableColumns),
+    rowHeightsPt: z
+      .array(positiveFiniteSchema.max(DOCUMENT_LIMITS.maxFrameDimensionPt))
+      .min(1)
+      .max(DOCUMENT_LIMITS.maxTableRows),
+    columnWidthsPt: z
+      .array(positiveFiniteSchema.max(DOCUMENT_LIMITS.maxFrameDimensionPt))
+      .min(1)
+      .max(DOCUMENT_LIMITS.maxTableColumns),
+    cells: z.array(tableCellSchema).min(1).max(DOCUMENT_LIMITS.maxTableCells),
     border: z
       .object({
         color: colorSchema,
         widthPt: nonNegativeFiniteSchema,
       })
       .strict(),
+    style: z
+      .object({
+        fill: colorSchema.nullable().optional(),
+        headerFill: colorSchema.nullable().optional(),
+        bandedRows: z.boolean().optional(),
+        cellPaddingPt: nonNegativeFiniteSchema.max(100).optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -195,6 +249,16 @@ const shapeElementSchema = z
     fill: colorSchema.nullable(),
     stroke: strokeStyleSchema,
     cornerRadiusPt: nonNegativeFiniteSchema,
+    shadow: z
+      .object({
+        color: colorSchema,
+        blurPt: nonNegativeFiniteSchema.max(1_000),
+        offsetXPt: z.number().finite().min(-10_000).max(10_000),
+        offsetYPt: z.number().finite().min(-10_000).max(10_000),
+        opacity: z.number().finite().min(0).max(1),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -242,7 +306,8 @@ const placeholderElementSchema = z
     type: z.literal('placeholder'),
     role: z.enum(['title', 'subtitle', 'body', 'media', 'table', 'footer', 'slide-number']),
     accepts: z.array(z.enum(['text', 'image', 'table', 'shape', 'icon'])).min(1),
-    prompt: z.string(),
+    prompt: z.string().max(DOCUMENT_LIMITS.maxTextRunLength),
+    defaultTextStyle: textStyleOverridesSchema.optional(),
   })
   .strict();
 
@@ -265,7 +330,7 @@ export const elementSchema: z.ZodType<Element> = z.lazy(() =>
             heightPt: positiveFiniteSchema,
           })
           .strict(),
-        children: z.array(elementSchema).min(2),
+        children: z.array(elementSchema).min(2).max(DOCUMENT_LIMITS.maxElementsPerContainer),
       })
       .strict(),
   ]),
@@ -278,6 +343,19 @@ const guideSchema = z
     positionPt: z.number().finite(),
   })
   .strict();
+
+const backgroundStyleSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('theme') }).strict(),
+  z.object({ type: z.literal('solid'), color: colorSchema }).strict(),
+  z
+    .object({
+      type: z.literal('image'),
+      assetId: identifierSchema,
+      fit: z.enum(['contain', 'cover', 'fill']),
+      opacity: z.number().finite().min(0).max(1),
+    })
+    .strict(),
+]);
 
 const themeSchema = z
   .object({
@@ -292,15 +370,15 @@ const themeSchema = z
         accent: colorSchema,
       })
       .strict(),
-    headingFontFamily: nonEmptyStringSchema,
-    bodyFontFamily: nonEmptyStringSchema,
+    headingFontFamily: boundedFontFamilySchema,
+    bodyFontFamily: boundedFontFamilySchema,
     textStyles: z
       .array(
         z
           .object({
             id: identifierSchema,
             role: textStyleRoleSchema,
-            fontFamily: nonEmptyStringSchema,
+            fontFamily: boundedFontFamilySchema,
             fontSizePt: positiveFiniteSchema,
             fontWeight: z.number().int().min(1).max(1000),
             italic: z.boolean(),
@@ -310,7 +388,8 @@ const themeSchema = z
           })
           .strict(),
       )
-      .min(1),
+      .min(1)
+      .max(16),
   })
   .strict();
 
@@ -319,8 +398,9 @@ const masterSchema = z
     id: identifierSchema,
     name: nonEmptyStringSchema,
     themeId: identifierSchema,
-    elements: z.array(elementSchema),
-    guides: z.array(guideSchema),
+    elements: z.array(elementSchema).max(DOCUMENT_LIMITS.maxElementsPerContainer),
+    guides: z.array(guideSchema).max(DOCUMENT_LIMITS.maxGuidesPerContainer),
+    background: backgroundStyleSchema.optional(),
   })
   .strict();
 
@@ -329,8 +409,9 @@ const layoutSchema = z
     id: identifierSchema,
     name: nonEmptyStringSchema,
     masterId: identifierSchema,
-    elements: z.array(elementSchema),
-    guides: z.array(guideSchema),
+    elements: z.array(elementSchema).max(DOCUMENT_LIMITS.maxElementsPerContainer),
+    guides: z.array(guideSchema).max(DOCUMENT_LIMITS.maxGuidesPerContainer),
+    background: backgroundStyleSchema.optional(),
   })
   .strict();
 
@@ -340,7 +421,8 @@ export const slideSchema: z.ZodType<Slide> = z
     name: nonEmptyStringSchema,
     layoutId: identifierSchema,
     hidden: z.boolean(),
-    elements: z.array(elementSchema),
+    background: backgroundStyleSchema.optional(),
+    elements: z.array(elementSchema).max(DOCUMENT_LIMITS.maxElementsPerContainer),
   })
   .strict();
 
@@ -351,26 +433,86 @@ const assetSchema = z
     hash: z.string().regex(/^[0-9a-f]{64}$/),
     mediaType: nonEmptyStringSchema,
     fileName: nonEmptyStringSchema,
+    byteLength: z.number().int().positive().max(DOCUMENT_LIMITS.maxAssetByteLength).optional(),
+    widthPx: z.number().int().positive().max(DOCUMENT_LIMITS.maxImageDimensionPx).optional(),
+    heightPx: z.number().int().positive().max(DOCUMENT_LIMITS.maxImageDimensionPx).optional(),
+  })
+  .strict()
+  .superRefine((asset, context) => {
+    if (asset.kind !== 'image') return;
+    if (asset.widthPx !== undefined && asset.heightPx !== undefined) {
+      if (asset.widthPx * asset.heightPx > DOCUMENT_LIMITS.maxImagePixels) {
+        context.addIssue({ code: 'custom', message: 'Image pixel count exceeds the limit.' });
+      }
+    }
+  });
+
+const pageSchema = z
+  .object({
+    widthPt: positiveFiniteSchema.max(DOCUMENT_LIMITS.maxPageDimensionPt),
+    heightPt: positiveFiniteSchema.max(DOCUMENT_LIMITS.maxPageDimensionPt),
+  })
+  .strict();
+
+const deckBaseShape = {
+  id: identifierSchema,
+  name: nonEmptyStringSchema,
+  page: pageSchema,
+  themes: z.array(themeSchema).min(1).max(DOCUMENT_LIMITS.maxThemes),
+  masters: z.array(masterSchema).min(1).max(DOCUMENT_LIMITS.maxMasters),
+  layouts: z.array(layoutSchema).min(1).max(DOCUMENT_LIMITS.maxLayouts),
+  slides: z.array(slideSchema).min(1).max(DOCUMENT_LIMITS.maxSlides),
+  assets: z.array(assetSchema).max(DOCUMENT_LIMITS.maxAssets),
+} as const;
+
+export const deckDocumentV1Schema: z.ZodType<DeckDocumentV1> = z
+  .object({
+    schemaVersion: z.literal(1),
+    ...deckBaseShape,
   })
   .strict();
 
 export const deckDocumentSchema: z.ZodType<DeckDocument> = z
   .object({
-    schemaVersion: z.literal(1),
-    id: identifierSchema,
-    name: nonEmptyStringSchema,
-    page: z
+    schemaVersion: z.literal(2),
+    ...deckBaseShape,
+    metadata: z
       .object({
-        widthPt: positiveFiniteSchema,
-        heightPt: positiveFiniteSchema,
+        createdAt: z.string().datetime({ offset: true }),
+        modifiedAt: z.string().datetime({ offset: true }),
+        locale: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxLocaleLength),
+        creator: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxNameLength).optional(),
+        iconCatalogVersion: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxCatalogVersionLength),
+        flagCatalogVersion: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxCatalogVersionLength),
       })
       .strict(),
-    themes: z.array(themeSchema).min(1),
-    masters: z.array(masterSchema).min(1),
-    layouts: z.array(layoutSchema).min(1),
-    slides: z.array(slideSchema).min(1),
-    assets: z.array(assetSchema),
+    settings: z
+      .object({
+        grid: z
+          .object({
+            enabled: z.boolean(),
+            spacingPt: positiveFiniteSchema.max(1_000),
+            snapToGrid: z.boolean(),
+            snapToObjects: z.boolean(),
+          })
+          .strict(),
+        defaultBackground: backgroundStyleSchema,
+        includeHiddenSlidesInExport: z.boolean(),
+      })
+      .strict(),
   })
   .strict();
 
-export { colorSchema, identifierSchema, richTextDocumentSchema };
+export {
+  assetSchema,
+  backgroundStyleSchema,
+  colorSchema,
+  guideSchema,
+  identifierSchema,
+  layoutSchema,
+  masterSchema,
+  richTextDocumentSchema,
+  tableCellSchema,
+  textStyleOverridesSchema,
+  themeSchema,
+};
