@@ -93,6 +93,48 @@ const expectCollaborationError = (
 };
 
 describe('authoritative collaboration host', () => {
+  it('does not acknowledge or advance a durable submission before its async journal boundary', async () => {
+    const memory = new InMemoryDocumentAdapter(createNeutralDemoDeck());
+    let releaseJournal: (() => void) | undefined;
+    const journalGate = new Promise<void>((resolve) => {
+      releaseJournal = resolve;
+    });
+    const host = new AuthoritativeSessionHost(
+      {
+        durability: 'async',
+        getSnapshot: () => memory.getSnapshot(),
+        transact: async (commands, options) => {
+          await journalGate;
+          return memory.transact(commands, options);
+        },
+      },
+      { sessionId: SESSION_ID, idFactory: deterministicIdFactory() },
+    );
+    const first = host.getSnapshot().document.slides[0]?.elements[0];
+    if (first === undefined) throw new Error('Missing fixture element.');
+    let acknowledged = false;
+    const pending = host
+      .submitAsync(
+        createRequest(host, {
+          clientId: CLIENT_A,
+          clientRequestId: requestId(999),
+          commands: [transformCommand(first.id, { ...first.frame, xPt: first.frame.xPt + 10 })],
+        }),
+      )
+      .then((transaction) => {
+        acknowledged = true;
+        return transaction;
+      });
+
+    await Promise.resolve();
+    expect(acknowledged).toBe(false);
+    expect(host.sessionSeq).toBe(0);
+    releaseJournal?.();
+    const transaction = await pending;
+    expect(transaction.sessionSeq).toBe(1);
+    expect(host.sessionSeq).toBe(1);
+  });
+
   it('replicates committed transactions and converges deterministically', () => {
     const { host } = createHost();
     const replica = new InMemoryDocumentAdapter(createNeutralDemoDeck());

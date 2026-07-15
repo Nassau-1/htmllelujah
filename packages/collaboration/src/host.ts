@@ -45,6 +45,16 @@ export interface CollaborationDocumentAdapter {
   transact(commands: readonly DocumentCommand[], options: TransactionOptions): TransactionResult;
 }
 
+/** Durable adapters acknowledge only after their asynchronous journal boundary completes. */
+export interface DurableCollaborationDocumentAdapter {
+  readonly durability: 'async';
+  getSnapshot(): DocumentSnapshot;
+  transact(
+    commands: readonly DocumentCommand[],
+    options: TransactionOptions,
+  ): Promise<TransactionResult>;
+}
+
 export interface AuthoritativeSessionHostOptions {
   readonly sessionId?: string;
   readonly clock?: () => number;
@@ -62,6 +72,17 @@ export interface AuthoritativeSessionHostOptions {
 interface IdempotencyEntry {
   readonly fingerprint: string;
   readonly transaction: CommittedTransaction;
+}
+
+interface PreparedSubmission {
+  readonly request: CommandBatchRequest;
+  readonly fingerprint: string;
+  readonly idempotencyKey: string;
+  readonly access: CommandAccess;
+  readonly rebased: boolean;
+  readonly beforeRevision: string;
+  readonly transactionId: string;
+  readonly options: TransactionOptions;
 }
 
 const DEFAULT_TAIL_LIMIT = 256;
@@ -134,7 +155,7 @@ export class AuthoritativeSessionHost {
   public readonly sessionId: string;
   public readonly documentId: string;
 
-  private readonly adapter: CollaborationDocumentAdapter;
+  private readonly adapter: CollaborationDocumentAdapter | DurableCollaborationDocumentAdapter;
   private readonly clock: () => number;
   private readonly idFactory: () => string;
   private readonly tailLimit: number;
@@ -153,9 +174,10 @@ export class AuthoritativeSessionHost {
   private sessionSequence = 0;
   private currentRevision: string;
   private readonly initialRevision: string;
+  private submissionQueue: Promise<void> = Promise.resolve();
 
   public constructor(
-    adapter: CollaborationDocumentAdapter,
+    adapter: CollaborationDocumentAdapter | DurableCollaborationDocumentAdapter,
     options: AuthoritativeSessionHostOptions = {},
   ) {
     this.adapter = adapter;
@@ -211,6 +233,37 @@ export class AuthoritativeSessionHost {
   }
 
   public submit(rawRequest: unknown): CommittedTransaction {
+    if ('durability' in this.adapter && this.adapter.durability === 'async') {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'A durable collaboration adapter must be submitted through submitAsync().',
+      );
+    }
+    const prepared = this.prepareSubmission(rawRequest);
+    if (!('request' in prepared)) return prepared;
+    const result = (this.adapter as CollaborationDocumentAdapter).transact(
+      prepared.request.commands,
+      prepared.options,
+    );
+    return this.finalizeSubmission(prepared, result);
+  }
+
+  /** Serializes durable submissions and broadcasts only after journal acknowledgement. */
+  public submitAsync(rawRequest: unknown): Promise<CommittedTransaction> {
+    const operation = this.submissionQueue.then(async () => {
+      const prepared = this.prepareSubmission(rawRequest);
+      if (!('request' in prepared)) return prepared;
+      const result = await this.adapter.transact(prepared.request.commands, prepared.options);
+      return this.finalizeSubmission(prepared, result);
+    });
+    this.submissionQueue = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  private prepareSubmission(rawRequest: unknown): PreparedSubmission | CommittedTransaction {
     const request = parseRequest(
       commandBatchRequestSchema,
       rawRequest,
@@ -263,17 +316,33 @@ export class AuthoritativeSessionHost {
     const beforeRevision = this.currentRevision;
     const timestampMs = this.clock();
     const transactionId = this.idFactory();
-    const result = this.adapter.transact(request.commands, {
-      expectedRevision: beforeRevision,
-      metadata: {
-        transactionId,
-        actorId: request.clientId,
-        origin: request.metadata.origin,
-        label: request.metadata.label,
-        timestamp: new Date(timestampMs).toISOString(),
+    return {
+      request,
+      fingerprint,
+      idempotencyKey,
+      access,
+      rebased,
+      beforeRevision,
+      transactionId,
+      options: {
+        expectedRevision: beforeRevision,
+        metadata: {
+          transactionId,
+          actorId: request.clientId,
+          origin: request.metadata.origin,
+          label: request.metadata.label,
+          timestamp: new Date(timestampMs).toISOString(),
+        },
       },
-    });
+    };
+  }
 
+  private finalizeSubmission(
+    prepared: PreparedSubmission,
+    result: TransactionResult,
+  ): CommittedTransaction {
+    const { request, fingerprint, idempotencyKey, access, rebased, beforeRevision, transactionId } =
+      prepared;
     const nextSeq = this.sessionSequence + 1;
     const transaction = committedTransactionSchema.parse({
       protocolVersion: COLLABORATION_PROTOCOL_VERSION,

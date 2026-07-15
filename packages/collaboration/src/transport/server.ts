@@ -302,7 +302,7 @@ export class CollaborationTransportServer {
       state.socket.close(1008, 'Malformed protocol message');
       return;
     }
-    this.handleRequest(state, message);
+    void this.handleRequest(state, message);
   }
 
   private authenticate(state: ConnectionState, raw: unknown): void {
@@ -366,7 +366,10 @@ export class CollaborationTransportServer {
     );
   }
 
-  private handleRequest(state: ConnectionState, message: ClientRequestMessage): void {
+  private async handleRequest(
+    state: ConnectionState,
+    message: ClientRequestMessage,
+  ): Promise<void> {
     if ('clientId' in message.payload && message.payload.clientId !== state.clientId) {
       this.sendRequestError(
         state,
@@ -379,7 +382,7 @@ export class CollaborationTransportServer {
     try {
       switch (message.type) {
         case 'command.submit': {
-          const transaction = this.engine.submit(message.payload as CommandBatchRequest);
+          const transaction = await this.engine.submitAsync(message.payload as CommandBatchRequest);
           state.socket.send(
             json({
               type: 'command.result',
