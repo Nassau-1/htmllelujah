@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -9,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createHtmllelujahMcpServer,
   LocalRpcClient,
+  runHtmllelujahMcpStdioFromDescriptor,
   startLocalRpcServer,
   type CommitProposalInput,
   type ExportDocumentInput,
@@ -263,5 +265,238 @@ describe('authenticated local RPC', () => {
     await expect(new LocalRpcClient(descriptorPath).appStatus()).rejects.toMatchObject({
       code: 'SERVICE_UNAVAILABLE',
     });
+  });
+
+  it('routes permission decisions and consumes approvals exactly once', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v1.json');
+    const permissions = createPermissions();
+    permissions.approvals.add(approvalId);
+    permissions.canRead = vi.fn((candidate) => candidate === documentId);
+    permissions.canEdit = vi.fn(() => false);
+    const server = await startLocalRpcServer({
+      service: createService(),
+      permissions,
+      descriptorPath,
+    });
+    const client = new LocalRpcClient(descriptorPath);
+    try {
+      await expect(client.canRead(documentId)).resolves.toBe(true);
+      await expect(client.canEdit(documentId)).resolves.toBe(false);
+      await expect(
+        client.consumeApproval({ approvalId, documentId, action: 'import' }),
+      ).resolves.toBe(true);
+      await expect(
+        client.consumeApproval({ approvalId, documentId, action: 'import' }),
+      ).resolves.toBe(false);
+      expect(permissions.canRead).toHaveBeenCalledWith(documentId);
+      expect(permissions.canEdit).toHaveBeenCalledWith(documentId);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('fails closed when no permission gate is supplied', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v1.json');
+    const server = await startLocalRpcServer({ service: createService(), descriptorPath });
+    const client = new LocalRpcClient(descriptorPath);
+    try {
+      await expect(client.canRead(documentId)).resolves.toBe(false);
+      await expect(client.canEdit(documentId)).resolves.toBe(false);
+      await expect(
+        client.consumeApproval({ approvalId, documentId, action: 'export-pdf' }),
+      ).resolves.toBe(false);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('strictly rejects malformed permission RPC parameters before invoking the gate', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v1.json');
+    const permissions = createPermissions();
+    permissions.canRead = vi.fn(() => true);
+    const server = await startLocalRpcServer({
+      service: createService(),
+      permissions,
+      descriptorPath,
+    });
+    const client = new LocalRpcClient(descriptorPath);
+    const rawCall = (
+      client as unknown as {
+        call(method: string, params: unknown): Promise<unknown>;
+      }
+    ).call.bind(client);
+    try {
+      await expect(
+        rawCall('canRead', { documentId, unexpectedPath: 'C:\\private.txt' }),
+      ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+      await expect(
+        rawCall('consumeApproval', {
+          approvalId,
+          documentId,
+          action: 'export-anywhere',
+        }),
+      ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+      expect(permissions.canRead).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('fails safely when a permission gate throws or returns invalid data', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v1.json');
+    const permissions = createPermissions();
+    permissions.canRead = () => {
+      throw new Error('sensitive permission backend details');
+    };
+    permissions.canEdit = (() => 'yes') as unknown as McpPermissionGate['canEdit'];
+    const server = await startLocalRpcServer({
+      service: createService(),
+      permissions,
+      descriptorPath,
+    });
+    const client = new LocalRpcClient(descriptorPath);
+    try {
+      await expect(client.canRead(documentId)).rejects.toMatchObject({
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'The local document service is unavailable.',
+      });
+      await expect(client.canEdit(documentId)).rejects.toMatchObject({
+        code: 'SERVICE_UNAVAILABLE',
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('uses the RPC client as both MCP service and permission gate', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v1.json');
+    const service = createService();
+    const permissions = createPermissions();
+    permissions.approvals.add(approvalId);
+    const rpcServer = await startLocalRpcServer({
+      service,
+      permissions,
+      descriptorPath,
+    });
+    const rpcClient = new LocalRpcClient(descriptorPath);
+    const { server, client } = await connectMcp(rpcClient, rpcClient);
+    try {
+      const first = await client.callTool({
+        name: 'assets_request_import',
+        arguments: { documentId, approvalId },
+      });
+      expect(first.isError).not.toBe(true);
+      expect(textResult(first)).toMatchObject({ assetId: slideId });
+
+      const replay = await client.callTool({
+        name: 'assets_request_import',
+        arguments: { documentId, approvalId },
+      });
+      expect(replay.isError).toBe(true);
+      expect(textResult(replay)).toMatchObject({ error: { code: 'APPROVAL_EXPIRED' } });
+      expect(service.importAsset).toHaveBeenCalledTimes(1);
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+      await rpcClient.close();
+      await rpcServer.close();
+    }
+  });
+
+  it('closes clients, pending connections, descriptors, and stdio bridge cleanly', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v1.json');
+    const service = createService();
+    let releaseStatus: ((value: Readonly<Record<string, unknown>>) => void) | undefined;
+    service.appStatus = vi.fn(
+      () =>
+        new Promise<Readonly<Record<string, unknown>>>((resolve) => {
+          releaseStatus = resolve;
+        }),
+    );
+    const rpcServer = await startLocalRpcServer({
+      service,
+      permissions: createPermissions(),
+      descriptorPath,
+    });
+    const client = new LocalRpcClient(descriptorPath);
+    await client.connect();
+    await client.close();
+    await client.close();
+    await expect(client.appStatus()).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
+
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let stdoutText = '';
+    stdout.on('data', (chunk: Buffer) => {
+      stdoutText += chunk.toString('utf8');
+    });
+    const bridge = runHtmllelujahMcpStdioFromDescriptor(descriptorPath, { stdin, stdout });
+    stdin.write(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-11-25',
+          capabilities: {},
+          clientInfo: { name: 'stdio-test', version: '1.0.0' },
+        },
+      })}\n`,
+    );
+    await vi.waitFor(
+      () => {
+        const messages = stdoutText
+          .trim()
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
+        expect(messages).toContainEqual(expect.objectContaining({ jsonrpc: '2.0', id: 1 }));
+      },
+      { timeout: 5_000 },
+    );
+    stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+    stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
+    await vi.waitFor(
+      () => {
+        const messages = stdoutText
+          .trim()
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
+        expect(messages).toContainEqual(expect.objectContaining({ jsonrpc: '2.0', id: 2 }));
+      },
+      { timeout: 5_000 },
+    );
+    stdin.end();
+    await bridge;
+    const stdoutMessages = stdoutText
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(stdoutMessages).toHaveLength(2);
+    expect(stdoutMessages.every((message) => message.jsonrpc === '2.0')).toBe(true);
+
+    const pendingClient = new LocalRpcClient(descriptorPath);
+    const pendingStatus = pendingClient.appStatus();
+    const pendingRejection = expect(pendingStatus).rejects.toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+    });
+    await vi.waitFor(() => expect(service.appStatus).toHaveBeenCalledTimes(1));
+    await rpcServer.close();
+    await pendingRejection;
+    releaseStatus?.({ running: true });
+    await pendingClient.close();
+    await rpcServer.close();
+    await expect(readFile(descriptorPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

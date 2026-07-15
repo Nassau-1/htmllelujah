@@ -3,6 +3,10 @@ import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { createServer, createConnection, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { type Readable, type Writable } from 'node:stream';
+
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
 
 import type {
   CommitProposalInput,
@@ -11,7 +15,23 @@ import type {
   ProposeCommandsInput,
   TransactionTargetInput,
 } from './contracts.js';
-import { McpSafeError, type HtmllelujahMcpService, type SafeRecord } from './service.js';
+import {
+  approvalIdSchema,
+  commitProposalSchema,
+  documentTargetSchema,
+  exportDocumentSchema,
+  importAssetSchema,
+  proposeCommandsSchema,
+  slideTargetSchema,
+  transactionTargetSchema,
+} from './contracts.js';
+import {
+  createHtmllelujahMcpServer,
+  McpSafeError,
+  type HtmllelujahMcpService,
+  type McpPermissionGate,
+  type SafeRecord,
+} from './service.js';
 
 const PROTOCOL_VERSION = 1;
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
@@ -46,7 +66,10 @@ type RpcMethod =
   | 'undoAgentTransaction'
   | 'importAsset'
   | 'exportDocument'
-  | 'collaborationStatus';
+  | 'collaborationStatus'
+  | 'canRead'
+  | 'canEdit'
+  | 'consumeApproval';
 
 interface RpcRequest {
   readonly type: 'request';
@@ -76,7 +99,32 @@ const allowedMethods = new Set<RpcMethod>([
   'importAsset',
   'exportDocument',
   'collaborationStatus',
+  'canRead',
+  'canEdit',
+  'consumeApproval',
 ]);
+
+const emptyParamsSchema = z.object({}).strict();
+const permissionActionSchema = z.enum([
+  'commit-destructive',
+  'undo',
+  'import',
+  'export-html',
+  'export-pdf',
+]);
+const consumeApprovalSchema = z
+  .object({
+    approvalId: approvalIdSchema,
+    documentId: documentTargetSchema.shape.documentId,
+    action: permissionActionSchema,
+  })
+  .strict();
+
+const FAIL_CLOSED_PERMISSION_GATE: McpPermissionGate = Object.freeze({
+  canRead: () => false,
+  canEdit: () => false,
+  consumeApproval: () => false,
+});
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -150,62 +198,77 @@ const safeRpcError = (error: unknown): { readonly code: string; readonly message
   return { code: 'SERVICE_UNAVAILABLE', message: 'The local document service is unavailable.' };
 };
 
-const requireObject = (params: unknown): Record<string, unknown> => {
-  if (!isRecord(params)) throw new McpSafeError('INVALID_REQUEST', 'RPC parameters are invalid.');
-  return params;
+const parseParams = <T>(schema: z.ZodType<T>, params: unknown): T => {
+  const result = schema.safeParse(params);
+  if (!result.success) {
+    throw new McpSafeError('INVALID_REQUEST', 'RPC parameters are invalid.');
+  }
+  return result.data;
 };
 
-const requireString = (params: Record<string, unknown>, key: string): string => {
-  const value = params[key];
-  if (typeof value !== 'string')
-    throw new McpSafeError('INVALID_REQUEST', 'RPC parameter is invalid.');
+const requirePermissionDecision = (value: unknown): boolean => {
+  if (typeof value !== 'boolean') {
+    throw new McpSafeError('SERVICE_UNAVAILABLE', 'The permission service returned invalid data.');
+  }
   return value;
 };
 
 const dispatch = async (
   service: HtmllelujahMcpService,
+  permissions: McpPermissionGate,
   method: RpcMethod,
   params: unknown,
 ): Promise<unknown> => {
   switch (method) {
-    case 'appStatus':
+    case 'appStatus': {
+      parseParams(emptyParamsSchema, params);
       return service.appStatus();
-    case 'listOpenDocuments':
+    }
+    case 'listOpenDocuments': {
+      parseParams(emptyParamsSchema, params);
       return service.listOpenDocuments();
+    }
     case 'getDocumentOutline': {
-      const record = requireObject(params);
-      return service.getDocumentOutline(requireString(record, 'documentId'));
+      const input = parseParams(documentTargetSchema, params);
+      return service.getDocumentOutline(input.documentId);
     }
     case 'getSlide': {
-      const record = requireObject(params);
-      return service.getSlide(
-        requireString(record, 'documentId'),
-        requireString(record, 'slideId'),
-      );
+      const input = parseParams(slideTargetSchema, params);
+      return service.getSlide(input.documentId, input.slideId);
     }
     case 'getStyleCatalog': {
-      const record = requireObject(params);
-      return service.getStyleCatalog(requireString(record, 'documentId'));
+      const input = parseParams(documentTargetSchema, params);
+      return service.getStyleCatalog(input.documentId);
     }
     case 'validateDocument': {
-      const record = requireObject(params);
-      return service.validateDocument(requireString(record, 'documentId'));
+      const input = parseParams(documentTargetSchema, params);
+      return service.validateDocument(input.documentId);
     }
     case 'proposeCommands':
-      return service.proposeCommands(requireObject(params) as unknown as ProposeCommandsInput);
+      return service.proposeCommands(parseParams(proposeCommandsSchema, params));
     case 'commitProposal':
-      return service.commitProposal(requireObject(params) as unknown as CommitProposalInput);
+      return service.commitProposal(parseParams(commitProposalSchema, params));
     case 'undoAgentTransaction':
-      return service.undoAgentTransaction(
-        requireObject(params) as unknown as TransactionTargetInput,
-      );
+      return service.undoAgentTransaction(parseParams(transactionTargetSchema, params));
     case 'importAsset':
-      return service.importAsset(requireObject(params) as unknown as ImportAssetInput);
+      return service.importAsset(parseParams(importAssetSchema, params));
     case 'exportDocument':
-      return service.exportDocument(requireObject(params) as unknown as ExportDocumentInput);
+      return service.exportDocument(parseParams(exportDocumentSchema, params));
     case 'collaborationStatus': {
-      const record = requireObject(params);
-      return service.collaborationStatus(requireString(record, 'documentId'));
+      const input = parseParams(documentTargetSchema, params);
+      return service.collaborationStatus(input.documentId);
+    }
+    case 'canRead': {
+      const input = parseParams(documentTargetSchema, params);
+      return requirePermissionDecision(await permissions.canRead(input.documentId));
+    }
+    case 'canEdit': {
+      const input = parseParams(documentTargetSchema, params);
+      return requirePermissionDecision(await permissions.canEdit(input.documentId));
+    }
+    case 'consumeApproval': {
+      const input = parseParams(consumeApprovalSchema, params);
+      return requirePermissionDecision(await permissions.consumeApproval(input));
     }
   }
 };
@@ -214,9 +277,11 @@ const parseRpcRequest = (value: unknown): RpcRequest => {
   if (!isRecord(value)) throw new McpSafeError('INVALID_REQUEST', 'RPC request is invalid.');
   const keys = Object.keys(value);
   if (
+    keys.length !== 4 ||
     keys.some((key) => !['type', 'id', 'method', 'params'].includes(key)) ||
     value.type !== 'request' ||
     typeof value.id !== 'string' ||
+    value.id.length === 0 ||
     value.id.length > 80 ||
     typeof value.method !== 'string' ||
     !allowedMethods.has(value.method as RpcMethod)
@@ -229,6 +294,7 @@ const parseRpcRequest = (value: unknown): RpcRequest => {
 const handleServerSocket = (
   socket: Socket,
   service: HtmllelujahMcpService,
+  permissions: McpPermissionGate,
   secret: string,
   usedNonces: Set<string>,
 ): void => {
@@ -305,7 +371,7 @@ const handleServerSocket = (
       return;
     }
     try {
-      const result = await dispatch(service, request.method, request.params);
+      const result = await dispatch(service, permissions, request.method, request.params);
       writeFrame(socket, {
         type: 'response',
         id: request.id,
@@ -334,14 +400,39 @@ const writeDescriptorAtomic = async (
 ): Promise<void> => {
   await mkdir(path.dirname(descriptorPath), { recursive: true });
   const temporary = `${descriptorPath}.${randomUUID()}.tmp`;
-  const handle = await open(temporary, 'wx', 0o600);
   try {
-    await handle.writeFile(`${JSON.stringify(descriptor)}\n`, 'utf8');
-    await handle.sync();
-  } finally {
-    await handle.close();
+    const handle = await open(temporary, 'wx', 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(descriptor)}\n`, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, descriptorPath);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
   }
-  await rename(temporary, descriptorPath);
+};
+
+const removeDescriptorIfOwned = async (
+  descriptorPath: string,
+  descriptor: LocalRpcEndpointDescriptor,
+): Promise<void> => {
+  try {
+    const bytes = await readFile(descriptorPath);
+    if (bytes.byteLength > 16 * 1024) return;
+    const value = JSON.parse(bytes.toString('utf8')) as unknown;
+    if (
+      isRecord(value) &&
+      value.instanceId === descriptor.instanceId &&
+      value.secret === descriptor.secret
+    ) {
+      await rm(descriptorPath, { force: true });
+    }
+  } catch {
+    // A missing, replaced, or malformed descriptor is not owned by this server anymore.
+  }
 };
 
 const listen = async (server: Server, pipeName: string): Promise<void> =>
@@ -361,6 +452,7 @@ const listen = async (server: Server, pipeName: string): Promise<void> =>
 
 export const startLocalRpcServer = async (input: {
   readonly service: HtmllelujahMcpService;
+  readonly permissions?: McpPermissionGate | undefined;
   readonly descriptorPath: string;
   readonly lifetimeMs?: number | undefined;
 }): Promise<LocalRpcServerHandle> => {
@@ -383,16 +475,18 @@ export const startLocalRpcServer = async (input: {
   };
   const usedNonces = new Set<string>();
   const sockets = new Set<Socket>();
+  const permissions = input.permissions ?? FAIL_CLOSED_PERMISSION_GATE;
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
-    handleServerSocket(socket, input.service, secret, usedNonces);
+    handleServerSocket(socket, input.service, permissions, secret, usedNonces);
   });
   await listen(server, pipeName);
   try {
     await writeDescriptorAtomic(input.descriptorPath, descriptor);
   } catch (error) {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (process.platform !== 'win32') await rm(pipeName, { force: true }).catch(() => undefined);
     throw error;
   }
   let closed = false;
@@ -403,7 +497,7 @@ export const startLocalRpcServer = async (input: {
       closed = true;
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(input.descriptorPath, { force: true }).catch(() => undefined);
+      await removeDescriptorIfOwned(input.descriptorPath, descriptor);
       if (process.platform !== 'win32') await rm(pipeName, { force: true }).catch(() => undefined);
     },
   };
@@ -459,7 +553,7 @@ const connectSocket = async (pipeName: string): Promise<Socket> =>
     socket.once('error', onError);
   });
 
-export class LocalRpcClient implements HtmllelujahMcpService {
+export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate {
   private readonly pending = new Map<
     string,
     {
@@ -472,12 +566,16 @@ export class LocalRpcClient implements HtmllelujahMcpService {
   private descriptor: LocalRpcEndpointDescriptor | undefined;
   private readyPromise: Promise<void> | undefined;
   private removeReader: (() => void) | undefined;
+  private closed = false;
 
   public constructor(private readonly descriptorPath: string) {}
 
   public async connect(): Promise<void> {
-    if (this.socket !== undefined) return;
+    if (this.closed) {
+      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Local RPC client is closed.');
+    }
     if (this.readyPromise !== undefined) return this.readyPromise;
+    if (this.socket !== undefined && !this.socket.destroyed) return;
     this.readyPromise = this.connectInternal();
     try {
       await this.readyPromise;
@@ -487,12 +585,30 @@ export class LocalRpcClient implements HtmllelujahMcpService {
   }
 
   private async connectInternal(): Promise<void> {
-    const descriptorBytes = await readFile(this.descriptorPath);
+    let descriptorBytes: Buffer;
+    try {
+      descriptorBytes = await readFile(this.descriptorPath);
+    } catch {
+      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is unavailable.');
+    }
     if (descriptorBytes.byteLength > 16 * 1024) {
       throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is too large.');
     }
-    const descriptor = parseDescriptor(JSON.parse(descriptorBytes.toString('utf8')) as unknown);
+    let descriptorValue: unknown;
+    try {
+      descriptorValue = JSON.parse(descriptorBytes.toString('utf8')) as unknown;
+    } catch {
+      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is invalid.');
+    }
+    const descriptor = parseDescriptor(descriptorValue);
+    if (this.closed) {
+      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Local RPC client is closed.');
+    }
     const socket = await connectSocket(descriptor.pipeName);
+    if (this.closed) {
+      socket.destroy();
+      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Local RPC client is closed.');
+    }
     socket.setNoDelay(true);
     this.socket = socket;
     this.descriptor = descriptor;
@@ -506,6 +622,10 @@ export class LocalRpcClient implements HtmllelujahMcpService {
         clearTimeout(timeout);
         socket.off('close', fail);
         socket.off('error', fail);
+        this.removeReader?.();
+        this.removeReader = undefined;
+        if (this.socket === socket) this.socket = undefined;
+        this.descriptor = undefined;
         reject(new McpSafeError('SERVICE_UNAVAILABLE', 'Local authentication failed.'));
       };
       const timeout = setTimeout(() => {
@@ -520,8 +640,11 @@ export class LocalRpcClient implements HtmllelujahMcpService {
           if (state === 'challenge') {
             if (
               !isRecord(value) ||
+              Object.keys(value).length !== 3 ||
+              Object.keys(value).some((key) => !['type', 'serverNonce', 'proof'].includes(key)) ||
               value.type !== 'challenge' ||
               typeof value.serverNonce !== 'string' ||
+              !/^[0-9a-f]{64}$/u.test(value.serverNonce) ||
               typeof value.proof !== 'string'
             ) {
               throw new Error('Invalid challenge.');
@@ -541,7 +664,13 @@ export class LocalRpcClient implements HtmllelujahMcpService {
             state = 'ready';
             return;
           }
-          if (!isRecord(value) || value.type !== 'ready' || value.protocolVersion !== 1) {
+          if (
+            !isRecord(value) ||
+            Object.keys(value).length !== 2 ||
+            Object.keys(value).some((key) => !['type', 'protocolVersion'].includes(key)) ||
+            value.type !== 'ready' ||
+            value.protocolVersion !== 1
+          ) {
             throw new Error('Invalid readiness frame.');
           }
           settled = true;
@@ -565,6 +694,7 @@ export class LocalRpcClient implements HtmllelujahMcpService {
   private handleResponse(value: unknown): void {
     if (
       !isRecord(value) ||
+      Object.keys(value).some((key) => !['type', 'id', 'ok', 'result', 'error'].includes(key)) ||
       value.type !== 'response' ||
       typeof value.id !== 'string' ||
       typeof value.ok !== 'boolean'
@@ -576,17 +706,42 @@ export class LocalRpcClient implements HtmllelujahMcpService {
     if (pending === undefined) return;
     this.pending.delete(value.id);
     clearTimeout(pending.timer);
-    if (value.ok) pending.resolve(value.result);
-    else {
+    if (value.ok) {
+      if ('error' in value) {
+        this.socket?.destroy();
+        pending.reject(new McpSafeError('SERVICE_UNAVAILABLE', 'Local RPC response is invalid.'));
+        return;
+      }
+      pending.resolve(value.result);
+    } else {
+      if ('result' in value) {
+        this.socket?.destroy();
+        pending.reject(new McpSafeError('SERVICE_UNAVAILABLE', 'Local RPC response is invalid.'));
+        return;
+      }
       const error = isRecord(value.error) ? value.error : {};
-      pending.reject(
-        new McpSafeError(
-          typeof error.code === 'string' && error.code === 'NOT_FOUND'
-            ? 'NOT_FOUND'
-            : 'SERVICE_UNAVAILABLE',
-          typeof error.message === 'string' ? error.message : 'Local operation failed.',
-        ),
-      );
+      if (
+        Object.keys(error).length !== 2 ||
+        Object.keys(error).some((key) => !['code', 'message'].includes(key)) ||
+        typeof error.code !== 'string' ||
+        typeof error.message !== 'string'
+      ) {
+        this.socket?.destroy();
+        pending.reject(new McpSafeError('SERVICE_UNAVAILABLE', 'Local RPC response is invalid.'));
+        return;
+      }
+      const code = [
+        'MCP_UNAUTHORIZED',
+        'APPROVAL_REQUIRED',
+        'APPROVAL_EXPIRED',
+        'REVISION_CONFLICT',
+        'NOT_FOUND',
+        'INVALID_REQUEST',
+        'SERVICE_UNAVAILABLE',
+      ].includes(error.code)
+        ? (error.code as ConstructorParameters<typeof McpSafeError>[0])
+        : 'SERVICE_UNAVAILABLE';
+      pending.reject(new McpSafeError(code, error.message));
     }
   }
 
@@ -603,6 +758,8 @@ export class LocalRpcClient implements HtmllelujahMcpService {
   }
 
   public async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     this.socket?.destroy();
     this.rejectAll();
   }
@@ -671,4 +828,93 @@ export class LocalRpcClient implements HtmllelujahMcpService {
   public async collaborationStatus(documentId: string): Promise<SafeRecord> {
     return (await this.call('collaborationStatus', { documentId })) as SafeRecord;
   }
+
+  public async canRead(documentId: string): Promise<boolean> {
+    return this.callPermission('canRead', { documentId });
+  }
+
+  public async canEdit(documentId: string): Promise<boolean> {
+    return this.callPermission('canEdit', { documentId });
+  }
+
+  public async consumeApproval(
+    input: Parameters<McpPermissionGate['consumeApproval']>[0],
+  ): Promise<boolean> {
+    return this.callPermission('consumeApproval', input);
+  }
+
+  private async callPermission(method: 'canRead' | 'canEdit' | 'consumeApproval', params: unknown) {
+    const result = await this.call(method, params);
+    if (typeof result !== 'boolean') {
+      this.socket?.destroy();
+      throw new McpSafeError(
+        'SERVICE_UNAVAILABLE',
+        'The local permission service returned invalid data.',
+      );
+    }
+    return result;
+  }
 }
+
+export interface DescriptorStdioStreams {
+  readonly stdin?: Readable | undefined;
+  readonly stdout?: Writable | undefined;
+}
+
+/**
+ * Runs an MCP stdio bridge backed by the authenticated desktop RPC endpoint.
+ *
+ * The supplied stdout is owned exclusively by the MCP transport. This function
+ * deliberately performs no logging so protocol frames are never mixed with
+ * diagnostic text.
+ */
+export const runHtmllelujahMcpStdioFromDescriptor = async (
+  descriptorPath: string,
+  streams: DescriptorStdioStreams = {},
+): Promise<void> => {
+  if (!path.isAbsolute(descriptorPath)) {
+    throw new McpSafeError('INVALID_REQUEST', 'Endpoint descriptor path must be absolute.');
+  }
+
+  const stdin = streams.stdin ?? process.stdin;
+  const stdout = streams.stdout ?? process.stdout;
+  const rpc = new LocalRpcClient(descriptorPath);
+  const mcp = createHtmllelujahMcpServer(rpc, rpc);
+  const transport = new StdioServerTransport(stdin, stdout);
+
+  let resolveClosed: (() => void) | undefined;
+  let terminalError: Error | undefined;
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  const fail = (error: Error): void => {
+    terminalError ??= error;
+    resolveClosed?.();
+  };
+  const closeTransport = (): void => {
+    void transport.close().catch((error: unknown) => {
+      fail(error instanceof Error ? error : new Error('The MCP stdio transport failed to close.'));
+    });
+  };
+  const onInputError = (error: Error): void => fail(error);
+
+  transport.onclose = () => resolveClosed?.();
+  transport.onerror = (error) => fail(error);
+  stdin.once('end', closeTransport);
+  stdin.once('close', closeTransport);
+  stdin.once('error', onInputError);
+
+  try {
+    await rpc.connect();
+    if (terminalError !== undefined) throw terminalError;
+    await mcp.connect(transport);
+    if (stdin.readableEnded || stdin.destroyed) closeTransport();
+    await closed;
+    if (terminalError !== undefined) throw terminalError;
+  } finally {
+    stdin.off('end', closeTransport);
+    stdin.off('close', closeTransport);
+    stdin.off('error', onInputError);
+    await Promise.allSettled([mcp.close(), rpc.close()]);
+  }
+};
