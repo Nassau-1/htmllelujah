@@ -83,8 +83,19 @@ export interface CommitProposalResult {
   readonly acceptedCommandCount: number;
 }
 
+const APPROVAL_REQUIRED_COMMANDS = new Set<DocumentCommand['type']>([
+  'slide.delete',
+  'element.delete',
+  'theme.delete',
+  'master.delete',
+  'layout.delete',
+  'asset.remove',
+  'table.delete-row',
+  'table.delete-column',
+  'slide.set-layout',
+  'slide.reset-placeholder',
+  'deck.set-page',
+]);
+
 export const commandsRequireApproval = (commands: readonly DocumentCommand[]): boolean =>
-  commands.some((command) => {
-    const commandType: string = command.type;
-    return ['slide.delete', 'element.delete', 'deck.set-page'].includes(commandType);
-  });
+  commands.some((command) => APPROVAL_REQUIRED_COMMANDS.has(command.type));

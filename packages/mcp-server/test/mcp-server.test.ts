@@ -5,10 +5,12 @@ import { PassThrough } from 'node:stream';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import type { DocumentCommand } from '@htmllelujah/document-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createHtmllelujahMcpServer,
+  commandsRequireApproval,
   LocalRpcClient,
   runHtmllelujahMcpStdioFromDescriptor,
   startLocalRpcServer,
@@ -39,6 +41,32 @@ const createTemporaryDirectory = async (): Promise<string> => {
   directories.push(directory);
   return directory;
 };
+
+describe('MCP destructive command classification', () => {
+  it('requires approval for every destructive or content-remapping command', () => {
+    const destructiveCommands: readonly DocumentCommand[] = [
+      { type: 'slide.delete', slideId },
+      { type: 'element.delete', slideId, elementIds: [proposalId] },
+      { type: 'theme.delete', themeId: proposalId },
+      { type: 'master.delete', masterId: proposalId },
+      { type: 'layout.delete', layoutId: proposalId },
+      { type: 'asset.remove', assetId: proposalId },
+      { type: 'table.delete-row', slideId, tableId: proposalId, index: 0 },
+      { type: 'table.delete-column', slideId, tableId: proposalId, index: 0 },
+      { type: 'slide.set-layout', slideId, layoutId: proposalId },
+      { type: 'slide.reset-placeholder', slideId, placeholderId: proposalId },
+      {
+        type: 'deck.set-page',
+        page: { widthPt: 960, heightPt: 540 },
+      },
+    ];
+
+    for (const command of destructiveCommands) {
+      expect(commandsRequireApproval([command]), command.type).toBe(true);
+    }
+    expect(commandsRequireApproval([{ type: 'deck.rename', name: 'Safe rename' }])).toBe(false);
+  });
+});
 
 const createService = (): HtmllelujahMcpService => ({
   appStatus: vi.fn(async () => ({ running: true, version: '1.0.0' })),
