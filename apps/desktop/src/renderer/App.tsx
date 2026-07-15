@@ -61,6 +61,7 @@ import {
   type Frame,
   type Guide,
   type ImageElement,
+  type ConnectorElement,
   type Layout,
   type Master,
   type PlaceholderElement,
@@ -72,7 +73,7 @@ import {
   type TextMarks,
   type TextStyleRole,
 } from '@htmllelujah/document-core';
-import { SlideSurface } from '@htmllelujah/renderer';
+import { LOCAL_ICON_PATHS, SlideSurface } from '@htmllelujah/renderer';
 import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 
@@ -105,6 +106,37 @@ import {
 } from './editor/canonical-factories';
 
 const menuItems = ['File', 'Edit', 'View', 'Insert', 'Arrange', 'Help'] as const;
+const commonCountryCodes = [
+  'AR',
+  'AU',
+  'BE',
+  'BR',
+  'CA',
+  'CH',
+  'CN',
+  'DE',
+  'DK',
+  'ES',
+  'EU',
+  'FI',
+  'FR',
+  'GB',
+  'GR',
+  'IE',
+  'IN',
+  'IT',
+  'JP',
+  'KR',
+  'LU',
+  'MX',
+  'NL',
+  'NO',
+  'PL',
+  'PT',
+  'SE',
+  'SG',
+  'US',
+] as const;
 type MenuItem = (typeof menuItems)[number];
 type InspectorTab = 'properties' | 'design';
 type Toast = { readonly kind: 'success' | 'error' | 'info'; readonly message: string };
@@ -444,6 +476,7 @@ function EditorApp() {
   const [textDraftDirty, setTextDraftDirty] = useState(false);
   const [textDraftConflict, setTextDraftConflict] = useState(false);
   const textBaselineRef = useRef<{ readonly id: string; readonly value: string } | null>(null);
+  const textApplyInFlightRef = useRef(false);
   const [tableTsv, setTableTsv] = useState('');
   const [selectedTableCellId, setSelectedTableCellId] = useState('');
   const [designMasterId, setDesignMasterId] = useState('');
@@ -1104,11 +1137,27 @@ function EditorApp() {
         },
       });
     }
-    if (commands.length > 0 && (await execute('Edit text', commands))) {
+    if (commands.length === 0) {
       setTextDraftDirty(false);
       setTextDraftConflict(false);
+    } else if (!textApplyInFlightRef.current) {
+      textApplyInFlightRef.current = true;
+      try {
+        if (await execute('Edit text', commands)) {
+          setTextDraftDirty(false);
+          setTextDraftConflict(false);
+        }
+      } finally {
+        textApplyInFlightRef.current = false;
+      }
     }
   }, [activeSlide, document, execute, primaryText, textDraft, textDraftConflict]);
+
+  useEffect(() => {
+    if (!textDraftDirty || textDraftConflict || primaryText === undefined) return;
+    const timer = window.setTimeout(() => void applyTextDraft(), 800);
+    return () => window.clearTimeout(timer);
+  }, [applyTextDraft, primaryText, textDraftConflict, textDraftDirty]);
 
   const pasteTable = useCallback(async (): Promise<void> => {
     if (activeSlide === undefined || primaryTable === undefined || tableTsv.trim() === '') return;
@@ -1152,6 +1201,26 @@ function EditorApp() {
       );
     },
     [patchElement, primaryImage],
+  );
+
+  const updateConnectorEndpoint = useCallback(
+    (
+      connector: ConnectorElement,
+      endpoint: 'start' | 'end',
+      value: ConnectorElement['start'],
+    ): void => {
+      if (activeSlide === undefined) return;
+      void execute('Update connector endpoint', [
+        {
+          type: 'connector.update-endpoint',
+          slideId: activeSlide.id,
+          connectorId: connector.id,
+          endpoint,
+          value,
+        },
+      ]);
+    },
+    [activeSlide, execute],
   );
 
   const updateMaster = useCallback(
@@ -2812,7 +2881,17 @@ function EditorApp() {
                 </div>
               </section>
               {primaryText !== undefined && textDraft !== null ? (
-                <section className="inspector-section text-editor-section">
+                <section
+                  className="inspector-section text-editor-section"
+                  onBlurCapture={(event) => {
+                    if (
+                      textDraftDirty &&
+                      !textDraftConflict &&
+                      !event.currentTarget.contains(event.relatedTarget)
+                    )
+                      void applyTextDraft();
+                  }}
+                >
                   <div className="section-heading-row">
                     <h3>Text</h3>
                     <span className="section-status">
@@ -3153,10 +3232,40 @@ function EditorApp() {
                 </section>
               ) : null}
               {primaryElement?.type === 'shape' ? (
-                <section className="inspector-section">
-                  <h3>Shape</h3>
+                <section className="inspector-section vector-editor-section">
+                  <div className="section-heading-row">
+                    <h3>Shape</h3>
+                    <span className="section-status">Native SVG</span>
+                  </div>
+                  <label className="stacked-field">
+                    <span>Shape</span>
+                    <select
+                      value={primaryElement.shape}
+                      onChange={(event) =>
+                        patchElement(
+                          {
+                            ...primaryElement,
+                            shape: event.currentTarget.value as typeof primaryElement.shape,
+                            cornerRadiusPt:
+                              event.currentTarget.value === 'rounded-rectangle'
+                                ? Math.max(primaryElement.cornerRadiusPt, 12)
+                                : primaryElement.cornerRadiusPt,
+                          },
+                          'Change shape type',
+                        )
+                      }
+                    >
+                      <option value="rectangle">Rectangle</option>
+                      <option value="rounded-rectangle">Rounded rectangle</option>
+                      <option value="ellipse">Ellipse</option>
+                      <option value="triangle">Triangle</option>
+                      <option value="diamond">Diamond</option>
+                      <option value="line">Line</option>
+                      <option value="arrow">Arrow</option>
+                    </select>
+                  </label>
                   <label className="color-field">
-                    Fill{' '}
+                    Fill
                     <input
                       type="color"
                       value={primaryElement.fill ?? '#ffffff'}
@@ -3172,8 +3281,17 @@ function EditorApp() {
                       }
                     />
                   </label>
+                  <button
+                    type="button"
+                    className="secondary-action compact-action"
+                    onClick={() =>
+                      patchElement({ ...primaryElement, fill: null }, 'Remove shape fill')
+                    }
+                  >
+                    No fill
+                  </button>
                   <label className="color-field">
-                    Stroke{' '}
+                    Stroke
                     <input
                       type="color"
                       value={primaryElement.stroke.color}
@@ -3195,6 +3313,358 @@ function EditorApp() {
                       }
                     />
                   </label>
+                  <div className="field-grid vector-number-grid">
+                    <label>
+                      <span>Stroke width</span>
+                      <input
+                        key={`${primaryElement.id}-stroke-width`}
+                        type="number"
+                        min="0"
+                        max="24"
+                        step="0.25"
+                        defaultValue={primaryElement.stroke.widthPt}
+                        onBlur={(event) => {
+                          const widthPt = clamp(Number(event.currentTarget.value), 0, 24);
+                          if (!Number.isFinite(widthPt)) return;
+                          patchElement(
+                            {
+                              ...primaryElement,
+                              stroke: { ...primaryElement.stroke, widthPt },
+                            },
+                            'Change shape stroke width',
+                          );
+                        }}
+                      />
+                    </label>
+                    <label>
+                      <span>Corner radius</span>
+                      <input
+                        key={`${primaryElement.id}-corner-radius`}
+                        type="number"
+                        min="0"
+                        max="240"
+                        step="1"
+                        defaultValue={primaryElement.cornerRadiusPt}
+                        onBlur={(event) => {
+                          const cornerRadiusPt = clamp(Number(event.currentTarget.value), 0, 240);
+                          if (!Number.isFinite(cornerRadiusPt)) return;
+                          patchElement(
+                            { ...primaryElement, cornerRadiusPt },
+                            'Change corner radius',
+                          );
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <label className="stacked-field">
+                    <span>Stroke pattern</span>
+                    <select
+                      value={primaryElement.stroke.dash}
+                      onChange={(event) =>
+                        patchElement(
+                          {
+                            ...primaryElement,
+                            stroke: {
+                              ...primaryElement.stroke,
+                              dash: event.currentTarget.value as typeof primaryElement.stroke.dash,
+                            },
+                          },
+                          'Change shape stroke pattern',
+                        )
+                      }
+                    >
+                      <option value="solid">Solid</option>
+                      <option value="dash">Dashed</option>
+                      <option value="dot">Dotted</option>
+                    </select>
+                  </label>
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={primaryElement.shadow !== undefined}
+                      onChange={(event) =>
+                        patchElement(
+                          event.currentTarget.checked
+                            ? {
+                                ...primaryElement,
+                                shadow: {
+                                  color: '#172033',
+                                  blurPt: 10,
+                                  offsetXPt: 0,
+                                  offsetYPt: 5,
+                                  opacity: 0.2,
+                                },
+                              }
+                            : { ...primaryElement, shadow: undefined },
+                          event.currentTarget.checked ? 'Add shape shadow' : 'Remove shape shadow',
+                        )
+                      }
+                    />
+                    Drop shadow
+                  </label>
+                </section>
+              ) : null}
+              {primaryElement?.type === 'connector' ? (
+                <section className="inspector-section vector-editor-section">
+                  <div className="section-heading-row">
+                    <h3>Connector</h3>
+                    <span className="section-status">Bindable</span>
+                  </div>
+                  <div className="font-controls">
+                    <label className="stacked-field">
+                      <span>Routing</span>
+                      <select
+                        value={primaryElement.routing}
+                        onChange={(event) =>
+                          patchElement(
+                            {
+                              ...primaryElement,
+                              routing: event.currentTarget.value as typeof primaryElement.routing,
+                            },
+                            'Change connector routing',
+                          )
+                        }
+                      >
+                        <option value="straight">Straight</option>
+                        <option value="elbow">Elbow</option>
+                      </select>
+                    </label>
+                    <label className="stacked-field">
+                      <span>Pattern</span>
+                      <select
+                        value={primaryElement.stroke.dash}
+                        onChange={(event) =>
+                          patchElement(
+                            {
+                              ...primaryElement,
+                              stroke: {
+                                ...primaryElement.stroke,
+                                dash: event.currentTarget
+                                  .value as typeof primaryElement.stroke.dash,
+                              },
+                            },
+                            'Change connector pattern',
+                          )
+                        }
+                      >
+                        <option value="solid">Solid</option>
+                        <option value="dash">Dashed</option>
+                        <option value="dot">Dotted</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label className="color-field">
+                    Line color
+                    <input
+                      type="color"
+                      value={primaryElement.stroke.color}
+                      onChange={(event) =>
+                        patchElement(
+                          {
+                            ...primaryElement,
+                            stroke: { ...primaryElement.stroke, color: event.currentTarget.value },
+                          },
+                          'Change connector color',
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="field-grid">
+                    <label>
+                      <span>Width</span>
+                      <input
+                        key={`${primaryElement.id}-connector-width`}
+                        type="number"
+                        min="0"
+                        max="24"
+                        step="0.25"
+                        defaultValue={primaryElement.stroke.widthPt}
+                        onBlur={(event) => {
+                          const widthPt = clamp(Number(event.currentTarget.value), 0, 24);
+                          if (!Number.isFinite(widthPt)) return;
+                          patchElement(
+                            {
+                              ...primaryElement,
+                              stroke: { ...primaryElement.stroke, widthPt },
+                            },
+                            'Change connector width',
+                          );
+                        }}
+                      />
+                    </label>
+                    <label>
+                      <span>End cap</span>
+                      <select
+                        value={primaryElement.endCap}
+                        onChange={(event) =>
+                          patchElement(
+                            {
+                              ...primaryElement,
+                              endCap: event.currentTarget.value as typeof primaryElement.endCap,
+                            },
+                            'Change connector end cap',
+                          )
+                        }
+                      >
+                        <option value="none">None</option>
+                        <option value="arrow">Arrow</option>
+                      </select>
+                    </label>
+                  </div>
+                  {(['start', 'end'] as const).map((endpointName) => {
+                    const endpoint = primaryElement[endpointName];
+                    return (
+                      <div className="connector-endpoint-card" key={endpointName}>
+                        <strong>{endpointName === 'start' ? 'Start' : 'End'} endpoint</strong>
+                        <label className="stacked-field">
+                          <span>Attach to object</span>
+                          <select
+                            value={endpoint.binding.elementId ?? ''}
+                            onChange={(event) => {
+                              const elementId = event.currentTarget.value;
+                              updateConnectorEndpoint(primaryElement, endpointName, {
+                                ...endpoint,
+                                binding:
+                                  elementId === ''
+                                    ? {}
+                                    : {
+                                        elementId,
+                                        anchor: endpoint.binding.anchor ?? 'center',
+                                      },
+                              });
+                            }}
+                          >
+                            <option value="">Free endpoint</option>
+                            {activeSlide.elements
+                              .filter((element) => element.id !== primaryElement.id)
+                              .map((element) => (
+                                <option key={element.id} value={element.id}>
+                                  {element.name}
+                                </option>
+                              ))}
+                          </select>
+                        </label>
+                        <label className="stacked-field">
+                          <span>Anchor</span>
+                          <select
+                            disabled={endpoint.binding.elementId === undefined}
+                            value={endpoint.binding.anchor ?? 'center'}
+                            onChange={(event) =>
+                              updateConnectorEndpoint(primaryElement, endpointName, {
+                                ...endpoint,
+                                binding: {
+                                  ...endpoint.binding,
+                                  anchor: event.currentTarget.value as NonNullable<
+                                    typeof endpoint.binding.anchor
+                                  >,
+                                },
+                              })
+                            }
+                          >
+                            <option value="top">Top</option>
+                            <option value="right">Right</option>
+                            <option value="bottom">Bottom</option>
+                            <option value="left">Left</option>
+                            <option value="center">Center</option>
+                          </select>
+                        </label>
+                        <div className="field-grid">
+                          {(['xPt', 'yPt'] as const).map((axis) => (
+                            <label key={axis}>
+                              <span>{axis === 'xPt' ? 'X' : 'Y'}</span>
+                              <input
+                                key={`${primaryElement.id}-${endpointName}-${axis}`}
+                                type="number"
+                                disabled={endpoint.binding.elementId !== undefined}
+                                defaultValue={endpoint[axis]}
+                                onBlur={(event) => {
+                                  const value = Number(event.currentTarget.value);
+                                  if (!Number.isFinite(value)) return;
+                                  updateConnectorEndpoint(primaryElement, endpointName, {
+                                    ...endpoint,
+                                    [axis]: value,
+                                  });
+                                }}
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </section>
+              ) : null}
+              {primaryElement?.type === 'icon' ? (
+                <section className="inspector-section icon-editor-section">
+                  <div className="section-heading-row">
+                    <h3>{primaryElement.iconSet === 'flags' ? 'Flag' : 'Icon'}</h3>
+                    <span className="section-status">Local vector catalog</span>
+                  </div>
+                  <label className="stacked-field">
+                    <span>Catalog</span>
+                    <select
+                      value={primaryElement.iconSet === 'flags' ? 'flags' : 'htmllelujah-local'}
+                      onChange={(event) => {
+                        const iconSet = event.currentTarget.value;
+                        patchElement(
+                          {
+                            ...primaryElement,
+                            name: iconSet === 'flags' ? 'FR flag' : 'Icon',
+                            iconSet,
+                            iconName: iconSet === 'flags' ? 'FR' : 'star',
+                          },
+                          'Change icon catalog',
+                        );
+                      }}
+                    >
+                      <option value="htmllelujah-local">Icons</option>
+                      <option value="flags">Round flags</option>
+                    </select>
+                  </label>
+                  <label className="stacked-field">
+                    <span>{primaryElement.iconSet === 'flags' ? 'Country' : 'Symbol'}</span>
+                    <select
+                      value={primaryElement.iconName}
+                      onChange={(event) => {
+                        const iconName = event.currentTarget.value;
+                        patchElement(
+                          {
+                            ...primaryElement,
+                            name:
+                              primaryElement.iconSet === 'flags'
+                                ? `${iconName} flag`
+                                : `${iconName} icon`,
+                            iconName,
+                          },
+                          primaryElement.iconSet === 'flags' ? 'Change flag' : 'Change icon',
+                        );
+                      }}
+                    >
+                      {(primaryElement.iconSet === 'flags'
+                        ? commonCountryCodes
+                        : Object.keys(LOCAL_ICON_PATHS)
+                      ).map((name) => (
+                        <option key={name} value={name}>
+                          {name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {primaryElement.iconSet !== 'flags' ? (
+                    <label className="color-field">
+                      Color
+                      <input
+                        type="color"
+                        value={primaryElement.color}
+                        onChange={(event) =>
+                          patchElement(
+                            { ...primaryElement, color: event.currentTarget.value },
+                            'Change icon color',
+                          )
+                        }
+                      />
+                    </label>
+                  ) : null}
                 </section>
               ) : null}
               {primaryTable !== undefined ? (
