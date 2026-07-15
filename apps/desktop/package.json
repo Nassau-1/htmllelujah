@@ -47,7 +47,7 @@
     "appId": "app.htmllelujah.desktop",
     "productName": "HTMLlelujah",
     "asar": true,
-    "artifactName": "HTMLlelujah-${version}-${arch}-Setup.${ext}",
+    "artifactName": "HTMLlelujah-${version}-${arch}-unsigned-Setup.${ext}",
     "directories": {
       "output": "out"
     },
@@ -55,12 +55,26 @@
       "dist/**/*",
       "dist-electron/**/*",
       "assets/icon.png",
-      "package.json"
+      "package.json",
+      "!**/*.map",
+      "!node_modules/**/*"
     ],
     "extraFiles": [
       {
         "from": "assets/HTMLlelujah-MCP.cmd",
         "to": "HTMLlelujah-MCP.cmd"
+      },
+      {
+        "from": "../../LICENSE",
+        "to": "LICENSE.txt"
+      },
+      {
+        "from": "../../EULA.txt",
+        "to": "EULA.txt"
+      },
+      {
+        "from": "../../THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
       }
     ],
     "fileAssociations": [
@@ -95,6 +109,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "deleteAppDataOnUninstall": false,
+      "license": "../../EULA.txt",
       "menuCategory": false
     }
   }

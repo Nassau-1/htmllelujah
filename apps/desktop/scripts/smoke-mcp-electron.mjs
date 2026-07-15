@@ -5,6 +5,9 @@ import path from 'node:path';
 
 import electronPath from 'electron';
 
+const desktopRoot = path.resolve(import.meta.dirname, '..');
+const packagedExecutable = process.env.HTMLLELUJAH_EXECUTABLE;
+const packagedLauncher = process.env.HTMLLELUJAH_MCP_LAUNCHER;
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const waitFor = async (operation, timeoutMs, label) => {
@@ -43,11 +46,15 @@ const terminate = async (child) => {
 
 const userData = await mkdtemp(path.join(tmpdir(), 'htmllelujah-electron-smoke-'));
 const descriptorPath = path.join(userData, 'mcp', 'endpoint-v1.json');
-const application = spawn(electronPath, ['.', `--user-data-dir=${userData}`], {
-  cwd: path.resolve(import.meta.dirname, '..'),
-  windowsHide: true,
-  stdio: ['ignore', 'ignore', 'pipe'],
-});
+const application = spawn(
+  packagedExecutable === undefined ? electronPath : path.resolve(packagedExecutable),
+  [...(packagedExecutable === undefined ? ['.'] : []), `--user-data-dir=${userData}`],
+  {
+    cwd: desktopRoot,
+    windowsHide: true,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  },
+);
 let applicationError = '';
 let mcpError = '';
 application.stderr.on('data', (chunk) => {
@@ -65,20 +72,22 @@ try {
     'Desktop MCP descriptor',
   );
 
-  mcp = spawn(
-    electronPath,
-    [path.resolve(import.meta.dirname, '..', 'dist-electron', 'mcp-cli.js')],
-    {
-      cwd: path.resolve(import.meta.dirname, '..'),
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        ELECTRON_RUN_AS_NODE: '1',
-        HTMLLELUJAH_USER_DATA_DIR: userData,
-      },
+  const mcpCommand =
+    packagedLauncher === undefined ? electronPath : (process.env.ComSpec ?? 'cmd.exe');
+  const mcpArguments =
+    packagedLauncher === undefined
+      ? [path.join(desktopRoot, 'dist-electron', 'mcp-cli.js')]
+      : ['/d', '/q', '/s', '/c', `call "${path.resolve(packagedLauncher)}"`];
+  mcp = spawn(mcpCommand, mcpArguments, {
+    cwd: desktopRoot,
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+      HTMLLELUJAH_USER_DATA_DIR: userData,
     },
-  );
+  });
   let buffered = '';
   const responses = new Map();
   const waiters = new Map();
@@ -197,7 +206,7 @@ try {
   await waitFor(() => mcp.exitCode !== null, 5_000, 'MCP stdio shutdown');
   if (mcp.exitCode !== 0) throw new Error(`MCP process exited with ${mcp.exitCode}.`);
   process.stdout.write(
-    'Electron MCP smoke passed: opened app, listed tools, committed edit, converged.\n',
+    `Electron MCP smoke passed (${packagedLauncher === undefined ? 'source' : 'packaged launcher'}): opened app, listed tools, committed edit, converged.\n`,
   );
 } catch (error) {
   if (applicationError !== '') {
