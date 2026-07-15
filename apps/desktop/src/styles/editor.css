@@ -1831,6 +1831,83 @@
   user-select: text;
 }
 
+.mcp-dialog {
+  width: min(640px, 94vw);
+}
+
+.recovery-dialog {
+  width: min(680px, 94vw);
+}
+
+.recovery-list {
+  display: grid;
+  gap: 9px;
+}
+
+.recovery-list article {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 6px;
+  background: var(--color-surface-muted);
+}
+
+.recovery-list article > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.recovery-list span,
+.recovery-list code {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+
+.mcp-command-card {
+  display: grid;
+  gap: 5px;
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 6px;
+  background: var(--color-surface-muted);
+}
+
+.mcp-command-card > span,
+.mcp-command-card > small,
+.mcp-approval-secret small {
+  color: var(--color-text-muted);
+  font-size: 10px;
+}
+
+.mcp-command-card code {
+  overflow-wrap: anywhere;
+  color: var(--color-text-primary);
+  font: 11px var(--font-code);
+  user-select: text;
+}
+
+.mcp-approval-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.mcp-approval-secret {
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid var(--color-accent-border);
+  border-radius: 6px;
+  background: var(--color-accent-soft);
+}
+
 .presentation-stage {
   display: grid;
   width: 100vw;
@@ -1879,6 +1956,10 @@
 
 @media (max-width: 900px) {
   .share-columns {
+    grid-template-columns: 1fr;
+  }
+
+  .mcp-approval-grid {
     grid-template-columns: 1fr;
   }
 }

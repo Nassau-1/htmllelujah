@@ -14,6 +14,7 @@
     "make": "pnpm build && electron-builder --win nsis --x64",
     "package": "pnpm build && electron-builder --dir --win --x64",
     "preview": "vite preview",
+    "smoke:electron:mcp": "pnpm build && node scripts/smoke-mcp-electron.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit"
   },
@@ -29,6 +30,7 @@
     "lucide-react": "1.24.0",
     "react": "19.2.7",
     "react-dom": "19.2.7",
+    "tslib": "1.14.1",
     "zod": "4.4.3"
   },
   "devDependencies": {
@@ -54,6 +56,12 @@
       "dist-electron/**/*",
       "assets/icon.png",
       "package.json"
+    ],
+    "extraFiles": [
+      {
+        "from": "assets/HTMLlelujah-MCP.cmd",
+        "to": "HTMLlelujah-MCP.cmd"
+      }
     ],
     "fileAssociations": [
       {

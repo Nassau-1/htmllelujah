@@ -23,6 +23,7 @@ export const DESKTOP_IPC = Object.freeze({
   collaborationJoin: 'htmllelujah:v1:collaboration-join',
   collaborationLeave: 'htmllelujah:v1:collaboration-leave',
   mcpStatus: 'htmllelujah:v1:mcp-status',
+  mcpCreateApproval: 'htmllelujah:v1:mcp-create-approval',
   documentChanged: 'htmllelujah:v1:event-document-changed',
   presentationChanged: 'htmllelujah:v1:event-presentation-changed',
 } as const);
@@ -129,7 +130,21 @@ export interface McpStatus {
   readonly available: boolean;
   readonly connected: boolean;
   readonly visibleDocuments: number;
+  readonly pendingApprovals: number;
   readonly transport: 'local-stdio';
+}
+
+export type McpApprovalAction =
+  'commit-destructive' | 'undo' | 'import' | 'export-html' | 'export-pdf';
+
+export interface McpApprovalInput extends SessionInput {
+  readonly action: McpApprovalAction;
+}
+
+export interface McpApproval {
+  readonly approvalId: string;
+  readonly action: McpApprovalAction;
+  readonly expiresAt: string;
 }
 
 export interface SafeDocumentChangedEvent {
@@ -165,6 +180,7 @@ export interface HtmllelujahDesktopApi {
   collaborationJoin(input: CollaborationJoinInput): Promise<DesktopResult<CollaborationStatus>>;
   collaborationLeave(input: SessionInput): Promise<DesktopResult<CollaborationStatus>>;
   mcpStatus(): Promise<DesktopResult<McpStatus>>;
+  mcpCreateApproval(input: McpApprovalInput): Promise<DesktopResult<McpApproval>>;
   onDocumentChanged(listener: (event: SafeDocumentChangedEvent) => void): () => void;
   onPresentationChanged(listener: (event: PresentationChangedEvent) => void): () => void;
 }

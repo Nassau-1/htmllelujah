@@ -51,6 +51,7 @@ export interface LocalRpcEndpointDescriptor {
 
 export interface LocalRpcServerHandle {
   readonly descriptor: LocalRpcEndpointDescriptor;
+  readonly connectionCount: number;
   close(): Promise<void>;
 }
 
@@ -492,6 +493,9 @@ export const startLocalRpcServer = async (input: {
   let closed = false;
   return {
     descriptor,
+    get connectionCount() {
+      return sockets.size;
+    },
     async close() {
       if (closed) return;
       closed = true;

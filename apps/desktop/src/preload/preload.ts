@@ -16,6 +16,8 @@ import {
   type ImportImageResult,
   type InitializeResult,
   type McpStatus,
+  type McpApproval,
+  type McpApprovalInput,
   type PresentationChangedEvent,
   type PresentationInput,
   type SafeDocumentChangedEvent,
@@ -98,6 +100,8 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
   collaborationLeave: (input: SessionInput): Promise<DesktopResult<CollaborationStatus>> =>
     invoke(DESKTOP_IPC.collaborationLeave, input),
   mcpStatus: (): Promise<DesktopResult<McpStatus>> => invoke(DESKTOP_IPC.mcpStatus),
+  mcpCreateApproval: (input: McpApprovalInput): Promise<DesktopResult<McpApproval>> =>
+    invoke(DESKTOP_IPC.mcpCreateApproval, input),
   onDocumentChanged,
   onPresentationChanged,
 });

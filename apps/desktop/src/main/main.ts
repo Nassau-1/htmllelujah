@@ -11,6 +11,7 @@ import {
   type DocumentSessionSnapshot,
 } from '@htmllelujah/document-runtime';
 import { createPrintHtml, createStandaloneHtml, ExporterError } from '@htmllelujah/exporter';
+import { startLocalRpcServer, type LocalRpcServerHandle } from '@htmllelujah/mcp-server';
 import {
   app,
   BrowserWindow,
@@ -25,6 +26,7 @@ import {
 import { z } from 'zod';
 
 import { DesktopCollaborationCoordinator } from './collaboration-service.js';
+import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
 import {
   DESKTOP_API_VERSION,
   DESKTOP_IPC,
@@ -51,6 +53,8 @@ protocol.registerSchemesAsPrivileged([
     privileges: { standard: true, secure: true, supportFetchAPI: false, corsEnabled: false },
   },
 ]);
+
+app.setName('HTMLlelujah');
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -370,6 +374,11 @@ const joinInputSchema = sessionInputSchema
     displayName: z.string().trim().min(1).max(80),
   })
   .strict();
+const mcpApprovalInputSchema = sessionInputSchema
+  .extend({
+    action: z.enum(['commit-destructive', 'undo', 'import', 'export-html', 'export-pdf']),
+  })
+  .strict();
 
 const metadataFor = (event: IpcMainInvokeEvent, label: string): TransactionMetadata => ({
   transactionId: randomUUID(),
@@ -550,11 +559,10 @@ const safeExportBaseName = (name: string): string =>
     .slice(0, 100) || 'Untitled';
 
 const chooseExportPath = async (
-  event: IpcMainInvokeEvent,
+  parent: BrowserWindow | undefined,
   documentName: string,
   format: 'html' | 'pdf',
 ): Promise<ApprovedExportTarget> => {
-  const parent = findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
   const extension = format === 'html' ? 'html' : 'pdf';
   const result = await saveDialog(parent, {
     title: format === 'html' ? 'Export standalone HTML' : 'Export PDF',
@@ -784,6 +792,58 @@ const createPdfBytesIsolated = async (printHtml: string): Promise<Uint8Array> =>
 const createPdfBytes = (printHtml: string): Promise<Uint8Array> =>
   enqueuePdfExport(() => createPdfBytesIsolated(printHtml));
 
+const exportSessionDocument = async (
+  sessionId: string,
+  input: {
+    readonly expectedRevision: string;
+    readonly format: 'html' | 'pdf';
+    readonly includeHidden: boolean;
+  },
+  parent: BrowserWindow | undefined,
+): Promise<ExportResult> => {
+  const initialSnapshot = runtime.getSnapshot(sessionId);
+  if (initialSnapshot.revision !== input.expectedRevision) {
+    throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
+  }
+  const target = await chooseExportPath(parent, initialSnapshot.document.name, input.format);
+  const snapshot = runtime.getSnapshot(sessionId);
+  if (snapshot.revision !== input.expectedRevision) {
+    throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
+  }
+  const startedAt = Date.now();
+  const assets = collectExportAssets(sessionId, snapshot);
+  const hiddenSlides = input.includeHidden ? 'include' : 'exclude';
+  const pageCount = snapshot.document.slides.filter(
+    (slide) => input.includeHidden || !slide.hidden,
+  ).length;
+  let html: string;
+  let bytesWritten: number;
+  if (input.format === 'html') {
+    html = createStandaloneHtml(snapshot.document, assets, {
+      hiddenSlides,
+      title: snapshot.document.name,
+      clickNavigation: true,
+    });
+    bytesWritten = await writeExportAtomically(target, Buffer.from(html, 'utf8'));
+  } else {
+    html = createPrintHtml(snapshot.document, assets, {
+      hiddenSlides,
+      title: snapshot.document.name,
+      readinessDeadlineMs: PDF_READINESS_DEADLINE_MS,
+    });
+    const pdf = await createPdfBytes(html);
+    bytesWritten = await writeExportAtomically(target, pdf);
+  }
+  return {
+    format: input.format,
+    pageCount,
+    page: snapshot.document.page,
+    bytesWritten,
+    durationMs: Math.max(0, Date.now() - startedAt),
+    warnings: exportWarnings(html),
+  };
+};
+
 const assertNoWriterSidecar = async (targetPath: string): Promise<void> => {
   try {
     await lstat(`${targetPath}.writer.json`);
@@ -904,7 +964,19 @@ const assignSession = async (
   }
   const window = findWindow(event.sender);
   window?.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
+  event.sender.send(DESKTOP_IPC.documentChanged, {
+    sessionId: snapshot.sessionId,
+    revision: snapshot.revision,
+    reason: 'opened',
+  });
   return sessionView(event.sender.id, snapshot);
+};
+
+const openPathInEditorWindow = async (window: BrowserWindow, targetPath: string): Promise<void> => {
+  const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
+  if (!(await confirmReplace(syntheticEvent))) return;
+  const opened = await runtime.openMainOnly({ targetPath });
+  await assignSession(syntheticEvent, opened, targetPath);
 };
 
 const imageMediaType = (
@@ -932,6 +1004,116 @@ const imageMediaType = (
     return 'image/webp';
   return undefined;
 };
+
+const importImageForSession = async (input: {
+  readonly sessionId: string;
+  readonly expectedRevision: string;
+  readonly parent: BrowserWindow | undefined;
+  readonly metadata: TransactionMetadata;
+}): Promise<{ readonly snapshot: DocumentSessionSnapshot; readonly assetId: string }> => {
+  collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
+  const result = await openDialog(input.parent, {
+    title: 'Insert image',
+    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+    properties: ['openFile'],
+  });
+  const targetPath = result.filePaths[0];
+  if (result.canceled || targetPath === undefined) {
+    throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+  }
+  const targetStat = await lstat(targetPath);
+  if (
+    !targetStat.isFile() ||
+    targetStat.isSymbolicLink() ||
+    targetStat.size <= 0 ||
+    targetStat.size > MAX_IMAGE_BYTES
+  ) {
+    throw new DesktopMainError(
+      'INVALID_ASSET',
+      'Choose a PNG, JPEG, or WebP image smaller than 25 MB.',
+    );
+  }
+  const bytes = await readFile(targetPath);
+  const mediaType = imageMediaType(bytes);
+  if (mediaType === undefined) {
+    throw new DesktopMainError('INVALID_ASSET', 'The selected file is not a supported image.');
+  }
+  const decoded = nativeImage.createFromBuffer(bytes);
+  const dimensions = decoded.getSize();
+  if (
+    decoded.isEmpty() ||
+    dimensions.width < 1 ||
+    dimensions.height < 1 ||
+    dimensions.width > MAX_IMAGE_EDGE_PX ||
+    dimensions.height > MAX_IMAGE_EDGE_PX ||
+    dimensions.width * dimensions.height > MAX_IMAGE_AREA_PX
+  ) {
+    throw new DesktopMainError('INVALID_ASSET', 'The image dimensions are unsupported.');
+  }
+  const assetId = randomUUID();
+  const snapshot = await runtime.storeAsset(input.sessionId, {
+    id: assetId,
+    bytes,
+    mediaType,
+    fileName: path.basename(targetPath).slice(0, 255),
+    widthPx: dimensions.width,
+    heightPx: dimensions.height,
+    expectedRevision: input.expectedRevision,
+    metadata: input.metadata,
+  });
+  return { snapshot, assetId };
+};
+
+const visibleEditorSessionIds = (): readonly string[] => [
+  ...new Set(
+    BrowserWindow.getAllWindows()
+      .filter((window) => windowModes.get(window.webContents.id) === 'editor')
+      .map((window) => windowSessions.get(window.webContents.id))
+      .filter((sessionId): sessionId is string => sessionId !== undefined),
+  ),
+];
+
+const mcpBridge = new DesktopMcpBridge({
+  runtime,
+  appVersion: () => app.getVersion(),
+  visibleSessionIds: visibleEditorSessionIds,
+  collaborationStatus: (sessionId) => collaboration.status(sessionId),
+  importAsset: async (sessionId, expectedRevision) => {
+    const imported = await importImageForSession({
+      sessionId,
+      expectedRevision,
+      parent: BrowserWindow.getFocusedWindow() ?? undefined,
+      metadata: {
+        transactionId: randomUUID(),
+        actorId: 'mcp-local-agent',
+        origin: 'agent',
+        label: 'Import approved image',
+        timestamp: new Date().toISOString(),
+      },
+    });
+    const asset = imported.snapshot.document.assets.find(
+      (candidate) => candidate.id === imported.assetId,
+    );
+    return {
+      documentId: imported.snapshot.documentId,
+      revision: imported.snapshot.revision,
+      assetId: imported.assetId,
+      mediaType: asset?.mediaType ?? 'unknown',
+      byteLength: asset?.byteLength ?? 0,
+    };
+  },
+  exportDocument: async (sessionId, input) => ({
+    documentId: input.documentId,
+    ...(await exportSessionDocument(
+      sessionId,
+      input,
+      BrowserWindow.getFocusedWindow() ?? undefined,
+    )),
+  }),
+});
+
+let mcpRpcServer: LocalRpcServerHandle | undefined;
+let gracefulShutdownStarted = false;
 
 const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> => {
   const window = new BrowserWindow({
@@ -1190,50 +1372,16 @@ const configureIpc = (): void => {
 
   handle(DESKTOP_IPC.importImage, historyInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
-    collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
-    const parent = findWindow(event.sender);
-    const result = await openDialog(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
-      title: 'Insert image',
-      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
-      properties: ['openFile'],
-    });
-    const targetPath = result.filePaths[0];
-    if (result.canceled || targetPath === undefined)
-      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-    const stat = await lstat(targetPath);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > MAX_IMAGE_BYTES) {
-      throw new DesktopMainError(
-        'INVALID_ASSET',
-        'Choose a PNG, JPEG, or WebP image smaller than 25 MB.',
-      );
-    }
-    const bytes = await readFile(targetPath);
-    const mediaType = imageMediaType(bytes);
-    if (mediaType === undefined)
-      throw new DesktopMainError('INVALID_ASSET', 'The selected file is not a supported image.');
-    const decoded = nativeImage.createFromBuffer(bytes);
-    const dimensions = decoded.getSize();
-    if (
-      decoded.isEmpty() ||
-      dimensions.width < 1 ||
-      dimensions.height < 1 ||
-      dimensions.width > MAX_IMAGE_EDGE_PX ||
-      dimensions.height > MAX_IMAGE_EDGE_PX ||
-      dimensions.width * dimensions.height > MAX_IMAGE_AREA_PX
-    )
-      throw new DesktopMainError('INVALID_ASSET', 'The image dimensions are unsupported.');
-    const assetId = randomUUID();
-    const snapshot = await runtime.storeAsset(input.sessionId, {
-      id: assetId,
-      bytes,
-      mediaType,
-      fileName: path.basename(targetPath).slice(0, 255),
-      widthPx: dimensions.width,
-      heightPx: dimensions.height,
+    const imported = await importImageForSession({
+      sessionId: input.sessionId,
       expectedRevision: input.expectedRevision,
+      parent: findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined,
       metadata: metadataFor(event, 'Import image'),
     });
-    return { session: sessionView(event.sender.id, snapshot), assetId };
+    return {
+      session: sessionView(event.sender.id, imported.snapshot),
+      assetId: imported.assetId,
+    };
   });
 
   handle(DESKTOP_IPC.listRecovery, z.undefined(), () => runtime.listRecoveryCandidatesMainOnly());
@@ -1252,54 +1400,14 @@ const configureIpc = (): void => {
     return null;
   });
 
-  handle(
-    DESKTOP_IPC.exportDocument,
-    exportInputSchema,
-    async (event, input): Promise<ExportResult> => {
-      assertSessionAccess(event, input.sessionId);
-      const initialSnapshot = runtime.getSnapshot(input.sessionId);
-      if (initialSnapshot.revision !== input.expectedRevision) {
-        throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
-      }
-      const target = await chooseExportPath(event, initialSnapshot.document.name, input.format);
-      const snapshot = runtime.getSnapshot(input.sessionId);
-      if (snapshot.revision !== input.expectedRevision) {
-        throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
-      }
-      const startedAt = Date.now();
-      const assets = collectExportAssets(input.sessionId, snapshot);
-      const hiddenSlides = input.includeHidden ? 'include' : 'exclude';
-      const pageCount = snapshot.document.slides.filter(
-        (slide) => input.includeHidden || !slide.hidden,
-      ).length;
-      let html: string;
-      let bytesWritten: number;
-      if (input.format === 'html') {
-        html = createStandaloneHtml(snapshot.document, assets, {
-          hiddenSlides,
-          title: snapshot.document.name,
-          clickNavigation: true,
-        });
-        bytesWritten = await writeExportAtomically(target, Buffer.from(html, 'utf8'));
-      } else {
-        html = createPrintHtml(snapshot.document, assets, {
-          hiddenSlides,
-          title: snapshot.document.name,
-          readinessDeadlineMs: PDF_READINESS_DEADLINE_MS,
-        });
-        const pdf = await createPdfBytes(html);
-        bytesWritten = await writeExportAtomically(target, pdf);
-      }
-      return {
-        format: input.format,
-        pageCount,
-        page: snapshot.document.page,
-        bytesWritten,
-        durationMs: Math.max(0, Date.now() - startedAt),
-        warnings: exportWarnings(html),
-      };
-    },
-  );
+  handle(DESKTOP_IPC.exportDocument, exportInputSchema, (event, input): Promise<ExportResult> => {
+    assertSessionAccess(event, input.sessionId);
+    return exportSessionDocument(
+      input.sessionId,
+      input,
+      findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined,
+    );
+  });
 
   handle(DESKTOP_IPC.collaborationStatus, sessionInputSchema, (event, input) => {
     assertSessionAccess(event, input.sessionId, false);
@@ -1355,11 +1463,25 @@ const configureIpc = (): void => {
   });
 
   handle(DESKTOP_IPC.mcpStatus, z.undefined(), (): McpStatus => ({
-    available: true,
-    connected: false,
-    visibleDocuments: runtime.listSessions().length,
+    available: mcpRpcServer !== undefined,
+    connected: (mcpRpcServer?.connectionCount ?? 0) > 0,
+    visibleDocuments: visibleEditorSessionIds().length,
+    pendingApprovals: mcpBridge.pendingApprovalCount(),
     transport: 'local-stdio',
   }));
+  handle(DESKTOP_IPC.mcpCreateApproval, mcpApprovalInputSchema, (event, input) => {
+    assertSessionAccess(event, input.sessionId);
+    const snapshot = runtime.getSnapshot(input.sessionId);
+    const approval = mcpBridge.issueApproval(
+      snapshot.documentId,
+      input.action as McpApprovalAction,
+    );
+    return {
+      approvalId: approval.approvalId,
+      action: approval.action,
+      expiresAt: approval.expiresAt,
+    };
+  });
 };
 
 runtime.subscribe((event) => {
@@ -1412,7 +1534,17 @@ else {
       if (editor.isMinimized()) editor.restore();
       editor.show();
       editor.focus();
-      if (filePath !== undefined) pendingOpenPath = filePath;
+      if (filePath !== undefined) {
+        void openPathInEditorWindow(editor, filePath).catch(() => {
+          void dialog.showMessageBox(editor, {
+            type: 'error',
+            title: 'Presentation could not be opened',
+            message: 'The selected .hdeck could not be opened safely.',
+            buttons: ['OK'],
+            noLink: true,
+          });
+        });
+      }
     } else {
       void createEditorWindow(filePath).catch(() => undefined);
     }
@@ -1420,12 +1552,26 @@ else {
 
   app.on('open-file', (event, filePath) => {
     event.preventDefault();
-    pendingOpenPath = filePath;
+    const editor = BrowserWindow.getAllWindows().find(
+      (window) => windowModes.get(window.webContents.id) === 'editor',
+    );
+    if (!app.isReady() || editor === undefined) pendingOpenPath = filePath;
+    else void openPathInEditorWindow(editor, filePath).catch(() => undefined);
   });
 
   void app.whenReady().then(async () => {
     registerSecureProtocols();
     configureIpc();
+    try {
+      mcpRpcServer = await startLocalRpcServer({
+        service: mcpBridge,
+        permissions: mcpBridge,
+        descriptorPath: path.join(app.getPath('userData'), 'mcp', 'endpoint-v1.json'),
+      });
+    } catch {
+      // The editor remains usable if local automation cannot start. No path or secret is logged.
+      console.error('[MCP] The authenticated local bridge is unavailable.');
+    }
     session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
       callback(false),
     );
@@ -1449,8 +1595,18 @@ else {
         void createEditorWindow().catch(() => undefined);
     });
   });
-}
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+
+  app.on('will-quit', (event) => {
+    if (gracefulShutdownStarted) return;
+    gracefulShutdownStarted = true;
+    event.preventDefault();
+    mcpBridge.revokeApprovals();
+    void Promise.allSettled([collaboration.shutdownAll(), mcpRpcServer?.close()]).finally(() => {
+      app.exit(0);
+    });
+  });
+}

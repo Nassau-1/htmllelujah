@@ -68,9 +68,17 @@ import {
   type TextStyleRole,
 } from '@htmllelujah/document-core';
 import { SlideSurface } from '@htmllelujah/renderer';
+import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 
-import type { CollaborationStatus, DesktopResult, SessionView } from '../shared/desktop-api';
+import type {
+  CollaborationStatus,
+  DesktopResult,
+  McpApproval,
+  McpApprovalAction,
+  McpStatus,
+  SessionView,
+} from '../shared/desktop-api';
 import { EditorButton } from './components/EditorButton';
 import { CanonicalSlideCanvas } from './components/CanonicalSlideCanvas';
 import {
@@ -361,6 +369,13 @@ function EditorApp() {
   const [joinEndpoint, setJoinEndpoint] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [joinFingerprint, setJoinFingerprint] = useState('');
+  const [mcpOpen, setMcpOpen] = useState(false);
+  const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
+  const [mcpApprovalAction, setMcpApprovalAction] =
+    useState<McpApprovalAction>('commit-destructive');
+  const [mcpApproval, setMcpApproval] = useState<McpApproval | null>(null);
+  const [recoveryCandidates, setRecoveryCandidates] = useState<readonly RecoveryCandidate[]>([]);
+  const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
   const [tableTsv, setTableTsv] = useState('');
   const workspaceRef = useRef<HTMLDivElement>(null);
@@ -403,6 +418,7 @@ function EditorApp() {
         return;
       }
       acceptSession(result.value.session);
+      setRecoveryCandidates(result.value.recoveryCandidates);
       if (result.value.recoveryCandidates.length > 0) {
         notify(
           `${result.value.recoveryCandidates.length} recoverable presentation${result.value.recoveryCandidates.length > 1 ? 's' : ''} found.`,
@@ -414,8 +430,8 @@ function EditorApp() {
       const current = sessionRef.current;
       if (
         current === null ||
-        event.sessionId !== current.snapshot.sessionId ||
-        event.revision === current.snapshot.revision
+        (event.sessionId === current.snapshot.sessionId &&
+          event.revision === current.snapshot.revision)
       )
         return;
       void window.htmllelujah.initialize().then((result) => {
@@ -550,7 +566,31 @@ function EditorApp() {
         }
         acceptSession(result.value);
         setSelectedIds([]);
+        const remaining = await window.htmllelujah.listRecovery();
+        if (remaining.ok) setRecoveryCandidates(remaining.value);
         notify(kind === 'new' ? 'New presentation created.' : 'Presentation opened.', 'success');
+      } finally {
+        setBusy(false);
+      }
+    },
+    [acceptSession, busy, notify, showFailure],
+  );
+
+  const recoverPresentation = useCallback(
+    async (candidateId: string): Promise<void> => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const result = await window.htmllelujah.recover(candidateId);
+        if (!result.ok) {
+          showFailure(result);
+          return;
+        }
+        acceptSession(result.value);
+        setRecoveryOpen(false);
+        const remaining = await window.htmllelujah.listRecovery();
+        if (remaining.ok) setRecoveryCandidates(remaining.value);
+        notify('Recovered journal opened. Save it to keep the restored work.', 'success');
       } finally {
         setBusy(false);
       }
@@ -919,6 +959,31 @@ function EditorApp() {
     if (!result.ok) showFailure(result);
   }, [activeSlide, showFailure]);
 
+  const openMcp = useCallback(async (): Promise<void> => {
+    setMcpOpen(true);
+    setMcpApproval(null);
+    const result = await window.htmllelujah.mcpStatus();
+    if (result.ok) setMcpStatus(result.value);
+    else showFailure(result);
+  }, [showFailure]);
+
+  const createMcpApproval = useCallback(async (): Promise<void> => {
+    const current = sessionRef.current;
+    if (current === null) return;
+    const result = await window.htmllelujah.mcpCreateApproval({
+      sessionId: current.snapshot.sessionId,
+      action: mcpApprovalAction,
+    });
+    if (!result.ok) {
+      showFailure(result);
+      return;
+    }
+    setMcpApproval(result.value);
+    notify('One-time MCP approval created for two minutes.', 'success');
+    const status = await window.htmllelujah.mcpStatus();
+    if (status.ok) setMcpStatus(status.value);
+  }, [mcpApprovalAction, notify, showFailure]);
+
   const openShare = useCallback(async (): Promise<void> => {
     const current = sessionRef.current;
     if (current === null) return;
@@ -1113,6 +1178,11 @@ function EditorApp() {
             <MenuButton onClick={closeThen(() => void save(true))}>
               Save as… <kbd>Ctrl Shift S</kbd>
             </MenuButton>
+            {recoveryCandidates.length > 0 ? (
+              <MenuButton onClick={closeThen(() => setRecoveryOpen(true))}>
+                Recover local work <kbd>{recoveryCandidates.length}</kbd>
+              </MenuButton>
+            ) : null}
             <span className="menu-separator" />
             <MenuButton onClick={closeThen(() => void exportDocument('html'))}>
               Export standalone HTML…
@@ -1279,6 +1349,9 @@ function EditorApp() {
             <EditorButton label="Save locally" onClick={() => void save()} disabled={busy}>
               <Save size={16} />
             </EditorButton>
+            <button type="button" className="share-button" onClick={() => void openMcp()}>
+              <Code2 size={15} aria-hidden="true" /> Codex
+            </button>
             <button type="button" className="share-button" onClick={() => void openShare()}>
               <Share2 size={15} aria-hidden="true" /> Share
             </button>
@@ -2315,6 +2388,142 @@ function EditorApp() {
         </div>
       ) : null}
       {busy ? <div className="busy-bar" aria-hidden="true" /> : null}
+
+      {recoveryOpen ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) setRecoveryOpen(false);
+          }}
+        >
+          <section
+            className="share-dialog recovery-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="recovery-title"
+          >
+            <header>
+              <div>
+                <span className="eyebrow">CRASH RECOVERY</span>
+                <h2 id="recovery-title">Recover local work</h2>
+              </div>
+              <button type="button" aria-label="Close" onClick={() => setRecoveryOpen(false)}>
+                <X size={18} />
+              </button>
+            </header>
+            <p>
+              HTMLlelujah journals every accepted edit locally. Open a recovered copy, verify it,
+              then choose Save As to keep it.
+            </p>
+            <div className="recovery-list">
+              {recoveryCandidates.map((candidate, index) => (
+                <article key={candidate.candidateId}>
+                  <div>
+                    <strong>Recovery {index + 1}</strong>
+                    <span>
+                      {candidate.recordCount} journaled change
+                      {candidate.recordCount === 1 ? '' : 's'} ·{' '}
+                      {candidate.complete ? 'complete journal' : 'repaired safe prefix'}
+                    </span>
+                    <code>{candidate.documentId}</code>
+                  </div>
+                  <button
+                    type="button"
+                    className="primary-inspector-action"
+                    onClick={() => void recoverPresentation(candidate.candidateId)}
+                  >
+                    Open recovered copy
+                  </button>
+                </article>
+              ))}
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {mcpOpen ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) setMcpOpen(false);
+          }}
+        >
+          <section
+            className="share-dialog mcp-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mcp-title"
+          >
+            <header>
+              <div>
+                <span className="eyebrow">LOCAL AGENT BRIDGE</span>
+                <h2 id="mcp-title">Work with Codex through MCP</h2>
+              </div>
+              <button type="button" aria-label="Close" onClick={() => setMcpOpen(false)}>
+                <X size={18} />
+              </button>
+            </header>
+            <p>
+              The local MCP process can inspect this open deck and propose typed edits. It cannot
+              read arbitrary files, execute HTML, or export without a one-time approval.
+            </p>
+            <div className="collaboration-status">
+              <Code2 size={18} />
+              <div>
+                <strong>{mcpStatus?.available ? 'Bridge ready' : 'Bridge unavailable'}</strong>
+                <span>
+                  {mcpStatus?.visibleDocuments ?? 0} visible presentation
+                  {(mcpStatus?.visibleDocuments ?? 0) === 1 ? '' : 's'} ·{' '}
+                  {mcpStatus?.pendingApprovals ?? 0} pending approval
+                  {(mcpStatus?.pendingApprovals ?? 0) === 1 ? '' : 's'}
+                </span>
+              </div>
+            </div>
+            <div className="mcp-command-card">
+              <span>Codex MCP command</span>
+              <code>HTMLlelujah-MCP.cmd</code>
+              <small>Keep the desktop app open while the MCP process is connected.</small>
+            </div>
+            <div className="mcp-approval-grid">
+              <label className="stacked-field">
+                <span>Approve one action</span>
+                <select
+                  value={mcpApprovalAction}
+                  onChange={(event) =>
+                    setMcpApprovalAction(event.currentTarget.value as McpApprovalAction)
+                  }
+                >
+                  <option value="commit-destructive">Delete or change page format</option>
+                  <option value="undo">Undo the latest agent transaction</option>
+                  <option value="import">Choose and import one image</option>
+                  <option value="export-html">Export one standalone HTML</option>
+                  <option value="export-pdf">Export one PDF</option>
+                </select>
+              </label>
+              <button
+                type="button"
+                className="primary-inspector-action"
+                disabled={!mcpStatus?.available}
+                onClick={() => void createMcpApproval()}
+              >
+                Create one-time approval
+              </button>
+            </div>
+            {mcpApproval !== null ? (
+              <div className="session-secret mcp-approval-secret">
+                <span>
+                  Approval capability · expires{' '}
+                  {new Date(mcpApproval.expiresAt).toLocaleTimeString()}
+                </span>
+                <code>{mcpApproval.approvalId}</code>
+                <small>Give this value only to the current local MCP request. It works once.</small>
+              </div>
+            ) : null}
+          </section>
+        </div>
+      ) : null}
 
       {shareOpen ? (
         <div
