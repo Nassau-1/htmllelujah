@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import {
   affectedSlideIds,
   commandsRequireApproval,
+  MCP_LIMITS,
   McpSafeError,
   type CommitProposalInput,
   type CommitProposalResult,
@@ -49,6 +50,7 @@ interface PendingProposal {
   readonly documentId: string;
   readonly requiresApproval: boolean;
   readonly commandCount: number;
+  readonly expiresAtMs: number;
 }
 
 interface ApprovalGrant {
@@ -87,6 +89,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
   readonly #proposals = new Map<string, PendingProposal>();
   readonly #approvals = new Map<string, ApprovalGrant>();
   readonly #receipts = new Map<string, ApprovalReceipt>();
+  #proposalReservations = 0;
 
   public constructor(options: DesktopMcpBridgeOptions) {
     this.#runtime = options.runtime;
@@ -132,12 +135,26 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
 
   #purgeExpired(): void {
     const now = this.#nowMs();
+    for (const [id, proposal] of this.#proposals) {
+      if (proposal.expiresAtMs <= now) this.#proposals.delete(id);
+    }
     for (const [id, grant] of this.#approvals) {
       if (grant.expiresAtMs <= now) this.#approvals.delete(id);
     }
     for (const [id, receipt] of this.#receipts) {
       if (receipt.consumedAtMs + RECEIPT_TTL_MS <= now) this.#receipts.delete(id);
     }
+  }
+
+  #reserveProposalSlot(): void {
+    this.#purgeExpired();
+    if (this.#proposals.size + this.#proposalReservations >= MCP_LIMITS.maxPendingProposals) {
+      throw new McpSafeError(
+        'INVALID_REQUEST',
+        'Too many proposals are pending; commit one or wait for expiry.',
+      );
+    }
+    this.#proposalReservations += 1;
   }
 
   #takeReceipt(
@@ -176,6 +193,12 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
   public issueApproval(documentId: string, action: McpApprovalAction): McpApprovalCapability {
     const snapshot = this.#assertEditable(documentId);
     this.#purgeExpired();
+    if (this.#approvals.size >= MCP_LIMITS.maxPendingApprovals) {
+      throw new McpSafeError(
+        'INVALID_REQUEST',
+        'Too many desktop approvals are pending; revoke them or wait for expiry.',
+      );
+    }
     const approvalId = `approval-${randomBytes(24).toString('base64url')}`;
     const expiresAtMs = this.#nowMs() + APPROVAL_TTL_MS;
     this.#approvals.set(approvalId, {
@@ -242,6 +265,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
       return false;
     }
     if (current.revision !== grant.baseRevision) return false;
+    if (this.#receipts.size >= MCP_LIMITS.maxApprovalReceipts) return false;
     this.#approvals.delete(input.approvalId);
     this.#receipts.set(input.approvalId, { ...grant, consumedAtMs: this.#nowMs() });
     return true;
@@ -316,41 +340,57 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
   public async proposeCommands(input: ProposeCommandsInput): Promise<ProposalResult> {
     try {
       const snapshot = this.#assertEditable(input.documentId);
-      const requiresApproval = commandsRequireApproval(input.commands);
-      const proposal = this.#runtime.propose(snapshot.sessionId, {
-        expectedRevision: input.expectedRevision,
-        commands: input.commands,
-        metadata: {
-          transactionId: randomUUID(),
-          actorId: 'mcp-local-agent',
-          origin: 'agent',
-          label: input.label,
-          timestamp: new Date(this.#nowMs()).toISOString(),
-        },
-      });
-      this.#proposals.set(proposal.proposalId, {
-        sessionId: snapshot.sessionId,
-        documentId: input.documentId,
-        requiresApproval,
-        commandCount: input.commands.length,
-      });
-      return {
-        proposalId: proposal.proposalId,
-        documentId: proposal.documentId,
-        baseRevision: proposal.baseRevision,
-        expiresAt: proposal.expiresAt,
-        requiresApproval,
-        commandCount: proposal.diff.commandCount,
-        affectedSlideIds: affectedSlideIds(input.commands),
-        warnings: proposal.diff.changed ? [] : ['NO_EFFECT'],
-        summary: `${proposal.diff.commandCount} typed command${proposal.diff.commandCount === 1 ? '' : 's'}; slides ${proposal.diff.slidesBefore} to ${proposal.diff.slidesAfter}; elements ${proposal.diff.elementsBefore} to ${proposal.diff.elementsAfter}.`,
-      };
+      this.#reserveProposalSlot();
+      try {
+        const requiresApproval = commandsRequireApproval(input.commands);
+        const proposal = this.#runtime.propose(snapshot.sessionId, {
+          expectedRevision: input.expectedRevision,
+          commands: input.commands,
+          metadata: {
+            transactionId: randomUUID(),
+            actorId: 'mcp-local-agent',
+            origin: 'agent',
+            label: input.label,
+            timestamp: new Date(this.#nowMs()).toISOString(),
+          },
+        });
+        const expiresAtMs = Date.parse(proposal.expiresAt);
+        const now = this.#nowMs();
+        if (
+          !Number.isFinite(expiresAtMs) ||
+          expiresAtMs <= now ||
+          expiresAtMs > now + MCP_LIMITS.proposalTtlMs
+        ) {
+          throw new McpSafeError('SERVICE_UNAVAILABLE', 'Proposal expiration is invalid.');
+        }
+        this.#proposals.set(proposal.proposalId, {
+          sessionId: snapshot.sessionId,
+          documentId: input.documentId,
+          requiresApproval,
+          commandCount: input.commands.length,
+          expiresAtMs,
+        });
+        return {
+          proposalId: proposal.proposalId,
+          documentId: proposal.documentId,
+          baseRevision: proposal.baseRevision,
+          expiresAt: proposal.expiresAt,
+          requiresApproval,
+          commandCount: proposal.diff.commandCount,
+          affectedSlideIds: affectedSlideIds(input.commands),
+          warnings: proposal.diff.changed ? [] : ['NO_EFFECT'],
+          summary: `${proposal.diff.commandCount} typed command${proposal.diff.commandCount === 1 ? '' : 's'}; slides ${proposal.diff.slidesBefore} to ${proposal.diff.slidesAfter}; elements ${proposal.diff.elementsBefore} to ${proposal.diff.elementsAfter}.`,
+        };
+      } finally {
+        this.#proposalReservations -= 1;
+      }
     } catch (error) {
       return asSafeError(error);
     }
   }
 
   public async commitProposal(input: CommitProposalInput): Promise<CommitProposalResult> {
+    this.#purgeExpired();
     const proposal = this.#proposals.get(input.proposalId);
     if (proposal === undefined)
       throw new McpSafeError('NOT_FOUND', 'Proposal is missing or expired.');

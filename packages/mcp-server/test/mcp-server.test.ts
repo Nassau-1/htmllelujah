@@ -12,6 +12,7 @@ import {
   createHtmllelujahMcpServer,
   commandsRequireApproval,
   LocalRpcClient,
+  MCP_LIMITS,
   runHtmllelujahMcpStdioFromDescriptor,
   startLocalRpcServer,
   type CommitProposalInput,
@@ -19,6 +20,7 @@ import {
   type HtmllelujahMcpService,
   type ImportAssetInput,
   type McpPermissionGate,
+  type ProposalResult,
   type ProposeCommandsInput,
   type TransactionTargetInput,
 } from '../src/index.js';
@@ -129,7 +131,7 @@ const createService = (): HtmllelujahMcpService => ({
     proposalId,
     documentId: input.documentId,
     baseRevision: input.expectedRevision,
-    expiresAt: '2026-07-15T13:00:00.000Z',
+    expiresAt: new Date(Date.now() + MCP_LIMITS.proposalTtlMs).toISOString(),
     requiresApproval: input.commands.some((command) => command.type === 'slide.delete'),
     commandCount: input.commands.length,
     affectedSlideIds: input.commands.flatMap((command) =>
@@ -278,6 +280,200 @@ describe('MCP tools', () => {
       expect(textResult(committed)).toMatchObject({ revision: 'rev-2', transactionId });
       expect(permissions.approvals.has(approvalId)).toBe(false);
     } finally {
+      await Promise.all([client.close(), server.close()]);
+    }
+  });
+
+  it('purges expired proposal metadata before commit', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-16T12:00:00.000Z'));
+    const service = createService();
+    const { server, client } = await connectMcp(service, createPermissions());
+    try {
+      const proposed = await client.callTool({
+        name: 'documents_propose_commands',
+        arguments: {
+          documentId,
+          expectedRevision: 'rev-1',
+          label: 'Short-lived proposal',
+          commands: [{ type: 'deck.rename', name: 'Still bounded' }],
+        },
+      });
+      expect(textResult(proposed)).toMatchObject({ proposalId });
+
+      vi.advanceTimersByTime(MCP_LIMITS.proposalTtlMs + 1);
+      const expired = await client.callTool({
+        name: 'documents_commit_proposal',
+        arguments: { proposalId },
+      });
+      expect(expired.isError).toBe(true);
+      expect(textResult(expired)).toMatchObject({ error: { code: 'NOT_FOUND' } });
+      expect(service.commitProposal).not.toHaveBeenCalled();
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects invalid expirations and duplicate proposal identities without leaking reservations', async () => {
+    const service = createService();
+    service.proposeCommands = vi
+      .fn<HtmllelujahMcpService['proposeCommands']>()
+      .mockImplementationOnce(async (input) => ({
+        proposalId,
+        documentId: input.documentId,
+        baseRevision: input.expectedRevision,
+        expiresAt: new Date(Date.now() + MCP_LIMITS.proposalTtlMs + 60_000).toISOString(),
+        requiresApproval: false,
+        commandCount: input.commands.length,
+        affectedSlideIds: [],
+        warnings: [],
+        summary: 'Invalid long-lived proposal',
+      }))
+      .mockImplementation(async (input) => ({
+        proposalId,
+        documentId: input.documentId,
+        baseRevision: input.expectedRevision,
+        expiresAt: new Date(Date.now() + MCP_LIMITS.proposalTtlMs).toISOString(),
+        requiresApproval: false,
+        commandCount: input.commands.length,
+        affectedSlideIds: [],
+        warnings: [],
+        summary: 'Valid proposal',
+      }));
+    const { server, client } = await connectMcp(service, createPermissions());
+    const request = {
+      name: 'documents_propose_commands',
+      arguments: {
+        documentId,
+        expectedRevision: 'rev-1',
+        label: 'Validate proposal identity and TTL',
+        commands: [{ type: 'deck.rename', name: 'Bounded' }],
+      },
+    } as const;
+    try {
+      const invalidExpiry = await client.callTool(request);
+      expect(invalidExpiry.isError).toBe(true);
+      expect(textResult(invalidExpiry)).toMatchObject({
+        error: { code: 'SERVICE_UNAVAILABLE' },
+      });
+
+      const valid = await client.callTool(request);
+      expect(valid.isError).not.toBe(true);
+      expect(textResult(valid)).toMatchObject({ proposalId });
+
+      const duplicate = await client.callTool(request);
+      expect(duplicate.isError).toBe(true);
+      expect(textResult(duplicate)).toMatchObject({
+        error: { code: 'SERVICE_UNAVAILABLE' },
+      });
+      expect(service.proposeCommands).toHaveBeenCalledTimes(3);
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+    }
+  });
+
+  it('bounds pending and in-flight proposals and recovers capacity after commit', async () => {
+    const release: Array<
+      (value: Awaited<ReturnType<HtmllelujahMcpService['proposeCommands']>>) => void
+    > = [];
+    const service = createService();
+    service.proposeCommands = vi.fn(
+      (_input: ProposeCommandsInput) =>
+        new Promise<ProposalResult>((resolve) => {
+          release.push((value) => resolve(value));
+        }),
+    );
+    const { server, client } = await connectMcp(service, createPermissions());
+    const calls = Array.from({ length: MCP_LIMITS.maxPendingProposals }, (_, index) =>
+      client.callTool({
+        name: 'documents_propose_commands',
+        arguments: {
+          documentId,
+          expectedRevision: 'rev-1',
+          label: `Concurrent proposal ${index}`,
+          commands: [{ type: 'deck.rename', name: `Bounded ${index}` }],
+        },
+      }),
+    );
+    try {
+      await vi.waitFor(() => expect(release).toHaveLength(MCP_LIMITS.maxPendingProposals));
+      const saturated = await client.callTool({
+        name: 'documents_propose_commands',
+        arguments: {
+          documentId,
+          expectedRevision: 'rev-1',
+          label: 'One too many',
+          commands: [{ type: 'deck.rename', name: 'Rejected' }],
+        },
+      });
+      expect(saturated.isError).toBe(true);
+      expect(textResult(saturated)).toMatchObject({ error: { code: 'INVALID_REQUEST' } });
+      expect(service.proposeCommands).toHaveBeenCalledTimes(MCP_LIMITS.maxPendingProposals);
+
+      for (let index = 0; index < release.length; index += 1) {
+        release[index]?.({
+          proposalId: `10000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+          documentId,
+          baseRevision: 'rev-1',
+          expiresAt: new Date(Date.now() + MCP_LIMITS.proposalTtlMs).toISOString(),
+          requiresApproval: false,
+          commandCount: 1,
+          affectedSlideIds: [],
+          warnings: [],
+          summary: 'One typed command',
+        });
+      }
+      await Promise.all(calls);
+
+      const firstProposalId = '10000000-0000-4000-8000-000000000000';
+      const committed = await client.callTool({
+        name: 'documents_commit_proposal',
+        arguments: { proposalId: firstProposalId },
+      });
+      expect(textResult(committed)).toMatchObject({ revision: 'rev-2' });
+
+      const admitted = client.callTool({
+        name: 'documents_propose_commands',
+        arguments: {
+          documentId,
+          expectedRevision: 'rev-2',
+          label: 'Capacity restored',
+          commands: [{ type: 'deck.rename', name: 'Accepted' }],
+        },
+      });
+      await vi.waitFor(() => expect(release).toHaveLength(MCP_LIMITS.maxPendingProposals + 1));
+      release.at(-1)?.({
+        proposalId: '10000000-0000-4000-8000-999999999999',
+        documentId,
+        baseRevision: 'rev-2',
+        expiresAt: new Date(Date.now() + MCP_LIMITS.proposalTtlMs).toISOString(),
+        requiresApproval: false,
+        commandCount: 1,
+        affectedSlideIds: [],
+        warnings: [],
+        summary: 'One typed command',
+      });
+      const admittedResult = await admitted;
+      expect(admittedResult.isError).not.toBe(true);
+      expect(textResult(admittedResult)).toMatchObject({
+        proposalId: '10000000-0000-4000-8000-999999999999',
+      });
+    } finally {
+      for (const complete of release) {
+        complete({
+          proposalId,
+          documentId,
+          baseRevision: 'rev-1',
+          expiresAt: new Date(Date.now() + MCP_LIMITS.proposalTtlMs).toISOString(),
+          requiresApproval: false,
+          commandCount: 1,
+          affectedSlideIds: [],
+          warnings: [],
+          summary: 'One typed command',
+        });
+      }
+      await Promise.allSettled(calls);
       await Promise.all([client.close(), server.close()]);
     }
   });

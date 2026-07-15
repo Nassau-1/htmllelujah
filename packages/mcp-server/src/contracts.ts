@@ -7,6 +7,9 @@ export const MCP_LIMITS = Object.freeze({
   maxResultBytes: 2 * 1024 * 1024,
   maxFrameBytes: 2 * 1024 * 1024,
   proposalTtlMs: 5 * 60 * 1000,
+  maxPendingProposals: 64,
+  maxPendingApprovals: 32,
+  maxApprovalReceipts: 64,
 });
 
 export const identifierSchema = z.string().uuid();

@@ -139,8 +139,50 @@ export const createHtmllelujahMcpServer = (
   const server = new McpServer({ name: 'htmllelujah', version: '1.0.0' });
   const proposals = new Map<
     string,
-    { readonly documentId: string; readonly requiresApproval: boolean }
+    {
+      readonly documentId: string;
+      readonly requiresApproval: boolean;
+      readonly expiresAtMs: number;
+    }
   >();
+  let proposalReservations = 0;
+
+  const purgeExpiredProposals = (now = Date.now()): void => {
+    for (const [id, proposal] of proposals) {
+      if (proposal.expiresAtMs <= now) proposals.delete(id);
+    }
+  };
+
+  const reserveProposalSlot = (): void => {
+    purgeExpiredProposals();
+    if (proposals.size + proposalReservations >= MCP_LIMITS.maxPendingProposals) {
+      throw new McpSafeError(
+        'INVALID_REQUEST',
+        'Too many proposals are pending; commit one or wait for expiry.',
+      );
+    }
+    proposalReservations += 1;
+  };
+
+  const registerProposal = (proposal: ProposalResult): void => {
+    const now = Date.now();
+    const expiresAtMs = Date.parse(proposal.expiresAt);
+    if (
+      !Number.isFinite(expiresAtMs) ||
+      expiresAtMs <= now ||
+      expiresAtMs > now + MCP_LIMITS.proposalTtlMs
+    ) {
+      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Proposal expiration is invalid.');
+    }
+    if (proposals.has(proposal.proposalId)) {
+      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Proposal identity is not unique.');
+    }
+    proposals.set(proposal.proposalId, {
+      documentId: proposal.documentId,
+      requiresApproval: proposal.requiresApproval,
+      expiresAtMs,
+    });
+  };
 
   server.registerTool(
     'app_status',
@@ -236,14 +278,16 @@ export const createHtmllelujahMcpServer = (
     },
     async (input) =>
       toolResult(async () => {
-        await assertRead(permissions, input.documentId);
-        await assertEdit(permissions, input.documentId);
-        const proposal = await service.proposeCommands(input);
-        proposals.set(proposal.proposalId, {
-          documentId: proposal.documentId,
-          requiresApproval: proposal.requiresApproval,
-        });
-        return proposal;
+        reserveProposalSlot();
+        try {
+          await assertRead(permissions, input.documentId);
+          await assertEdit(permissions, input.documentId);
+          const proposal = await service.proposeCommands(input);
+          registerProposal(proposal);
+          return proposal;
+        } finally {
+          proposalReservations -= 1;
+        }
       }),
   );
 
@@ -257,6 +301,7 @@ export const createHtmllelujahMcpServer = (
     },
     async (input) =>
       toolResult(async () => {
+        purgeExpiredProposals();
         const proposal = proposals.get(input.proposalId);
         if (proposal === undefined) {
           throw new McpSafeError('NOT_FOUND', 'Proposal is missing or expired.');

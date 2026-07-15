@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { DocumentSessionManager } from '@htmllelujah/document-runtime';
+import { MCP_LIMITS } from '@htmllelujah/mcp-server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DesktopMcpBridge } from '../src/main/mcp-bridge.js';
@@ -21,12 +22,13 @@ describe('DesktopMcpBridge', () => {
 
   it('exposes visible decks, commits attributable proposals, and enforces one-time approvals', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-mcp-'));
+    let now = new Date('2026-07-15T12:00:00.000Z');
     const runtime = new DocumentSessionManager({
       recoveryDirectory: path.join(directory, 'recovery'),
       autosaveDelayMs: 0,
+      now: () => now.toISOString(),
     });
     const source = await runtime.createMainOnly();
-    let now = new Date('2026-07-15T12:00:00.000Z');
     let collaborationMode: 'offline' | 'host' | 'guest' = 'offline';
     const importAsset = vi.fn(async () => ({ assetId: 'approved-asset' }));
     const exportDocument = vi.fn(async (_sessionId, input: { readonly format: string }) => ({
@@ -197,5 +199,106 @@ describe('DesktopMcpBridge', () => {
     collaborationMode = 'host';
     await expect(bridge.canRead(source.documentId)).resolves.toBe(true);
     await expect(bridge.canEdit(source.documentId)).resolves.toBe(false);
+  });
+
+  it('purges expired proposals and fails closed at proposal, approval, and receipt caps', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-mcp-limits-'));
+    let now = new Date('2026-07-16T12:00:00.000Z');
+    const runtime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'recovery'),
+      autosaveDelayMs: 0,
+      defaultProposalTtlMs: 1_000,
+      now: () => now.toISOString(),
+    });
+    const source = await runtime.createMainOnly();
+    const bridge = new DesktopMcpBridge({
+      runtime,
+      appVersion: () => '1.0.0',
+      visibleSessionIds: () => [source.sessionId],
+      collaborationStatus: () => ({
+        mode: 'offline',
+        connectedPeers: 0,
+        discoveryEnabled: false,
+      }),
+      importAsset: vi.fn(async () => ({ assetId: 'approved-asset' })),
+      exportDocument: vi.fn(async () => ({ format: 'pdf', pageCount: 1 })),
+      now: () => now,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(async () => {
+      await Promise.all(
+        runtime
+          .listSessions()
+          .map((session) => runtime.close(session.sessionId, { discardUnsaved: true })),
+      );
+    });
+
+    const propose = (index: number) =>
+      bridge.proposeCommands({
+        documentId: source.documentId,
+        expectedRevision: source.revision,
+        label: `Bounded proposal ${index}`,
+        commands: [{ type: 'deck.rename', name: `Proposed ${index}` }],
+      });
+    await Promise.all(
+      Array.from({ length: MCP_LIMITS.maxPendingProposals }, (_, index) => propose(index)),
+    );
+    await expect(propose(MCP_LIMITS.maxPendingProposals)).rejects.toMatchObject({
+      code: 'INVALID_REQUEST',
+    });
+
+    now = new Date(now.getTime() + 1_001);
+    const afterExpiry = await propose(MCP_LIMITS.maxPendingProposals + 1);
+    expect(afterExpiry.proposalId).toEqual(expect.any(String));
+    now = new Date(now.getTime() + 1_001);
+    await expect(
+      bridge.commitProposal({ proposalId: afterExpiry.proposalId }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    const grants = Array.from({ length: MCP_LIMITS.maxPendingApprovals }, () =>
+      bridge.issueApproval(source.documentId, 'import'),
+    );
+    expect(bridge.pendingApprovalCount()).toBe(MCP_LIMITS.maxPendingApprovals);
+    expect(() => bridge.issueApproval(source.documentId, 'import')).toThrowError(
+      expect.objectContaining({ code: 'INVALID_REQUEST' }),
+    );
+    await Promise.all(
+      grants.map((grant) =>
+        bridge.consumeApproval({
+          approvalId: grant.approvalId,
+          documentId: source.documentId,
+          action: 'import',
+        }),
+      ),
+    );
+    const secondBatch = Array.from({ length: MCP_LIMITS.maxPendingApprovals }, () =>
+      bridge.issueApproval(source.documentId, 'import'),
+    );
+    await Promise.all(
+      secondBatch.map((grant) =>
+        bridge.consumeApproval({
+          approvalId: grant.approvalId,
+          documentId: source.documentId,
+          action: 'import',
+        }),
+      ),
+    );
+    const blockedByReceiptCap = bridge.issueApproval(source.documentId, 'import');
+    await expect(
+      bridge.consumeApproval({
+        approvalId: blockedByReceiptCap.approvalId,
+        documentId: source.documentId,
+        action: 'import',
+      }),
+    ).resolves.toBe(false);
+
+    now = new Date(now.getTime() + 30_001);
+    await expect(
+      bridge.consumeApproval({
+        approvalId: blockedByReceiptCap.approvalId,
+        documentId: source.documentId,
+        action: 'import',
+      }),
+    ).resolves.toBe(true);
   });
 });
