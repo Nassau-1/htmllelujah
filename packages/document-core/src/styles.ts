@@ -30,12 +30,12 @@ export const DEFAULT_STYLE_CATALOG: StyleCatalog = Object.freeze({
     mutedText: '#697386',
     accent: '#2F6BFF',
   },
-  headingFontFamily: 'Inter',
-  bodyFontFamily: 'Inter',
+  headingFontFamily: 'Arial',
+  bodyFontFamily: 'Arial',
   textStyles: [
     {
       role: 'title',
-      fontFamily: 'Inter',
+      fontFamily: 'Arial',
       fontSizePt: 32,
       fontWeight: 650,
       italic: false,
@@ -45,7 +45,7 @@ export const DEFAULT_STYLE_CATALOG: StyleCatalog = Object.freeze({
     },
     {
       role: 'subtitle',
-      fontFamily: 'Inter',
+      fontFamily: 'Arial',
       fontSizePt: 18,
       fontWeight: 400,
       italic: false,
@@ -55,7 +55,7 @@ export const DEFAULT_STYLE_CATALOG: StyleCatalog = Object.freeze({
     },
     {
       role: 'body',
-      fontFamily: 'Inter',
+      fontFamily: 'Arial',
       fontSizePt: 15,
       fontWeight: 400,
       italic: false,
@@ -65,7 +65,7 @@ export const DEFAULT_STYLE_CATALOG: StyleCatalog = Object.freeze({
     },
     {
       role: 'caption',
-      fontFamily: 'Inter',
+      fontFamily: 'Arial',
       fontSizePt: 10,
       fontWeight: 400,
       italic: false,
@@ -75,7 +75,7 @@ export const DEFAULT_STYLE_CATALOG: StyleCatalog = Object.freeze({
     },
     {
       role: 'label',
-      fontFamily: 'Inter',
+      fontFamily: 'Arial',
       fontSizePt: 11,
       fontWeight: 600,
       italic: false,
@@ -85,7 +85,7 @@ export const DEFAULT_STYLE_CATALOG: StyleCatalog = Object.freeze({
     },
     {
       role: 'quote',
-      fontFamily: 'Inter',
+      fontFamily: 'Arial',
       fontSizePt: 18,
       fontWeight: 400,
       italic: true,

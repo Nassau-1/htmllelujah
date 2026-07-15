@@ -59,6 +59,11 @@ import {
   type DocumentCommand,
   type Element,
   type Frame,
+  type Guide,
+  type ImageElement,
+  type Layout,
+  type Master,
+  type PlaceholderElement,
   type RichTextDocument,
   type Slide,
   type TableElement,
@@ -117,6 +122,11 @@ type TextDraft = {
   readonly bold: boolean;
   readonly italic: boolean;
   readonly underline: boolean;
+  readonly strikethrough: boolean;
+  readonly color: string;
+  readonly lineHeight: number;
+  readonly letterSpacingPt: number;
+  readonly listLevel: number;
 };
 
 const clamp = (value: number, minimum: number, maximum: number): number =>
@@ -147,6 +157,7 @@ const textAlignment = (element: TextElement): TextAlignment => {
 
 const initialTextDraft = (element: TextElement, document: DeckDocument): TextDraft => {
   const marks = firstMarks(element.content);
+  const firstBlock = element.content.blocks[0];
   const theme =
     document.themes.find((candidate) =>
       document.masters.some((master) => master.themeId === candidate.id),
@@ -165,6 +176,50 @@ const initialTextDraft = (element: TextElement, document: DeckDocument): TextDra
       (marks.fontWeight ?? element.style?.fontWeight ?? roleStyle?.fontWeight ?? 400) >= 600,
     italic: marks.italic || (element.style?.italic ?? false),
     underline: marks.underline,
+    strikethrough: marks.strikethrough,
+    color:
+      marks.color ?? element.style?.color ?? roleStyle?.color ?? theme?.colors.text ?? '#172033',
+    lineHeight: element.style?.lineHeight ?? roleStyle?.lineHeight ?? 1.25,
+    letterSpacingPt: element.style?.letterSpacingPt ?? 0,
+    listLevel: firstBlock?.type === 'list' ? (firstBlock.items[0]?.level ?? 0) : 0,
+  };
+};
+
+const textEditingFingerprint = (element: TextElement): string =>
+  JSON.stringify({
+    styleRole: element.styleRole,
+    verticalAlignment: element.verticalAlignment,
+    content: element.content,
+    style: element.style,
+  });
+
+const duplicateGuides = (guides: readonly Guide[]): readonly Guide[] =>
+  guides.map((guide) => ({ ...guide, id: crypto.randomUUID() }));
+
+const createPlaceholder = (
+  role: PlaceholderElement['role'],
+  page: DeckDocument['page'],
+): PlaceholderElement => {
+  const titleLike = role === 'title' || role === 'subtitle';
+  const mediaLike = role === 'media' || role === 'table';
+  return {
+    id: crypto.randomUUID(),
+    type: 'placeholder',
+    name: `${role.slice(0, 1).toUpperCase()}${role.slice(1)} placeholder`,
+    frame: {
+      xPt: page.widthPt * 0.08,
+      yPt: titleLike ? page.heightPt * 0.1 : page.heightPt * 0.28,
+      widthPt: page.widthPt * 0.84,
+      heightPt: titleLike ? page.heightPt * 0.14 : page.heightPt * 0.56,
+      rotationDeg: 0,
+    },
+    opacity: 1,
+    visible: true,
+    locked: false,
+    role,
+    accepts:
+      role === 'media' ? ['image', 'shape', 'icon'] : role === 'table' ? ['table'] : ['text'],
+    prompt: mediaLike ? `Add ${role}` : `Add ${role} text`,
   };
 };
 
@@ -259,8 +314,12 @@ function PresentationMode() {
   }, [go, index, slides.length]);
 
   if (error !== null) return <LoadingScreen message={error} />;
-  if (session === null || active === undefined)
-    return <LoadingScreen message="Preparing presentation…" />;
+  if (session === null) return <LoadingScreen message="Preparing presentation…" />;
+  if (slides.length === 0)
+    return (
+      <LoadingScreen message="This presentation has no visible slides. Press Escape to close." />
+    );
+  if (active === undefined) return <LoadingScreen message="Preparing presentation…" />;
   const projection = resolveSlide(session.snapshot.document, active.id);
   const rawWidth = projection.page.widthPt * (4 / 3);
   const rawHeight = projection.page.heightPt * (4 / 3);
@@ -382,9 +441,17 @@ function EditorApp() {
   const [recoveryCandidates, setRecoveryCandidates] = useState<readonly RecoveryCandidate[]>([]);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
+  const [textDraftDirty, setTextDraftDirty] = useState(false);
+  const [textDraftConflict, setTextDraftConflict] = useState(false);
+  const textBaselineRef = useRef<{ readonly id: string; readonly value: string } | null>(null);
   const [tableTsv, setTableTsv] = useState('');
+  const [selectedTableCellId, setSelectedTableCellId] = useState('');
+  const [designMasterId, setDesignMasterId] = useState('');
+  const [designLayoutId, setDesignLayoutId] = useState('');
   const workspaceRef = useRef<HTMLDivElement>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
+  const executeQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingExecuteCountRef = useRef(0);
 
   const acceptSession = useCallback((next: SessionView): void => {
     sessionRef.current = next;
@@ -406,6 +473,11 @@ function EditorApp() {
 
   const notify = useCallback((message: string, kind: Toast['kind'] = 'info'): void => {
     setToast({ message, kind });
+  }, []);
+
+  const editTextDraft = useCallback((next: TextDraft): void => {
+    setTextDraft(next);
+    setTextDraftDirty(true);
   }, []);
 
   useEffect(() => {
@@ -460,7 +532,11 @@ function EditorApp() {
   );
   const primaryElement = selectedElements.at(-1);
   const primaryText = primaryElement?.type === 'text' ? primaryElement : undefined;
+  const primaryImage = primaryElement?.type === 'image' ? primaryElement : undefined;
   const primaryTable = primaryElement?.type === 'table' ? primaryElement : undefined;
+  const selectedTableCell = primaryTable?.cells.find((cell) => cell.id === selectedTableCellId);
+  const designMaster = document?.masters.find((master) => master.id === designMasterId);
+  const designLayout = document?.layouts.find((layout) => layout.id === designLayoutId);
   const canvasScale = fitScale * (zoom / 100);
 
   useEffect(() => {
@@ -485,10 +561,56 @@ function EditorApp() {
   useEffect(() => {
     if (primaryText === undefined || document === undefined) {
       setTextDraft(null);
+      setTextDraftDirty(false);
+      setTextDraftConflict(false);
+      textBaselineRef.current = null;
+      return;
+    }
+    const value = textEditingFingerprint(primaryText);
+    const baseline = textBaselineRef.current;
+    if (baseline === null || baseline.id !== primaryText.id) {
+      setTextDraft(initialTextDraft(primaryText, document));
+      setTextDraftDirty(false);
+      setTextDraftConflict(false);
+      textBaselineRef.current = { id: primaryText.id, value };
+      return;
+    }
+    if (baseline.value === value) return;
+    if (textDraftDirty) {
+      setTextDraftConflict(true);
       return;
     }
     setTextDraft(initialTextDraft(primaryText, document));
-  }, [document?.id, primaryText?.id, session?.snapshot.revision]);
+    setTextDraftConflict(false);
+    textBaselineRef.current = { id: primaryText.id, value };
+  }, [document, primaryText, textDraftDirty]);
+
+  useEffect(() => {
+    if (primaryTable === undefined) {
+      setSelectedTableCellId('');
+      return;
+    }
+    setSelectedTableCellId((current) =>
+      primaryTable.cells.some((cell) => cell.id === current)
+        ? current
+        : (primaryTable.cells[0]?.id ?? ''),
+    );
+  }, [primaryTable?.id, session?.snapshot.revision]);
+
+  useEffect(() => {
+    if (document === undefined || activeSlide === undefined) return;
+    const activeLayout = document.layouts.find((layout) => layout.id === activeSlide.layoutId);
+    setDesignLayoutId((current) =>
+      document.layouts.some((layout) => layout.id === current)
+        ? current
+        : (activeLayout?.id ?? document.layouts[0]?.id ?? ''),
+    );
+    setDesignMasterId((current) =>
+      document.masters.some((master) => master.id === current)
+        ? current
+        : (activeLayout?.masterId ?? document.masters[0]?.id ?? ''),
+    );
+  }, [activeSlide?.id, document?.id, session?.snapshot.revision]);
 
   const showFailure = useCallback(
     (result: DesktopResult<unknown>): void => {
@@ -504,32 +626,44 @@ function EditorApp() {
   );
 
   const execute = useCallback(
-    async (
+    (
       label: string,
       commands: readonly DocumentCommand[],
       options: { readonly select?: readonly string[]; readonly message?: string } = {},
     ): Promise<boolean> => {
-      const current = sessionRef.current;
-      if (current === null || commands.length === 0 || busy) return false;
+      if (sessionRef.current === null || commands.length === 0) return Promise.resolve(false);
+      if (busy && pendingExecuteCountRef.current === 0) return Promise.resolve(false);
+      pendingExecuteCountRef.current += 1;
       setBusy(true);
-      try {
-        const result = await window.htmllelujah.execute({
-          sessionId: current.snapshot.sessionId,
-          expectedRevision: current.snapshot.revision,
-          label,
-          commands,
-        });
-        if (!result.ok) {
-          showFailure(result);
-          return false;
+      const run = async (): Promise<boolean> => {
+        try {
+          const current = sessionRef.current;
+          if (current === null) return false;
+          const result = await window.htmllelujah.execute({
+            sessionId: current.snapshot.sessionId,
+            expectedRevision: current.snapshot.revision,
+            label,
+            commands,
+          });
+          if (!result.ok) {
+            showFailure(result);
+            return false;
+          }
+          acceptSession(result.value);
+          if (options.select !== undefined) setSelectedIds(options.select);
+          if (options.message !== undefined) notify(options.message, 'success');
+          return true;
+        } finally {
+          pendingExecuteCountRef.current -= 1;
+          if (pendingExecuteCountRef.current === 0) setBusy(false);
         }
-        acceptSession(result.value);
-        if (options.select !== undefined) setSelectedIds(options.select);
-        if (options.message !== undefined) notify(options.message, 'success');
-        return true;
-      } finally {
-        setBusy(false);
-      }
+      };
+      const queued = executeQueueRef.current.then(run, run);
+      executeQueueRef.current = queued.then(
+        () => undefined,
+        () => undefined,
+      );
+      return queued;
     },
     [acceptSession, busy, notify, showFailure],
   );
@@ -634,41 +768,56 @@ function EditorApp() {
     [activeSlide, execute],
   );
 
-  const importImage = useCallback(async (): Promise<void> => {
-    const current = sessionRef.current;
-    if (current === null || activeSlide === undefined || busy) return;
-    setBusy(true);
-    try {
-      const imported = await window.htmllelujah.importImage({
-        sessionId: current.snapshot.sessionId,
-        expectedRevision: current.snapshot.revision,
-      });
-      if (!imported.ok) {
-        showFailure(imported);
-        return;
+  const importImage = useCallback(
+    async (replace?: ImageElement): Promise<void> => {
+      const current = sessionRef.current;
+      if (current === null || activeSlide === undefined || busy) return;
+      setBusy(true);
+      try {
+        const imported = await window.htmllelujah.importImage({
+          sessionId: current.snapshot.sessionId,
+          expectedRevision: current.snapshot.revision,
+        });
+        if (!imported.ok) {
+          showFailure(imported);
+          return;
+        }
+        acceptSession(imported.value.session);
+        const asset = imported.value.session.snapshot.document.assets.find(
+          (candidate) => candidate.id === imported.value.assetId,
+        );
+        const element =
+          replace === undefined
+            ? createImageElement(imported.value.assetId, asset?.widthPx, asset?.heightPx)
+            : { ...replace, assetId: imported.value.assetId };
+        const inserted = await window.htmllelujah.execute({
+          sessionId: imported.value.session.snapshot.sessionId,
+          expectedRevision: imported.value.session.snapshot.revision,
+          label: replace === undefined ? 'Insert image' : 'Replace image',
+          commands: [
+            replace === undefined
+              ? { type: 'element.insert', slideId: activeSlide.id, element }
+              : {
+                  type: 'element.update',
+                  slideId: activeSlide.id,
+                  elementId: replace.id,
+                  replacement: element,
+                },
+          ],
+        });
+        if (!inserted.ok) {
+          showFailure(inserted);
+          return;
+        }
+        acceptSession(inserted.value);
+        setSelectedIds([element.id]);
+        notify(replace === undefined ? 'Image added.' : 'Image replaced.', 'success');
+      } finally {
+        setBusy(false);
       }
-      acceptSession(imported.value.session);
-      const asset = imported.value.session.snapshot.document.assets.find(
-        (candidate) => candidate.id === imported.value.assetId,
-      );
-      const element = createImageElement(imported.value.assetId, asset?.widthPx, asset?.heightPx);
-      const inserted = await window.htmllelujah.execute({
-        sessionId: imported.value.session.snapshot.sessionId,
-        expectedRevision: imported.value.session.snapshot.revision,
-        label: 'Insert image',
-        commands: [{ type: 'element.insert', slideId: activeSlide.id, element }],
-      });
-      if (!inserted.ok) {
-        showFailure(inserted);
-        return;
-      }
-      acceptSession(inserted.value);
-      setSelectedIds([element.id]);
-      notify('Image added.', 'success');
-    } finally {
-      setBusy(false);
-    }
-  }, [acceptSession, activeSlide, busy, notify, showFailure]);
+    },
+    [acceptSession, activeSlide, busy, notify, showFailure],
+  );
 
   const addSlide = useCallback(async (): Promise<void> => {
     if (document === undefined) return;
@@ -844,6 +993,13 @@ function EditorApp() {
       document === undefined
     )
       return;
+    if (
+      textDraftConflict &&
+      !window.confirm(
+        'This text changed elsewhere while you were editing. Replace it with your draft?',
+      )
+    )
+      return;
     const baseline = initialTextDraft(primaryText, document);
     const markPatch: MutableTextMarksPatch = {};
     if (textDraft.bold !== baseline.bold) {
@@ -852,11 +1008,15 @@ function EditorApp() {
     }
     if (textDraft.italic !== baseline.italic) markPatch.italic = textDraft.italic;
     if (textDraft.underline !== baseline.underline) markPatch.underline = textDraft.underline;
+    if (textDraft.strikethrough !== baseline.strikethrough)
+      markPatch.strikethrough = textDraft.strikethrough;
+    if (textDraft.color !== baseline.color) markPatch.color = textDraft.color;
     if (textDraft.fontFamily !== baseline.fontFamily) markPatch.fontFamily = textDraft.fontFamily;
     if (textDraft.fontSizePt !== baseline.fontSizePt) markPatch.fontSizePt = textDraft.fontSizePt;
     const marksChanged = Object.keys(markPatch).length > 0;
     const alignmentChanged = textDraft.alignment !== baseline.alignment;
     const kindChanged = textDraft.kind !== baseline.kind;
+    const listLevelChanged = textDraft.listLevel !== baseline.listLevel;
     const textChanged = textDraft.text !== baseline.text;
     let content = primaryText.content;
     if (kindChanged) {
@@ -869,18 +1029,36 @@ function EditorApp() {
           bold: textDraft.bold,
           italic: textDraft.italic,
           underline: textDraft.underline,
+          strikethrough: textDraft.strikethrough,
+          color: textDraft.color,
           fontFamily: textDraft.fontFamily,
           fontSizePt: textDraft.fontSizePt,
           fontWeight: textDraft.bold ? 700 : 400,
         },
         headingLevel: 1,
       });
-    } else if (textChanged || marksChanged || alignmentChanged) {
+    } else if (textChanged || marksChanged || alignmentChanged || listLevelChanged) {
       content = replacePlainTextPreservingStyles(primaryText.content, textDraft.text);
       content = updateRichTextPresentation(content, {
         ...(alignmentChanged ? { alignment: textDraft.alignment } : {}),
         ...(marksChanged ? { marks: markPatch } : {}),
       });
+    }
+    if (
+      (listLevelChanged || kindChanged) &&
+      textDraft.kind !== 'paragraph' &&
+      textDraft.kind !== 'heading'
+    ) {
+      content = {
+        blocks: content.blocks.map((block) =>
+          block.type === 'list'
+            ? {
+                ...block,
+                items: block.items.map((item) => ({ ...item, level: textDraft.listLevel })),
+              }
+            : block,
+        ),
+      };
     }
 
     const styleChanged =
@@ -889,9 +1067,12 @@ function EditorApp() {
       textDraft.fontFamily !== baseline.fontFamily ||
       textDraft.fontSizePt !== baseline.fontSizePt ||
       textDraft.bold !== baseline.bold ||
-      textDraft.italic !== baseline.italic;
+      textDraft.italic !== baseline.italic ||
+      textDraft.color !== baseline.color ||
+      textDraft.lineHeight !== baseline.lineHeight ||
+      textDraft.letterSpacingPt !== baseline.letterSpacingPt;
     const commands: DocumentCommand[] = [];
-    if (kindChanged || textChanged || marksChanged || alignmentChanged) {
+    if (kindChanged || textChanged || marksChanged || alignmentChanged || listLevelChanged) {
       commands.push({
         type: 'text.replace-content',
         slideId: activeSlide.id,
@@ -913,12 +1094,18 @@ function EditorApp() {
             fontSizePt: textDraft.fontSizePt,
             fontWeight: textDraft.bold ? 700 : 400,
             italic: textDraft.italic,
+            color: textDraft.color,
+            lineHeight: textDraft.lineHeight,
+            letterSpacingPt: textDraft.letterSpacingPt,
           },
         },
       });
     }
-    if (commands.length > 0) await execute('Edit text', commands);
-  }, [activeSlide, document, execute, primaryText, textDraft]);
+    if (commands.length > 0 && (await execute('Edit text', commands))) {
+      setTextDraftDirty(false);
+      setTextDraftConflict(false);
+    }
+  }, [activeSlide, document, execute, primaryText, textDraft, textDraftConflict]);
 
   const pasteTable = useCallback(async (): Promise<void> => {
     if (activeSlide === undefined || primaryTable === undefined || tableTsv.trim() === '') return;
@@ -936,6 +1123,109 @@ function EditorApp() {
     )
       setTableTsv('');
   }, [activeSlide, execute, primaryTable, tableTsv]);
+
+  const updateImageCrop = useCallback(
+    (side: keyof ImageElement['crop'], raw: string): void => {
+      if (primaryImage === undefined) return;
+      const requested = Number(raw);
+      if (!Number.isFinite(requested)) return;
+      const opposite =
+        side === 'left'
+          ? primaryImage.crop.right
+          : side === 'right'
+            ? primaryImage.crop.left
+            : side === 'top'
+              ? primaryImage.crop.bottom
+              : primaryImage.crop.top;
+      patchElement(
+        {
+          ...primaryImage,
+          crop: {
+            ...primaryImage.crop,
+            [side]: clamp(requested, 0, Math.max(0, 0.99 - opposite)),
+          },
+        },
+        'Crop image',
+      );
+    },
+    [patchElement, primaryImage],
+  );
+
+  const updateMaster = useCallback(
+    (replacement: Master, label = 'Update master'): void => {
+      void execute(label, [{ type: 'master.update', masterId: replacement.id, replacement }]);
+    },
+    [execute],
+  );
+
+  const updateLayout = useCallback(
+    (replacement: Layout, label = 'Update layout'): void => {
+      void execute(label, [{ type: 'layout.update', layoutId: replacement.id, replacement }]);
+    },
+    [execute],
+  );
+
+  const duplicateMaster = useCallback(async (): Promise<void> => {
+    if (designMaster === undefined) return;
+    const master: Master = {
+      ...designMaster,
+      id: crypto.randomUUID(),
+      name: `${designMaster.name} copy`,
+      elements: duplicateElements(designMaster.elements),
+      guides: duplicateGuides(designMaster.guides),
+    };
+    if (await execute('Create master', [{ type: 'master.create', master }]))
+      setDesignMasterId(master.id);
+  }, [designMaster, execute]);
+
+  const duplicateLayout = useCallback(async (): Promise<void> => {
+    if (designLayout === undefined) return;
+    const layout: Layout = {
+      ...designLayout,
+      id: crypto.randomUUID(),
+      name: `${designLayout.name} copy`,
+      elements: duplicateElements(designLayout.elements),
+      guides: duplicateGuides(designLayout.guides),
+    };
+    if (await execute('Create layout', [{ type: 'layout.create', layout }]))
+      setDesignLayoutId(layout.id);
+  }, [designLayout, execute]);
+
+  const deleteMaster = useCallback(async (): Promise<void> => {
+    if (document === undefined || designMaster === undefined || document.masters.length <= 1)
+      return;
+    if (!window.confirm(`Delete master “${designMaster.name}” and remap its layouts?`)) return;
+    const replacement = document.masters.find((master) => master.id !== designMaster.id);
+    if (replacement === undefined) return;
+    if (
+      await execute('Delete master', [
+        {
+          type: 'master.delete',
+          masterId: designMaster.id,
+          replacementMasterId: replacement.id,
+        },
+      ])
+    )
+      setDesignMasterId(replacement.id);
+  }, [designMaster, document, execute]);
+
+  const deleteLayout = useCallback(async (): Promise<void> => {
+    if (document === undefined || designLayout === undefined || document.layouts.length <= 1)
+      return;
+    if (!window.confirm(`Delete layout “${designLayout.name}” and remap its slides?`)) return;
+    const replacement = document.layouts.find((layout) => layout.id !== designLayout.id);
+    if (replacement === undefined) return;
+    if (
+      await execute('Delete layout', [
+        {
+          type: 'layout.delete',
+          layoutId: designLayout.id,
+          replacementLayoutId: replacement.id,
+        },
+      ])
+    )
+      setDesignLayoutId(replacement.id);
+  }, [designLayout, document, execute]);
 
   const toggleLock = useCallback((): void => {
     if (activeSlide === undefined || primaryElement === undefined) return;
@@ -1726,15 +2016,21 @@ function EditorApp() {
                   <span>Layout</span>
                   <select
                     value={activeSlide.layoutId}
-                    onChange={(event) =>
+                    onChange={(event) => {
+                      const layoutId = event.currentTarget.value;
+                      const layout = document.layouts.find(
+                        (candidate) => candidate.id === layoutId,
+                      );
+                      setDesignLayoutId(layoutId);
+                      if (layout !== undefined) setDesignMasterId(layout.masterId);
                       void execute('Change slide layout', [
                         {
                           type: 'slide.set-layout',
                           slideId: activeSlide.id,
-                          layoutId: event.currentTarget.value,
+                          layoutId,
                         },
-                      ])
-                    }
+                      ]);
+                    }}
                   >
                     {document.layouts.map((layout) => (
                       <option key={layout.id} value={layout.id}>
@@ -1767,50 +2063,545 @@ function EditorApp() {
               </section>
               <section className="inspector-section">
                 <div className="section-heading-row">
-                  <h3>Slide master</h3>
+                  <h3>Layout editor</h3>
+                  <span className="section-status">Reusable placeholders</span>
+                </div>
+                <label className="stacked-field">
+                  <span>Layout to edit</span>
+                  <select
+                    value={designLayout?.id ?? ''}
+                    onChange={(event) => {
+                      const layout = document.layouts.find(
+                        (candidate) => candidate.id === event.currentTarget.value,
+                      );
+                      setDesignLayoutId(event.currentTarget.value);
+                      if (layout !== undefined) setDesignMasterId(layout.masterId);
+                    }}
+                  >
+                    {document.layouts.map((layout) => (
+                      <option key={layout.id} value={layout.id}>
+                        {layout.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {designLayout !== undefined ? (
+                  <div className="design-editor-card">
+                    <label className="stacked-field">
+                      <span>Name</span>
+                      <input
+                        key={`${designLayout.id}-name`}
+                        defaultValue={designLayout.name}
+                        maxLength={120}
+                        onBlur={(event) => {
+                          const name = event.currentTarget.value.trim();
+                          if (name !== '' && name !== designLayout.name)
+                            updateLayout({ ...designLayout, name }, 'Rename layout');
+                        }}
+                      />
+                    </label>
+                    <label className="stacked-field">
+                      <span>Master</span>
+                      <select
+                        value={designLayout.masterId}
+                        onChange={(event) =>
+                          updateLayout(
+                            { ...designLayout, masterId: event.currentTarget.value },
+                            'Change layout master',
+                          )
+                        }
+                      >
+                        {document.masters.map((master) => (
+                          <option key={master.id} value={master.id}>
+                            {master.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="color-field">
+                      Background
+                      <input
+                        type="color"
+                        value={
+                          designLayout.background?.type === 'solid'
+                            ? designLayout.background.color
+                            : (document.themes[0]?.colors.background ?? '#ffffff')
+                        }
+                        onChange={(event) =>
+                          updateLayout(
+                            {
+                              ...designLayout,
+                              background: {
+                                type: 'solid',
+                                color: event.currentTarget.value,
+                              },
+                            },
+                            'Change layout background',
+                          )
+                        }
+                      />
+                    </label>
+                    <div className="design-actions">
+                      <button type="button" onClick={() => void duplicateLayout()}>
+                        <Copy size={13} /> Duplicate
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-action"
+                        disabled={document.layouts.length <= 1}
+                        onClick={() => void deleteLayout()}
+                      >
+                        <Trash2 size={13} /> Delete
+                      </button>
+                    </div>
+                    <div className="design-subheading">Placeholders</div>
+                    {designLayout.elements
+                      .filter(
+                        (element): element is PlaceholderElement => element.type === 'placeholder',
+                      )
+                      .map((placeholder) => (
+                        <div className="placeholder-card" key={placeholder.id}>
+                          <div>
+                            <strong>{placeholder.name}</strong>
+                            <span>{placeholder.role}</span>
+                          </div>
+                          <button
+                            type="button"
+                            title="Delete placeholder"
+                            onClick={() =>
+                              updateLayout(
+                                {
+                                  ...designLayout,
+                                  elements: designLayout.elements.filter(
+                                    (element) => element.id !== placeholder.id,
+                                  ),
+                                },
+                                'Delete layout placeholder',
+                              )
+                            }
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                          <label className="stacked-field placeholder-prompt">
+                            <span>Prompt</span>
+                            <input
+                              key={`${placeholder.id}-prompt`}
+                              defaultValue={placeholder.prompt}
+                              onBlur={(event) => {
+                                const prompt = event.currentTarget.value;
+                                if (prompt === placeholder.prompt) return;
+                                updateLayout(
+                                  {
+                                    ...designLayout,
+                                    elements: designLayout.elements.map((element) =>
+                                      element.id === placeholder.id
+                                        ? { ...placeholder, prompt }
+                                        : element,
+                                    ),
+                                  },
+                                  'Edit placeholder prompt',
+                                );
+                              }}
+                            />
+                          </label>
+                          <div className="field-grid placeholder-frame-grid">
+                            {(
+                              [
+                                ['xPt', 'X'],
+                                ['yPt', 'Y'],
+                                ['widthPt', 'W'],
+                                ['heightPt', 'H'],
+                              ] as const
+                            ).map(([property, label]) => (
+                              <label key={property}>
+                                <span>{label}</span>
+                                <input
+                                  key={`${placeholder.id}-${property}`}
+                                  type="number"
+                                  min="0"
+                                  max={
+                                    property === 'xPt' || property === 'widthPt'
+                                      ? document.page.widthPt
+                                      : document.page.heightPt
+                                  }
+                                  step="1"
+                                  defaultValue={Math.round(placeholder.frame[property])}
+                                  onBlur={(event) => {
+                                    const value = Number(event.currentTarget.value);
+                                    if (!Number.isFinite(value)) return;
+                                    const maximum =
+                                      property === 'xPt' || property === 'widthPt'
+                                        ? document.page.widthPt
+                                        : document.page.heightPt;
+                                    const minimum =
+                                      property === 'widthPt' || property === 'heightPt' ? 12 : 0;
+                                    const replacement = {
+                                      ...placeholder,
+                                      frame: {
+                                        ...placeholder.frame,
+                                        [property]: clamp(value, minimum, maximum),
+                                      },
+                                    };
+                                    updateLayout(
+                                      {
+                                        ...designLayout,
+                                        elements: designLayout.elements.map((element) =>
+                                          element.id === placeholder.id ? replacement : element,
+                                        ),
+                                      },
+                                      'Resize layout placeholder',
+                                    );
+                                  }}
+                                />
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    <div className="placeholder-actions">
+                      {(['title', 'body', 'media', 'table'] as const).map((role) => (
+                        <button
+                          type="button"
+                          key={role}
+                          onClick={() =>
+                            updateLayout(
+                              {
+                                ...designLayout,
+                                elements: [
+                                  ...designLayout.elements,
+                                  createPlaceholder(role, document.page),
+                                ],
+                              },
+                              `Add ${role} placeholder`,
+                            )
+                          }
+                        >
+                          <Plus size={12} /> {role}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="design-subheading">Guides</div>
+                    {designLayout.guides.map((guide) => (
+                      <div className="guide-row" key={guide.id}>
+                        <select
+                          value={guide.orientation}
+                          aria-label="Guide orientation"
+                          onChange={(event) =>
+                            updateLayout(
+                              {
+                                ...designLayout,
+                                guides: designLayout.guides.map((candidate) =>
+                                  candidate.id === guide.id
+                                    ? {
+                                        ...candidate,
+                                        orientation: event.currentTarget.value as
+                                          'horizontal' | 'vertical',
+                                      }
+                                    : candidate,
+                                ),
+                              },
+                              'Change layout guide',
+                            )
+                          }
+                        >
+                          <option value="vertical">Vertical</option>
+                          <option value="horizontal">Horizontal</option>
+                        </select>
+                        <input
+                          key={guide.id}
+                          type="number"
+                          aria-label="Guide position in points"
+                          defaultValue={guide.positionPt}
+                          onBlur={(event) => {
+                            const positionPt = Number(event.currentTarget.value);
+                            if (!Number.isFinite(positionPt)) return;
+                            updateLayout(
+                              {
+                                ...designLayout,
+                                guides: designLayout.guides.map((candidate) =>
+                                  candidate.id === guide.id
+                                    ? { ...candidate, positionPt }
+                                    : candidate,
+                                ),
+                              },
+                              'Move layout guide',
+                            );
+                          }}
+                        />
+                        <button
+                          type="button"
+                          title="Delete guide"
+                          onClick={() =>
+                            updateLayout(
+                              {
+                                ...designLayout,
+                                guides: designLayout.guides.filter(
+                                  (candidate) => candidate.id !== guide.id,
+                                ),
+                              },
+                              'Delete layout guide',
+                            )
+                          }
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() =>
+                        updateLayout(
+                          {
+                            ...designLayout,
+                            guides: [
+                              ...designLayout.guides,
+                              {
+                                id: crypto.randomUUID(),
+                                orientation: 'vertical',
+                                positionPt: document.page.widthPt / 2,
+                              },
+                            ],
+                          },
+                          'Add layout guide',
+                        )
+                      }
+                    >
+                      <Plus size={13} /> Add guide
+                    </button>
+                  </div>
+                ) : null}
+              </section>
+              <section className="inspector-section">
+                <div className="section-heading-row">
+                  <h3>Master editor</h3>
                   <Layers3 size={14} />
                 </div>
-                {document.masters.map((master) => (
-                  <div key={master.id} className="master-card">
-                    <strong>{master.name}</strong>
-                    <span>
-                      {master.elements.length} fixed object{master.elements.length === 1 ? '' : 's'}
-                    </span>
+                <label className="stacked-field">
+                  <span>Master to edit</span>
+                  <select
+                    value={designMaster?.id ?? ''}
+                    onChange={(event) => setDesignMasterId(event.currentTarget.value)}
+                  >
+                    {document.masters.map((master) => (
+                      <option key={master.id} value={master.id}>
+                        {master.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {designMaster !== undefined ? (
+                  <div className="design-editor-card">
+                    <label className="stacked-field">
+                      <span>Name</span>
+                      <input
+                        key={`${designMaster.id}-name`}
+                        defaultValue={designMaster.name}
+                        maxLength={120}
+                        onBlur={(event) => {
+                          const name = event.currentTarget.value.trim();
+                          if (name !== '' && name !== designMaster.name)
+                            updateMaster({ ...designMaster, name }, 'Rename master');
+                        }}
+                      />
+                    </label>
+                    <label className="stacked-field">
+                      <span>Theme</span>
+                      <select
+                        value={designMaster.themeId}
+                        onChange={(event) =>
+                          updateMaster(
+                            { ...designMaster, themeId: event.currentTarget.value },
+                            'Change master theme',
+                          )
+                        }
+                      >
+                        {document.themes.map((theme) => (
+                          <option key={theme.id} value={theme.id}>
+                            {theme.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="color-field">
+                      Background
+                      <input
+                        type="color"
+                        value={
+                          designMaster.background?.type === 'solid'
+                            ? designMaster.background.color
+                            : (document.themes[0]?.colors.background ?? '#ffffff')
+                        }
+                        onChange={(event) =>
+                          updateMaster(
+                            {
+                              ...designMaster,
+                              background: {
+                                type: 'solid',
+                                color: event.currentTarget.value,
+                              },
+                            },
+                            'Change master background',
+                          )
+                        }
+                      />
+                    </label>
+                    <div className="design-actions">
+                      <button type="button" onClick={() => void duplicateMaster()}>
+                        <Copy size={13} /> Duplicate
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-action"
+                        disabled={document.masters.length <= 1}
+                        onClick={() => void deleteMaster()}
+                      >
+                        <Trash2 size={13} /> Delete
+                      </button>
+                    </div>
+                    <div className="design-subheading">Fixed objects</div>
+                    {designMaster.elements.map((element) => (
+                      <div className="master-object-row" key={element.id}>
+                        <span>
+                          <strong>{element.name}</strong>
+                          <small>{element.type}</small>
+                        </span>
+                        <button
+                          type="button"
+                          title="Delete master object"
+                          onClick={() =>
+                            updateMaster(
+                              {
+                                ...designMaster,
+                                elements: designMaster.elements.filter(
+                                  (candidate) => candidate.id !== element.id,
+                                ),
+                              },
+                              'Delete master object',
+                            )
+                          }
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() => {
+                        const footer = {
+                          ...createTextElement('caption', document.name),
+                          name: 'Master footer',
+                          frame: {
+                            xPt: 72,
+                            yPt: document.page.heightPt - 36,
+                            widthPt: document.page.widthPt - 144,
+                            heightPt: 20,
+                            rotationDeg: 0,
+                          },
+                        };
+                        updateMaster(
+                          {
+                            ...designMaster,
+                            elements: [...designMaster.elements, footer],
+                          },
+                          'Add master footer',
+                        );
+                      }}
+                    >
+                      <Plus size={13} /> Add presentation footer
+                    </button>
+                    <div className="design-subheading">Guides</div>
+                    {designMaster.guides.map((guide) => (
+                      <div className="guide-row" key={guide.id}>
+                        <select
+                          value={guide.orientation}
+                          aria-label="Master guide orientation"
+                          onChange={(event) =>
+                            updateMaster(
+                              {
+                                ...designMaster,
+                                guides: designMaster.guides.map((candidate) =>
+                                  candidate.id === guide.id
+                                    ? {
+                                        ...candidate,
+                                        orientation: event.currentTarget.value as
+                                          'horizontal' | 'vertical',
+                                      }
+                                    : candidate,
+                                ),
+                              },
+                              'Change master guide',
+                            )
+                          }
+                        >
+                          <option value="vertical">Vertical</option>
+                          <option value="horizontal">Horizontal</option>
+                        </select>
+                        <input
+                          key={guide.id}
+                          type="number"
+                          aria-label="Master guide position in points"
+                          defaultValue={guide.positionPt}
+                          onBlur={(event) => {
+                            const positionPt = Number(event.currentTarget.value);
+                            if (!Number.isFinite(positionPt)) return;
+                            updateMaster(
+                              {
+                                ...designMaster,
+                                guides: designMaster.guides.map((candidate) =>
+                                  candidate.id === guide.id
+                                    ? { ...candidate, positionPt }
+                                    : candidate,
+                                ),
+                              },
+                              'Move master guide',
+                            );
+                          }}
+                        />
+                        <button
+                          type="button"
+                          title="Delete master guide"
+                          onClick={() =>
+                            updateMaster(
+                              {
+                                ...designMaster,
+                                guides: designMaster.guides.filter(
+                                  (candidate) => candidate.id !== guide.id,
+                                ),
+                              },
+                              'Delete master guide',
+                            )
+                          }
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() =>
+                        updateMaster(
+                          {
+                            ...designMaster,
+                            guides: [
+                              ...designMaster.guides,
+                              {
+                                id: crypto.randomUUID(),
+                                orientation: 'vertical',
+                                positionPt: document.page.widthPt / 2,
+                              },
+                            ],
+                          },
+                          'Add master guide',
+                        )
+                      }
+                    >
+                      <Plus size={13} /> Add guide
+                    </button>
                   </div>
-                ))}
-                <button
-                  type="button"
-                  className="secondary-action"
-                  onClick={() => {
-                    const layout = document.layouts.find(
-                      (candidate) => candidate.id === activeSlide.layoutId,
-                    );
-                    const master = document.masters.find(
-                      (candidate) => candidate.id === layout?.masterId,
-                    );
-                    if (master === undefined) return;
-                    const footer = {
-                      ...createTextElement('caption', document.name),
-                      name: 'Master footer',
-                      frame: {
-                        xPt: 72,
-                        yPt: document.page.heightPt - 36,
-                        widthPt: document.page.widthPt - 144,
-                        heightPt: 20,
-                        rotationDeg: 0,
-                      },
-                    };
-                    void execute('Add master footer', [
-                      {
-                        type: 'master.update',
-                        masterId: master.id,
-                        replacement: { ...master, elements: [...master.elements, footer] },
-                      },
-                    ]);
-                  }}
-                >
-                  Add presentation footer to master
-                </button>
+                ) : null}
               </section>
               <section className="inspector-section">
                 <h3>Page format</h3>
@@ -2021,14 +2812,39 @@ function EditorApp() {
                 <section className="inspector-section text-editor-section">
                   <div className="section-heading-row">
                     <h3>Text</h3>
-                    <span className="section-status">Double-click to focus</span>
+                    <span className="section-status">
+                      {textDraftConflict
+                        ? 'Conflict — draft preserved'
+                        : textDraftDirty
+                          ? 'Draft not applied'
+                          : 'Up to date'}
+                    </span>
                   </div>
+                  {textDraftConflict ? (
+                    <div className="draft-conflict" role="alert">
+                      <span>The same text changed elsewhere. Your draft has not been lost.</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTextDraft(initialTextDraft(primaryText, document));
+                          setTextDraftDirty(false);
+                          setTextDraftConflict(false);
+                          textBaselineRef.current = {
+                            id: primaryText.id,
+                            value: textEditingFingerprint(primaryText),
+                          };
+                        }}
+                      >
+                        Use latest
+                      </button>
+                    </div>
+                  ) : null}
                   <div className="rich-toolbar" role="toolbar" aria-label="Text formatting">
                     <button
                       type="button"
                       className={textDraft.bold ? 'is-active' : ''}
                       aria-pressed={textDraft.bold}
-                      onClick={() => setTextDraft({ ...textDraft, bold: !textDraft.bold })}
+                      onClick={() => editTextDraft({ ...textDraft, bold: !textDraft.bold })}
                     >
                       <Bold size={14} />
                       <span className="sr-only">Bold</span>
@@ -2037,7 +2853,7 @@ function EditorApp() {
                       type="button"
                       className={textDraft.italic ? 'is-active' : ''}
                       aria-pressed={textDraft.italic}
-                      onClick={() => setTextDraft({ ...textDraft, italic: !textDraft.italic })}
+                      onClick={() => editTextDraft({ ...textDraft, italic: !textDraft.italic })}
                     >
                       <Italic size={14} />
                       <span className="sr-only">Italic</span>
@@ -2047,7 +2863,7 @@ function EditorApp() {
                       className={textDraft.underline ? 'is-active' : ''}
                       aria-pressed={textDraft.underline}
                       onClick={() =>
-                        setTextDraft({ ...textDraft, underline: !textDraft.underline })
+                        editTextDraft({ ...textDraft, underline: !textDraft.underline })
                       }
                     >
                       <Underline size={14} />
@@ -2055,10 +2871,26 @@ function EditorApp() {
                     </button>
                     <button
                       type="button"
+                      className={textDraft.strikethrough ? 'is-active' : ''}
+                      aria-pressed={textDraft.strikethrough}
+                      onClick={() =>
+                        editTextDraft({
+                          ...textDraft,
+                          strikethrough: !textDraft.strikethrough,
+                        })
+                      }
+                    >
+                      <span aria-hidden="true" className="strikethrough-glyph">
+                        S
+                      </span>
+                      <span className="sr-only">Strikethrough</span>
+                    </button>
+                    <button
+                      type="button"
                       className={textDraft.kind === 'bullets' ? 'is-active' : ''}
                       aria-pressed={textDraft.kind === 'bullets'}
                       onClick={() =>
-                        setTextDraft({
+                        editTextDraft({
                           ...textDraft,
                           kind: textDraft.kind === 'bullets' ? 'paragraph' : 'bullets',
                         })
@@ -2072,7 +2904,7 @@ function EditorApp() {
                       className={textDraft.kind === 'numbered' ? 'is-active' : ''}
                       aria-pressed={textDraft.kind === 'numbered'}
                       onClick={() =>
-                        setTextDraft({
+                        editTextDraft({
                           ...textDraft,
                           kind: textDraft.kind === 'numbered' ? 'paragraph' : 'numbered',
                         })
@@ -2088,7 +2920,7 @@ function EditorApp() {
                     value={textDraft.text}
                     spellCheck
                     onChange={(event) =>
-                      setTextDraft({ ...textDraft, text: event.currentTarget.value })
+                      editTextDraft({ ...textDraft, text: event.currentTarget.value })
                     }
                     onKeyDown={(event) => {
                       if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
@@ -2102,7 +2934,7 @@ function EditorApp() {
                     <select
                       value={textDraft.role}
                       onChange={(event) =>
-                        setTextDraft({
+                        editTextDraft({
                           ...textDraft,
                           role: event.currentTarget.value as TextStyleRole,
                           kind: event.currentTarget.value === 'title' ? 'heading' : textDraft.kind,
@@ -2123,7 +2955,7 @@ function EditorApp() {
                       <select
                         value={textDraft.fontFamily}
                         onChange={(event) =>
-                          setTextDraft({ ...textDraft, fontFamily: event.currentTarget.value })
+                          editTextDraft({ ...textDraft, fontFamily: event.currentTarget.value })
                         }
                       >
                         <option value="Arial">Arial</option>
@@ -2142,9 +2974,70 @@ function EditorApp() {
                         max="240"
                         value={textDraft.fontSizePt}
                         onChange={(event) =>
-                          setTextDraft({
+                          editTextDraft({
                             ...textDraft,
                             fontSizePt: clamp(Number(event.currentTarget.value), 6, 240),
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+                  <div className="text-detail-controls">
+                    <label className="color-field">
+                      Text color
+                      <input
+                        type="color"
+                        value={textDraft.color}
+                        onChange={(event) =>
+                          editTextDraft({ ...textDraft, color: event.currentTarget.value })
+                        }
+                      />
+                    </label>
+                    <label className="stacked-field">
+                      <span>Line spacing</span>
+                      <input
+                        type="number"
+                        min="0.5"
+                        max="4"
+                        step="0.05"
+                        value={textDraft.lineHeight}
+                        onChange={(event) =>
+                          editTextDraft({
+                            ...textDraft,
+                            lineHeight: clamp(Number(event.currentTarget.value), 0.5, 4),
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="stacked-field">
+                      <span>Letter spacing</span>
+                      <input
+                        type="number"
+                        min="-10"
+                        max="50"
+                        step="0.1"
+                        value={textDraft.letterSpacingPt}
+                        onChange={(event) =>
+                          editTextDraft({
+                            ...textDraft,
+                            letterSpacingPt: clamp(Number(event.currentTarget.value), -10, 50),
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="stacked-field">
+                      <span>List level</span>
+                      <input
+                        type="number"
+                        min="0"
+                        max="8"
+                        step="1"
+                        disabled={textDraft.kind !== 'bullets' && textDraft.kind !== 'numbered'}
+                        value={textDraft.listLevel}
+                        onChange={(event) =>
+                          editTextDraft({
+                            ...textDraft,
+                            listLevel: Math.round(clamp(Number(event.currentTarget.value), 0, 8)),
                           })
                         }
                       />
@@ -2157,7 +3050,7 @@ function EditorApp() {
                         key={alignment}
                         className={textDraft.alignment === alignment ? 'is-active' : ''}
                         aria-pressed={textDraft.alignment === alignment}
-                        onClick={() => setTextDraft({ ...textDraft, alignment })}
+                        onClick={() => editTextDraft({ ...textDraft, alignment })}
                       >
                         {alignment.slice(0, 1).toUpperCase()}
                         <span className="sr-only">Align {alignment}</span>
@@ -2170,6 +3063,89 @@ function EditorApp() {
                     onClick={() => void applyTextDraft()}
                   >
                     Apply text <kbd>Ctrl Enter</kbd>
+                  </button>
+                </section>
+              ) : null}
+              {primaryImage !== undefined ? (
+                <section className="inspector-section image-editor-section">
+                  <div className="section-heading-row">
+                    <h3>Image</h3>
+                    <span className="section-status">Embedded locally</span>
+                  </div>
+                  <label className="stacked-field">
+                    <span>Alternative text</span>
+                    <input
+                      key={`${primaryImage.id}-alt`}
+                      type="text"
+                      maxLength={2_000}
+                      defaultValue={primaryImage.altText}
+                      onBlur={(event) => {
+                        if (event.currentTarget.value !== primaryImage.altText)
+                          patchElement(
+                            { ...primaryImage, altText: event.currentTarget.value },
+                            'Edit image description',
+                          );
+                      }}
+                    />
+                  </label>
+                  <label className="stacked-field">
+                    <span>Fit</span>
+                    <select
+                      value={primaryImage.fit}
+                      onChange={(event) =>
+                        patchElement(
+                          {
+                            ...primaryImage,
+                            fit: event.currentTarget.value as ImageElement['fit'],
+                          },
+                          'Change image fit',
+                        )
+                      }
+                    >
+                      <option value="contain">Contain</option>
+                      <option value="cover">Cover</option>
+                      <option value="fill">Stretch</option>
+                    </select>
+                  </label>
+                  <div className="field-grid image-crop-grid">
+                    {(['top', 'right', 'bottom', 'left'] as const).map((side) => (
+                      <label key={side}>
+                        <span>Crop {side} (%)</span>
+                        <input
+                          key={`${primaryImage.id}-${side}`}
+                          type="number"
+                          min="0"
+                          max="99"
+                          step="1"
+                          defaultValue={Math.round(primaryImage.crop[side] * 100)}
+                          onBlur={(event) =>
+                            updateImageCrop(side, String(Number(event.currentTarget.value) / 100))
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <label className="stacked-field">
+                    <span>Opacity (%)</span>
+                    <input
+                      key={`${primaryImage.id}-opacity`}
+                      type="number"
+                      min="0"
+                      max="100"
+                      defaultValue={Math.round(primaryImage.opacity * 100)}
+                      onBlur={(event) => {
+                        const opacity = clamp(Number(event.currentTarget.value) / 100, 0, 1);
+                        if (Number.isFinite(opacity) && opacity !== primaryImage.opacity)
+                          patchElement({ ...primaryImage, opacity }, 'Change image opacity');
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    onClick={() => void importImage(primaryImage)}
+                  >
+                    <Image size={14} /> Replace image…
                   </button>
                 </section>
               ) : null}
@@ -2219,8 +3195,65 @@ function EditorApp() {
                 </section>
               ) : null}
               {primaryTable !== undefined ? (
-                <section className="inspector-section">
-                  <h3>Table</h3>
+                <section className="inspector-section table-editor-section">
+                  <div className="section-heading-row">
+                    <h3>Table</h3>
+                    <span className="section-status">
+                      {primaryTable.rowCount} × {primaryTable.columnCount}
+                    </span>
+                  </div>
+                  <div
+                    className="table-cell-grid"
+                    role="grid"
+                    aria-label="Editable table cells"
+                    style={{
+                      gridTemplateColumns: `repeat(${Math.min(primaryTable.columnCount, 6)}, minmax(58px, 1fr))`,
+                    }}
+                  >
+                    {Array.from({ length: Math.min(primaryTable.rowCount, 10) }, (_, row) =>
+                      Array.from({ length: Math.min(primaryTable.columnCount, 6) }, (_, column) => {
+                        const cell = primaryTable.cells.find(
+                          (candidate) => candidate.row === row && candidate.column === column,
+                        );
+                        if (cell === undefined)
+                          return (
+                            <span
+                              key={`covered-${row}-${column}`}
+                              className="table-cell-covered"
+                              aria-label={`Covered cell ${row + 1}, ${column + 1}`}
+                            />
+                          );
+                        return (
+                          <input
+                            key={cell.id}
+                            role="gridcell"
+                            aria-label={`Cell ${row + 1}, ${column + 1}`}
+                            className={selectedTableCellId === cell.id ? 'is-selected' : ''}
+                            defaultValue={contentToPlainText(cell.content)}
+                            onFocus={() => setSelectedTableCellId(cell.id)}
+                            onBlur={(event) => {
+                              const value = event.currentTarget.value;
+                              if (value === contentToPlainText(cell.content)) return;
+                              void execute('Edit table cell', [
+                                {
+                                  type: 'table.update-cell',
+                                  slideId: activeSlide.id,
+                                  tableId: primaryTable.id,
+                                  cellId: cell.id,
+                                  content: plainParagraph(value),
+                                },
+                              ]);
+                            }}
+                          />
+                        );
+                      }),
+                    )}
+                  </div>
+                  {primaryTable.rowCount > 10 || primaryTable.columnCount > 6 ? (
+                    <p className="field-hint">
+                      Showing the first 10 rows and 6 columns. Paste TSV to update a larger range.
+                    </p>
+                  ) : null}
                   <textarea
                     className="tsv-editor"
                     value={tableTsv}
@@ -2303,7 +3336,241 @@ function EditorApp() {
                     >
                       <Columns3 size={14} /> Add column
                     </button>
+                    <button
+                      type="button"
+                      disabled={primaryTable.rowCount <= 1}
+                      onClick={() =>
+                        void execute('Delete table row', [
+                          {
+                            type: 'table.delete-row',
+                            slideId: activeSlide.id,
+                            tableId: primaryTable.id,
+                            index: primaryTable.rowCount - 1,
+                          },
+                        ])
+                      }
+                    >
+                      <Trash2 size={14} /> Last row
+                    </button>
+                    <button
+                      type="button"
+                      disabled={primaryTable.columnCount <= 1}
+                      onClick={() =>
+                        void execute('Delete table column', [
+                          {
+                            type: 'table.delete-column',
+                            slideId: activeSlide.id,
+                            tableId: primaryTable.id,
+                            index: primaryTable.columnCount - 1,
+                          },
+                        ])
+                      }
+                    >
+                      <Trash2 size={14} /> Last column
+                    </button>
                   </div>
+                  <div className="table-style-grid">
+                    <label className="color-field">
+                      Border
+                      <input
+                        type="color"
+                        value={primaryTable.border.color}
+                        onChange={(event) =>
+                          void execute('Change table border', [
+                            {
+                              type: 'table.update-style',
+                              slideId: activeSlide.id,
+                              tableId: primaryTable.id,
+                              border: {
+                                ...primaryTable.border,
+                                color: event.currentTarget.value,
+                              },
+                            },
+                          ])
+                        }
+                      />
+                    </label>
+                    <label className="stacked-field">
+                      <span>Border width</span>
+                      <input
+                        key={`${primaryTable.id}-border`}
+                        type="number"
+                        min="0"
+                        max="24"
+                        step="0.25"
+                        defaultValue={primaryTable.border.widthPt}
+                        onBlur={(event) => {
+                          const widthPt = clamp(Number(event.currentTarget.value), 0, 24);
+                          if (!Number.isFinite(widthPt) || widthPt === primaryTable.border.widthPt)
+                            return;
+                          void execute('Change table border width', [
+                            {
+                              type: 'table.update-style',
+                              slideId: activeSlide.id,
+                              tableId: primaryTable.id,
+                              border: { ...primaryTable.border, widthPt },
+                            },
+                          ]);
+                        }}
+                      />
+                    </label>
+                    <label className="color-field">
+                      Header fill
+                      <input
+                        type="color"
+                        value={primaryTable.style?.headerFill ?? '#e8ecf7'}
+                        onChange={(event) =>
+                          void execute('Change table header', [
+                            {
+                              type: 'table.update-style',
+                              slideId: activeSlide.id,
+                              tableId: primaryTable.id,
+                              style: {
+                                ...primaryTable.style,
+                                headerFill: event.currentTarget.value,
+                              },
+                            },
+                          ])
+                        }
+                      />
+                    </label>
+                    <label className="toggle-row">
+                      <input
+                        type="checkbox"
+                        checked={primaryTable.style?.bandedRows ?? false}
+                        onChange={(event) =>
+                          void execute('Toggle banded rows', [
+                            {
+                              type: 'table.update-style',
+                              slideId: activeSlide.id,
+                              tableId: primaryTable.id,
+                              style: {
+                                ...primaryTable.style,
+                                bandedRows: event.currentTarget.checked,
+                              },
+                            },
+                          ])
+                        }
+                      />
+                      Banded rows
+                    </label>
+                  </div>
+                  {selectedTableCell !== undefined ? (
+                    <div className="table-cell-style">
+                      <strong>
+                        Cell {selectedTableCell.row + 1}, {selectedTableCell.column + 1}
+                      </strong>
+                      <label className="color-field">
+                        Fill
+                        <input
+                          type="color"
+                          value={selectedTableCell.style.fill ?? '#ffffff'}
+                          onChange={(event) =>
+                            void execute('Change cell fill', [
+                              {
+                                type: 'table.update-cell',
+                                slideId: activeSlide.id,
+                                tableId: primaryTable.id,
+                                cellId: selectedTableCell.id,
+                                style: {
+                                  ...selectedTableCell.style,
+                                  fill: event.currentTarget.value,
+                                },
+                              },
+                            ])
+                          }
+                        />
+                      </label>
+                      <label className="color-field">
+                        Text
+                        <input
+                          type="color"
+                          value={selectedTableCell.style.textColor}
+                          onChange={(event) =>
+                            void execute('Change cell text color', [
+                              {
+                                type: 'table.update-cell',
+                                slideId: activeSlide.id,
+                                tableId: primaryTable.id,
+                                cellId: selectedTableCell.id,
+                                style: {
+                                  ...selectedTableCell.style,
+                                  textColor: event.currentTarget.value,
+                                },
+                              },
+                            ])
+                          }
+                        />
+                      </label>
+                      <label className="stacked-field">
+                        <span>Horizontal</span>
+                        <select
+                          value={selectedTableCell.style.horizontalAlignment}
+                          onChange={(event) =>
+                            void execute('Align cell text', [
+                              {
+                                type: 'table.update-cell',
+                                slideId: activeSlide.id,
+                                tableId: primaryTable.id,
+                                cellId: selectedTableCell.id,
+                                style: {
+                                  ...selectedTableCell.style,
+                                  horizontalAlignment: event.currentTarget.value as TextAlignment,
+                                },
+                              },
+                            ])
+                          }
+                        >
+                          <option value="left">Left</option>
+                          <option value="center">Center</option>
+                          <option value="right">Right</option>
+                          <option value="justify">Justify</option>
+                        </select>
+                      </label>
+                      <label className="stacked-field">
+                        <span>Vertical</span>
+                        <select
+                          value={selectedTableCell.style.verticalAlignment}
+                          onChange={(event) =>
+                            void execute('Align cell vertically', [
+                              {
+                                type: 'table.update-cell',
+                                slideId: activeSlide.id,
+                                tableId: primaryTable.id,
+                                cellId: selectedTableCell.id,
+                                style: {
+                                  ...selectedTableCell.style,
+                                  verticalAlignment: event.currentTarget.value as
+                                    'top' | 'middle' | 'bottom',
+                                },
+                              },
+                            ])
+                          }
+                        >
+                          <option value="top">Top</option>
+                          <option value="middle">Middle</option>
+                          <option value="bottom">Bottom</option>
+                        </select>
+                      </label>
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        onClick={() =>
+                          void execute('Clear cell fill', [
+                            {
+                              type: 'table.update-cell',
+                              slideId: activeSlide.id,
+                              tableId: primaryTable.id,
+                              cellId: selectedTableCell.id,
+                              style: { ...selectedTableCell.style, fill: null },
+                            },
+                          ])
+                        }
+                      >
+                        Clear cell fill
+                      </button>
+                    </div>
+                  ) : null}
                 </section>
               ) : null}
               <section className="inspector-section">

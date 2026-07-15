@@ -270,13 +270,13 @@ export const createNeutralDemoDeck = (): DeckDocument => {
           mutedText: '#697386',
           accent: '#2F6BFF',
         },
-        headingFontFamily: 'Inter',
-        bodyFontFamily: 'Inter',
+        headingFontFamily: 'Arial',
+        bodyFontFamily: 'Arial',
         textStyles: [
           {
             id: ids.titleStyle,
             role: 'title',
-            fontFamily: 'Inter',
+            fontFamily: 'Arial',
             fontSizePt: 32,
             fontWeight: 650,
             italic: false,
@@ -287,7 +287,7 @@ export const createNeutralDemoDeck = (): DeckDocument => {
           {
             id: ids.subtitleStyle,
             role: 'subtitle',
-            fontFamily: 'Inter',
+            fontFamily: 'Arial',
             fontSizePt: 18,
             fontWeight: 400,
             italic: false,
@@ -298,7 +298,7 @@ export const createNeutralDemoDeck = (): DeckDocument => {
           {
             id: ids.bodyStyle,
             role: 'body',
-            fontFamily: 'Inter',
+            fontFamily: 'Arial',
             fontSizePt: 16,
             fontWeight: 400,
             italic: false,
@@ -309,7 +309,7 @@ export const createNeutralDemoDeck = (): DeckDocument => {
           {
             id: ids.captionStyle,
             role: 'caption',
-            fontFamily: 'Inter',
+            fontFamily: 'Arial',
             fontSizePt: 10,
             fontWeight: 400,
             italic: false,

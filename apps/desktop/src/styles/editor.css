@@ -1551,6 +1551,31 @@
   background: #fbfcff;
 }
 
+.draft-conflict {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  margin: 7px 0;
+  padding: 6px;
+  border: 1px solid #e3b14c;
+  border-radius: 4px;
+  background: #fff8e7;
+  color: #76510a;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.draft-conflict button {
+  min-height: 26px;
+  padding: 0 7px;
+  border: 1px solid #d49b2c;
+  border-radius: 4px;
+  background: white;
+  color: inherit;
+  font-size: 9px;
+}
+
 .rich-toolbar {
   display: flex;
   gap: 3px;
@@ -1573,6 +1598,34 @@
   border-color: var(--color-accent-border);
   background: var(--color-accent-soft);
   color: var(--color-accent-pressed);
+}
+
+.strikethrough-glyph {
+  font-weight: 650;
+  text-decoration: line-through;
+}
+
+.text-detail-controls,
+.table-style-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 7px;
+}
+
+.text-detail-controls .color-field,
+.table-style-grid .color-field {
+  min-height: var(--input-height);
+}
+
+.image-editor-section .stacked-field,
+.design-editor-card > .stacked-field {
+  display: block;
+  margin-top: 7px;
+}
+
+.image-crop-grid {
+  margin: 7px 0;
 }
 
 .text-content-editor,
@@ -1632,6 +1685,149 @@
   border: 1px solid var(--color-border-default);
   border-radius: 4px;
   background: white;
+}
+
+.table-cell-grid {
+  display: grid;
+  max-width: 100%;
+  gap: 2px;
+  margin: 7px 0;
+  overflow-x: auto;
+}
+
+.table-cell-grid input,
+.table-cell-covered {
+  min-width: 58px;
+  height: 27px;
+  padding: 3px 5px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 3px;
+  background: white;
+  font-size: 10px;
+}
+
+.table-cell-grid input.is-selected {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 1px var(--color-accent-soft);
+}
+
+.table-cell-covered {
+  background: var(--color-surface-muted);
+}
+
+.field-hint {
+  margin: 5px 0;
+  color: var(--color-text-muted);
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.table-cell-style,
+.design-editor-card {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 5px;
+  background: var(--color-surface-subtle);
+}
+
+.table-cell-style > strong {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 10px;
+}
+
+.design-actions,
+.placeholder-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.design-actions button,
+.placeholder-actions button,
+.guide-row button,
+.placeholder-card > button,
+.master-object-row button {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 4px;
+  background: white;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+
+.design-actions .danger-action {
+  color: var(--color-danger);
+}
+
+.design-subheading {
+  margin: 10px 0 5px;
+  color: var(--color-text-muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.placeholder-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  gap: 5px;
+  margin-top: 5px;
+  padding: 6px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 4px;
+  background: white;
+}
+
+.placeholder-card strong,
+.placeholder-card span,
+.master-object-row strong,
+.master-object-row small {
+  display: block;
+}
+
+.placeholder-card span,
+.master-object-row small {
+  color: var(--color-text-muted);
+  font-size: 9px;
+}
+
+.placeholder-prompt,
+.placeholder-frame-grid {
+  grid-column: 1 / -1;
+}
+
+.guide-row,
+.master-object-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px 28px;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.guide-row select,
+.guide-row input {
+  width: 100%;
+  height: 28px;
+  min-width: 0;
+  border: 1px solid var(--input-border);
+  border-radius: 4px;
+  background: white;
+  font-size: 9px;
+}
+
+.master-object-row {
+  grid-template-columns: minmax(0, 1fr) 28px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--color-border-default);
 }
 
 .status-center {

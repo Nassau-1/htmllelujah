@@ -135,7 +135,7 @@ describe('projection and placeholders', () => {
     const title = resolved.elements.find((item) => item.element.id === localTitle.id);
     expect(resolved.background).toEqual({ type: 'solid', color: resolved.theme.colors.background });
     expect(title?.element.frame.xPt).toBe(72);
-    expect(title?.resolvedTextStyle?.fontFamily).toBe('Inter');
+    expect(title?.resolvedTextStyle?.fontFamily).toBe('Arial');
     expect(resolved.elements.every((item) => item.element.type !== 'placeholder')).toBe(true);
   });
 

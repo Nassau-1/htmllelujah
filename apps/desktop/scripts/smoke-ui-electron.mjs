@@ -219,6 +219,24 @@ try {
     if (!clicked) throw new Error(`${label} was not found.`);
   };
 
+  const setInputValue = async (selector, value, label, blur = false) => {
+    const updated = await evaluate(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement))
+        return false;
+      const prototype = element instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+      setter?.call(element, ${JSON.stringify(String(value))});
+      element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      if (${JSON.stringify(blur)}) element.blur();
+      return true;
+    })()`);
+    if (!updated) throw new Error(`${label} was not found.`);
+  };
+
   await waitForRenderer(
     `document.readyState === 'complete' && document.querySelector('.app-shell') !== null`,
     'Editor application shell',
@@ -255,6 +273,46 @@ try {
     if (!initial[surface]) throw new Error(`The essential ${surface} surface is missing.`);
   }
   if (initial.slideCount < 1) throw new Error('The editor opened without a slide.');
+
+  const selectedText = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].find(
+      (candidate) => candidate.getAttribute('aria-label')?.includes(', text'),
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    return true;
+  })()`);
+  if (!selectedText) throw new Error('The initial text object could not be selected.');
+  await waitForRenderer(`document.querySelector('.text-content-editor') !== null`, 'Text editor');
+  const draftValue = 'V1 smoke draft preserved across revisions';
+  await setInputValue('.text-content-editor', draftValue, 'Text draft');
+  await waitForRenderer(
+    `document.querySelector('.text-editor-section .section-status')?.textContent?.includes('Draft not applied')`,
+    'Dirty text draft status',
+  );
+  const currentX = await evaluate(
+    `Number(document.querySelector('.inspector .field-grid input[type="number"]')?.value ?? 0)`,
+  );
+  await setInputValue(
+    '.inspector .field-grid input[type="number"]',
+    currentX + 1,
+    'Object X position',
+  );
+  await sleep(500);
+  await waitForRenderer(
+    `document.querySelector('.text-content-editor')?.value === ${JSON.stringify(draftValue)}`,
+    'Text draft preserved after unrelated revision',
+  );
+  await click('.text-editor-section .primary-inspector-action', 'Apply text draft');
+  await waitForRenderer(
+    `document.querySelector('.text-editor-section .section-status')?.textContent?.includes('Up to date')`,
+    'Applied text draft status',
+  );
+  await waitForRenderer(
+    `document.querySelector('.canonical-slide-surface')?.textContent?.includes(${JSON.stringify(draftValue)})`,
+    'Applied text rendered on canvas',
+  );
 
   await click('[aria-label="Add shape"]', 'Add shape');
   await waitForRenderer(
@@ -324,6 +382,41 @@ try {
     `document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() === 'Design'`,
     'Design inspector tab',
   );
+  await waitForRenderer(
+    `[...document.querySelectorAll('.inspector-section h3')].some((heading) => heading.textContent === 'Layout editor') && [...document.querySelectorAll('.inspector-section h3')].some((heading) => heading.textContent === 'Master editor')`,
+    'Master and layout editors',
+  );
+  const layoutCountBefore = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Layout editor',
+    );
+    const select = heading?.closest('.inspector-section')?.querySelector('select');
+    return select instanceof HTMLSelectElement ? select.options.length : 0;
+  })()`);
+  const duplicatedLayout = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Layout editor',
+    );
+    const section = heading?.closest('.inspector-section');
+    const button = [...(section?.querySelectorAll('button') ?? [])].find(
+      (candidate) => candidate.textContent?.includes('Duplicate'),
+    );
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!duplicatedLayout) throw new Error('The layout duplicate action was unavailable.');
+  await waitForRenderer(
+    `(() => {
+      const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+        (candidate) => candidate.textContent === 'Layout editor',
+      );
+      const select = heading?.closest('.inspector-section')?.querySelector('select');
+      return select instanceof HTMLSelectElement && select.options.length > ${layoutCountBefore};
+    })()`,
+    'Layout duplication',
+  );
+  await click('[aria-label="Undo"]', 'Undo layout duplication');
   await click('[role="tab"]:not(.is-active)', 'Properties inspector tab');
   await waitForRenderer(
     `document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() === 'Properties'`,
