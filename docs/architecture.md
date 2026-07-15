@@ -1,187 +1,211 @@
 # Architecture
 
-Status: Alpha architecture baseline, 2026-07-15.
+Status: V1 implementation baseline, 2026-07-15.
 
 ## System objective
 
-HTMLlelujah is a Windows-first, local-first presentation editor. Its core design
-separates a safe structured authoring model from derived DOM, SVG, HTML, and PDF
-views. The same deterministic renderer serves human editing, presentation, export,
-testing, and agent previews.
-
-## Current Alpha implementation
-
-The current repository is an architectural foundation, not an integrated authoring
-application:
-
-- `apps/desktop` implements the sandboxed desktop boundary and an isolated,
-  in-memory interaction prototype over synthetic fixtures. It demonstrates editor
-  chrome and selected interactions, but it does not consume `document-core`, persist
-  a deck, or provide a shared presentation/export renderer.
-- `packages/document-core` implements runtime-validated structured entities,
-  deterministic revisions, immutable command transactions, alignment, distribution,
-  grouping, snapshot undo, and an in-memory adapter. It does not yet implement
-  migrations, `.hdeck` storage, autosave, recovery, or collaborative state.
-- Shared rendering, presentation mode, standalone HTML and PDF export, MCP, LAN
-  collaboration, installers, and supported binaries remain unimplemented.
-
-The diagram and boundaries below describe the target architecture. Existing
-prototypes must be integrated through these boundaries rather than treated as their
-completed implementation.
+HTMLlelujah is a Windows-first, offline-first presentation editor. A typed structured
+document is the only mutable authoring source; DOM, SVG, standalone HTML, and PDF are
+derived views. Human input, local MCP tools, recovery, imports, and authenticated LAN
+peers all submit validated commands to one main-process authority.
 
 ```text
-Human input ───────┐
-Agent command ─────┼─> typed command bus ─> document core ─> local journal
-Remote peer update ┘          │                    │              │
-                              │                    ├─> .hdeck snapshot
-                              │                    │
-                              └─> audit/undo       └─> shared renderer
-                                                       ├─> editor canvas
-                                                       ├─> thumbnails
-                                                       ├─> presentation
-                                                       ├─> standalone HTML
-                                                       └─> PDF
+Human gestures ---------+
+Local MCP proposals ----+--> typed command engine --> canonical DeckDocument
+Recovery replay --------+             |                        |
+LAN host commands ------+             +--> audit / undo        +--> recovery journal
+                                                               +--> .hdeck snapshot
+                                                               +--> shared renderer
+                                                                    +--> editor
+                                                                    +--> thumbnails
+                                                                    +--> presentation
+                                                                    +--> HTML export
+                                                                    +--> PDF export
 ```
 
-## Current and intended repository boundaries
+This architecture is implemented across the current packages. The release test
+matrix remains the authority for proving a particular artifact, platform, or
+performance claim.
 
-- `apps/desktop` owns desktop lifecycle, windows, trusted operating-system
-  capabilities, preload bridges, packaging, and update behavior. The current shell
-  implements only a subset of this boundary.
-- `packages/document-core` owns schema versions, commands, transactions, revision
-  tokens, undo origins, migrations, and persistence contracts. Its current
-  foundation implements the schema, command, revision, undo, and adapter portions;
-  migrations and persistence behavior remain planned.
-- `packages/renderer` owns the pure DOM/SVG projection and render-ready signaling.
-- `packages/geometry` owns selection bounds, transforms, snapping, alignment, and
-  distribution math independently of UI interaction libraries.
-- `packages/export` owns print surfaces, standalone HTML packaging, and fidelity
-  checks.
-- `packages/mcp` owns the local agent protocol and maps validated requests to the
-  command bus.
-- `packages/collaboration` owns peer discovery, authentication, awareness, and
-  transport; it never owns document semantics or file snapshots.
+## Repository boundaries
 
-Packages other than `document-core` are planned and appear as their corresponding
-feature specs are implemented. Once integrated, `document-core` remains authoritative
-even when a derived surface is easier to inspect.
+- `apps/desktop` owns Electron lifecycle, windows, the visual editor, validated IPC,
+  OS dialogs, PDF printing, file associations, collaboration lifecycle, the desktop
+  MCP bridge, and Windows packaging.
+- `packages/document-core` owns the versioned model, closed element union, commands,
+  immutable transactions, revisions, validation, style inheritance, grouping,
+  alignment, distribution, and command-level undo contracts.
+- `packages/document-runtime` owns main-process sessions, revision-checked execution,
+  durable recovery, proposals, agent audit records, file fingerprints, assets, and
+  undo/redo history.
+- `packages/hdeck` owns deterministic `.hdeck` encoding, strict archive parsing,
+  checksummed journals, external-change detection, and atomic persistence.
+- `packages/geometry` owns pure transforms, bounds, snapping, guides, alignment, and
+  distribution independently of UI state.
+- `packages/renderer` owns the shared DOM/SVG slide projection and render-readiness
+  contract used by every visual surface.
+- `packages/exporter` owns restrictive standalone HTML, exact page surfaces, and
+  atomic HTML output.
+- `packages/mcp-server` owns typed local MCP tools, bounded stdio framing, and the
+  authenticated local RPC client/server.
+- `packages/collaboration` owns private-network discovery, TLS transport,
+  authentication, host ordering, replicas, reconnect state, and writer leases. It
+  does not own document semantics.
 
-## Desktop trust boundary
+## Desktop process and trust model
 
-The desktop application has three privilege levels:
+The application has three privilege levels:
 
-1. **Main process:** owns windows, approved file dialogs, atomic writes, printing,
-   packaging integration, and network-session lifecycle.
-2. **Preload bridge:** exposes a small versioned API. Every request and response is
-   runtime validated. It exposes no general IPC sender, shell, or filesystem API.
-3. **Renderer:** sandboxed, context-isolated, and unable to use Node.js. It renders
-   only normalized application data and sanitized imported content.
+1. The Electron main process owns each `DocumentSessionManager`, approved file
+   dialogs, archive reads and writes, private recovery storage, presentation and print
+   windows, collaboration listeners, and the local MCP RPC endpoint.
+2. The preload bridge exposes a small versioned capability API. Inputs are runtime
+   validated and results use typed safe errors. There is no generic IPC sender,
+   filesystem API, shell command, or unrestricted URL loader.
+3. Renderer processes are sandboxed and context-isolated, with Node.js integration
+   disabled. They hold immutable document snapshots plus ephemeral selection, zoom,
+   scroll, pointer preview, inspector, and text-composition state.
 
-External navigation, unapproved popups, permission prompts, and remote content are
-blocked. Content Security Policy permits bundled application resources only.
+A completed gesture, inspector action, edit session, paste, or agent batch commits as
+one revision-checked transaction. Renderer preview state cannot become persistent
+without a successful command. Navigation, popups, permission requests, and remote
+document resources are denied.
 
-## Target canonical document
+## Canonical document and styles
 
-The planned `.hdeck` authoring file is a ZIP container with a versioned manifest,
-serialized collaborative document state, content-addressed assets, optional embedded
-fonts, previews, and required asset notices.
+The core entities are `DeckDocument`, `Theme`, `Master`, `Layout`, `Slide`,
+`Element`, and `AssetRef`. Stable UUIDs identify mutable entities. Elements are a
+closed discriminated union for text, image, table, shape, connector, icon, group, and
+placeholder objects. Unknown fields and unknown element types fail validation rather
+than becoming executable extension points.
 
-Core entities are `Deck`, `Theme`, `Master`, `Layout`, `Slide`, `Element`, and
-`AssetRef`. Elements are a closed discriminated union: text, image, table, shape,
-connector, icon, group, and placeholder. Stable UUIDs identify all mutable entities.
-
-Geometry uses points in the canonical model. Common page presets are 960 x 540 for
-16:9 and 720 x 540 for 4:3. The renderer scales the complete slide as one coordinate
-space rather than recalculating individual positions at each zoom level.
-
-Style resolution is explicit and deterministic:
+Geometry uses points. The complete page scales as one coordinate space at different
+editor zoom levels and presentation viewport sizes. Style resolution is deterministic:
 
 ```text
 theme -> master -> layout -> slide -> local element override
 ```
 
-The document does not carry executable scripts, unrestricted CSS, active remote
-URLs, or arbitrary HTML. Markdown and rich-text clipboard input are parsed into
-typed structures before entering a transaction.
+Rich text is represented as typed blocks, spans, and marks. Tables persist native
+rows, columns, cells, and style data. Images reference embedded content-addressed
+assets. The model never stores arbitrary HTML, JavaScript, active remote URLs,
+unrestricted CSS, or shell instructions.
 
-## Target command, revision, and undo model
+## Shared rendering
 
-The current document-core foundation already enforces immutable typed commands,
-metadata, expected revisions, atomic batches, validation, and snapshot undo. The
-integrated target extends that boundary to every persistent human, agent, import,
-and remote change.
+`packages/renderer` resolves a canonical slide projection and renders semantic text,
+images, and tables in the DOM. Shapes, connectors, local icons, guides, and selection
+geometry use inline SVG. Editor-only overlays are separate from presentation and
+export modes.
 
-Human, agent, import, and remote operations have distinct origins. Undo is scoped so
-one agent batch or one completed drag becomes one understandable history step.
-Intermediate drag presence stays ephemeral and only the final transform is committed.
+Editor canvas, thumbnails, full-screen presentation, standalone HTML, and PDF print
+surfaces consume the same renderer contract. Differences are explicit mode, scale,
+slide filtering, and overlay inclusion. Export waits for fonts, images, and layout
+readiness before printing.
 
-The public revision token is derived from the collaborative state vector. Assets are
-stored outside the collaborative structure by content hash and are synchronized by a
-separate bounded transfer protocol.
+Round flags are Unicode regional-indicator glyphs inside a circular frame, not a
+bundled image catalog. Interface icons come from the reviewed Lucide dependency;
+slide-content vector paths are local project source. See
+[`legal/asset-provenance.md`](legal/asset-provenance.md).
 
-## Target rendering
+## `.hdeck`, persistence, and recovery
 
-Text, images, and tables render as semantic DOM. Shapes, connectors, guides, and
-icons render as inline SVG. An interaction overlay contains selection handles and
-live guides; it is excluded from presentation and export.
+A `.hdeck` is a deterministic STORE-only ZIP container. It contains required
+`manifest.json` and `document.json` entries plus content-addressed `assets/` entries.
+The manifest records independent container and document schema versions, declared
+lengths, media types, and SHA-256 hashes.
 
-One renderer contract receives a read-only slide projection plus an explicit render
-mode. It emits a `renderReady` signal only after fonts, decoded images, and layout
-have settled. Editor, presentation, thumbnails, HTML output, and PDF call this same
-contract with different chrome and scale settings.
+The decoder rejects unsafe or case-colliding names, absolute paths, traversal,
+backslashes, control characters, symlinks, encrypted or streamed entries,
+compression, undeclared entries, duplicate entries, invalid UTF-8, inconsistent ZIP
+records, bad CRCs, hash mismatches, excessive counts or sizes, and unsupported
+versions. Asset media type and document references are validated before exposure to
+a renderer.
 
-The first feature spec validates this boundary with fixture data. The current
-desktop prototype is a separate interaction experiment and does not yet satisfy the
-shared-renderer acceptance criteria.
+Every committed edit is appended to a checksummed private recovery journal. The UI
+acknowledges local durability only after the journal write completes. Recovery data
+lives under the current user's application-data directory and is not the shared file
+transport.
 
-## Planned persistence and recovery
+V1 deliberately separates recovery autosave from shared-file replacement: edits are
+journaled immediately, while replacing a user-selected `.hdeck` requires explicit
+Save. Save writes and validates a temporary sibling, checks the expected file
+fingerprint, then atomically replaces the target. An external change produces a
+conflict instead of a silent overwrite. A recovered state opens as an independent
+candidate and requires explicit Save or Save As.
 
-Committed transactions enter a local append journal immediately. After a short idle
-period, the designated writer creates a complete snapshot in the same directory and
-atomically replaces the target `.hdeck`. A snapshot is never overwritten in place.
+## LAN collaboration and synchronized folders
 
-Migration first preserves the original in the recovery area. Newer unsupported
-schema versions open read-only. Archive extraction rejects unsafe paths, unexpected
-entry types, excessive entry counts, and expanded sizes above configured limits.
+V1 uses an authoritative host rather than a CRDT. A synchronized folder carries the
+last `.hdeck` snapshot, while a direct encrypted LAN session carries live commands.
+The host validates and serializes each command, assigns a total order, journals the
+accepted transaction, broadcasts it, and is the only participant allowed to replace
+the shared file.
 
-## Planned collaboration
+Transport uses WSS with an ephemeral session certificate, displayed fingerprint,
+document-scoped session credential, HMAC-authenticated frames, bounded messages, and
+private-address validation. Optional discovery advertises only ephemeral protocol
+information, not titles, filenames, paths, slide text, assets, or reusable secrets.
 
-Each participant runs the desktop application. A file may live in a synchronized
-folder, but the folder-sync service is not the real-time transport.
+Guests maintain a detached local session and recovery record. Independent objects
+may be edited concurrently through host ordering. A soft lock prevents concurrent
+direct editing of the same text element. V1 does not queue disconnected edits,
+elect a new writer, or merge divergent text. If the host becomes unavailable, the
+guest becomes non-editing until an explicit rejoin or independent copy flow.
 
-The first local participant becomes the snapshot writer and advertises an
-authenticated session on a private local network. Peers with the same document
-capability join the collaborative state and persist their own recovery journals,
-while only the writer replaces the shared `.hdeck`. A signed expiring sidecar records
-writer ownership. Text being directly edited receives a soft lock; independent
-objects remain concurrently editable.
+## Local MCP architecture
 
-If the writer disappears, peers retain updates but do not silently overwrite the
-shared file. Recovery or writer transfer requires an explicit verified transition.
-The transport implements a provider interface so a future relay does not alter the
-document format.
+The installed `HTMLlelujah-MCP.cmd` starts the packaged MCP entrypoint as a console
+stdio process. Standard output is reserved for MCP protocol frames; redacted startup
+failure text goes to standard error. The process reads the current desktop endpoint
+descriptor from `%APPDATA%\HTMLlelujah\mcp\endpoint-v1.json` and connects to a random
+local named pipe.
 
-## Planned agent boundary
+The descriptor contains a random secret, instance identity, PID, and expiry. Client
+and server authenticate with fresh nonces and HMAC proofs; nonces cannot be reused.
+Frames, rates, authentication time, and service calls are bounded. The descriptor is
+atomically created under the current user profile and removed only by its owning
+desktop instance.
 
-The local MCP server exposes document-level tools, not implementation internals.
-Tools list open documents, inspect outlines and slides, render previews, validate,
-export, and apply typed command batches. Mutations require a document identifier and
-expected revision. Destructive or overwrite operations require explicit approval.
+Only currently visible documents are exposed. Read tools return bounded structured
+projections. Mutations use a propose/commit flow with document ID, expected revision,
+actor attribution, and transaction label. Destructive commit, undo, import, and
+export require a single-use desktop approval bound to action, document, and revision.
+MCP edits are paused during a live LAN session in V1; reads and redacted collaboration
+status remain available.
 
-The MCP process cannot evaluate scripts, fetch arbitrary URLs, access arbitrary
-paths, or bypass the command bus. It connects to the running app through a
-current-user-only local channel with a per-launch nonce.
+The packaged launcher requires Electron's `RunAsNode` fuse. `NODE_OPTIONS` and CLI
+inspection remain disabled, embedded ASAR integrity validation and ASAR-only loading
+remain enabled, and the MCP entrypoint exposes only typed RPC-backed tools. Enabling
+`RunAsNode` still means a user who already controls the local account can use the
+packaged executable as a same-user Node runtime. This grants no elevation, but it is
+an explicit V1 tradeoff; a dedicated signed helper should be evaluated for a later
+release. ADR-008 records the decision.
 
-## Target verification architecture
+## Packaging and distribution
 
-- Unit and property tests cover schema, command, migration, and geometry invariants.
-- Component tests cover renderer modes and interaction-state exclusion.
-- Desktop integration tests cover process isolation, IPC validation, file dialogs,
-  print readiness, and multi-window lifecycle.
-- Golden fixtures compare editor, presentation, standalone HTML, and rasterized PDF.
-- Adversarial fixtures cover archives, SVG, rich text, IPC, MCP, and network peers.
-- License scanning and SBOM generation gate distributable builds.
+The Windows x64 build is packaged as an ASAR application and a per-user NSIS
+installer with `.hdeck` association. Installation and normal use do not require
+elevation. User decks and recovery data are not deleted automatically by uninstall.
 
-See [`operations.md`](operations.md) for commands and release gates, and
+Release packaging must preserve the project source notice, binary terms,
+third-party notices, Electron and Chromium license files, exact artifact checksums,
+and the SBOM. Authenticode signing is applied when a certificate is configured;
+otherwise the artifact is labelled unsigned without weakening runtime fuses.
+
+## Security invariants
+
+- No document, renderer, MCP request, or collaborator receives an arbitrary path,
+  shell, raw HTML, script, active URL, or unrestricted network capability.
+- Every persistent mutation is typed, revision-checked, attributable, transactional,
+  journaled, and undoable.
+- Only one participant writes the shared `.hdeck` during collaboration.
+- Archive and network parsers fail closed on unknown or oversized input.
+- Diagnostics omit deck content, asset bytes, filenames, paths, capabilities,
+  endpoints, secrets, and serialized state by default.
+- Packaging and dependency review operate on the exact distributable, not only source
+  manifests.
+
+See [`operations.md`](operations.md) for verification and release procedure and
 [`decisions`](decisions/ADR-001-structured-document-source.md) for the decision
 history.

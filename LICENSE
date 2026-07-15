@@ -2,22 +2,41 @@ HTMLlelujah Source-Visible Proprietary License Notice
 
 Copyright (c) 2026 Nassau-1. All rights reserved.
 
-The source code and other original materials in this repository are made available
-for viewing and evaluation only. No license or permission is granted to use, copy,
-modify, merge, publish, distribute, sublicense, sell, create derivative works from,
-or otherwise exploit those materials, in whole or in part.
+1. Scope
 
-Access to this repository through a hosting platform may be subject to that
-platform's terms. Any limited rights supplied by the platform apply only to the
-extent required for the platform to operate and do not constitute an open-source
-license or a general grant from the copyright holder.
+This notice governs the source code and other original materials published in this
+repository (the "Source Materials"). The Source Materials are made available for
+inspection and evaluation only. They are not open-source software.
+
+2. No source-code license
+
+Except for the limited operation of the repository hosting service, no permission is
+granted to use, copy, modify, merge, publish, distribute, sublicense, sell, create
+derivative works from, or otherwise exploit the Source Materials, in whole or in
+part. Access to or forking of the repository does not create a copyright license.
+
+3. Official compiled application
+
+Official compiled distributions of HTMLlelujah are not licensed by this notice.
+Their installation and use are governed separately by EULA.txt. A binary license
+does not grant access to or rights in the Source Materials.
+
+4. User content and exports
+
+This notice does not claim ownership of presentation content created by a user.
+Rights to distribute an exported presentation that contains a bundled HTMLlelujah
+viewer component are defined in EULA.txt.
+
+5. Third-party materials
 
 Third-party components and assets are not covered by this notice. They remain
 subject to their respective licenses and notices, as identified in
-THIRD_PARTY_NOTICES.md and in their source distributions.
+THIRD_PARTY_NOTICES.md, the installed distribution, and their source distributions.
 
-THE ORIGINAL MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY
-LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
-LIABILITY ARISING FROM THE MATERIALS OR THEIR USE.
+6. Disclaimer
+
+THE SOURCE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY LAW,
+THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY
+ARISING FROM THE SOURCE MATERIALS OR THEIR USE.

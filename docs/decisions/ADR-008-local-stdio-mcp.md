@@ -13,25 +13,32 @@ also work entirely offline and should not need an API account or hosted service.
 
 ## Decision
 
-Ship a separate local MCP executable that communicates with its client over stdio. It
-uses protocol frames only on stdout; redacted diagnostics go to stderr. Frame size,
-request concurrency, initialization, shutdown, and malformed-input behavior are
-bounded and tested.
+Ship `HTMLlelujah-MCP.cmd` as a console launcher. It invokes the packaged Electron
+executable in Node mode with the MCP entrypoint inside the integrity-checked ASAR and
+communicates with its client over stdio. Protocol frames are the only stdout content;
+a redacted startup failure may go to stderr. Frame size, request rate, authentication
+time, service time, initialization, shutdown, and malformed-input behavior are
+bounded.
 
-The MCP process authenticates to the running desktop application through a current-
-user-only local channel using a per-launch nonce delivered through a protected launch
-mechanism. The nonce expires, is not reusable after restart, and grants no filesystem
-or document permission by itself.
+The running desktop application creates a random local named pipe and atomically
+writes an expiring endpoint descriptor under the current user's application-data
+directory. The descriptor contains a random 256-bit secret. Client and server prove
+possession with fresh nonces and HMAC; a client nonce cannot be reused. The secret
+authenticates only the local RPC connection and grants no document or filesystem
+permission by itself.
 
-Read tools list open documents, inspect bounded outlines/slides/elements, obtain the
-current revision, validate, and render previews. Mutation tools submit typed document
-command batches with document ID, expected revision, actor identity, and transaction
-label to the main-owned `DocumentSessionManager`.
+Read tools list visible open documents, inspect bounded outlines, slides, elements,
+and styles, obtain the current revision, validate the document, and inspect redacted
+collaboration status. Mutation tools use a typed propose/commit flow with document ID,
+expected revision, actor identity, and transaction label against the main-owned
+`DocumentSessionManager`.
 
-Destructive deletion, import, save overwrite, standalone HTML export, and PDF export
-require a visible desktop-issued approval capability that is purpose-bound, document-
-bound, expiring, and single-use. Tool results expose IDs, revisions, counts, dimensions,
-warnings, and stable safe error codes rather than paths or unrestricted bytes.
+Destructive commit, agent undo, import, standalone HTML export, and PDF export require
+a visible desktop-issued approval capability that is purpose-bound, document-bound,
+revision-bound, expires after two minutes, and is single-use. Tool results expose IDs,
+revisions, counts, dimensions, warnings, and stable safe error codes rather than paths
+or unrestricted bytes. V1 pauses MCP mutations during live LAN collaboration to avoid
+a second command-ordering authority.
 
 The server exposes no arbitrary path, raw file, shell, URL fetch, raw HTML/CSS/SVG,
 script execution, internal document-state replacement, secret retrieval, collaboration
@@ -45,6 +52,13 @@ administration, embedded model, hosted inference, or API service.
 - The desktop app remains the authority for documents, approvals, files, exports, and
   recovery.
 - MCP can operate offline and independently of an embedded chat interface.
+- The console launcher requires Electron's `RunAsNode` fuse. A user who already
+  controls the local account can therefore use the packaged executable as a same-user
+  Node runtime. This is not an elevation boundary, but it expands the utility of the
+  binary and is accepted as an explicit V1 tradeoff.
+- `NODE_OPTIONS` and CLI inspection stay disabled; embedded ASAR integrity validation
+  and ASAR-only application loading stay enabled. A later release should evaluate a
+  dedicated signed MCP helper so `RunAsNode` can be disabled.
 - Stdio purity, local authentication, schema fuzzing, approval expiry/replay, desktop
   absence, process teardown, and diagnostics redaction are hard release gates.
 - A future transport may reuse the typed tool contracts only after a new security ADR.
@@ -60,10 +74,14 @@ administration, embedded model, hosted inference, or API service.
   account, network, cost, and privacy scope outside V1.
 - **Network-listening MCP endpoint by default**: expands local automation into remote
   service authentication and exposure.
+- **Shipping a second general Node runtime**: increases installer size and duplicates
+  patching responsibility without removing the need for a narrow desktop RPC.
 
 ## Failure and containment
 
 Invalid framing, authentication, schema, revision, approval, or command closes or
-rejects only the MCP request/session and never partially mutates a document. Desktop or
-MCP process exit revokes all launch nonces and outstanding MCP approvals. Stdout
-contamination, arbitrary capability exposure, or redaction failure blocks release.
+rejects only the MCP request/session and never partially mutates a document. Desktop
+exit removes the owned descriptor and revokes outstanding approvals; MCP process exit
+closes its local connection. The descriptor secret, pipe name, endpoint, document
+content, and paths are excluded from diagnostics. Stdout contamination, arbitrary
+capability exposure, stale descriptor reuse, or redaction failure blocks release.

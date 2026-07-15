@@ -1,62 +1,94 @@
 # Roadmap and TODO
 
-Status: **Alpha**, last reviewed 2026-07-15.
+Status: **V1 release candidate**, last reviewed 2026-07-15.
 
-The feature specifications under `specs/` are authoritative for implementation.
-This file is the short cross-feature roadmap, not a substitute for task lists.
+The usable V1 implementation is present. Publication remains gated by observed
+release evidence for the exact Windows installer; unchecked items below must not be
+reported as passed until their results are recorded.
 
-## Active: platform fidelity
+## V1 implementation
 
-- [ ] Complete [`specs/001-platform-fidelity/tasks.md`](specs/001-platform-fidelity/tasks.md).
-- [ ] Validate the secure desktop-process boundary on Windows 11 x64.
-- [ ] Replace the desktop prototype's private fixture model with the specified shared
-      renderer contract before treating editor visuals as fidelity evidence.
-- [ ] Establish visual baselines for editor, presentation, and PDF surfaces.
-- [ ] Record Alpha performance and rendering measurements.
+- [x] Use `DeckDocument` and the typed transaction engine as the only persistent
+      authoring state for human, agent, import, recovery, and LAN operations.
+- [x] Integrate the sandboxed editor with main-process sessions, revision checks,
+      attribution, grouped undo/redo, snapping, alignment, grouping, layers, and
+      direct content controls.
+- [x] Implement themes, masters, layouts, placeholders, rich text, images, native
+      tables, shapes, connectors, icons, flags, page formats, and hidden slides.
+- [x] Use one DOM/SVG renderer for editor, thumbnails, presentation, standalone HTML,
+      and PDF.
+- [x] Implement bounded `.hdeck` archives, content-addressed assets, durable journals,
+      recovery candidates, external-change detection, and atomic explicit save.
+- [x] Implement offline presentation, standalone HTML export, and PDF export.
+- [x] Implement authenticated local stdio MCP with typed proposal/commit, revision
+      conflicts, attribution, undo, one-time approvals, import, and export.
+- [x] Implement encrypted private-LAN authoritative-host collaboration, optional
+      discovery, soft text locks, reconnect handling, detached guest recovery, and
+      one shared-file writer.
+- [x] Implement Windows x64 packaging, `.hdeck` association, second-instance file
+      opening, hardened Electron fuses, application icon, and console MCP launcher.
 
-## Parallel Alpha foundations
+## Release-candidate verification
 
-- [x] Add a tested document schema, validation, revision, transactional command,
-      snapshot undo, and in-memory adapter foundation in `packages/document-core`.
-- [x] Add an isolated in-memory desktop interaction prototype for selection, text
-      editing, drag, resize, snapping, alignment, layers, and basic synthetic objects.
-- [ ] Integrate the document core, editor interactions, and shared renderer through a
-      specified projection and command boundary.
-- [ ] Add persistence, migration, autosave, recovery, and compatibility tests before
-      the document foundation is considered feature-complete.
+- [ ] Run the complete clean-checkout `pnpm verify` gate and record the exact commit,
+      environment, command, and result.
+- [ ] Complete unit, integration, adversarial archive/recovery, IPC, MCP, and LAN
+      suites against the final source and packaged binaries.
+- [ ] Open the unpacked and installed application and complete create, edit, save,
+      close, reopen, recover, present, HTML export, and PDF export flows.
+- [ ] Review editor, presentation, standalone HTML, and rasterized PDF visual evidence
+      at supported page formats and display scales.
+- [ ] Complete keyboard, focus, reduced-motion, contrast, and screen-reader smoke
+      checks on Windows 11 x64.
+- [ ] Run the multi-instance LAN convergence and reconnect soak required by
+      [`specs/002-v1-release/test-matrix.md`](specs/002-v1-release/test-matrix.md).
+- [ ] Record warm-start, command acknowledgement, export, large-deck, repeated-save,
+      and repeated-export measurements without substituting synthetic estimates.
+- [ ] Install, associate, upgrade, repair, and uninstall from a standard-user clean
+      Windows account while preserving decks and recovery data.
 
-## Targeted beta sequence
+## Distribution and compliance
 
-- [ ] `002-document-core`: complete the existing foundation with migrations, `.hdeck`,
-      autosave, crash recovery, and integration contracts.
-- [ ] `003-editor-interactions`: replace the isolated prototype with command-backed
-      selection, resize, rotate, zoom, snapping, alignment, grouping, layers,
-      keyboard control, and undo.
-- [ ] `004-content-and-masters`: rich text, themes, masters, layouts, images, tables,
-      shapes, connectors, and icons.
-- [ ] `005-presentation-export`: offline presentation mode, standalone HTML output,
-      faithful PDF output, and slide-format conversion.
-- [ ] `006-mcp-cli`: local CLI, typed MCP tools, previews, revision checks, and audit
-      metadata.
-- [ ] `007-lan-collaboration`: discovery, authenticated sessions, presence, soft
-      locks, writer ownership, reconnect, and recovery.
-- [ ] `008-windows-pilot`: signed installer, `.hdeck` association, update policy,
-      pilot documentation, and release checks.
+- [x] Separate the source-visible proprietary notice from the compiled-application
+      license in `EULA.txt`.
+- [x] Inventory every direct external dependency and retain the direct runtime
+      license texts in `THIRD_PARTY_NOTICES.md`.
+- [x] Scope Python-2.0 to the build-only
+      `electron-builder -> js-yaml -> argparse@2.0.1` chain without relaxing the
+      production allowlist.
+- [x] Record application-icon, local-icon, Lucide, Unicode-flag, and font provenance.
+- [x] Document the narrow Electron/FFmpeg LGPL runtime exception, evidence, duties,
+      and re-review triggers.
+- [ ] Obtain qualified legal approval for the Electron/FFmpeg corresponding-source
+      mechanism before commercial distribution.
+- [ ] Confirm the final installer and installed directory contain `EULA.txt`, the
+      project source notice, `THIRD_PARTY_NOTICES.md`, `LICENSE.electron.txt`, and the
+      complete `LICENSES.chromium.html`.
+- [ ] Generate the locked production npm SBOM plus an exact packaged-file and native
+      runtime inventory covering Electron, Chromium, FFmpeg, and NSIS.
+- [ ] Scan the exact installer and installed files for vulnerabilities, licenses,
+      secrets, private paths, source maps, debug services, and unexpected binaries.
+- [ ] Generate final SHA-256 checksums and verify Authenticode state. Label every
+      artifact unsigned when no release certificate is supplied.
+- [ ] Tag the verified commit, publish the release notes and artifacts, re-download
+      them, verify checksums, and reinstall once from the public release.
 
-## Cross-cutting release gates
+## Post-V1 candidates
 
-- [ ] Generate and review a complete SBOM from the lockfile.
-- [ ] Keep every direct and transitive dependency inside the approved license policy.
-- [ ] Test malicious archives, SVG, rich text, IPC messages, and MCP requests.
-- [ ] Confirm exported diagnostics contain no deck content or secrets.
-- [ ] Complete visual, keyboard, and screen-reader smoke tests.
-- [ ] Run an independent trademark review before commercial distribution.
+- [ ] Evaluate a dedicated signed MCP helper so Electron `RunAsNode` can be disabled.
+- [ ] Add optional signed update delivery without making startup or local work depend
+      on network availability.
+- [ ] Add a relay provider only after a separate identity, authorization, privacy,
+      abuse, availability, and recovery design.
+- [ ] Expand templates, themes, layouts, accessibility automation, and licensed local
+      asset catalogs without adding remote runtime dependencies.
+- [ ] Evaluate additional desktop platforms after Windows V1 evidence is stable.
 
 ## Explicitly deferred
 
-- Presentation-file interchange.
-- Linked-data charting.
-- Advanced vector path editing and boolean operations.
-- Speaker notes, comments, and transitions.
-- Cloud accounts and internet relay collaboration.
-- Embedded AI chat and a hosted asset marketplace.
+- Third-party presentation-file interchange.
+- Advanced freeform paths and boolean vector operations.
+- Simultaneous editing of one text range and disconnected text merge.
+- Linked charts, formulas, and live spreadsheet links.
+- Transitions, animations, speaker notes, comments, and presenter coaching.
+- Cloud accounts, hosted templates, internet relay, and embedded model inference.
