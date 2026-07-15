@@ -144,6 +144,12 @@ export const requestErrorMessageSchema = z
     type: z.literal('request.error'),
     code: z.string().trim().min(1).max(64),
     message: z.string().trim().min(1).max(500),
+    details: z
+      .record(
+        z.string().trim().min(1).max(64),
+        z.union([z.string().max(256), z.number().finite(), z.boolean(), z.null()]),
+      )
+      .optional(),
   })
   .strict();
 

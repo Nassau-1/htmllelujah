@@ -371,6 +371,11 @@ describe('authoritative collaboration host', () => {
     expect(host.releaseTextLease({ ...leaseRequest, token: lease.token })).toBe(true);
 
     const next = host.acquireTextLease({ ...leaseRequest, clientId: CLIENT_B });
+    expect(host.releaseTextLeasesForClient(CLIENT_A)).toBe(0);
+    expect(host.releaseTextLeasesForClient(CLIENT_B)).toBe(1);
+    expect(host.listTextLeases()).toEqual([]);
+    const reacquired = host.acquireTextLease({ ...leaseRequest, clientId: CLIENT_B });
+    expect(reacquired.clientId).toBe(CLIENT_B);
     now = next.expiresAtMs;
     const afterExpiry = host.acquireTextLease(leaseRequest);
     expect(afterExpiry.clientId).toBe(CLIENT_A);

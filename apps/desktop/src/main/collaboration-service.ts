@@ -12,11 +12,13 @@ import {
   fingerprintSharedTargetBytes,
   isPrivateLanAddress,
   LanDiscoveryController,
+  RemoteTransportError,
   WriterLeaseStore,
   type CommandBatchRequest,
   type CommittedTransaction,
   type DurableCollaborationDocumentAdapter,
   type ManualInvitation,
+  type TextLease,
 } from '@htmllelujah/collaboration';
 import type {
   DocumentCommand,
@@ -49,7 +51,39 @@ export interface DesktopCollaborationCoordinatorOptions {
   readonly writerLeaseTtlMs?: number | undefined;
   readonly heartbeatIntervalMs?: number | undefined;
   readonly saveLeaseReservationMs?: number | undefined;
+  readonly textLeaseTtlMs?: number | undefined;
 }
+
+export type DesktopTextLeaseStatus =
+  | {
+      readonly status: 'available';
+      readonly owner: 'none';
+      readonly slideId: string;
+      readonly elementId: string;
+      readonly expiresAtMs: null;
+    }
+  | {
+      readonly status: 'owned';
+      readonly owner: 'self';
+      readonly slideId: string;
+      readonly elementId: string;
+      readonly expiresAtMs: number;
+    }
+  | {
+      readonly status: 'held';
+      readonly owner: 'peer';
+      readonly ownerClientId: string;
+      readonly slideId: string;
+      readonly elementId: string;
+      readonly expiresAtMs: number;
+    };
+
+type StoredTextLease =
+  | {
+      readonly view: Extract<DesktopTextLeaseStatus, { status: 'owned' }>;
+      readonly lease: TextLease;
+    }
+  | { readonly view: Extract<DesktopTextLeaseStatus, { status: 'held' }> };
 
 type CollaborationSafetyLatch = { failure?: Error };
 
@@ -67,6 +101,8 @@ type HostState = {
   readonly safety: CollaborationSafetyLatch;
   readonly discovery?: LanDiscoveryController | undefined;
   leaseQueue: Promise<void>;
+  textLeaseQueue: Promise<void>;
+  readonly textLeases: Map<string, StoredTextLease>;
   saveUnconfirmed: boolean;
   safeTransition?: Promise<void>;
 };
@@ -81,6 +117,8 @@ type GuestState = {
   readonly client: CollaborationTransportClient;
   lastSeq: number;
   applyQueue: Promise<void>;
+  textLeaseQueue: Promise<void>;
+  readonly textLeases: Map<string, StoredTextLease>;
   stopTransactionListener: () => void;
   stopDisconnectListener: () => void;
   failure?: Error;
@@ -91,6 +129,62 @@ type GuestState = {
 type CollaborationState = HostState | GuestState;
 
 const cloneSecret = (secret: Uint8Array): Uint8Array => Uint8Array.from(secret);
+
+const textLeaseKey = (slideId: string, elementId: string): string => `${slideId}\0${elementId}`;
+
+const availableTextLease = (slideId: string, elementId: string): DesktopTextLeaseStatus => ({
+  status: 'available',
+  owner: 'none',
+  slideId,
+  elementId,
+  expiresAtMs: null,
+});
+
+const ownedTextLease = (lease: TextLease): StoredTextLease => ({
+  lease,
+  view: {
+    status: 'owned',
+    owner: 'self',
+    slideId: lease.slideId,
+    elementId: lease.elementId,
+    expiresAtMs: lease.expiresAtMs,
+  },
+});
+
+const heldTextLeaseFromError = (
+  error: unknown,
+  slideId: string,
+  elementId: string,
+): StoredTextLease | undefined => {
+  if (!(
+    (error instanceof CollaborationError || error instanceof RemoteTransportError) &&
+    error.code === 'TEXT_LEASE_HELD'
+  )) {
+    return undefined;
+  }
+  const ownerClientId = error.details?.ownerClientId;
+  const expiresAtMs = error.details?.expiresAtMs;
+  if (
+    typeof ownerClientId !== 'string' ||
+    ownerClientId.length < 1 ||
+    ownerClientId.length > 128 ||
+    typeof expiresAtMs !== 'number' ||
+    !Number.isSafeInteger(expiresAtMs) ||
+    expiresAtMs <= 0
+  ) {
+    return undefined;
+  }
+  return {
+    view: {
+      status: 'held',
+      owner: 'peer',
+      ownerClientId,
+      slideId,
+      elementId,
+      expiresAtMs,
+    },
+  };
+};
 
 const advertisedLanAddress = (): string => {
   const candidates = Object.values(networkInterfaces())
@@ -267,6 +361,8 @@ export class DesktopCollaborationCoordinator {
     state.safety.failure = error;
     state.stopHeartbeat();
     state.discovery?.destroy();
+    state.textLeases.clear();
+    state.engine.releaseTextLeasesForClient(state.clientId);
     state.safeTransition = (async () => {
       await state.server.close().catch(() => undefined);
       await state.leaseQueue;
@@ -286,6 +382,7 @@ export class DesktopCollaborationCoordinator {
     state.failure = error;
     state.stopTransactionListener();
     state.stopDisconnectListener();
+    state.textLeases.clear();
     state.safeTransition = (async () => {
       await state.client.close().catch(() => undefined);
       state.secret.fill(0);
@@ -305,6 +402,65 @@ export class DesktopCollaborationCoordinator {
         'REVISION_CONFLICT',
         'The guest replica is disconnected or divergent; leave and rejoin.',
       );
+    }
+  }
+
+  #purgeLocalTextLeases(state: CollaborationState): void {
+    const now = this.#clock();
+    state.textLeases.forEach((stored, elementId) => {
+      if (stored.view.expiresAtMs <= now) state.textLeases.delete(elementId);
+    });
+  }
+
+  #enqueueTextLease<T>(state: CollaborationState, operation: () => Promise<T>): Promise<T> {
+    const result = state.textLeaseQueue.then(async () => {
+      if (this.#states.get(state.sessionId) !== state) {
+        throw new CollaborationError(
+          'INVALID_REQUEST',
+          'The collaboration session ended before the text lease operation completed.',
+        );
+      }
+      if (state.mode === 'guest' && !state.client.isConnected) await this.#reconnectGuest(state);
+      this.#assertHealthy(state);
+      return operation();
+    });
+    state.textLeaseQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  #ownedLockTokens(state: CollaborationState): Readonly<Record<string, string>> | undefined {
+    this.#purgeLocalTextLeases(state);
+    const entries = [...state.textLeases.values()]
+      .filter(
+        (stored): stored is Extract<StoredTextLease, { lease: TextLease }> => 'lease' in stored,
+      )
+      .map((stored) => [stored.lease.elementId, stored.lease.token] as const);
+    return entries.length === 0 ? undefined : Object.fromEntries(entries);
+  }
+
+  async #releaseOwnedTextLeases(state: CollaborationState): Promise<void> {
+    const owned = [...state.textLeases.values()].filter(
+      (stored): stored is Extract<StoredTextLease, { lease: TextLease }> => 'lease' in stored,
+    );
+    try {
+      for (const stored of owned) {
+        const request = {
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: stored.lease.sessionId,
+          documentId: stored.lease.documentId,
+          clientId: state.clientId,
+          slideId: stored.lease.slideId,
+          elementId: stored.lease.elementId,
+          token: stored.lease.token,
+        } as const;
+        if (state.mode === 'host') state.engine.releaseTextLease(request);
+        else if (state.client.isConnected) await state.client.releaseTextLease(request);
+      }
+    } finally {
+      state.textLeases.clear();
     }
   }
 
@@ -470,7 +626,12 @@ export class DesktopCollaborationCoordinator {
     const detached = await this.#cloneDetached(input.sessionId);
     const clientId = `host-${randomUUID()}`;
     const safety: CollaborationSafetyLatch = {};
-    const engine = new AuthoritativeSessionHost(this.#runtimeAdapter(detached.sessionId, safety));
+    const engine = new AuthoritativeSessionHost(this.#runtimeAdapter(detached.sessionId, safety), {
+      clock: this.#clock,
+      ...(this.#options.textLeaseTtlMs === undefined
+        ? {}
+        : { textLeaseTtlMs: this.#options.textLeaseTtlMs }),
+    });
     const writerLease = new WriterLeaseStore({
       targetPath: input.targetPath,
       documentId: detached.documentId,
@@ -517,6 +678,8 @@ export class DesktopCollaborationCoordinator {
         stopHeartbeat: () => stopHeartbeat?.(),
         safety,
         leaseQueue: Promise.resolve(),
+        textLeaseQueue: Promise.resolve(),
+        textLeases: new Map(),
         saveUnconfirmed: false,
         ...(discovery === undefined ? {} : { discovery }),
       };
@@ -565,6 +728,7 @@ export class DesktopCollaborationCoordinator {
       documentId: source.documentId,
       clientId,
       documentSecret: decoded.secret,
+      clock: this.#clock,
     });
     try {
       await client.connect();
@@ -598,6 +762,8 @@ export class DesktopCollaborationCoordinator {
         client,
         lastSeq,
         applyQueue: Promise.resolve(),
+        textLeaseQueue: Promise.resolve(),
+        textLeases: new Map(),
         stopTransactionListener: () => undefined,
         stopDisconnectListener: () => undefined,
       };
@@ -609,6 +775,7 @@ export class DesktopCollaborationCoordinator {
       this.#states.set(detached.sessionId, state);
       state.stopDisconnectListener = client.onDisconnect(() => {
         if (this.#states.get(state.sessionId) !== state || state.failure !== undefined) return;
+        state.textLeases.clear();
         void this.#reconnectGuest(state).catch(() => undefined);
       });
       return {
@@ -698,6 +865,155 @@ export class DesktopCollaborationCoordinator {
     state.lastSeq = response.toSeq;
   }
 
+  /** Returns the last authoritative lease result known to this desktop session. */
+  public textLeaseStatus(input: {
+    readonly sessionId: string;
+    readonly slideId: string;
+    readonly elementId: string;
+  }): DesktopTextLeaseStatus {
+    const state = this.#states.get(input.sessionId);
+    if (state === undefined) return availableTextLease(input.slideId, input.elementId);
+    this.#purgeLocalTextLeases(state);
+    const stored = state.textLeases.get(textLeaseKey(input.slideId, input.elementId));
+    if (stored === undefined || stored.view.slideId !== input.slideId) {
+      return availableTextLease(input.slideId, input.elementId);
+    }
+    return structuredClone(stored.view);
+  }
+
+  /** Begins (or idempotently reacquires) the current participant's text-editing lease. */
+  public async beginTextLease(input: {
+    readonly sessionId: string;
+    readonly slideId: string;
+    readonly elementId: string;
+  }): Promise<DesktopTextLeaseStatus> {
+    const state = this.#states.get(input.sessionId);
+    if (state === undefined) {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'Text leases are only available during a live collaboration session.',
+      );
+    }
+    return this.#enqueueTextLease(state, async () => {
+      this.#purgeLocalTextLeases(state);
+      const request = {
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        sessionId: state.mode === 'host' ? state.engine.sessionId : state.invitation.sessionId,
+        documentId: this.#runtime.getSnapshot(state.sessionId).documentId,
+        clientId: state.clientId,
+        slideId: input.slideId,
+        elementId: input.elementId,
+      } as const;
+      try {
+        const lease =
+          state.mode === 'host'
+            ? state.engine.acquireTextLease(request)
+            : await state.client.acquireTextLease(request);
+        if (this.#states.get(state.sessionId) !== state) {
+          throw new CollaborationError(
+            'INVALID_REQUEST',
+            'The collaboration session ended while acquiring the text lease.',
+          );
+        }
+        const stored = ownedTextLease(lease);
+        state.textLeases.set(textLeaseKey(input.slideId, input.elementId), stored);
+        return structuredClone(stored.view);
+      } catch (error) {
+        const held = heldTextLeaseFromError(error, input.slideId, input.elementId);
+        if (held !== undefined) {
+          state.textLeases.set(textLeaseKey(input.slideId, input.elementId), held);
+          return structuredClone(held.view);
+        }
+        state.textLeases.delete(textLeaseKey(input.slideId, input.elementId));
+        throw error;
+      }
+    });
+  }
+
+  /** Extends an owned lease. The opaque lock token never crosses the desktop/UI boundary. */
+  public async renewTextLease(input: {
+    readonly sessionId: string;
+    readonly slideId: string;
+    readonly elementId: string;
+  }): Promise<DesktopTextLeaseStatus> {
+    const state = this.#states.get(input.sessionId);
+    if (state === undefined) {
+      throw new CollaborationError('INVALID_LOCK_TOKEN', 'No text lease is owned by this session.');
+    }
+    return this.#enqueueTextLease(state, async () => {
+      this.#purgeLocalTextLeases(state);
+      const key = textLeaseKey(input.slideId, input.elementId);
+      const stored = state.textLeases.get(key);
+      if (stored === undefined || !('lease' in stored) || stored.lease.slideId !== input.slideId) {
+        throw new CollaborationError(
+          'INVALID_LOCK_TOKEN',
+          'No active text lease is owned for this element.',
+        );
+      }
+      try {
+        const request = {
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: stored.lease.sessionId,
+          documentId: stored.lease.documentId,
+          clientId: state.clientId,
+          slideId: input.slideId,
+          elementId: input.elementId,
+          token: stored.lease.token,
+        } as const;
+        const lease =
+          state.mode === 'host'
+            ? state.engine.renewTextLease(request)
+            : await state.client.renewTextLease(request);
+        if (this.#states.get(state.sessionId) !== state) {
+          throw new CollaborationError(
+            'INVALID_REQUEST',
+            'The collaboration session ended while renewing the text lease.',
+          );
+        }
+        const renewed = ownedTextLease(lease);
+        state.textLeases.set(key, renewed);
+        return structuredClone(renewed.view);
+      } catch (error) {
+        state.textLeases.delete(key);
+        throw error;
+      }
+    });
+  }
+
+  /** Releases an owned lease, or clears a locally observed peer lease. */
+  public async endTextLease(input: {
+    readonly sessionId: string;
+    readonly slideId: string;
+    readonly elementId: string;
+  }): Promise<DesktopTextLeaseStatus> {
+    const state = this.#states.get(input.sessionId);
+    if (state === undefined) return availableTextLease(input.slideId, input.elementId);
+    return this.#enqueueTextLease(state, async () => {
+      const key = textLeaseKey(input.slideId, input.elementId);
+      const stored = state.textLeases.get(key);
+      if (stored === undefined || !('lease' in stored)) {
+        state.textLeases.delete(key);
+        return availableTextLease(input.slideId, input.elementId);
+      }
+      try {
+        const request = {
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: stored.lease.sessionId,
+          documentId: stored.lease.documentId,
+          clientId: state.clientId,
+          slideId: stored.lease.slideId,
+          elementId: stored.lease.elementId,
+          token: stored.lease.token,
+        } as const;
+        if (state.mode === 'host') state.engine.releaseTextLease(request);
+        else await state.client.releaseTextLease(request);
+        return availableTextLease(input.slideId, input.elementId);
+      } finally {
+        state.textLeases.delete(key);
+      }
+    });
+  }
+
   public async execute(input: {
     readonly sessionId: string;
     readonly expectedRevision: string;
@@ -712,6 +1028,7 @@ export class DesktopCollaborationCoordinator {
     if (snapshot.revision !== input.expectedRevision) {
       throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
     }
+    const lockTokens = this.#ownedLockTokens(state);
     const request: CommandBatchRequest = {
       protocolVersion: COLLABORATION_PROTOCOL_VERSION,
       sessionId: state.mode === 'host' ? state.engine.sessionId : state.invitation.sessionId,
@@ -722,6 +1039,7 @@ export class DesktopCollaborationCoordinator {
       baseSeq: state.mode === 'host' ? state.engine.sessionSeq : state.lastSeq,
       commands: [...input.commands],
       metadata: { origin: 'user', label: input.label },
+      ...(lockTokens === undefined ? {} : { lockTokens }),
     };
     if (state.mode === 'host') {
       await state.server.submitAndBroadcast(request);
@@ -816,6 +1134,8 @@ export class DesktopCollaborationCoordinator {
         state.safety.failure !== undefined &&
         (state.saveUnconfirmed || snapshot.dirty)) ||
       (state.mode === 'guest' && snapshot.dirty);
+    await state.textLeaseQueue;
+    await this.#releaseOwnedTextLeases(state).catch(() => undefined);
     this.#states.delete(sessionId);
     if (state.mode === 'host') {
       state.stopHeartbeat();
@@ -845,6 +1165,8 @@ export class DesktopCollaborationCoordinator {
   public async shutdown(sessionId: string): Promise<void> {
     const state = this.#states.get(sessionId);
     if (state === undefined) return;
+    await state.textLeaseQueue;
+    await this.#releaseOwnedTextLeases(state).catch(() => undefined);
     this.#states.delete(sessionId);
     if (state.mode === 'host') {
       state.stopHeartbeat();

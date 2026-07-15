@@ -146,6 +146,169 @@ describe('DesktopCollaborationCoordinator', () => {
     expect((await host.leave(hosted.snapshot.sessionId))?.mode).toBe('host');
   }, 30_000);
 
+  it('coordinates text leases across a host and two guests through renew, disconnect, and expiry', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-text-leases-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    let now = Date.now();
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'host-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const firstGuestRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'guest-a-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const secondGuestRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'guest-b-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const host = new DesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+      clock: () => now,
+      textLeaseTtlMs: 1_000,
+    });
+    const firstGuest = new DesktopCollaborationCoordinator(firstGuestRuntime, {
+      clock: () => now,
+    });
+    const secondGuest = new DesktopCollaborationCoordinator(secondGuestRuntime, {
+      clock: () => now,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(secondGuestRuntime));
+    cleanup.push(() => closeRuntime(firstGuestRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => secondGuest.shutdownAll());
+    cleanup.push(() => firstGuest.shutdownAll());
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(source.sessionId, { targetPath, expectedFingerprint: null });
+    const firstSource = await firstGuestRuntime.openMainOnly({ targetPath });
+    const secondSource = await secondGuestRuntime.openMainOnly({ targetPath });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    const firstJoined = await firstGuest.join({
+      sessionId: firstSource.sessionId,
+      targetPath,
+      endpoint: hosted.status.endpoint!,
+      sessionCode: hosted.status.sessionCode!,
+      expectedFingerprint: hosted.status.hostFingerprint!,
+      displayName: 'Guest A',
+    });
+    const secondJoined = await secondGuest.join({
+      sessionId: secondSource.sessionId,
+      targetPath,
+      endpoint: hosted.status.endpoint!,
+      sessionCode: hosted.status.sessionCode!,
+      expectedFingerprint: hosted.status.hostFingerprint!,
+      displayName: 'Guest B',
+    });
+    await waitFor(() => host.status(hosted.snapshot.sessionId).connectedPeers === 2);
+    const slide = hosted.snapshot.document.slides[0]!;
+    const text = slide.elements.find((element) => element.type === 'text')!;
+    const target = { slideId: slide.id, elementId: text.id };
+
+    const firstOwned = await firstGuest.beginTextLease({
+      sessionId: firstJoined.snapshot.sessionId,
+      ...target,
+    });
+    expect(firstOwned).toMatchObject({
+      status: 'owned',
+      owner: 'self',
+      expiresAtMs: now + 1_000,
+    });
+    const secondHeld = await secondGuest.beginTextLease({
+      sessionId: secondJoined.snapshot.sessionId,
+      ...target,
+    });
+    const hostHeld = await host.beginTextLease({
+      sessionId: hosted.snapshot.sessionId,
+      ...target,
+    });
+    expect(secondHeld).toMatchObject({
+      status: 'held',
+      owner: 'peer',
+      expiresAtMs: firstOwned.expiresAtMs,
+    });
+    expect(hostHeld).toMatchObject({
+      status: 'held',
+      owner: 'peer',
+      expiresAtMs: firstOwned.expiresAtMs,
+    });
+
+    now += 250;
+    const renewed = await firstGuest.renewTextLease({
+      sessionId: firstJoined.snapshot.sessionId,
+      ...target,
+    });
+    expect(renewed).toMatchObject({ status: 'owned', expiresAtMs: now + 1_000 });
+    const edited = await firstGuest.execute({
+      sessionId: firstJoined.snapshot.sessionId,
+      expectedRevision: firstGuestRuntime.getSnapshot(firstJoined.snapshot.sessionId).revision,
+      label: 'Edit leased text',
+      commands: [
+        {
+          type: 'text.replace-content',
+          slideId: slide.id,
+          textId: text.id,
+          content: {
+            blocks: [
+              {
+                id: '97300000-0000-4000-8000-000000000001',
+                type: 'paragraph',
+                alignment: 'left',
+                runs: [
+                  {
+                    text: 'Edited while holding the lease',
+                    marks: {
+                      bold: false,
+                      italic: false,
+                      underline: false,
+                      strikethrough: false,
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    });
+    expect(edited?.revision).not.toBe(firstJoined.snapshot.revision);
+    await waitFor(
+      () =>
+        secondGuestRuntime.getSnapshot(secondJoined.snapshot.sessionId).revision ===
+        edited?.revision,
+    );
+
+    await firstGuest.leave(firstJoined.snapshot.sessionId);
+    await waitFor(() => host.status(hosted.snapshot.sessionId).connectedPeers === 1);
+    const transferred = await secondGuest.beginTextLease({
+      sessionId: secondJoined.snapshot.sessionId,
+      ...target,
+    });
+    expect(transferred).toMatchObject({ status: 'owned', owner: 'self' });
+
+    now = transferred.expiresAtMs!;
+    const hostAfterExpiry = await host.beginTextLease({
+      sessionId: hosted.snapshot.sessionId,
+      ...target,
+    });
+    expect(hostAfterExpiry).toMatchObject({ status: 'owned', owner: 'self' });
+    expect(await host.endTextLease({ sessionId: hosted.snapshot.sessionId, ...target })).toEqual({
+      status: 'available',
+      owner: 'none',
+      slideId: slide.id,
+      elementId: text.id,
+      expiresAtMs: null,
+    });
+  }, 30_000);
+
   it('does not overwrite a target changed between lease preflight and atomic save', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-save-race-'));
     const targetPath = path.join(directory, 'shared.hdeck');

@@ -227,12 +227,18 @@ export class CollaborationTransportServer {
     this.httpsServer = undefined;
     this.invitation = undefined;
 
+    const connectedClientIds = new Set<string>();
     this.connections.forEach((state) => {
       if (state.authTimer !== undefined) clearTimeout(state.authTimer);
+      if (state.clientId !== undefined) connectedClientIds.add(state.clientId);
       state.socket.close(1001, 'Server shutdown');
       state.socket.terminate();
     });
     this.connections.clear();
+    connectedClientIds.forEach((clientId) => {
+      this.engine.removePresence(clientId);
+      this.engine.releaseTextLeasesForClient(clientId);
+    });
     if (webSocketServer !== undefined) {
       await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
     }
@@ -303,6 +309,10 @@ export class CollaborationTransportServer {
   }
 
   private receive(state: ConnectionState, data: WebSocket.RawData, isBinary: boolean): void {
+    if (this.connections.get(state.socket) !== state) {
+      state.socket.terminate();
+      return;
+    }
     if (isBinary || !this.consumeRateToken(state)) {
       state.socket.close(1008, isBinary ? 'Text frames only' : 'Rate limit');
       return;
@@ -488,7 +498,13 @@ export class CollaborationTransportServer {
             ? error.code
             : 'REQUEST_FAILED';
       const messageText = error instanceof Error ? error.message : 'Request failed.';
-      this.sendRequestError(state, message.requestId, code, messageText);
+      this.sendRequestError(
+        state,
+        message.requestId,
+        code,
+        messageText,
+        error instanceof CollaborationError ? error.details : undefined,
+      );
     }
   }
 
@@ -508,7 +524,20 @@ export class CollaborationTransportServer {
     requestId: string,
     code: string,
     message: string,
+    details?: Readonly<Record<string, unknown>>,
   ): void {
+    const safeDetails =
+      details === undefined
+        ? undefined
+        : Object.fromEntries(
+            Object.entries(details).filter(
+              (entry): entry is [string, string | number | boolean | null] =>
+                entry[1] === null ||
+                typeof entry[1] === 'string' ||
+                (typeof entry[1] === 'number' && Number.isFinite(entry[1])) ||
+                typeof entry[1] === 'boolean',
+            ),
+          );
     state.socket.send(
       json({
         type: 'request.error',
@@ -516,6 +545,7 @@ export class CollaborationTransportServer {
         requestId,
         code: code.slice(0, 64),
         message: message.slice(0, 500),
+        ...(safeDetails === undefined ? {} : { details: safeDetails }),
       }),
     );
   }
@@ -559,8 +589,20 @@ export class CollaborationTransportServer {
 
   private removeConnection(state: ConnectionState): void {
     if (state.authTimer !== undefined) clearTimeout(state.authTimer);
+    const clientId = state.clientId;
+    state.authenticated = false;
+    state.clientId = undefined;
     this.connections.delete(state.socket);
-    if (state.clientId !== undefined) this.engine.removePresence(state.clientId);
+    if (
+      clientId !== undefined &&
+      ![...this.connections.values()].some(
+        (candidate) => candidate.authenticated && candidate.clientId === clientId,
+      )
+    ) {
+      this.engine.removePresence(clientId);
+      this.engine.releaseTextLeasesForClient(clientId);
+    }
+    if (state.socket.readyState !== WebSocket.CLOSED) state.socket.terminate();
   }
 
   private purgeReplayNonces(): void {

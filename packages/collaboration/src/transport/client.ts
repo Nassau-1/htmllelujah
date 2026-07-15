@@ -71,11 +71,17 @@ interface PendingRequest {
 
 export class RemoteTransportError extends Error {
   public readonly code: string;
+  public readonly details: Readonly<Record<string, string | number | boolean | null>> | undefined;
 
-  public constructor(code: string, message: string) {
+  public constructor(
+    code: string,
+    message: string,
+    details?: Readonly<Record<string, string | number | boolean | null>>,
+  ) {
     super(message);
     this.name = 'RemoteTransportError';
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -389,7 +395,7 @@ export class CollaborationTransportClient {
     clearTimeout(pending.timer);
     if (message.type === 'request.error') {
       const remote = requestErrorMessageSchema.parse(message);
-      pending.reject(new RemoteTransportError(remote.code, remote.message));
+      pending.reject(new RemoteTransportError(remote.code, remote.message, remote.details));
       return;
     }
     if (message.type !== pending.expectedType) {

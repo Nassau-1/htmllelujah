@@ -440,6 +440,7 @@ export class AuthoritativeSessionHost {
     if (existing !== undefined && existing.clientId !== request.clientId) {
       throw new CollaborationError('TEXT_LEASE_HELD', 'The text element is being edited.', {
         elementId: request.elementId,
+        ownerClientId: existing.clientId,
         expiresAtMs: existing.expiresAtMs,
       });
     }
@@ -490,6 +491,17 @@ export class AuthoritativeSessionHost {
     return [...this.textLeases.values()]
       .sort((left, right) => left.elementId.localeCompare(right.elementId))
       .map(clone);
+  }
+
+  /** Releases every soft text lease owned by a participant that left the session. */
+  public releaseTextLeasesForClient(clientId: string): number {
+    let released = 0;
+    this.textLeases.forEach((lease, elementId) => {
+      if (lease.clientId !== clientId) return;
+      this.textLeases.delete(elementId);
+      released += 1;
+    });
+    return released;
   }
 
   public updatePresence(rawUpdate: unknown): PresenceRecord {
@@ -596,6 +608,7 @@ export class AuthoritativeSessionHost {
       if (lease.clientId !== request.clientId) {
         throw new CollaborationError('TEXT_LEASE_HELD', 'The text element is being edited.', {
           elementId: lease.elementId,
+          ownerClientId: lease.clientId,
           expiresAtMs: lease.expiresAtMs,
         });
       }

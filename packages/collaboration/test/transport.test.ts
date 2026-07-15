@@ -227,6 +227,53 @@ describe('WSS collaboration transport', () => {
     }
   });
 
+  it('returns bounded lease-owner details and releases all leases on peer disconnect', async () => {
+    const engine = createEngine();
+    const server = new CollaborationTransportServer({ engine, documentSecret: SECRET });
+    const invitation = await server.start();
+    const first = createClient(invitation, engine, 'lease-client-a');
+    const second = createClient(invitation, engine, 'lease-client-b');
+    try {
+      await Promise.all([first.connect(), second.connect()]);
+      const slide = engine.getSnapshot().document.slides[0]!;
+      const text = slide.elements[0]!;
+      const request = {
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        sessionId: engine.sessionId,
+        documentId: engine.documentId,
+        clientId: 'lease-client-a',
+        slideId: slide.id,
+        elementId: text.id,
+      } as const;
+      const owned = await first.acquireTextLease(request);
+      expect(owned.clientId).toBe('lease-client-a');
+      try {
+        await second.acquireTextLease({ ...request, clientId: 'lease-client-b' });
+        throw new Error('Expected the second client to observe a held lease.');
+      } catch (error) {
+        expect(error).toBeInstanceOf(RemoteTransportError);
+        expect(error).toMatchObject({
+          code: 'TEXT_LEASE_HELD',
+          details: {
+            ownerClientId: 'lease-client-a',
+            expiresAtMs: owned.expiresAtMs,
+          },
+        });
+      }
+      await first.close();
+      await waitFor(() => engine.listTextLeases().length === 0);
+      const transferred = await second.acquireTextLease({
+        ...request,
+        clientId: 'lease-client-b',
+      });
+      expect(transferred.clientId).toBe('lease-client-b');
+    } finally {
+      await first.close();
+      await second.close();
+      await server.close();
+    }
+  });
+
   it('rejects a replayed invitation at the server after its original expiry', async () => {
     let now = 10_000;
     const engine = createEngine();
