@@ -445,6 +445,27 @@ try {
     `[...document.querySelectorAll('.inspector-section h3')].some((heading) => heading.textContent === 'Layout editor') && [...document.querySelectorAll('.inspector-section h3')].some((heading) => heading.textContent === 'Master editor')`,
     'Master and layout editors',
   );
+  const changedPageFormat = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Page format',
+    );
+    const select = heading?.closest('.inspector-section')?.querySelector('select');
+    if (!(select instanceof HTMLSelectElement)) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+    setter?.call(select, 'standard');
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`);
+  if (!changedPageFormat) throw new Error('The page-format control was unavailable.');
+  await waitForRenderer(
+    `document.querySelector('[data-page-width-pt="720"][data-page-height-pt="540"]') !== null`,
+    'Standard 4:3 page format',
+  );
+  await click('[aria-label="Undo"]', 'Undo page-format change');
+  await waitForRenderer(
+    `document.querySelector('[data-page-width-pt="960"][data-page-height-pt="540"]') !== null`,
+    'Restored widescreen page format',
+  );
   const layoutCountBefore = await evaluate(`(() => {
     const heading = [...document.querySelectorAll('.inspector-section h3')].find(
       (candidate) => candidate.textContent === 'Layout editor',
@@ -534,6 +555,7 @@ try {
       'File menu opened and closed',
       'Codex MCP dialog opened and closed',
       'LAN collaboration dialog opened and closed',
+      'page format changed through the Design inspector and undid cleanly',
       'Design and Properties inspector tabs switched',
       'stable PNG screenshot captured from the real window',
     ],
