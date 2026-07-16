@@ -23,6 +23,18 @@ import {
   normalizeDocumentSecret,
 } from './crypto.js';
 import {
+  BoundedSender,
+  ChunkReassembler,
+  DEFAULT_CHUNK_TIMEOUT_MS,
+  DEFAULT_MAX_BUFFERED_BYTES,
+  DEFAULT_MAX_CONCURRENT_TRANSFERS,
+  DEFAULT_MAX_FRAME_BYTES,
+  DEFAULT_MAX_LOGICAL_PAYLOAD_BYTES,
+  DEFAULT_MAX_QUEUED_BYTES,
+  DEFAULT_MAX_REASSEMBLY_BYTES,
+  DEFAULT_SEND_TIMEOUT_MS,
+} from './framing.js';
+import {
   authChallengeSchema,
   authResponseSchema,
   clientRequestMessageSchema,
@@ -39,7 +51,18 @@ export interface CollaborationTransportServerOptions {
   readonly advertisedHost?: string;
   readonly port?: number;
   readonly maxPayloadBytes?: number;
+  readonly maxLogicalPayloadBytes?: number;
+  readonly maxReassemblyBytes?: number;
+  readonly maxConcurrentTransfers?: number;
+  readonly chunkTimeoutMs?: number;
+  readonly maxBufferedBytes?: number;
+  readonly maxQueuedBytes?: number;
+  readonly sendTimeoutMs?: number;
   readonly maxPeers?: number;
+  readonly maxPendingConnections?: number;
+  readonly maxPendingPerAddress?: number;
+  readonly maxQueuedRequestsPerConnection?: number;
+  readonly maxQueuedRequestBytesPerConnection?: number;
   readonly maxMessagesPerWindow?: number;
   readonly rateWindowMs?: number;
   readonly authTimeoutMs?: number;
@@ -52,15 +75,25 @@ export interface CollaborationTransportServerOptions {
 interface ConnectionState {
   readonly socket: WebSocket;
   readonly challenge: AuthChallenge;
+  readonly remoteAddress: string;
+  readonly sender: BoundedSender;
+  readonly reassembler: ChunkReassembler;
   authTimer: ReturnType<typeof setTimeout> | undefined;
   authenticated: boolean;
+  closing: boolean;
   clientId: string | undefined;
   windowStartedAtMs: number;
   messageCount: number;
+  requestQueue: Promise<void>;
+  queuedRequests: number;
+  queuedRequestBytes: number;
 }
 
-const DEFAULT_MAX_PAYLOAD_BYTES = 1024 * 1024;
 const DEFAULT_MAX_PEERS = 8;
+const DEFAULT_MAX_PENDING_CONNECTIONS = 16;
+const DEFAULT_MAX_PENDING_PER_ADDRESS = 8;
+const DEFAULT_MAX_QUEUED_REQUESTS = 64;
+const DEFAULT_MAX_QUEUED_REQUEST_BYTES = 32 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT = 60;
 const DEFAULT_RATE_WINDOW_MS = 1_000;
 const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
@@ -75,7 +108,18 @@ export class CollaborationTransportServer {
   private readonly advertisedHost: string;
   private readonly requestedPort: number;
   private readonly maxPayloadBytes: number;
+  private readonly maxLogicalPayloadBytes: number;
+  private readonly maxReassemblyBytes: number;
+  private readonly maxConcurrentTransfers: number;
+  private readonly chunkTimeoutMs: number;
+  private readonly maxBufferedBytes: number;
+  private readonly maxQueuedBytes: number;
+  private readonly sendTimeoutMs: number;
   private readonly maxPeers: number;
+  private readonly maxPendingConnections: number;
+  private readonly maxPendingPerAddress: number;
+  private readonly maxQueuedRequestsPerConnection: number;
+  private readonly maxQueuedRequestBytesPerConnection: number;
   private readonly maxMessagesPerWindow: number;
   private readonly rateWindowMs: number;
   private readonly authTimeoutMs: number;
@@ -98,8 +142,23 @@ export class CollaborationTransportServer {
     this.bindHost = options.bindHost ?? '127.0.0.1';
     this.advertisedHost = options.advertisedHost ?? this.bindHost;
     this.requestedPort = options.port ?? 0;
-    this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
+    this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_FRAME_BYTES;
+    this.maxLogicalPayloadBytes =
+      options.maxLogicalPayloadBytes ?? DEFAULT_MAX_LOGICAL_PAYLOAD_BYTES;
+    this.maxReassemblyBytes = options.maxReassemblyBytes ?? DEFAULT_MAX_REASSEMBLY_BYTES;
+    this.maxConcurrentTransfers =
+      options.maxConcurrentTransfers ?? DEFAULT_MAX_CONCURRENT_TRANSFERS;
+    this.chunkTimeoutMs = options.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS;
+    this.maxBufferedBytes = options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
+    this.maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
+    this.sendTimeoutMs = options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
     this.maxPeers = options.maxPeers ?? DEFAULT_MAX_PEERS;
+    this.maxPendingConnections = options.maxPendingConnections ?? DEFAULT_MAX_PENDING_CONNECTIONS;
+    this.maxPendingPerAddress = options.maxPendingPerAddress ?? DEFAULT_MAX_PENDING_PER_ADDRESS;
+    this.maxQueuedRequestsPerConnection =
+      options.maxQueuedRequestsPerConnection ?? DEFAULT_MAX_QUEUED_REQUESTS;
+    this.maxQueuedRequestBytesPerConnection =
+      options.maxQueuedRequestBytesPerConnection ?? DEFAULT_MAX_QUEUED_REQUEST_BYTES;
     this.maxMessagesPerWindow = options.maxMessagesPerWindow ?? DEFAULT_RATE_LIMIT;
     this.rateWindowMs = options.rateWindowMs ?? DEFAULT_RATE_WINDOW_MS;
     this.authTimeoutMs = options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS;
@@ -110,7 +169,18 @@ export class CollaborationTransportServer {
     if (
       ![
         this.maxPayloadBytes,
+        this.maxLogicalPayloadBytes,
+        this.maxReassemblyBytes,
+        this.maxConcurrentTransfers,
+        this.chunkTimeoutMs,
+        this.maxBufferedBytes,
+        this.maxQueuedBytes,
+        this.sendTimeoutMs,
         this.maxPeers,
+        this.maxPendingConnections,
+        this.maxPendingPerAddress,
+        this.maxQueuedRequestsPerConnection,
+        this.maxQueuedRequestBytesPerConnection,
         this.maxMessagesPerWindow,
         this.rateWindowMs,
         this.authTimeoutMs,
@@ -169,7 +239,12 @@ export class CollaborationTransportServer {
       perMessageDeflate: false,
     });
     webSocketServer.on('connection', (socket, request) => {
-      this.acceptConnection(socket, request.url ?? '', certificate.fingerprint);
+      this.acceptConnection(
+        socket,
+        request.url ?? '',
+        certificate.fingerprint,
+        request.socket.remoteAddress ?? 'unknown',
+      );
     });
     webSocketServer.on('error', () => undefined);
     server.on('clientError', (_error, socket) => socket.destroy());
@@ -230,6 +305,8 @@ export class CollaborationTransportServer {
     const connectedClientIds = new Set<string>();
     this.connections.forEach((state) => {
       if (state.authTimer !== undefined) clearTimeout(state.authTimer);
+      state.sender.dispose();
+      state.reassembler.dispose();
       if (state.clientId !== undefined) connectedClientIds.add(state.clientId);
       state.socket.close(1001, 'Server shutdown');
       state.socket.terminate();
@@ -249,7 +326,12 @@ export class CollaborationTransportServer {
     this.documentSecret.fill(0);
   }
 
-  private acceptConnection(socket: WebSocket, requestUrl: string, fingerprint: string): void {
+  private acceptConnection(
+    socket: WebSocket,
+    requestUrl: string,
+    fingerprint: string,
+    remoteAddress: string,
+  ): void {
     const expectedPath = `/v1/session/${this.engine.sessionId}`;
     if (requestUrl !== expectedPath) {
       socket.close(1008, 'Invalid session path');
@@ -267,16 +349,21 @@ export class CollaborationTransportServer {
       socket.close(1008, 'Invitation expired');
       return;
     }
-    if (this.connections.size >= this.maxPeers) {
+    const pending = [...this.connections.values()].filter((state) => !state.authenticated);
+    if (
+      pending.length >= this.maxPendingConnections ||
+      pending.filter((state) => state.remoteAddress === remoteAddress).length >=
+        this.maxPendingPerAddress
+    ) {
       socket.send(
         json({
           type: 'auth.rejected',
           protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-          code: 'PEER_LIMIT',
-          message: 'The collaboration session reached its peer limit.',
+          code: 'PENDING_LIMIT',
+          message: 'The collaboration authentication queue is full.',
         }),
       );
-      socket.close(1013, 'Peer limit');
+      socket.close(1013, 'Pending limit');
       return;
     }
 
@@ -289,14 +376,45 @@ export class CollaborationTransportServer {
       certificateFingerprint: fingerprint,
       expiresAtMs: this.clock() + this.authTimeoutMs,
     });
-    const state: ConnectionState = {
+    let state!: ConnectionState;
+    const sender = new BoundedSender(socket, {
+      stream: 'server',
+      secret: this.documentSecret,
+      idFactory: this.idFactory,
+      maxFrameBytes: this.maxPayloadBytes,
+      maxLogicalPayloadBytes: this.maxLogicalPayloadBytes,
+      maxBufferedBytes: this.maxBufferedBytes,
+      maxQueuedBytes: this.maxQueuedBytes,
+      sendTimeoutMs: this.sendTimeoutMs,
+    });
+    const reassembler = new ChunkReassembler({
+      stream: 'client',
+      secret: this.documentSecret,
+      maxFrameBytes: this.maxPayloadBytes,
+      maxLogicalPayloadBytes: this.maxLogicalPayloadBytes,
+      maxReassemblyBytes: this.maxReassemblyBytes,
+      maxConcurrentTransfers: this.maxConcurrentTransfers,
+      chunkTimeoutMs: this.chunkTimeoutMs,
+      clock: this.clock,
+      onTimeout: () => {
+        if (state !== undefined) this.closeProtocolPeer(state, 'Chunk timeout');
+      },
+    });
+    state = {
       socket,
       challenge,
+      remoteAddress,
+      sender,
+      reassembler,
       authTimer: undefined,
       authenticated: false,
+      closing: false,
       clientId: undefined,
       windowStartedAtMs: this.clock(),
       messageCount: 0,
+      requestQueue: Promise.resolve(),
+      queuedRequests: 0,
+      queuedRequestBytes: 0,
     };
     state.authTimer = setTimeout(() => {
       this.rejectAuthentication(state, 'AUTH_EXPIRED', 'Authentication timed out.');
@@ -305,7 +423,7 @@ export class CollaborationTransportServer {
     socket.on('message', (data, isBinary) => this.receive(state, data, isBinary));
     socket.on('close', () => this.removeConnection(state));
     socket.on('error', () => this.removeConnection(state));
-    socket.send(json(challenge));
+    void sender.sendRaw(json(challenge)).catch(() => this.removeConnection(state));
   }
 
   private receive(state: ConnectionState, data: WebSocket.RawData, isBinary: boolean): void {
@@ -313,30 +431,72 @@ export class CollaborationTransportServer {
       state.socket.terminate();
       return;
     }
-    if (isBinary || !this.consumeRateToken(state)) {
-      state.socket.close(1008, isBinary ? 'Text frames only' : 'Rate limit');
+    if (state.closing) return;
+    if (isBinary) {
+      this.closeProtocolPeer(state, 'Text frames only');
       return;
     }
     let raw: unknown;
     try {
       raw = JSON.parse(data.toString());
     } catch {
-      state.socket.close(1008, 'Malformed JSON');
+      this.closeProtocolPeer(state, 'Malformed JSON');
       return;
     }
 
     if (!state.authenticated) {
+      if (!this.consumeRateToken(state)) {
+        this.closeProtocolPeer(state, 'Rate limit');
+        return;
+      }
       this.authenticate(state, raw);
+      return;
+    }
+    let logical: string | undefined;
+    try {
+      logical = state.reassembler.accept(raw);
+    } catch {
+      this.closeProtocolPeer(state, 'Malformed chunk');
+      return;
+    }
+    if (logical === undefined) return;
+    if (!this.consumeRateToken(state)) {
+      this.closeProtocolPeer(state, 'Rate limit');
+      return;
+    }
+    const logicalByteLength = Buffer.byteLength(logical);
+    if (
+      state.queuedRequests >= this.maxQueuedRequestsPerConnection ||
+      state.queuedRequestBytes + logicalByteLength > this.maxQueuedRequestBytesPerConnection
+    ) {
+      this.closeProtocolPeer(state, 'Request queue limit');
       return;
     }
     let message: ClientRequestMessage;
     try {
-      message = clientRequestMessageSchema.parse(raw);
+      message = clientRequestMessageSchema.parse(JSON.parse(logical));
     } catch {
-      state.socket.close(1008, 'Malformed protocol message');
+      this.closeProtocolPeer(state, 'Malformed protocol message');
       return;
     }
-    void this.handleRequest(state, message);
+    state.queuedRequests += 1;
+    state.queuedRequestBytes += logicalByteLength;
+    const operation = state.requestQueue.then(() => {
+      if (
+        this.connections.get(state.socket) !== state ||
+        !state.authenticated ||
+        state.socket.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      return this.handleRequest(state, message);
+    });
+    state.requestQueue = operation
+      .catch(() => this.removeConnection(state))
+      .finally(() => {
+        state.queuedRequests -= 1;
+        state.queuedRequestBytes -= logicalByteLength;
+      });
   }
 
   private authenticate(state: ConnectionState, raw: unknown): void {
@@ -388,6 +548,26 @@ export class CollaborationTransportServer {
       this.rejectAuthentication(state, 'AUTH_FAILED', 'Authentication proof is invalid.');
       return;
     }
+    if (this.authenticatedPeerCount >= this.maxPeers) {
+      this.rejectAuthentication(
+        state,
+        'PEER_LIMIT',
+        'The collaboration session reached its authenticated peer limit.',
+      );
+      return;
+    }
+    if (
+      [...this.connections.values()].some(
+        (candidate) => candidate !== state && candidate.clientId === response.clientId,
+      )
+    ) {
+      this.rejectAuthentication(
+        state,
+        'CLIENT_ID_IN_USE',
+        'The collaboration client identity is already connected.',
+      );
+      return;
+    }
 
     state.authenticated = true;
     state.clientId = response.clientId;
@@ -396,16 +576,18 @@ export class CollaborationTransportServer {
     if (state.authTimer !== undefined) clearTimeout(state.authTimer);
     state.authTimer = undefined;
     this.replayNonces.set(replayKey, challenge.expiresAtMs);
-    state.socket.send(
-      json({
-        type: 'auth.accepted',
-        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-        sessionId: this.engine.sessionId,
-        clientId: response.clientId,
-        sessionSeq: this.engine.sessionSeq,
-        revision: this.engine.revision,
-      }),
-    );
+    void state.sender
+      .sendRaw(
+        json({
+          type: 'auth.accepted',
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: this.engine.sessionId,
+          clientId: response.clientId,
+          sessionSeq: this.engine.sessionSeq,
+          revision: this.engine.revision,
+        }),
+      )
+      .catch(() => this.removeConnection(state));
   }
 
   private async handleRequest(
@@ -413,7 +595,7 @@ export class CollaborationTransportServer {
     message: ClientRequestMessage,
   ): Promise<void> {
     if ('clientId' in message.payload && message.payload.clientId !== state.clientId) {
-      this.sendRequestError(
+      await this.sendRequestError(
         state,
         message.requestId,
         'CLIENT_MISMATCH',
@@ -425,38 +607,32 @@ export class CollaborationTransportServer {
       switch (message.type) {
         case 'command.submit': {
           const transaction = await this.submitAndBroadcast(message.payload as CommandBatchRequest);
-          state.socket.send(
-            json({
-              type: 'command.result',
-              protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-              requestId: message.requestId,
-              payload: transaction,
-            }),
-          );
+          await state.sender.sendLogical({
+            type: 'command.result',
+            protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+            requestId: message.requestId,
+            payload: transaction,
+          });
           break;
         }
         case 'resync.request': {
           const result = this.engine.getResync(message.payload as ResyncRequest);
-          state.socket.send(
-            json({
-              type: 'resync.result',
-              protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-              requestId: message.requestId,
-              payload: result,
-            }),
-          );
+          await state.sender.sendLogical({
+            type: 'resync.result',
+            protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+            requestId: message.requestId,
+            payload: result,
+          });
           break;
         }
         case 'presence.update': {
           const result = this.engine.updatePresence(message.payload as PresenceUpdate);
-          state.socket.send(
-            json({
-              type: 'presence.result',
-              protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-              requestId: message.requestId,
-              payload: result,
-            }),
-          );
+          await state.sender.sendLogical({
+            type: 'presence.result',
+            protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+            requestId: message.requestId,
+            payload: result,
+          });
           this.broadcast({
             type: 'presence.changed',
             protocolVersion: COLLABORATION_PROTOCOL_VERSION,
@@ -466,24 +642,22 @@ export class CollaborationTransportServer {
         }
         case 'lease.acquire': {
           const result = this.engine.acquireTextLease(message.payload as AcquireTextLeaseRequest);
-          this.sendLeaseResult(state, message.requestId, result);
+          await this.sendLeaseResult(state, message.requestId, result);
           break;
         }
         case 'lease.renew': {
           const result = this.engine.renewTextLease(message.payload as RenewTextLeaseRequest);
-          this.sendLeaseResult(state, message.requestId, result);
+          await this.sendLeaseResult(state, message.requestId, result);
           break;
         }
         case 'lease.release': {
           const released = this.engine.releaseTextLease(message.payload as ReleaseTextLeaseRequest);
-          state.socket.send(
-            json({
-              type: 'lease.release.result',
-              protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-              requestId: message.requestId,
-              released,
-            }),
-          );
+          await state.sender.sendLogical({
+            type: 'lease.release.result',
+            protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+            requestId: message.requestId,
+            released,
+          });
           break;
         }
       }
@@ -498,34 +672,40 @@ export class CollaborationTransportServer {
             ? error.code
             : 'REQUEST_FAILED';
       const messageText = error instanceof Error ? error.message : 'Request failed.';
-      this.sendRequestError(
-        state,
-        message.requestId,
-        code,
-        messageText,
-        error instanceof CollaborationError ? error.details : undefined,
-      );
+      try {
+        await this.sendRequestError(
+          state,
+          message.requestId,
+          code,
+          messageText,
+          error instanceof CollaborationError ? error.details : undefined,
+        );
+      } catch {
+        this.removeConnection(state);
+      }
     }
   }
 
-  private sendLeaseResult(state: ConnectionState, requestId: string, payload: unknown): void {
-    state.socket.send(
-      json({
-        type: 'lease.result',
-        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-        requestId,
-        payload,
-      }),
-    );
+  private async sendLeaseResult(
+    state: ConnectionState,
+    requestId: string,
+    payload: unknown,
+  ): Promise<void> {
+    await state.sender.sendLogical({
+      type: 'lease.result',
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      requestId,
+      payload,
+    });
   }
 
-  private sendRequestError(
+  private async sendRequestError(
     state: ConnectionState,
     requestId: string,
     code: string,
     message: string,
     details?: Readonly<Record<string, unknown>>,
-  ): void {
+  ): Promise<void> {
     const safeDetails =
       details === undefined
         ? undefined
@@ -538,23 +718,20 @@ export class CollaborationTransportServer {
                 typeof entry[1] === 'boolean',
             ),
           );
-    state.socket.send(
-      json({
-        type: 'request.error',
-        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-        requestId,
-        code: code.slice(0, 64),
-        message: message.slice(0, 500),
-        ...(safeDetails === undefined ? {} : { details: safeDetails }),
-      }),
-    );
+    await state.sender.sendLogical({
+      type: 'request.error',
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      requestId,
+      code: code.slice(0, 64),
+      message: message.slice(0, 500),
+      ...(safeDetails === undefined ? {} : { details: safeDetails }),
+    });
   }
 
   private broadcast(message: unknown): void {
-    const encoded = json(message);
     this.connections.forEach((state) => {
       if (state.authenticated && state.socket.readyState === WebSocket.OPEN) {
-        state.socket.send(encoded);
+        void state.sender.sendLogical(message).catch(() => this.removeConnection(state));
       }
     });
   }
@@ -571,26 +748,44 @@ export class CollaborationTransportServer {
 
   private rejectAuthentication(
     state: ConnectionState,
-    code: 'AUTH_FAILED' | 'AUTH_EXPIRED' | 'AUTH_REPLAY' | 'INVITATION_EXPIRED' | 'PROTOCOL_ERROR',
+    code:
+      | 'AUTH_FAILED'
+      | 'AUTH_EXPIRED'
+      | 'AUTH_REPLAY'
+      | 'CLIENT_ID_IN_USE'
+      | 'INVITATION_EXPIRED'
+      | 'PEER_LIMIT'
+      | 'PROTOCOL_ERROR',
     message: string,
   ): void {
+    if (state.closing) return;
+    state.closing = true;
+    if (state.authTimer !== undefined) clearTimeout(state.authTimer);
+    state.authTimer = undefined;
     if (state.socket.readyState === WebSocket.OPEN) {
-      state.socket.send(
-        json({
-          type: 'auth.rejected',
-          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-          code,
-          message,
-        }),
-      );
-      state.socket.close(1008, code);
+      void state.sender
+        .sendRaw(
+          json({
+            type: 'auth.rejected',
+            protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+            code,
+            message,
+          }),
+        )
+        .finally(() => {
+          if (state.socket.readyState !== WebSocket.CLOSED) state.socket.close(1008, code);
+        })
+        .catch(() => this.removeConnection(state));
     }
   }
 
   private removeConnection(state: ConnectionState): void {
     if (state.authTimer !== undefined) clearTimeout(state.authTimer);
+    state.sender.dispose();
+    state.reassembler.dispose();
     const clientId = state.clientId;
     state.authenticated = false;
+    state.closing = true;
     state.clientId = undefined;
     this.connections.delete(state.socket);
     if (
@@ -603,6 +798,19 @@ export class CollaborationTransportServer {
       this.engine.releaseTextLeasesForClient(clientId);
     }
     if (state.socket.readyState !== WebSocket.CLOSED) state.socket.terminate();
+  }
+
+  private closeProtocolPeer(state: ConnectionState, reason: string): void {
+    if (state.closing) return;
+    state.closing = true;
+    state.authenticated = false;
+    state.sender.dispose();
+    state.reassembler.dispose();
+    if (state.socket.readyState === WebSocket.OPEN) state.socket.close(1008, reason.slice(0, 123));
+    const timer = setTimeout(() => {
+      if (state.socket.readyState !== WebSocket.CLOSED) state.socket.terminate();
+    }, 100);
+    timer.unref?.();
   }
 
   private purgeReplayNonces(): void {

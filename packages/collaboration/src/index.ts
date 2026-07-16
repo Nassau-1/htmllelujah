@@ -7,5 +7,6 @@ export * from './shared-drive.js';
 export * from './transport/client.js';
 export * from './transport/crypto.js';
 export * from './transport/discovery.js';
+export * from './transport/framing.js';
 export * from './transport/protocol.js';
 export * from './transport/server.js';

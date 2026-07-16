@@ -19,6 +19,7 @@ const clientIdSchema = z.string().trim().min(1).max(128);
 const nonceSchema = z.string().regex(/^[A-Za-z0-9_-]{22,128}$/);
 export const certificateFingerprintSchema = z.string().regex(/^sha256-[A-Za-z0-9_-]{43}$/);
 const proofSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+const chunkDataSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
 
 export const authChallengeSchema = z
   .object({
@@ -64,7 +65,9 @@ export const authRejectedSchema = z
       'AUTH_FAILED',
       'AUTH_EXPIRED',
       'AUTH_REPLAY',
+      'CLIENT_ID_IN_USE',
       'INVITATION_EXPIRED',
+      'PENDING_LIMIT',
       'PEER_LIMIT',
       'PROTOCOL_ERROR',
     ]),
@@ -168,6 +171,26 @@ export const presenceBroadcastSchema = z
   })
   .strict();
 
+export const transportChunkSchema = z
+  .object({
+    type: z.literal('transport.chunk'),
+    protocolVersion: z.literal(COLLABORATION_PROTOCOL_VERSION),
+    stream: z.enum(['client', 'server']),
+    transferId: identifierSchema,
+    index: z.number().int().nonnegative().max(65_535),
+    totalChunks: z.number().int().min(1).max(65_536),
+    totalBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+    sha256: proofSchema,
+    data: chunkDataSchema,
+    mac: proofSchema,
+  })
+  .strict()
+  .superRefine((chunk, context) => {
+    if (chunk.index >= chunk.totalChunks) {
+      context.addIssue({ code: 'custom', message: 'Chunk index exceeds transfer length.' });
+    }
+  });
+
 export const serverMessageSchema = z.discriminatedUnion('type', [
   authChallengeSchema,
   authAcceptedSchema,
@@ -199,3 +222,4 @@ export type AuthAccepted = z.infer<typeof authAcceptedSchema>;
 export type ClientRequestMessage = z.infer<typeof clientRequestMessageSchema>;
 export type ServerMessage = z.infer<typeof serverMessageSchema>;
 export type ManualInvitation = z.infer<typeof manualInvitationSchema>;
+export type TransportChunk = z.infer<typeof transportChunkSchema>;

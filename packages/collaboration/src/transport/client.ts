@@ -34,6 +34,19 @@ import {
   normalizeDocumentSecret,
 } from './crypto.js';
 import {
+  BoundedSender,
+  ChunkReassembler,
+  DEFAULT_CHUNK_TIMEOUT_MS,
+  DEFAULT_MAX_BUFFERED_BYTES,
+  DEFAULT_MAX_CONCURRENT_TRANSFERS,
+  DEFAULT_MAX_FRAME_BYTES,
+  DEFAULT_MAX_LOGICAL_PAYLOAD_BYTES,
+  DEFAULT_MAX_QUEUED_BYTES,
+  DEFAULT_MAX_REASSEMBLY_BYTES,
+  DEFAULT_SEND_TIMEOUT_MS,
+  TransportFramingError,
+} from './framing.js';
+import {
   authAcceptedSchema,
   authChallengeSchema,
   authRejectedSchema,
@@ -55,8 +68,16 @@ export interface CollaborationTransportClientOptions {
   readonly clientId: string;
   readonly documentSecret: Uint8Array;
   readonly maxPayloadBytes?: number;
+  readonly maxLogicalPayloadBytes?: number;
+  readonly maxReassemblyBytes?: number;
+  readonly maxConcurrentTransfers?: number;
+  readonly chunkTimeoutMs?: number;
+  readonly maxBufferedBytes?: number;
+  readonly maxQueuedBytes?: number;
+  readonly sendTimeoutMs?: number;
   readonly authTimeoutMs?: number;
   readonly requestTimeoutMs?: number;
+  readonly maxPendingRequests?: number;
   readonly clock?: () => number;
   readonly idFactory?: () => string;
   readonly nonceFactory?: () => string;
@@ -85,9 +106,9 @@ export class RemoteTransportError extends Error {
   }
 }
 
-const DEFAULT_MAX_PAYLOAD_BYTES = 1024 * 1024;
 const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_PENDING_REQUESTS = 128;
 
 export class CollaborationTransportClient {
   private readonly invitation: ManualInvitation;
@@ -95,8 +116,16 @@ export class CollaborationTransportClient {
   private readonly clientId: string;
   private readonly documentSecret: Buffer;
   private readonly maxPayloadBytes: number;
+  private readonly maxLogicalPayloadBytes: number;
+  private readonly maxReassemblyBytes: number;
+  private readonly maxConcurrentTransfers: number;
+  private readonly chunkTimeoutMs: number;
+  private readonly maxBufferedBytes: number;
+  private readonly maxQueuedBytes: number;
+  private readonly sendTimeoutMs: number;
   private readonly authTimeoutMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly maxPendingRequests: number;
   private readonly clock: () => number;
   private readonly idFactory: () => string;
   private readonly nonceFactory: () => string;
@@ -113,22 +142,44 @@ export class CollaborationTransportClient {
   private challengeAnswered = false;
   private authenticated = false;
   private clientNonce = '';
+  private sender: BoundedSender | undefined;
+  private reassembler: ChunkReassembler | undefined;
 
   public constructor(options: CollaborationTransportClientOptions) {
     this.invitation = manualInvitationSchema.parse(options.invitation);
     this.documentId = options.documentId;
     this.clientId = options.clientId;
     this.documentSecret = normalizeDocumentSecret(options.documentSecret);
-    this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
+    this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_FRAME_BYTES;
+    this.maxLogicalPayloadBytes =
+      options.maxLogicalPayloadBytes ?? DEFAULT_MAX_LOGICAL_PAYLOAD_BYTES;
+    this.maxReassemblyBytes = options.maxReassemblyBytes ?? DEFAULT_MAX_REASSEMBLY_BYTES;
+    this.maxConcurrentTransfers =
+      options.maxConcurrentTransfers ?? DEFAULT_MAX_CONCURRENT_TRANSFERS;
+    this.chunkTimeoutMs = options.chunkTimeoutMs ?? DEFAULT_CHUNK_TIMEOUT_MS;
+    this.maxBufferedBytes = options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
+    this.maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
+    this.sendTimeoutMs = options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
     this.authTimeoutMs = options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.maxPendingRequests = options.maxPendingRequests ?? DEFAULT_MAX_PENDING_REQUESTS;
     this.clock = options.clock ?? (() => Date.now());
     this.idFactory = options.idFactory ?? (() => globalThis.crypto.randomUUID());
     this.nonceFactory = options.nonceFactory ?? createNonce;
     if (
-      ![this.maxPayloadBytes, this.authTimeoutMs, this.requestTimeoutMs].every(
-        (value) => Number.isSafeInteger(value) && value > 0,
-      )
+      ![
+        this.maxPayloadBytes,
+        this.maxLogicalPayloadBytes,
+        this.maxReassemblyBytes,
+        this.maxConcurrentTransfers,
+        this.chunkTimeoutMs,
+        this.maxBufferedBytes,
+        this.maxQueuedBytes,
+        this.sendTimeoutMs,
+        this.authTimeoutMs,
+        this.requestTimeoutMs,
+        this.maxPendingRequests,
+      ].every((value) => Number.isSafeInteger(value) && value > 0)
     ) {
       throw new CollaborationError(
         'INVALID_REQUEST',
@@ -162,6 +213,27 @@ export class CollaborationTransportClient {
       maxPayload: this.maxPayloadBytes,
     });
     this.socket = socket;
+    this.sender = new BoundedSender(socket, {
+      stream: 'client',
+      secret: this.documentSecret,
+      idFactory: this.idFactory,
+      maxFrameBytes: this.maxPayloadBytes,
+      maxLogicalPayloadBytes: this.maxLogicalPayloadBytes,
+      maxBufferedBytes: this.maxBufferedBytes,
+      maxQueuedBytes: this.maxQueuedBytes,
+      sendTimeoutMs: this.sendTimeoutMs,
+    });
+    this.reassembler = new ChunkReassembler({
+      stream: 'server',
+      secret: this.documentSecret,
+      maxFrameBytes: this.maxPayloadBytes,
+      maxLogicalPayloadBytes: this.maxLogicalPayloadBytes,
+      maxReassemblyBytes: this.maxReassemblyBytes,
+      maxConcurrentTransfers: this.maxConcurrentTransfers,
+      chunkTimeoutMs: this.chunkTimeoutMs,
+      clock: this.clock,
+      onTimeout: (error) => this.failFraming(error),
+    });
     this.connectionPromise = new Promise<void>((resolve, reject) => {
       this.connectionResolve = resolve;
       this.connectionReject = reject;
@@ -323,13 +395,37 @@ export class CollaborationTransportClient {
     if (this.pending.has(requestId)) {
       throw new RemoteTransportError('DUPLICATE_REQUEST', 'A request with this ID is pending.');
     }
+    if (this.pending.size >= this.maxPendingRequests) {
+      throw new RemoteTransportError(
+        'BACKPRESSURE_LIMIT',
+        'Too many collaboration requests are pending.',
+      );
+    }
     return new Promise<ServerMessage>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         reject(new RemoteTransportError('REQUEST_TIMEOUT', 'Collaboration request timed out.'));
       }, this.requestTimeoutMs);
       this.pending.set(requestId, { expectedType, resolve, reject, timer });
-      socket.send(JSON.stringify(message));
+      const sender = this.sender;
+      if (sender === undefined) {
+        clearTimeout(timer);
+        this.pending.delete(requestId);
+        reject(new RemoteTransportError('NOT_CONNECTED', 'Transport sender is unavailable.'));
+        return;
+      }
+      void sender.sendLogical(message).catch((error: unknown) => {
+        const current = this.pending.get(requestId);
+        if (current === undefined) return;
+        clearTimeout(current.timer);
+        this.pending.delete(requestId);
+        if (error instanceof TransportFramingError && error.code === 'LOGICAL_PAYLOAD_TOO_LARGE') {
+          current.reject(new RemoteTransportError(error.code, error.message));
+          return;
+        }
+        current.reject(error instanceof Error ? error : new Error('Transport send failed.'));
+        this.failConnection(error instanceof Error ? error : new Error('Transport send failed.'));
+      });
     });
   }
 
@@ -338,12 +434,33 @@ export class CollaborationTransportClient {
       this.failConnection(new RemoteTransportError('PROTOCOL_ERROR', 'Binary frame rejected.'));
       return;
     }
-    let message: ServerMessage;
+    let raw: unknown;
     try {
-      message = serverMessageSchema.parse(JSON.parse(data.toString()));
+      raw = JSON.parse(data.toString());
     } catch {
       this.failConnection(new RemoteTransportError('PROTOCOL_ERROR', 'Malformed server message.'));
       return;
+    }
+
+    let message: ServerMessage;
+    if (!this.authenticated) {
+      try {
+        message = serverMessageSchema.parse(raw);
+      } catch {
+        this.failConnection(
+          new RemoteTransportError('PROTOCOL_ERROR', 'Malformed authentication message.'),
+        );
+        return;
+      }
+    } else {
+      try {
+        const logical = this.reassembler?.accept(raw);
+        if (logical === undefined) return;
+        message = serverMessageSchema.parse(JSON.parse(logical));
+      } catch (error) {
+        this.failFraming(error);
+        return;
+      }
     }
 
     if (message.type === 'auth.challenge') {
@@ -439,17 +556,38 @@ export class CollaborationTransportClient {
       expiresAtMs: challenge.expiresAtMs,
     });
     this.challengeAnswered = true;
-    this.socket?.send(
-      JSON.stringify({
-        type: 'auth.response',
-        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-        sessionId: challenge.sessionId,
-        documentId: this.documentId,
-        challengeId: challenge.challengeId,
-        clientId: this.clientId,
-        clientNonce: this.clientNonce,
-        proof,
-      }),
+    const response = JSON.stringify({
+      type: 'auth.response',
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      sessionId: challenge.sessionId,
+      documentId: this.documentId,
+      challengeId: challenge.challengeId,
+      clientId: this.clientId,
+      clientNonce: this.clientNonce,
+      proof,
+    });
+    const sender = this.sender;
+    if (sender === undefined) {
+      this.failConnection(new RemoteTransportError('NOT_CONNECTED', 'Transport sender missing.'));
+      return;
+    }
+    void sender.sendRaw(response).catch((error: unknown) => {
+      this.failConnection(
+        error instanceof Error ? error : new Error('Authentication send failed.'),
+      );
+    });
+  }
+
+  private failFraming(error: unknown): void {
+    const code =
+      error instanceof TransportFramingError && error.code === 'LOGICAL_PAYLOAD_TOO_LARGE'
+        ? 'LOGICAL_PAYLOAD_TOO_LARGE'
+        : 'PROTOCOL_ERROR';
+    this.failConnection(
+      new RemoteTransportError(
+        code,
+        error instanceof Error ? error.message : 'Malformed chunked transport payload.',
+      ),
     );
   }
 
@@ -465,6 +603,8 @@ export class CollaborationTransportClient {
     });
     this.pending.clear();
     const socket = this.socket;
+    this.sender?.dispose();
+    this.reassembler?.dispose();
     if (socket !== undefined && socket.readyState !== WebSocket.CLOSED) socket.terminate();
   }
 
@@ -483,6 +623,10 @@ export class CollaborationTransportClient {
     this.certificateVerified = false;
     this.challengeAnswered = false;
     this.socket = undefined;
+    this.sender?.dispose();
+    this.reassembler?.dispose();
+    this.sender = undefined;
+    this.reassembler = undefined;
     this.connectionPromise = undefined;
     this.connectionResolve = undefined;
     this.connectionReject = undefined;
