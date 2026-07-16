@@ -11,7 +11,7 @@
   },
   "scripts": {
     "build": "pnpm --workspace-concurrency=1 -r --if-present build",
-    "build:packages": "pnpm --workspace-concurrency=1 --filter ./packages/** -r --if-present build",
+    "build:packages": "pnpm --workspace-concurrency=1 --filter \"./packages/**\" -r --if-present build",
     "dev": "pnpm --filter @htmllelujah/desktop dev",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
