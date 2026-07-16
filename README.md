@@ -94,12 +94,12 @@ used as the live-edit protocol.
    leave and explicitly save an independent copy.
 
 Start exactly one host session. The writer sidecar is enforceable when every machine
-sees one coherent filesystem namespace, such as an SMB/NAS share. Google Drive,
-OneDrive, Dropbox, and similar tools usually expose separate local replicas; sync
-latency can let two independently started hosts both believe they own the file. V1
-therefore uses those folders only to carry snapshots and cannot make a cross-device
-single-writer guarantee between independent sessions. Participants must join the one
-LAN host instead of starting another host from their replica.
+sees one coherent filesystem namespace, such as an SMB/NAS share. Consumer
+synchronized folders usually expose separate local replicas; sync latency can let two
+independently started hosts both believe they own the file. V1 therefore uses those
+folders only to carry snapshots and cannot make a cross-device single-writer
+guarantee between independent sessions. Participants must join the one LAN host
+instead of starting another host from their replica.
 
 If the host disappears, guests stop editing rather than electing a new file writer or
 overwriting the shared file. Their acknowledged local recovery records remain

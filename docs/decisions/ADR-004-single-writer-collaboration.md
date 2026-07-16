@@ -33,7 +33,7 @@ independent sessions.
 - Simultaneous edits converge through the collaborative document state.
 - Writer loss preserves peer journals but never triggers an unverified overwrite.
 - Conflict copies with the same document ID require detection and explicit merge.
-- A true SMB/NAS namespace can enforce the writer lease; delayed OneDrive/Drive-style
+- A true SMB/NAS namespace can enforce the writer lease; delayed consumer-folder
   replication cannot.
 - Internet relay collaboration can later implement the same provider contract
   without changing the authoring format.

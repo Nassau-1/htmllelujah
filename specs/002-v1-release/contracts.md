@@ -509,8 +509,8 @@ V1 has no automatic host election, offline edit queue, disconnected merge, or
 simultaneous direct editing of one text element. On host loss, peers become read-only
 after bounded reconnect and may explicitly save independent copies with new IDs.
 Only a coherent shared filesystem such as SMB/NAS can enforce the writer sidecar
-across machines. OneDrive, Google Drive, Dropbox, and comparable local replicas carry
-snapshots but cannot arbitrate independently started hosts.
+across machines. Consumer-synchronization replicas carry snapshots but cannot
+arbitrate independently started hosts.
 
 ## Presentation and export contracts
 

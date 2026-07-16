@@ -212,10 +212,9 @@ synchronized folder may hold the same `.hdeck`, but the direct WSS session is th
 live command transport and the host is the only shared-file writer in that session.
 
 Use the lease as an enforcement mechanism only on a coherent shared filesystem such
-as SMB/NAS. With OneDrive, Google Drive, Dropbox, or another replicated local folder,
-designate one host out of band and have everyone else join it. Do not start two host
-sessions: both local replicas can acquire a lease before the sync provider propagates
-either sidecar.
+as SMB/NAS. With a consumer-synchronized local folder, designate one host out of band
+and have everyone else join it. Do not start two host sessions: both local replicas
+can acquire a lease before the synchronization service propagates either sidecar.
 
 - Share the endpoint, session code, and certificate fingerprint through a trusted
   channel; treat all three as sensitive session data.

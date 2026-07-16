@@ -163,9 +163,9 @@ the shared file within that authenticated session.
 
 The writer sidecar is a filesystem lease, not a cloud coordination service. It is
 authoritative only when participants observe one coherent namespace (for example an
-SMB/NAS share). Separate OneDrive/Google Drive/Dropbox replicas may both create a
-local lease before synchronization, so V1 requires one explicitly chosen host and
-does not claim to prevent a second independent host on another replica.
+SMB/NAS share). Separate consumer-synchronization replicas may both create a local
+lease before synchronization, so V1 requires one explicitly chosen host and does not
+claim to prevent a second independent host on another replica.
 
 Transport uses WSS with an ephemeral session certificate, displayed fingerprint,
 document-scoped session credential, HMAC-authenticated frames, bounded messages, and
