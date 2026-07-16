@@ -47,6 +47,7 @@ export const latestReleaseInput = async (repositoryRoot) => {
     path.join(repositoryRoot, 'apps', 'desktop', 'tsconfig.json'),
     path.join(repositoryRoot, 'apps', 'desktop', 'tsconfig.node.json'),
     path.join(repositoryRoot, 'apps', 'desktop', 'scripts', 'apply-fuses.mjs'),
+    path.join(repositoryRoot, 'apps', 'desktop', 'scripts', 'installer-association.nsh'),
     path.join(repositoryRoot, 'apps', 'desktop', 'vite.config.ts'),
   ];
   let newest = { mtimeMs: 0, path: null };
