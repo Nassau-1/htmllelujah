@@ -423,6 +423,36 @@ try {
     'Redo native image import',
   );
 
+  await click('[aria-label="Add table"]', 'Add table');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 3}`,
+    'Native table insertion',
+  );
+  await waitForRenderer(
+    `document.querySelector('[aria-label="Table cells (tab-separated values)"]') !== null`,
+    'Table TSV editor',
+  );
+  await setInputValue(
+    '[aria-label="Table cells (tab-separated values)"]',
+    'Company\tValue\nAlpha\t42',
+    'Table TSV data',
+  );
+  await clickButtonWithText('Paste TSV into table', 'Paste TSV into table');
+  await waitForRenderer(
+    `document.querySelector('.canonical-slide-surface')?.textContent?.includes('Alpha') === true && document.querySelector('.canonical-slide-surface')?.textContent?.includes('42') === true`,
+    'TSV rendered in native table',
+  );
+  await click('[aria-label="Undo"]', 'Undo TSV paste');
+  await waitForRenderer(
+    `document.querySelector('.canonical-slide-surface')?.textContent?.includes('Alpha') !== true`,
+    'Undo TSV paste result',
+  );
+  await click('[aria-label="Redo"]', 'Redo TSV paste');
+  await waitForRenderer(
+    `document.querySelector('.canonical-slide-surface')?.textContent?.includes('Alpha') === true`,
+    'Redo TSV paste result',
+  );
+
   await clickButtonWithText('File', 'File menu');
   await waitForRenderer(
     `document.querySelector('[role="menu"][aria-label="File menu"]') !== null`,
@@ -593,7 +623,7 @@ try {
     activeInspectorTab:
       document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() ?? '',
   }))()`);
-  if (finalState.elementCount !== initial.elementCount + 2 || finalState.selectedCount !== 1) {
+  if (finalState.elementCount !== initial.elementCount + 3 || finalState.selectedCount !== 1) {
     throw new Error('The user edit was not preserved after undo and redo.');
   }
   if (finalState.openDialogs !== 0 || finalState.activeInspectorTab !== 'Properties') {
@@ -626,6 +656,7 @@ try {
       'essential editor surfaces rendered',
       'shape insertion, undo, and redo converged',
       'native image chooser imported one decoded image with atomic undo and redo',
+      'native table insertion and literal TSV paste undid and redid cleanly',
       'File menu opened and closed',
       'Codex MCP dialog opened and closed',
       'LAN collaboration dialog opened and closed',
