@@ -452,6 +452,21 @@ try {
     `document.querySelector('.canonical-slide-surface')?.textContent?.includes('Alpha') === true`,
     'Redo TSV paste result',
   );
+  await click('[aria-label="Add icon"]', 'Add icon');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 4}`,
+    'Native icon insertion',
+  );
+  await click('[aria-label="Add flag"]', 'Add flag');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 5}`,
+    'Unicode flag insertion',
+  );
+  await click('[aria-label="Add connector"]', 'Add connector');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 6}`,
+    'Native connector insertion',
+  );
 
   await clickButtonWithText('File', 'File menu');
   await waitForRenderer(
@@ -623,7 +638,7 @@ try {
     activeInspectorTab:
       document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() ?? '',
   }))()`);
-  if (finalState.elementCount !== initial.elementCount + 3 || finalState.selectedCount !== 1) {
+  if (finalState.elementCount !== initial.elementCount + 6 || finalState.selectedCount !== 1) {
     throw new Error('The user edit was not preserved after undo and redo.');
   }
   if (finalState.openDialogs !== 0 || finalState.activeInspectorTab !== 'Properties') {
@@ -657,6 +672,7 @@ try {
       'shape insertion, undo, and redo converged',
       'native image chooser imported one decoded image with atomic undo and redo',
       'native table insertion and literal TSV paste undid and redid cleanly',
+      'native icon, Unicode flag, and connector insertions rendered',
       'File menu opened and closed',
       'Codex MCP dialog opened and closed',
       'LAN collaboration dialog opened and closed',
