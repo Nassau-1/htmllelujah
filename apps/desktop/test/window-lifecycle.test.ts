@@ -30,17 +30,41 @@ describe('native window lifecycle guards', () => {
         autosaveDelayMs: 0,
       });
       await expect(
-        initializeWindowSafely(
-          window,
-          async () => runtime.openMainOnly({ targetPath }),
-          cleanup,
-        ),
+        initializeWindowSafely(window, async () => runtime.openMainOnly({ targetPath }), cleanup),
       ).rejects.toMatchObject({ code: 'SAVE_FAILED' });
       expect(cleanup).toHaveBeenCalledOnce();
       expect(window.destroy).toHaveBeenCalledOnce();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it('revokes presentation registration before destroying a window whose navigation fails', async () => {
+    const window = fakeWindow();
+    const modes = new Map<number, 'presentation'>();
+    const sessions = new Map<number, string>();
+    const tokens = new Set<number>();
+    const webContentsId = 41;
+    modes.set(webContentsId, 'presentation');
+    sessions.set(webContentsId, 'presentation-session');
+    tokens.add(webContentsId);
+
+    await expect(
+      initializeWindowSafely(
+        window,
+        async () => Promise.reject(new Error('loadURL failed')),
+        async () => {
+          tokens.delete(webContentsId);
+          modes.delete(webContentsId);
+          sessions.delete(webContentsId);
+        },
+      ),
+    ).rejects.toThrow('loadURL failed');
+
+    expect(tokens.has(webContentsId)).toBe(false);
+    expect(modes.has(webContentsId)).toBe(false);
+    expect(sessions.has(webContentsId)).toBe(false);
+    expect(window.destroy).toHaveBeenCalledOnce();
   });
 
   it('keeps the window alive and reports a failed disk save without an unhandled rejection', async () => {

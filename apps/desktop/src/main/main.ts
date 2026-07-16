@@ -1535,25 +1535,36 @@ const createPresentationWindow = async (
       navigateOnDragDrop: false,
     },
   });
-  windowModes.set(window.webContents.id, 'presentation');
-  windowSessions.set(window.webContents.id, sessionId);
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  window.webContents.on('will-navigate', (event) => event.preventDefault());
-  window.webContents.on('will-attach-webview', (event) => event.preventDefault());
-  window.webContents.on('destroyed', () => {
-    revokeWebContentsTokens(window.webContents.id);
-    windowModes.delete(window.webContents.id);
-    windowSessions.delete(window.webContents.id);
-  });
-  window.once('ready-to-show', () => window.show());
-  const query = new URLSearchParams({ mode: 'presentation' });
-  if (startSlideId !== undefined) query.set('startSlideId', startSlideId);
-  if (process.env.VITE_DEV_SERVER_URL) {
-    await window.loadURL(`${process.env.VITE_DEV_SERVER_URL}?${query.toString()}`);
-  } else {
-    await window.loadURL(`htmllelujah-app://app/index.html?${query.toString()}`);
-  }
-  return window;
+  const webContentsId = window.webContents.id;
+  return initializeWindowSafely(
+    window,
+    async () => {
+      windowModes.set(webContentsId, 'presentation');
+      windowSessions.set(webContentsId, sessionId);
+      window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+      window.webContents.on('will-navigate', (event) => event.preventDefault());
+      window.webContents.on('will-attach-webview', (event) => event.preventDefault());
+      window.webContents.on('destroyed', () => {
+        revokeWebContentsTokens(webContentsId);
+        windowModes.delete(webContentsId);
+        windowSessions.delete(webContentsId);
+      });
+      window.once('ready-to-show', () => window.show());
+      const query = new URLSearchParams({ mode: 'presentation' });
+      if (startSlideId !== undefined) query.set('startSlideId', startSlideId);
+      if (process.env.VITE_DEV_SERVER_URL) {
+        await window.loadURL(`${process.env.VITE_DEV_SERVER_URL}?${query.toString()}`);
+      } else {
+        await window.loadURL(`htmllelujah-app://app/index.html?${query.toString()}`);
+      }
+      return window;
+    },
+    async () => {
+      revokeWebContentsTokens(webContentsId);
+      windowModes.delete(webContentsId);
+      windowSessions.delete(webContentsId);
+    },
+  );
 };
 
 const configureIpc = (): void => {
