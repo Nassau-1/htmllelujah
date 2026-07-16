@@ -565,6 +565,54 @@ const runScale = async ({ factor, executable }) => {
       assert(focused, `${label} could not receive keyboard focus.`);
     };
 
+    const waitForFittedCanvas = (label) =>
+      waitFor(
+        async () => {
+          const state = await evaluate(`(() => {
+            const fitButton = document.querySelector('button[aria-label="Fit slide"]');
+            const workspace = document.querySelector('section[aria-label="Slide workspace"]');
+            const canvas = document.querySelector('[data-testid="editor-canvas-root"]');
+            if (!(fitButton instanceof HTMLButtonElement) ||
+                !(workspace instanceof HTMLElement) || !(canvas instanceof HTMLElement)) {
+              return { valid: false, missing: true };
+            }
+            const workspaceRect = workspace.getBoundingClientRect();
+            const canvasRect = canvas.getBoundingClientRect();
+            const clientRight = workspaceRect.left + workspace.clientWidth;
+            const clientBottom = workspaceRect.top + workspace.clientHeight;
+            const tolerance = 2;
+            const contained = canvasRect.left >= workspaceRect.left - tolerance &&
+              canvasRect.top >= workspaceRect.top - tolerance &&
+              canvasRect.right <= clientRight + tolerance &&
+              canvasRect.bottom <= clientBottom + tolerance;
+            return {
+              valid: fitButton.getAttribute('aria-label') === 'Fit slide' &&
+                fitButton.getAttribute('aria-pressed') === 'true' && contained,
+              missing: false,
+              ariaLabel: fitButton.getAttribute('aria-label'),
+              ariaPressed: fitButton.getAttribute('aria-pressed'),
+              zoomPercent: Number(document.querySelector('[aria-label="Zoom percentage"]')?.value ?? 0),
+              contained,
+              workspace: {
+                left: workspaceRect.left,
+                top: workspaceRect.top,
+                right: clientRight,
+                bottom: clientBottom,
+              },
+              canvas: {
+                left: canvasRect.left,
+                top: canvasRect.top,
+                right: canvasRect.right,
+                bottom: canvasRect.bottom,
+              },
+            };
+          })()`);
+          return state.valid ? state : undefined;
+        },
+        10_000,
+        label,
+      );
+
     await focusSelector('.application-menu button', 'File menu button');
     await sendKey(cdp, 'Enter', 'Enter', 13);
     await waitForRenderer(
@@ -625,11 +673,74 @@ const runScale = async ({ factor, executable }) => {
     );
     await focusSelector('[aria-label="Fit slide"]', 'Fit slide button');
     await sendKey(cdp, 'Enter', 'Enter', 13);
-    await waitForRenderer(
-      `Number(document.querySelector('[aria-label="Zoom percentage"]')?.value ?? 0) === 100`,
-      'Keyboard canvas zoom reset',
-    );
+    const fittedCanvas = await waitForFittedCanvas('Keyboard canvas fit');
     const postZoomLayout = await layoutAudit('post-keyboard-zoom');
+
+    await focusSelector('[aria-label="Zoom percentage"]', 'Canvas zoom slider');
+    await sendKey(cdp, 'End', 'End', 35);
+    await waitForRenderer(
+      `Number(document.querySelector('[aria-label="Zoom percentage"]')?.value ?? 0) === 200`,
+      'Keyboard canvas 200 percent zoom',
+    );
+    const scrollAt200Percent = await evaluate(`(async () => {
+      const workspace = document.querySelector('section[aria-label="Slide workspace"]');
+      const canvas = document.querySelector('[data-testid="editor-canvas-root"]');
+      if (!(workspace instanceof HTMLElement) || !(canvas instanceof HTMLElement)) {
+        return { valid: false, missing: true, corners: [] };
+      }
+      const settle = () => new Promise((resolve) => requestAnimationFrame(() =>
+        requestAnimationFrame(resolve)));
+      const maxLeft = Math.max(0, workspace.scrollWidth - workspace.clientWidth);
+      const maxTop = Math.max(0, workspace.scrollHeight - workspace.clientHeight);
+      const targets = [
+        { name: 'top-left', left: 0, top: 0, horizontal: 'left', vertical: 'top' },
+        { name: 'top-right', left: maxLeft, top: 0, horizontal: 'right', vertical: 'top' },
+        { name: 'bottom-right', left: maxLeft, top: maxTop, horizontal: 'right', vertical: 'bottom' },
+        { name: 'bottom-left', left: 0, top: maxTop, horizontal: 'left', vertical: 'bottom' },
+      ];
+      const corners = [];
+      for (const target of targets) {
+        workspace.scrollLeft = target.left;
+        workspace.scrollTop = target.top;
+        await settle();
+        const workspaceRect = workspace.getBoundingClientRect();
+        const canvasRect = canvas.getBoundingClientRect();
+        const viewportRight = workspaceRect.left + workspace.clientWidth;
+        const viewportBottom = workspaceRect.top + workspace.clientHeight;
+        const horizontalCornerVisible = target.horizontal === 'left'
+          ? canvasRect.left >= workspaceRect.left - 2 && canvasRect.left <= viewportRight + 2
+          : canvasRect.right <= viewportRight + 2 && canvasRect.right >= workspaceRect.left - 2;
+        const verticalCornerVisible = target.vertical === 'top'
+          ? canvasRect.top >= workspaceRect.top - 2 && canvasRect.top <= viewportBottom + 2
+          : canvasRect.bottom <= viewportBottom + 2 && canvasRect.bottom >= workspaceRect.top - 2;
+        corners.push({
+          name: target.name,
+          targetLeft: target.left,
+          targetTop: target.top,
+          actualLeft: workspace.scrollLeft,
+          actualTop: workspace.scrollTop,
+          reached: Math.abs(workspace.scrollLeft - target.left) <= 2 &&
+            Math.abs(workspace.scrollTop - target.top) <= 2,
+          canvasCornerVisible: horizontalCornerVisible && verticalCornerVisible,
+        });
+      }
+      return {
+        valid: maxLeft > 2 && maxTop > 2 &&
+          corners.every((corner) => corner.reached && corner.canvasCornerVisible),
+        missing: false,
+        maxLeft,
+        maxTop,
+        corners,
+      };
+    })()`);
+    assert(
+      scrollAt200Percent.valid,
+      `The 200 percent canvas could not be reached at all four corners: ${JSON.stringify(scrollAt200Percent)}`,
+    );
+
+    await focusSelector('[aria-label="Fit slide"]', 'Fit slide button after 200 percent zoom');
+    await sendKey(cdp, 'Enter', 'Enter', 13);
+    const refittedCanvas = await waitForFittedCanvas('Canvas refit after four-corner scroll');
 
     await cdp.send('Emulation.setEmulatedMedia', {
       media: '',
@@ -771,6 +882,9 @@ const runScale = async ({ factor, executable }) => {
         fileMenuItem: menuFocus,
         canvasZoomBefore: zoomBefore,
         canvasZoomFromKeyboard: zoomKeyboardValue,
+        fittedCanvas,
+        scrollAt200Percent,
+        refittedCanvas,
       },
       reducedMotion,
       dom: domAudit,

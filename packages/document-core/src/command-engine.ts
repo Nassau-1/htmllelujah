@@ -11,6 +11,7 @@ import { documentCommandSchema, transactionMetadataSchema } from './commands.js'
 import { DOCUMENT_LIMITS } from './limits.js';
 import type {
   DeckDocument,
+  ConnectorEndpoint,
   Element,
   ElementStylePatch,
   Frame,
@@ -193,7 +194,113 @@ const replaceFrames = (
 ): readonly Element[] =>
   elements.map((element) => {
     const frame = frames.get(element.id);
-    return frame === undefined ? element : withPlaceholderOverride({ ...element, frame }, 'frame');
+    if (frame === undefined) return element;
+    const transformed =
+      element.type === 'connector'
+        ? {
+            ...element,
+            frame,
+            start: connectorEndpointAfterFrameTransform(element.start, element.frame, frame),
+            end: connectorEndpointAfterFrameTransform(element.end, element.frame, frame),
+          }
+        : { ...element, frame };
+    return withPlaceholderOverride(transformed, 'frame');
+  });
+
+const rotatePoint = (
+  point: Readonly<{ xPt: number; yPt: number }>,
+  centerXPt: number,
+  centerYPt: number,
+  rotationDeg: number,
+): Readonly<{ xPt: number; yPt: number }> => {
+  if (rotationDeg === 0) return point;
+  const radians = (rotationDeg * Math.PI) / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  const deltaX = point.xPt - centerXPt;
+  const deltaY = point.yPt - centerYPt;
+  return {
+    xPt: centerXPt + deltaX * cosine - deltaY * sine,
+    yPt: centerYPt + deltaX * sine + deltaY * cosine,
+  };
+};
+
+/**
+ * Connector endpoint coordinates are persisted in their container coordinate space.
+ * Re-express the fallback point in the replacement frame so moving, resizing, and
+ * rotating a connector never leaves its hit frame detached from the painted line.
+ * A binding is deliberately preserved: renderers continue to prefer its live anchor,
+ * while the transformed fallback remains ready if that target is later deleted.
+ */
+const connectorEndpointAfterFrameTransform = (
+  endpoint: ConnectorEndpoint,
+  previousFrame: Frame,
+  nextFrame: Frame,
+): ConnectorEndpoint => {
+  const previousCenterX = previousFrame.xPt + previousFrame.widthPt / 2;
+  const previousCenterY = previousFrame.yPt + previousFrame.heightPt / 2;
+  const unrotated = rotatePoint(
+    endpoint,
+    previousCenterX,
+    previousCenterY,
+    -previousFrame.rotationDeg,
+  );
+  const normalizedX = (unrotated.xPt - previousFrame.xPt) / previousFrame.widthPt;
+  const normalizedY = (unrotated.yPt - previousFrame.yPt) / previousFrame.heightPt;
+  const nextCenterX = nextFrame.xPt + nextFrame.widthPt / 2;
+  const nextCenterY = nextFrame.yPt + nextFrame.heightPt / 2;
+  const nextUnrotated = {
+    xPt: nextFrame.xPt + normalizedX * nextFrame.widthPt,
+    yPt: nextFrame.yPt + normalizedY * nextFrame.heightPt,
+  };
+  const transformed = rotatePoint(nextUnrotated, nextCenterX, nextCenterY, nextFrame.rotationDeg);
+  return { ...endpoint, ...transformed };
+};
+
+const collectElementIds = (elements: readonly Element[], output: Set<string>): void => {
+  for (const element of elements) {
+    output.add(element.id);
+    if (element.type === 'group') collectElementIds(element.children, output);
+  }
+};
+
+const releaseDeletedConnectorBindings = (
+  elements: readonly Element[],
+  deletedIds: ReadonlySet<string>,
+): readonly Element[] =>
+  elements.map((element) => {
+    if (element.type === 'group') {
+      return {
+        ...element,
+        children: releaseDeletedConnectorBindings(element.children, deletedIds),
+      };
+    }
+    if (element.type !== 'connector') return element;
+    const release = (endpoint: ConnectorEndpoint): ConnectorEndpoint =>
+      endpoint.binding.elementId !== undefined && deletedIds.has(endpoint.binding.elementId)
+        ? { ...endpoint, binding: {} }
+        : endpoint;
+    return { ...element, start: release(element.start), end: release(element.end) };
+  });
+
+const deleteElementsAndReleaseConnectorBindings = (
+  document: DeckDocument,
+  slideId: string,
+  containerId: string | undefined,
+  elementIds: readonly string[],
+): DeckDocument =>
+  replaceSlide(document, slideId, (slide) => {
+    const deletedIds = new Set<string>();
+    const withoutDeleted = updateContainer(slide.elements, containerId, (elements) => {
+      const selected = requireElements(elements, elementIds);
+      requireEditable(selected);
+      collectElementIds(selected, deletedIds);
+      return elements.filter((element) => !deletedIds.has(element.id));
+    });
+    return {
+      ...slide,
+      elements: releaseDeletedConnectorBindings(withoutDeleted, deletedIds),
+    };
   });
 
 function withPlaceholderOverride(
@@ -304,14 +411,25 @@ const groupElements = (document: DeckDocument, command: GroupElementsCommand): D
     );
     const children = elements
       .filter((element) => selectedIds.has(element.id))
-      .map((element) => ({
-        ...element,
-        frame: {
+      .map((element): Element => {
+        const frame = {
           ...element.frame,
           xPt: element.frame.xPt - bounds.left,
           yPt: element.frame.yPt - bounds.top,
-        },
-      }));
+        };
+        if (element.type !== 'connector') return { ...element, frame };
+        const intoGroup = (endpoint: ConnectorEndpoint): ConnectorEndpoint => ({
+          ...endpoint,
+          xPt: endpoint.xPt - bounds.left,
+          yPt: endpoint.yPt - bounds.top,
+        });
+        return {
+          ...element,
+          frame,
+          start: intoGroup(element.start),
+          end: intoGroup(element.end),
+        };
+      });
     const group: GroupElement = {
       id: command.groupId,
       name: command.name,
@@ -359,6 +477,25 @@ const childFrameAfterUngroup = (child: Element, group: GroupElement): Frame => {
   };
 };
 
+const connectorEndpointAfterUngroup = (
+  endpoint: ConnectorEndpoint,
+  group: GroupElement,
+): ConnectorEndpoint => {
+  const scaleX = group.frame.widthPt / group.coordinateSpace.widthPt;
+  const scaleY = group.frame.heightPt / group.coordinateSpace.heightPt;
+  const unrotated = {
+    xPt: group.frame.xPt + endpoint.xPt * scaleX,
+    yPt: group.frame.yPt + endpoint.yPt * scaleY,
+  };
+  const transformed = rotatePoint(
+    unrotated,
+    group.frame.xPt + group.frame.widthPt / 2,
+    group.frame.yPt + group.frame.heightPt / 2,
+    group.frame.rotationDeg,
+  );
+  return { ...endpoint, ...transformed };
+};
+
 const ungroupElements = (document: DeckDocument, command: UngroupElementsCommand): DeckDocument =>
   updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
     const groupIndex = elements.findIndex((element) => element.id === command.groupId);
@@ -370,12 +507,20 @@ const ungroupElements = (document: DeckDocument, command: UngroupElementsCommand
       );
     }
     requireEditable([element]);
-    const children = element.children.map((child): Element => ({
-      ...child,
-      frame: childFrameAfterUngroup(child, element),
-      opacity: child.opacity * element.opacity,
-      visible: child.visible && element.visible,
-    }));
+    const children = element.children.map((child): Element => {
+      const frame = childFrameAfterUngroup(child, element);
+      const opacity = child.opacity * element.opacity;
+      const visible = child.visible && element.visible;
+      if (child.type !== 'connector') return { ...child, frame, opacity, visible };
+      return {
+        ...child,
+        frame,
+        opacity,
+        visible,
+        start: connectorEndpointAfterUngroup(child.start, element),
+        end: connectorEndpointAfterUngroup(child.end, element),
+      };
+    });
     return [...elements.slice(0, groupIndex), ...children, ...elements.slice(groupIndex + 1)];
   });
 
@@ -590,6 +735,84 @@ const placeholdersForSlide = (
   return output;
 };
 
+const placeholderAcceptsElement = (placeholder: PlaceholderElement, element: Element): boolean =>
+  element.type !== 'connector' &&
+  element.type !== 'group' &&
+  element.type !== 'placeholder' &&
+  placeholder.accepts.includes(element.type);
+
+const remapPlaceholderBindings = (
+  sourceDocument: DeckDocument,
+  targetDocument: DeckDocument,
+  slide: Slide,
+  layoutId: string,
+): readonly Element[] => {
+  const sourcePlaceholders = placeholdersForSlide(sourceDocument, slide);
+  const targetPlaceholders = [
+    ...placeholdersForSlide(targetDocument, { ...slide, layoutId }).values(),
+  ];
+  const targetPlaceholdersById = new Map(
+    targetPlaceholders.map((placeholder) => [placeholder.id, placeholder]),
+  );
+
+  // Reserve bindings inherited by both layouts before remapping. This prevents an
+  // earlier element from claiming a shared placeholder that a later element already uses.
+  const retainedPlaceholderIds = new Set<string>();
+  const reserveRetainedBindings = (element: Element): void => {
+    if (element.type === 'group') {
+      element.children.forEach(reserveRetainedBindings);
+      return;
+    }
+    const placeholderId = element.placeholderBinding?.placeholderId;
+    if (placeholderId === undefined) return;
+    const targetPlaceholder = targetPlaceholdersById.get(placeholderId);
+    if (targetPlaceholder !== undefined && placeholderAcceptsElement(targetPlaceholder, element)) {
+      retainedPlaceholderIds.add(placeholderId);
+    }
+  };
+  slide.elements.forEach(reserveRetainedBindings);
+
+  const usedPlaceholderIds = new Set(retainedPlaceholderIds);
+  const visit = (element: Element): Element => {
+    if (element.type === 'group') {
+      return { ...element, children: element.children.map(visit) };
+    }
+    const binding = element.placeholderBinding;
+    if (binding === undefined) return element;
+
+    const retainedPlaceholder = targetPlaceholdersById.get(binding.placeholderId);
+    if (
+      retainedPlaceholder !== undefined &&
+      placeholderAcceptsElement(retainedPlaceholder, element)
+    ) {
+      return element;
+    }
+
+    const sourcePlaceholder = sourcePlaceholders.get(binding.placeholderId);
+    const replacement =
+      sourcePlaceholder === undefined
+        ? undefined
+        : targetPlaceholders.find(
+            (candidate) =>
+              candidate.role === sourcePlaceholder.role &&
+              !usedPlaceholderIds.has(candidate.id) &&
+              placeholderAcceptsElement(candidate, element),
+          );
+    if (replacement === undefined) {
+      const { placeholderBinding: _placeholderBinding, ...unbound } = element;
+      return unbound;
+    }
+
+    usedPlaceholderIds.add(replacement.id);
+    return {
+      ...element,
+      placeholderBinding: { ...binding, placeholderId: replacement.id },
+    };
+  };
+
+  return slide.elements.map(visit);
+};
+
 const resetPlaceholderElements = (
   elements: readonly Element[],
   placeholder: PlaceholderElement,
@@ -622,13 +845,7 @@ const resetPlaceholderElements = (
     return withoutStyle;
   };
   const result = elements.map(visit);
-  if (!found) {
-    throw new DocumentCommandError(
-      'NOT_FOUND',
-      `No slide element is bound to placeholder ${placeholder.id}.`,
-    );
-  }
-  return result;
+  return found ? result : elements;
 };
 
 const elementReferencesAsset = (element: Element, assetId: string): boolean => {
@@ -671,6 +888,14 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
       return { ...document, name: command.name };
     case 'deck.set-page':
       return { ...document, page: command.page };
+    case 'deck.set-export-options':
+      return {
+        ...document,
+        settings: {
+          ...document.settings,
+          includeHiddenSlidesInExport: command.includeHiddenSlidesInExport,
+        },
+      };
     case 'theme.create':
       return {
         ...document,
@@ -742,10 +967,26 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
       if (!document.masters.some((master) => master.id === command.masterId)) {
         throw new DocumentCommandError('NOT_FOUND', `Master ${command.masterId} does not exist.`);
       }
-      return {
+      const targetDocument: DeckDocument = {
         ...document,
         masters: document.masters.map((master) =>
           master.id === command.masterId ? command.replacement : master,
+        ),
+      };
+      const affectedLayoutIds = new Set(
+        document.layouts
+          .filter((layout) => layout.masterId === command.masterId)
+          .map((layout) => layout.id),
+      );
+      return {
+        ...targetDocument,
+        slides: document.slides.map((slide) =>
+          affectedLayoutIds.has(slide.layoutId)
+            ? {
+                ...slide,
+                elements: remapPlaceholderBindings(document, targetDocument, slide, slide.layoutId),
+              }
+            : slide,
         ),
       };
     }
@@ -770,7 +1011,7 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
       ) {
         throw new DocumentCommandError('NOT_FOUND', 'Replacement master does not exist.');
       }
-      return {
+      const targetDocument: DeckDocument = {
         ...document,
         masters: document.masters.filter((master) => master.id !== command.masterId),
         layouts:
@@ -781,6 +1022,22 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
                   ? { ...layout, masterId: command.replacementMasterId as string }
                   : layout,
               ),
+      };
+      const affectedLayoutIds = new Set(
+        document.layouts
+          .filter((layout) => layout.masterId === command.masterId)
+          .map((layout) => layout.id),
+      );
+      return {
+        ...targetDocument,
+        slides: document.slides.map((slide) =>
+          affectedLayoutIds.has(slide.layoutId)
+            ? {
+                ...slide,
+                elements: remapPlaceholderBindings(document, targetDocument, slide, slide.layoutId),
+              }
+            : slide,
+        ),
       };
     }
     case 'layout.create':
@@ -798,10 +1055,21 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
       if (!document.layouts.some((layout) => layout.id === command.layoutId)) {
         throw new DocumentCommandError('NOT_FOUND', `Layout ${command.layoutId} does not exist.`);
       }
-      return {
+      const targetDocument: DeckDocument = {
         ...document,
         layouts: document.layouts.map((layout) =>
           layout.id === command.layoutId ? command.replacement : layout,
+        ),
+      };
+      return {
+        ...targetDocument,
+        slides: document.slides.map((slide) =>
+          slide.layoutId === command.layoutId
+            ? {
+                ...slide,
+                elements: remapPlaceholderBindings(document, targetDocument, slide, slide.layoutId),
+              }
+            : slide,
         ),
       };
     }
@@ -826,7 +1094,7 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
       ) {
         throw new DocumentCommandError('NOT_FOUND', 'Replacement layout does not exist.');
       }
-      return {
+      const targetDocument: DeckDocument = {
         ...document,
         layouts: document.layouts.filter((layout) => layout.id !== command.layoutId),
         slides:
@@ -837,6 +1105,23 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
                   ? { ...slide, layoutId: command.replacementLayoutId as string }
                   : slide,
               ),
+      };
+      return {
+        ...targetDocument,
+        slides: document.slides.map((slide) =>
+          slide.layoutId === command.layoutId && command.replacementLayoutId !== undefined
+            ? {
+                ...slide,
+                layoutId: command.replacementLayoutId,
+                elements: remapPlaceholderBindings(
+                  document,
+                  targetDocument,
+                  slide,
+                  command.replacementLayoutId,
+                ),
+              }
+            : slide,
+        ),
       };
     }
     case 'slide.duplicate': {
@@ -882,6 +1167,7 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
       return replaceSlide(document, command.slideId, (slide) => ({
         ...slide,
         layoutId: command.layoutId,
+        elements: remapPlaceholderBindings(document, document, slide, command.layoutId),
       }));
     case 'slide.reset-placeholder':
       return replaceSlide(document, command.slideId, (slide) => {
@@ -1311,12 +1597,12 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
         );
       });
     case 'element.delete':
-      return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
-        const selected = requireElements(elements, command.elementIds);
-        requireEditable(selected);
-        const selectedIds = new Set(command.elementIds);
-        return elements.filter((element) => !selectedIds.has(element.id));
-      });
+      return deleteElementsAndReleaseConnectorBindings(
+        document,
+        command.slideId,
+        command.containerId,
+        command.elementIds,
+      );
     case 'element.transform':
       return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
         const elementIds = command.transforms.map((transform) => transform.elementId);

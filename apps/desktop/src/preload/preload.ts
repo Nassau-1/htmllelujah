@@ -6,6 +6,8 @@ import {
   type AppInfo,
   type CollaborationHostInput,
   type CollaborationJoinInput,
+  type CollaborationJoinDecisionInput,
+  type CollaborationPresenceInput,
   type CollaborationStatus,
   type CollaborationTextLeaseInput,
   type CollaborationTextLeaseStatus,
@@ -100,6 +102,14 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
     invoke(DESKTOP_IPC.collaborationHost, input),
   collaborationJoin: (input: CollaborationJoinInput): Promise<DesktopResult<CollaborationStatus>> =>
     invoke(DESKTOP_IPC.collaborationJoin, input),
+  collaborationDecideJoin: (
+    input: CollaborationJoinDecisionInput,
+  ): Promise<DesktopResult<CollaborationStatus>> =>
+    invoke(DESKTOP_IPC.collaborationDecideJoin, input),
+  collaborationUpdatePresence: (
+    input: CollaborationPresenceInput,
+  ): Promise<DesktopResult<CollaborationStatus>> =>
+    invoke(DESKTOP_IPC.collaborationUpdatePresence, input),
   collaborationLeave: (input: SessionInput): Promise<DesktopResult<CollaborationStatus>> =>
     invoke(DESKTOP_IPC.collaborationLeave, input),
   collaborationTextLeaseStatus: (

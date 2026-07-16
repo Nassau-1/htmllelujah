@@ -36,16 +36,20 @@ import {
 } from './framing.js';
 import {
   authChallengeSchema,
+  authPendingSchema,
   authResponseSchema,
+  collaborationDisplayNameSchema,
   clientRequestMessageSchema,
   manualInvitationSchema,
   type AuthChallenge,
+  type AuthResponse,
   type ClientRequestMessage,
   type ManualInvitation,
 } from './protocol.js';
 
 export interface CollaborationTransportServerOptions {
   readonly engine: AuthoritativeSessionHost;
+  readonly hostClientId?: string;
   readonly documentSecret: Uint8Array;
   readonly bindHost?: string;
   readonly advertisedHost?: string;
@@ -66,6 +70,8 @@ export interface CollaborationTransportServerOptions {
   readonly maxMessagesPerWindow?: number;
   readonly rateWindowMs?: number;
   readonly authTimeoutMs?: number;
+  readonly joinApprovalTimeoutMs?: number;
+  readonly reconnectGrantTtlMs?: number;
   readonly invitationTtlMs?: number;
   readonly clock?: () => number;
   readonly idFactory?: () => string;
@@ -80,13 +86,33 @@ interface ConnectionState {
   readonly reassembler: ChunkReassembler;
   authTimer: ReturnType<typeof setTimeout> | undefined;
   authenticated: boolean;
+  operationalReady: boolean;
   closing: boolean;
   clientId: string | undefined;
+  displayName: string | undefined;
+  pendingJoinRequestId: string | undefined;
+  pendingJoinRequestedAtMs: number | undefined;
+  pendingJoinExpiresAtMs: number | undefined;
   windowStartedAtMs: number;
   messageCount: number;
   requestQueue: Promise<void>;
   queuedRequests: number;
   queuedRequestBytes: number;
+}
+
+export interface PendingJoinRequest {
+  readonly joinRequestId: string;
+  readonly clientId: string;
+  readonly displayName: string;
+  readonly requestedAtMs: number;
+  readonly expiresAtMs: number;
+}
+
+interface ReconnectGrant {
+  readonly clientId: string;
+  readonly displayName: string;
+  readonly token: string;
+  readonly expiresAtMs: number;
 }
 
 interface PreUpgradeConnectionState {
@@ -97,6 +123,8 @@ interface PreUpgradeConnectionState {
   upgraded: boolean;
 }
 
+const MAX_AUTHENTICATED_PEERS = 32;
+
 const DEFAULT_MAX_PEERS = 8;
 const DEFAULT_MAX_PENDING_CONNECTIONS = 16;
 const DEFAULT_MAX_PENDING_PER_ADDRESS = 8;
@@ -105,6 +133,8 @@ const DEFAULT_MAX_QUEUED_REQUEST_BYTES = 32 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT = 60;
 const DEFAULT_RATE_WINDOW_MS = 1_000;
 const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
+const DEFAULT_JOIN_APPROVAL_TIMEOUT_MS = 60_000;
+const DEFAULT_RECONNECT_GRANT_TTL_MS = 2 * 60_000;
 const DEFAULT_INVITATION_TTL_MS = 12 * 60 * 60 * 1_000;
 
 const json = (value: unknown): string => JSON.stringify(value);
@@ -112,6 +142,7 @@ const json = (value: unknown): string => JSON.stringify(value);
 export class CollaborationTransportServer {
   private readonly engine: AuthoritativeSessionHost;
   private readonly documentSecret: Buffer;
+  private readonly hostClientId: string | undefined;
   private readonly bindHost: string;
   private readonly advertisedHost: string;
   private readonly requestedPort: number;
@@ -131,6 +162,8 @@ export class CollaborationTransportServer {
   private readonly maxMessagesPerWindow: number;
   private readonly rateWindowMs: number;
   private readonly authTimeoutMs: number;
+  private readonly joinApprovalTimeoutMs: number;
+  private readonly reconnectGrantTtlMs: number;
   private readonly invitationTtlMs: number;
   private readonly clock: () => number;
   private readonly idFactory: () => string;
@@ -138,6 +171,9 @@ export class CollaborationTransportServer {
   private readonly connections = new Map<WebSocket, ConnectionState>();
   private readonly preUpgradeConnections = new Map<string, PreUpgradeConnectionState>();
   private readonly replayNonces = new Map<string, number>();
+  private readonly reconnectGrants = new Map<string, ReconnectGrant>();
+  private readonly pendingJoinListeners = new Set<(request: PendingJoinRequest) => void>();
+  private readonly participantListeners = new Set<() => void>();
   private httpsServer: HttpsServer | undefined;
   private webSocketServer: WebSocketServer | undefined;
   private invitation: ManualInvitation | undefined;
@@ -147,6 +183,7 @@ export class CollaborationTransportServer {
 
   public constructor(options: CollaborationTransportServerOptions) {
     this.engine = options.engine;
+    this.hostClientId = options.hostClientId?.trim();
     this.documentSecret = normalizeDocumentSecret(options.documentSecret);
     this.bindHost = options.bindHost ?? '127.0.0.1';
     this.advertisedHost = options.advertisedHost ?? this.bindHost;
@@ -171,6 +208,8 @@ export class CollaborationTransportServer {
     this.maxMessagesPerWindow = options.maxMessagesPerWindow ?? DEFAULT_RATE_LIMIT;
     this.rateWindowMs = options.rateWindowMs ?? DEFAULT_RATE_WINDOW_MS;
     this.authTimeoutMs = options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS;
+    this.joinApprovalTimeoutMs = options.joinApprovalTimeoutMs ?? DEFAULT_JOIN_APPROVAL_TIMEOUT_MS;
+    this.reconnectGrantTtlMs = options.reconnectGrantTtlMs ?? DEFAULT_RECONNECT_GRANT_TTL_MS;
     this.invitationTtlMs = options.invitationTtlMs ?? DEFAULT_INVITATION_TTL_MS;
     this.clock = options.clock ?? (() => Date.now());
     this.idFactory = options.idFactory ?? (() => globalThis.crypto.randomUUID());
@@ -193,15 +232,24 @@ export class CollaborationTransportServer {
         this.maxMessagesPerWindow,
         this.rateWindowMs,
         this.authTimeoutMs,
+        this.joinApprovalTimeoutMs,
+        this.reconnectGrantTtlMs,
         this.invitationTtlMs,
       ].every((value) => Number.isSafeInteger(value) && value > 0) ||
+      this.joinApprovalTimeoutMs > 5 * 60_000 ||
+      this.reconnectGrantTtlMs > 10 * 60_000 ||
+      this.maxPeers > MAX_AUTHENTICATED_PEERS ||
+      (this.hostClientId !== undefined &&
+        (this.hostClientId.length < 1 ||
+          this.hostClientId.length > 128 ||
+          /[\p{Cc}\p{Cf}]/u.test(this.hostClientId))) ||
       !Number.isSafeInteger(this.requestedPort) ||
       this.requestedPort < 0 ||
       this.requestedPort > 65_535
     ) {
       throw new CollaborationError(
         'INVALID_REQUEST',
-        'Transport limits and timeouts must be positive safe integers and the port must be valid.',
+        'Transport limits and timeouts must be positive safe integers, maxPeers must not exceed 32, and the port must be valid.',
       );
     }
   }
@@ -216,6 +264,78 @@ export class CollaborationTransportServer {
 
   public get pendingHandshakeCount(): number {
     return [...this.preUpgradeConnections.values()].filter((state) => !state.upgraded).length;
+  }
+
+  public onPendingJoin(listener: (request: PendingJoinRequest) => void): () => void {
+    this.pendingJoinListeners.add(listener);
+    return () => this.pendingJoinListeners.delete(listener);
+  }
+
+  public onParticipantsChanged(listener: () => void): () => void {
+    this.participantListeners.add(listener);
+    return () => this.participantListeners.delete(listener);
+  }
+
+  public listPendingJoins(): readonly PendingJoinRequest[] {
+    this.purgeExpiredPendingJoins();
+    return [...this.connections.values()]
+      .map((state) => this.pendingJoinForState(state))
+      .filter((request): request is PendingJoinRequest => request !== undefined)
+      .sort((left, right) => left.requestedAtMs - right.requestedAtMs)
+      .map((request) => structuredClone(request));
+  }
+
+  public async approveJoin(joinRequestId: string): Promise<boolean> {
+    this.purgeExpiredPendingJoins();
+    const state = [...this.connections.values()].find(
+      (candidate) => candidate.pendingJoinRequestId === joinRequestId,
+    );
+    if (state === undefined || state.clientId === undefined || state.displayName === undefined) {
+      return false;
+    }
+    if (this.authenticatedPeerCount >= this.maxPeers) {
+      this.rejectAuthentication(
+        state,
+        'PEER_LIMIT',
+        'The collaboration session reached its authenticated peer limit.',
+      );
+      return false;
+    }
+    if (
+      [...this.connections.values()].some(
+        (candidate) =>
+          candidate !== state && candidate.authenticated && candidate.clientId === state.clientId,
+      )
+    ) {
+      this.rejectAuthentication(
+        state,
+        'CLIENT_ID_IN_USE',
+        'The collaboration client identity is already connected.',
+      );
+      return false;
+    }
+    await this.acceptAuthenticatedConnection(state);
+    return state.authenticated && state.operationalReady;
+  }
+
+  public rejectJoin(joinRequestId: string): boolean {
+    this.purgeExpiredPendingJoins();
+    const state = [...this.connections.values()].find(
+      (candidate) => candidate.pendingJoinRequestId === joinRequestId,
+    );
+    if (state === undefined) return false;
+    this.rejectAuthentication(state, 'JOIN_REJECTED', 'The host rejected this join request.');
+    return true;
+  }
+
+  public async publishPresence(update: PresenceUpdate): Promise<void> {
+    const record = this.engine.updatePresence(update);
+    this.broadcast({
+      type: 'presence.changed',
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      payload: record,
+    });
+    this.participantListeners.forEach((listener) => listener());
   }
 
   public start(): Promise<ManualInvitation> {
@@ -347,6 +467,9 @@ export class CollaborationTransportServer {
       await new Promise<void>((resolve) => httpsServer.close(() => resolve()));
     }
     this.replayNonces.clear();
+    this.reconnectGrants.clear();
+    this.pendingJoinListeners.clear();
+    this.participantListeners.clear();
     this.documentSecret.fill(0);
   }
 
@@ -374,9 +497,13 @@ export class CollaborationTransportServer {
       return;
     }
     const pending = [...this.connections.values()].filter((state) => !state.authenticated);
+    const pendingPreUpgrade = [...this.preUpgradeConnections.values()].filter(
+      (state) => !state.upgraded,
+    );
     if (
-      pending.length >= this.maxPendingConnections ||
-      pending.filter((state) => state.remoteAddress === remoteAddress).length >=
+      pending.length + pendingPreUpgrade.length >= this.maxPendingConnections ||
+      pending.filter((state) => state.remoteAddress === remoteAddress).length +
+        pendingPreUpgrade.filter((state) => state.remoteAddress === remoteAddress).length >=
         this.maxPendingPerAddress
     ) {
       socket.send(
@@ -432,8 +559,13 @@ export class CollaborationTransportServer {
       reassembler,
       authTimer: undefined,
       authenticated: false,
+      operationalReady: false,
       closing: false,
       clientId: undefined,
+      displayName: undefined,
+      pendingJoinRequestId: undefined,
+      pendingJoinRequestedAtMs: undefined,
+      pendingJoinExpiresAtMs: undefined,
       windowStartedAtMs: this.clock(),
       messageCount: 0,
       requestQueue: Promise.resolve(),
@@ -454,9 +586,13 @@ export class CollaborationTransportServer {
     const remoteAddress = socket.remoteAddress ?? 'unknown';
     const key = this.connectionKey(socket);
     const pending = [...this.preUpgradeConnections.values()].filter((state) => !state.upgraded);
+    const pendingWebSockets = [...this.connections.values()].filter(
+      (state) => !state.authenticated,
+    );
     if (
-      pending.length >= this.maxPendingConnections ||
-      pending.filter((state) => state.remoteAddress === remoteAddress).length >=
+      pending.length + pendingWebSockets.length >= this.maxPendingConnections ||
+      pending.filter((state) => state.remoteAddress === remoteAddress).length +
+        pendingWebSockets.filter((state) => state.remoteAddress === remoteAddress).length >=
         this.maxPendingPerAddress ||
       this.preUpgradeConnections.has(key)
     ) {
@@ -532,6 +668,10 @@ export class CollaborationTransportServer {
       this.authenticate(state, raw);
       return;
     }
+    if (!state.operationalReady) {
+      this.closeProtocolPeer(state, 'Authentication bootstrap is still in progress');
+      return;
+    }
     let logical: string | undefined;
     try {
       logical = state.reassembler.accept(raw);
@@ -561,6 +701,7 @@ export class CollaborationTransportServer {
       if (
         this.connections.get(state.socket) !== state ||
         !state.authenticated ||
+        !state.operationalReady ||
         state.socket.readyState !== WebSocket.OPEN
       ) {
         return;
@@ -576,7 +717,11 @@ export class CollaborationTransportServer {
   }
 
   private authenticate(state: ConnectionState, raw: unknown): void {
-    let response;
+    if (state.pendingJoinRequestId !== undefined) {
+      this.rejectAuthentication(state, 'PROTOCOL_ERROR', 'Join confirmation is still pending.');
+      return;
+    }
+    let response: AuthResponse;
     try {
       response = authResponseSchema.parse(raw);
     } catch {
@@ -617,7 +762,9 @@ export class CollaborationTransportServer {
       challengeId: challenge.challengeId,
       serverNonce: challenge.serverNonce,
       clientId: response.clientId,
+      displayName: response.displayName,
       clientNonce: response.clientNonce,
+      ...(response.reconnectToken === undefined ? {} : { reconnectToken: response.reconnectToken }),
       expiresAtMs: challenge.expiresAtMs,
     });
     if (!constantTimeEqual(response.proof, expectedProof)) {
@@ -633,9 +780,11 @@ export class CollaborationTransportServer {
       return;
     }
     if (
+      response.clientId === this.hostClientId ||
       [...this.connections.values()].some(
         (candidate) => candidate !== state && candidate.clientId === response.clientId,
-      )
+      ) ||
+      this.engine.listPresence().some((presence) => presence.clientId === response.clientId)
     ) {
       this.rejectAuthentication(
         state,
@@ -645,25 +794,131 @@ export class CollaborationTransportServer {
       return;
     }
 
-    state.authenticated = true;
     state.clientId = response.clientId;
+    state.displayName = response.displayName;
     state.messageCount = 0;
     state.windowStartedAtMs = this.clock();
     if (state.authTimer !== undefined) clearTimeout(state.authTimer);
-    state.authTimer = undefined;
     this.replayNonces.set(replayKey, challenge.expiresAtMs);
+    this.purgeReconnectGrants();
+    const reconnectGrant = this.reconnectGrants.get(response.clientId);
+    if (
+      response.reconnectToken !== undefined &&
+      reconnectGrant !== undefined &&
+      reconnectGrant.displayName === response.displayName &&
+      constantTimeEqual(response.reconnectToken, reconnectGrant.token)
+    ) {
+      void this.acceptAuthenticatedConnection(state).catch(() => this.removeConnection(state));
+      return;
+    }
+
+    const requestedAtMs = this.clock();
+    const pending = authPendingSchema.parse({
+      type: 'auth.pending',
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      joinRequestId: this.idFactory(),
+      expiresAtMs: requestedAtMs + this.joinApprovalTimeoutMs,
+      timeoutMs: this.joinApprovalTimeoutMs,
+    });
+    state.pendingJoinRequestId = pending.joinRequestId;
+    state.pendingJoinRequestedAtMs = requestedAtMs;
+    state.pendingJoinExpiresAtMs = pending.expiresAtMs;
+    state.authTimer = setTimeout(() => {
+      this.rejectAuthentication(
+        state,
+        'JOIN_TIMEOUT',
+        'The host did not confirm this join request in time.',
+      );
+    }, this.joinApprovalTimeoutMs);
     void state.sender
-      .sendRaw(
+      .sendRaw(json(pending))
+      .then(() => {
+        const request = this.pendingJoinForState(state);
+        if (request !== undefined) {
+          this.pendingJoinListeners.forEach((listener) => listener(structuredClone(request)));
+        }
+      })
+      .catch(() => this.removeConnection(state));
+  }
+
+  private async acceptAuthenticatedConnection(state: ConnectionState): Promise<void> {
+    if (
+      state.closing ||
+      state.clientId === undefined ||
+      state.displayName === undefined ||
+      state.socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    const reconnectToken = this.nonceFactory();
+    const presence = this.engine.updatePresence({
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      sessionId: this.engine.sessionId,
+      documentId: this.engine.documentId,
+      clientId: state.clientId,
+      sequence: 0,
+      displayName: collaborationDisplayNameSchema.parse(state.displayName),
+      selectedElementIds: [],
+    });
+    if (state.authTimer !== undefined) clearTimeout(state.authTimer);
+    state.authTimer = undefined;
+    state.pendingJoinRequestId = undefined;
+    state.pendingJoinRequestedAtMs = undefined;
+    state.pendingJoinExpiresAtMs = undefined;
+    state.authenticated = true;
+    state.operationalReady = false;
+    this.storeReconnectGrant({
+      clientId: state.clientId,
+      displayName: state.displayName,
+      token: reconnectToken,
+      expiresAtMs: this.clock() + this.reconnectGrantTtlMs,
+    });
+    try {
+      await state.sender.sendRaw(
         json({
           type: 'auth.accepted',
           protocolVersion: COLLABORATION_PROTOCOL_VERSION,
           sessionId: this.engine.sessionId,
-          clientId: response.clientId,
+          ...(this.hostClientId === undefined ? {} : { hostClientId: this.hostClientId }),
+          clientId: state.clientId,
           sessionSeq: this.engine.sessionSeq,
           revision: this.engine.revision,
+          reconnectToken,
         }),
-      )
-      .catch(() => this.removeConnection(state));
+      );
+      const snapshotSend = state.sender.sendLogical({
+        type: 'presence.snapshot',
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        participants: this.engine.listPresence(),
+      });
+      // The snapshot is now synchronously ahead of every future broadcast in the
+      // bounded sender queue. Mark the peer ready before it can receive that snapshot
+      // and immediately submit its first operational request.
+      state.operationalReady = true;
+      await snapshotSend;
+      if (
+        this.connections.get(state.socket) !== state ||
+        state.closing ||
+        state.socket.readyState !== WebSocket.OPEN
+      ) {
+        throw new CollaborationError(
+          'INVALID_REQUEST',
+          'The approved peer disconnected during authentication bootstrap.',
+        );
+      }
+    } catch (error) {
+      this.removeConnection(state);
+      throw error;
+    }
+    this.broadcast(
+      {
+        type: 'presence.changed',
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        payload: presence,
+      },
+      state,
+    );
+    this.participantListeners.forEach((listener) => listener());
   }
 
   private async handleRequest(
@@ -676,6 +931,15 @@ export class CollaborationTransportServer {
         message.requestId,
         'CLIENT_MISMATCH',
         'Client identity mismatch.',
+      );
+      return;
+    }
+    if (message.type === 'presence.update' && message.payload.displayName !== state.displayName) {
+      await this.sendRequestError(
+        state,
+        message.requestId,
+        'CLIENT_MISMATCH',
+        'Approved display name mismatch.',
       );
       return;
     }
@@ -804,9 +1068,14 @@ export class CollaborationTransportServer {
     });
   }
 
-  private broadcast(message: unknown): void {
+  private broadcast(message: unknown, excludedState?: ConnectionState): void {
     this.connections.forEach((state) => {
-      if (state.authenticated && state.socket.readyState === WebSocket.OPEN) {
+      if (
+        state !== excludedState &&
+        state.authenticated &&
+        state.operationalReady &&
+        state.socket.readyState === WebSocket.OPEN
+      ) {
         void state.sender.sendLogical(message).catch(() => this.removeConnection(state));
       }
     });
@@ -830,6 +1099,8 @@ export class CollaborationTransportServer {
       | 'AUTH_REPLAY'
       | 'CLIENT_ID_IN_USE'
       | 'INVITATION_EXPIRED'
+      | 'JOIN_REJECTED'
+      | 'JOIN_TIMEOUT'
       | 'PEER_LIMIT'
       | 'PROTOCOL_ERROR',
     message: string,
@@ -861,8 +1132,13 @@ export class CollaborationTransportServer {
     state.reassembler.dispose();
     const clientId = state.clientId;
     state.authenticated = false;
+    state.operationalReady = false;
     state.closing = true;
     state.clientId = undefined;
+    state.displayName = undefined;
+    state.pendingJoinRequestId = undefined;
+    state.pendingJoinRequestedAtMs = undefined;
+    state.pendingJoinExpiresAtMs = undefined;
     this.connections.delete(state.socket);
     if (
       clientId !== undefined &&
@@ -870,8 +1146,16 @@ export class CollaborationTransportServer {
         (candidate) => candidate.authenticated && candidate.clientId === clientId,
       )
     ) {
-      this.engine.removePresence(clientId);
+      const removed = this.engine.removePresence(clientId);
       this.engine.releaseTextLeasesForClient(clientId);
+      if (removed) {
+        this.broadcast({
+          type: 'presence.removed',
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          clientId,
+        });
+        this.participantListeners.forEach((listener) => listener());
+      }
     }
     if (state.socket.readyState !== WebSocket.CLOSED) state.socket.terminate();
   }
@@ -880,6 +1164,7 @@ export class CollaborationTransportServer {
     if (state.closing) return;
     state.closing = true;
     state.authenticated = false;
+    state.operationalReady = false;
     state.sender.dispose();
     state.reassembler.dispose();
     if (state.socket.readyState === WebSocket.OPEN) state.socket.close(1008, reason.slice(0, 123));
@@ -894,5 +1179,58 @@ export class CollaborationTransportServer {
     this.replayNonces.forEach((expiresAtMs, key) => {
       if (expiresAtMs <= now) this.replayNonces.delete(key);
     });
+  }
+
+  private pendingJoinForState(state: ConnectionState): PendingJoinRequest | undefined {
+    if (
+      state.authenticated ||
+      state.closing ||
+      state.pendingJoinRequestId === undefined ||
+      state.pendingJoinRequestedAtMs === undefined ||
+      state.pendingJoinExpiresAtMs === undefined ||
+      state.clientId === undefined ||
+      state.displayName === undefined
+    ) {
+      return undefined;
+    }
+    return {
+      joinRequestId: state.pendingJoinRequestId,
+      clientId: state.clientId,
+      displayName: state.displayName,
+      requestedAtMs: state.pendingJoinRequestedAtMs,
+      expiresAtMs: state.pendingJoinExpiresAtMs,
+    };
+  }
+
+  private purgeExpiredPendingJoins(): void {
+    const now = this.clock();
+    this.connections.forEach((state) => {
+      if ((state.pendingJoinExpiresAtMs ?? Number.POSITIVE_INFINITY) <= now) {
+        this.rejectAuthentication(
+          state,
+          'JOIN_TIMEOUT',
+          'The host did not confirm this join request in time.',
+        );
+      }
+    });
+  }
+
+  private purgeReconnectGrants(): void {
+    const now = this.clock();
+    this.reconnectGrants.forEach((grant, clientId) => {
+      if (grant.expiresAtMs <= now) this.reconnectGrants.delete(clientId);
+    });
+  }
+
+  private storeReconnectGrant(grant: ReconnectGrant): void {
+    this.purgeReconnectGrants();
+    const capacity = Math.max(1, Math.min(this.maxPeers * 4, 256));
+    if (!this.reconnectGrants.has(grant.clientId) && this.reconnectGrants.size >= capacity) {
+      const oldest = [...this.reconnectGrants.values()].sort(
+        (left, right) => left.expiresAtMs - right.expiresAtMs,
+      )[0];
+      if (oldest !== undefined) this.reconnectGrants.delete(oldest.clientId);
+    }
+    this.reconnectGrants.set(grant.clientId, grant);
   }
 }

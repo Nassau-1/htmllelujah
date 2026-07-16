@@ -49,10 +49,14 @@ import {
 import {
   authAcceptedSchema,
   authChallengeSchema,
+  authPendingSchema,
   authRejectedSchema,
+  collaborationDisplayNameSchema,
   commandResultMessageSchema,
   manualInvitationSchema,
   presenceBroadcastSchema,
+  presenceRemovedBroadcastSchema,
+  presenceSnapshotSchema,
   presenceResultMessageSchema,
   requestErrorMessageSchema,
   resyncResultMessageSchema,
@@ -66,6 +70,7 @@ export interface CollaborationTransportClientOptions {
   readonly invitation: ManualInvitation;
   readonly documentId: string;
   readonly clientId: string;
+  readonly displayName: string;
   readonly documentSecret: Uint8Array;
   readonly maxPayloadBytes?: number;
   readonly maxLogicalPayloadBytes?: number;
@@ -76,6 +81,7 @@ export interface CollaborationTransportClientOptions {
   readonly maxQueuedBytes?: number;
   readonly sendTimeoutMs?: number;
   readonly authTimeoutMs?: number;
+  readonly joinApprovalTimeoutMs?: number;
   readonly requestTimeoutMs?: number;
   readonly maxPendingRequests?: number;
   readonly clock?: () => number;
@@ -114,6 +120,7 @@ export class CollaborationTransportClient {
   private readonly invitation: ManualInvitation;
   private readonly documentId: string;
   private readonly clientId: string;
+  private readonly displayName: string;
   private readonly documentSecret: Buffer;
   private readonly maxPayloadBytes: number;
   private readonly maxLogicalPayloadBytes: number;
@@ -124,6 +131,7 @@ export class CollaborationTransportClient {
   private readonly maxQueuedBytes: number;
   private readonly sendTimeoutMs: number;
   private readonly authTimeoutMs: number;
+  private readonly joinApprovalTimeoutMs: number;
   private readonly requestTimeoutMs: number;
   private readonly maxPendingRequests: number;
   private readonly clock: () => number;
@@ -132,7 +140,9 @@ export class CollaborationTransportClient {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly transactionListeners = new Set<(transaction: CommittedTransaction) => void>();
   private readonly presenceListeners = new Set<(presence: PresenceRecord) => void>();
+  private readonly presenceRemovedListeners = new Set<(clientId: string) => void>();
   private readonly disconnectListeners = new Set<(error: RemoteTransportError) => void>();
+  private readonly participants = new Map<string, PresenceRecord>();
   private socket: WebSocket | undefined;
   private connectionPromise: Promise<void> | undefined;
   private connectionResolve: (() => void) | undefined;
@@ -141,7 +151,11 @@ export class CollaborationTransportClient {
   private certificateVerified = false;
   private challengeAnswered = false;
   private authenticated = false;
+  private authAcceptedReceived = false;
+  private presenceReady = false;
   private clientNonce = '';
+  private reconnectToken: string | undefined;
+  private hostClientId: string | undefined;
   private sender: BoundedSender | undefined;
   private reassembler: ChunkReassembler | undefined;
 
@@ -149,6 +163,7 @@ export class CollaborationTransportClient {
     this.invitation = manualInvitationSchema.parse(options.invitation);
     this.documentId = options.documentId;
     this.clientId = options.clientId;
+    this.displayName = collaborationDisplayNameSchema.parse(options.displayName);
     this.documentSecret = normalizeDocumentSecret(options.documentSecret);
     this.maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_FRAME_BYTES;
     this.maxLogicalPayloadBytes =
@@ -161,6 +176,7 @@ export class CollaborationTransportClient {
     this.maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
     this.sendTimeoutMs = options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
     this.authTimeoutMs = options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS;
+    this.joinApprovalTimeoutMs = options.joinApprovalTimeoutMs ?? 65_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.maxPendingRequests = options.maxPendingRequests ?? DEFAULT_MAX_PENDING_REQUESTS;
     this.clock = options.clock ?? (() => Date.now());
@@ -177,6 +193,7 @@ export class CollaborationTransportClient {
         this.maxQueuedBytes,
         this.sendTimeoutMs,
         this.authTimeoutMs,
+        this.joinApprovalTimeoutMs,
         this.requestTimeoutMs,
         this.maxPendingRequests,
       ].every((value) => Number.isSafeInteger(value) && value > 0)
@@ -189,7 +206,10 @@ export class CollaborationTransportClient {
   }
 
   public get isConnected(): boolean {
-    return this.authenticated && this.socket?.readyState === WebSocket.OPEN;
+    return this.authenticated && this.presenceReady && this.socket?.readyState === WebSocket.OPEN;
+  }
+  public get authoritativeHostClientId(): string | undefined {
+    return this.hostClientId;
   }
 
   public connect(): Promise<void> {
@@ -202,6 +222,8 @@ export class CollaborationTransportClient {
     this.certificateVerified = false;
     this.challengeAnswered = false;
     this.authenticated = false;
+    this.authAcceptedReceived = false;
+    this.presenceReady = false;
     this.clientNonce = this.nonceFactory();
     const formattedHost = this.invitation.host.includes(':')
       ? `[${this.invitation.host}]`
@@ -298,6 +320,17 @@ export class CollaborationTransportClient {
     return () => this.presenceListeners.delete(listener);
   }
 
+  public onPresenceRemoved(listener: (clientId: string) => void): () => void {
+    this.presenceRemovedListeners.add(listener);
+    return () => this.presenceRemovedListeners.delete(listener);
+  }
+
+  public listPresence(): readonly PresenceRecord[] {
+    return [...this.participants.values()]
+      .sort((left, right) => left.clientId.localeCompare(right.clientId))
+      .map((presence) => structuredClone(presence));
+  }
+
   public onDisconnect(listener: (error: RemoteTransportError) => void): () => void {
     this.disconnectListeners.add(listener);
     return () => this.disconnectListeners.delete(listener);
@@ -340,7 +373,11 @@ export class CollaborationTransportClient {
       },
       'presence.result',
     );
-    return presenceRecordSchema.parse(presenceResultMessageSchema.parse(response).payload);
+    const presence = presenceRecordSchema.parse(
+      presenceResultMessageSchema.parse(response).payload,
+    );
+    this.participants.set(presence.clientId, structuredClone(presence));
+    return presence;
   }
 
   public async acquireTextLease(request: AcquireTextLeaseRequest): Promise<TextLease> {
@@ -467,6 +504,23 @@ export class CollaborationTransportClient {
       this.answerChallenge(authChallengeSchema.parse(message));
       return;
     }
+    if (message.type === 'auth.pending') {
+      const pending = authPendingSchema.parse(message);
+      if (!this.certificateVerified || !this.challengeAnswered) {
+        this.failConnection(
+          new RemoteTransportError('AUTH_FAILED', 'Invalid join-approval response.'),
+        );
+        return;
+      }
+      if (this.authTimer !== undefined) clearTimeout(this.authTimer);
+      const remainingMs = Math.min(this.joinApprovalTimeoutMs, pending.timeoutMs + 250);
+      this.authTimer = setTimeout(() => {
+        this.failConnection(
+          new RemoteTransportError('JOIN_TIMEOUT', 'The host did not confirm this join request.'),
+        );
+      }, remainingMs);
+      return;
+    }
     if (message.type === 'auth.accepted') {
       const accepted = authAcceptedSchema.parse(message);
       if (
@@ -481,11 +535,9 @@ export class CollaborationTransportClient {
         return;
       }
       this.authenticated = true;
-      if (this.authTimer !== undefined) clearTimeout(this.authTimer);
-      this.authTimer = undefined;
-      this.connectionResolve?.();
-      this.connectionResolve = undefined;
-      this.connectionReject = undefined;
+      this.authAcceptedReceived = true;
+      this.reconnectToken = accepted.reconnectToken;
+      this.hostClientId = accepted.hostClientId;
       return;
     }
     if (message.type === 'auth.rejected') {
@@ -493,14 +545,109 @@ export class CollaborationTransportClient {
       this.failConnection(new RemoteTransportError(rejected.code, rejected.message));
       return;
     }
+    if (!this.authAcceptedReceived) {
+      this.failConnection(
+        new RemoteTransportError(
+          'PROTOCOL_ERROR',
+          'Operational data arrived before host approval.',
+        ),
+      );
+      return;
+    }
+    if (!this.presenceReady && message.type !== 'presence.snapshot') {
+      this.failConnection(
+        new RemoteTransportError(
+          'PROTOCOL_ERROR',
+          'Operational data arrived before the initial presence snapshot.',
+        ),
+      );
+      return;
+    }
+
     if (message.type === 'transaction.committed') {
       const transaction = transactionBroadcastSchema.parse(message).payload;
+      if (
+        transaction.sessionId !== this.invitation.sessionId ||
+        transaction.documentId !== this.documentId
+      ) {
+        this.failConnection(
+          new RemoteTransportError('PROTOCOL_ERROR', 'Transaction scope mismatch.'),
+        );
+        return;
+      }
+
       this.transactionListeners.forEach((listener) => listener(transaction));
       return;
     }
     if (message.type === 'presence.changed') {
       const presence = presenceBroadcastSchema.parse(message).payload;
+      if (
+        presence.sessionId !== this.invitation.sessionId ||
+        presence.documentId !== this.documentId
+      ) {
+        this.failConnection(new RemoteTransportError('PROTOCOL_ERROR', 'Presence scope mismatch.'));
+        return;
+      }
+      const current = this.participants.get(presence.clientId);
+      if (current !== undefined && presence.sequence <= current.sequence) {
+        return;
+      }
+
+      this.participants.set(presence.clientId, structuredClone(presence));
       this.presenceListeners.forEach((listener) => listener(presence));
+      return;
+    }
+    if (message.type === 'presence.removed') {
+      const removed = presenceRemovedBroadcastSchema.parse(message);
+      this.participants.delete(removed.clientId);
+      this.presenceRemovedListeners.forEach((listener) => listener(removed.clientId));
+      return;
+    }
+    if (message.type === 'presence.snapshot') {
+      if (!this.authAcceptedReceived) {
+        this.failConnection(
+          new RemoteTransportError('PROTOCOL_ERROR', 'Presence arrived before authentication.'),
+        );
+        return;
+      }
+      const snapshot = presenceSnapshotSchema.parse(message);
+      const participantIds = snapshot.participants.map((presence) => presence.clientId);
+      const self = snapshot.participants.find((presence) => presence.clientId === this.clientId);
+      if (
+        new Set(participantIds).size !== participantIds.length ||
+        snapshot.participants.some(
+          (presence) =>
+            presence.sessionId !== this.invitation.sessionId ||
+            presence.documentId !== this.documentId,
+        ) ||
+        self === undefined ||
+        self.displayName !== this.displayName
+      ) {
+        this.failConnection(
+          new RemoteTransportError(
+            'PROTOCOL_ERROR',
+            'The initial presence snapshot is incomplete or out of scope.',
+          ),
+        );
+        return;
+      }
+
+      const nextIds = new Set(snapshot.participants.map((presence) => presence.clientId));
+      this.participants.forEach((_presence, clientId) => {
+        if (!nextIds.has(clientId)) this.participants.delete(clientId);
+      });
+      snapshot.participants.forEach((presence) => {
+        const current = this.participants.get(presence.clientId);
+        if (current === undefined || presence.sequence >= current.sequence) {
+          this.participants.set(presence.clientId, structuredClone(presence));
+        }
+      });
+      if (this.authTimer !== undefined) clearTimeout(this.authTimer);
+      this.authTimer = undefined;
+      this.presenceReady = true;
+      this.connectionResolve?.();
+      this.connectionResolve = undefined;
+      this.connectionReject = undefined;
       return;
     }
 
@@ -552,7 +699,9 @@ export class CollaborationTransportClient {
       challengeId: challenge.challengeId,
       serverNonce: challenge.serverNonce,
       clientId: this.clientId,
+      displayName: this.displayName,
       clientNonce: this.clientNonce,
+      ...(this.reconnectToken === undefined ? {} : { reconnectToken: this.reconnectToken }),
       expiresAtMs: challenge.expiresAtMs,
     });
     this.challengeAnswered = true;
@@ -563,7 +712,9 @@ export class CollaborationTransportClient {
       documentId: this.documentId,
       challengeId: challenge.challengeId,
       clientId: this.clientId,
+      displayName: this.displayName,
       clientNonce: this.clientNonce,
+      ...(this.reconnectToken === undefined ? {} : { reconnectToken: this.reconnectToken }),
       proof,
     });
     const sender = this.sender;
@@ -620,6 +771,9 @@ export class CollaborationTransportClient {
     if (this.authTimer !== undefined) clearTimeout(this.authTimer);
     this.authTimer = undefined;
     this.authenticated = false;
+    this.authAcceptedReceived = false;
+    this.presenceReady = false;
+    this.participants.clear();
     this.certificateVerified = false;
     this.challengeAnswered = false;
     this.socket = undefined;

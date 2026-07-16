@@ -9,7 +9,7 @@ import {
   type ImageElement,
   type TransactionMetadata,
 } from '@htmllelujah/document-core';
-import { CollaborationError } from '@htmllelujah/collaboration';
+import { CollaborationError, RemoteTransportError } from '@htmllelujah/collaboration';
 import {
   DocumentRuntimeError,
   DocumentSessionManager,
@@ -38,6 +38,7 @@ import {
   inspectImageBeforeDecode,
 } from './image-import-validation.js';
 import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
+import { isTrustedRendererUrl, resolveRendererEntryUrl } from './renderer-entry.js';
 import { resolveSaveTarget } from './save-target.js';
 import { initializeWindowSafely, retainWindowOnFailure } from './window-lifecycle.js';
 import {
@@ -164,6 +165,38 @@ const failure = (error: unknown): DesktopResult<never> => {
       error: {
         code: error.code,
         message: safeMessages[error.code] ?? 'The collaboration action could not be completed.',
+        recoverable: true,
+      },
+    };
+  }
+  if (error instanceof RemoteTransportError) {
+    const safeMessages: Readonly<Record<string, string>> = {
+      AUTH_FAILED: 'The host could not authenticate this device or session code.',
+      AUTH_EXPIRED: 'The collaboration authentication request expired.',
+      AUTH_REPLAY: 'This collaboration request was already used.',
+      AUTH_TIMEOUT: 'The collaboration authentication request timed out.',
+      BACKPRESSURE_LIMIT: 'The LAN connection is overloaded. Try again after it recovers.',
+      CLIENT_ID_IN_USE: 'This device identity is already connected to the host.',
+      CLIENT_MISMATCH: 'The host rejected a collaboration request from another device identity.',
+      CONNECTION_CLOSED: 'The LAN connection closed before the operation completed.',
+      DUPLICATE_REQUEST: 'That collaboration request is already pending.',
+      FINGERPRINT_MISMATCH: 'The host certificate fingerprint does not match the invitation.',
+      INVITATION_EXPIRED: 'The LAN invitation expired. Ask the host for a new session code.',
+      JOIN_REJECTED: 'The host rejected this join request.',
+      JOIN_TIMEOUT: 'The host did not answer the join request in time.',
+      LOGICAL_PAYLOAD_TOO_LARGE: 'The collaboration update is too large for this LAN session.',
+      NOT_CONNECTED: 'This device is not connected to the LAN session.',
+      PEER_LIMIT: 'The LAN session has reached its participant limit.',
+      PENDING_LIMIT: 'The host already has too many join requests waiting for approval.',
+      PROTOCOL_ERROR: 'The LAN session returned an invalid protocol response.',
+      REQUEST_TIMEOUT: 'The host did not answer the collaboration request in time.',
+    };
+    return {
+      ok: false,
+      error: {
+        code: error.code,
+        message:
+          safeMessages[error.code] ?? 'The LAN collaboration request could not be completed.',
         recoverable: true,
       },
     };
@@ -319,9 +352,7 @@ const sessionView = (webContentsId: number, snapshot: DocumentSessionSnapshot): 
 const isTrustedSender = (event: IpcMainInvokeEvent): boolean => {
   const frame = event.senderFrame;
   if (frame === null || frame !== event.sender.mainFrame) return false;
-  const url = frame.url;
-  if (url.startsWith('htmllelujah-app://app/')) return true;
-  return !app.isPackaged && url.startsWith('http://127.0.0.1:5173/');
+  return isTrustedRendererUrl(frame.url, app.isPackaged);
 };
 
 const assertSessionAccess = (
@@ -362,6 +393,12 @@ const handle = <TInput, TOutput>(
 
 const identifier = z.string().uuid();
 const revision = z.string().min(1).max(160);
+const collaborationDisplayName = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .refine((value) => !/[\p{Cc}\p{Cf}]/u.test(value));
 const sessionInputSchema = z.object({ sessionId: identifier }).strict();
 const historyInputSchema = sessionInputSchema.extend({ expectedRevision: revision }).strict();
 const collaborationTextLeaseInputSchema = sessionInputSchema
@@ -384,14 +421,27 @@ const exportInputSchema = historyInputSchema
   .extend({ format: z.enum(['html', 'pdf']), includeHidden: z.boolean() })
   .strict();
 const hostInputSchema = sessionInputSchema
-  .extend({ displayName: z.string().trim().min(1).max(80), enableDiscovery: z.boolean() })
+  .extend({ displayName: collaborationDisplayName, enableDiscovery: z.boolean() })
   .strict();
 const joinInputSchema = sessionInputSchema
   .extend({
     endpoint: z.string().trim().min(1).max(512),
     sessionCode: z.string().trim().min(4).max(128),
     expectedFingerprint: z.string().trim().min(32).max(256),
-    displayName: z.string().trim().min(1).max(80),
+    displayName: collaborationDisplayName,
+  })
+  .strict();
+const collaborationJoinDecisionInputSchema = sessionInputSchema
+  .extend({ joinRequestId: identifier, decision: z.enum(['accept', 'reject']) })
+  .strict();
+const collaborationPresenceInputSchema = sessionInputSchema
+  .extend({
+    slideId: identifier.optional(),
+    selectedElementIds: z
+      .array(identifier)
+      .max(100)
+      .refine((values) => new Set(values).size === values.length),
+    editingElementId: identifier.optional(),
   })
   .strict();
 const mcpApprovalInputSchema = sessionInputSchema
@@ -1443,8 +1493,14 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
         ).finally(() => closingDecisions.delete(webContentsId));
       });
 
-      if (process.env.VITE_DEV_SERVER_URL) await window.loadURL(process.env.VITE_DEV_SERVER_URL);
-      else await window.loadURL('htmllelujah-app://app/index.html');
+      await window.loadURL(
+        resolveRendererEntryUrl({
+          packaged: app.isPackaged,
+          ...(process.env.VITE_DEV_SERVER_URL === undefined
+            ? {}
+            : { devServerUrl: process.env.VITE_DEV_SERVER_URL }),
+        }),
+      );
       return window;
     },
     async () => {
@@ -1552,11 +1608,15 @@ const createPresentationWindow = async (
       window.once('ready-to-show', () => window.show());
       const query = new URLSearchParams({ mode: 'presentation' });
       if (startSlideId !== undefined) query.set('startSlideId', startSlideId);
-      if (process.env.VITE_DEV_SERVER_URL) {
-        await window.loadURL(`${process.env.VITE_DEV_SERVER_URL}?${query.toString()}`);
-      } else {
-        await window.loadURL(`htmllelujah-app://app/index.html?${query.toString()}`);
-      }
+      await window.loadURL(
+        resolveRendererEntryUrl({
+          packaged: app.isPackaged,
+          ...(process.env.VITE_DEV_SERVER_URL === undefined
+            ? {}
+            : { devServerUrl: process.env.VITE_DEV_SERVER_URL }),
+          query,
+        }),
+      );
       return window;
     },
     async () => {
@@ -1710,6 +1770,22 @@ const configureIpc = (): void => {
     assertSessionAccess(event, input.sessionId, false);
     return collaboration.status(input.sessionId);
   });
+  handle(
+    DESKTOP_IPC.collaborationDecideJoin,
+    collaborationJoinDecisionInputSchema,
+    async (event, input) => {
+      assertSessionAccess(event, input.sessionId);
+      return collaboration.decideJoin(input);
+    },
+  );
+  handle(
+    DESKTOP_IPC.collaborationUpdatePresence,
+    collaborationPresenceInputSchema,
+    async (event, input) => {
+      assertSessionAccess(event, input.sessionId);
+      return collaboration.updatePresence(input);
+    },
+  );
   handle(
     DESKTOP_IPC.collaborationTextLeaseStatus,
     collaborationTextLeaseInputSchema,

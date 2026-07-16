@@ -38,8 +38,215 @@ export interface SlideSurfaceProps {
   readonly className?: string | undefined;
 }
 
+/** Effective connector geometry for editor hit-testing and overlays. */
+export interface ResolvedConnectorGeometry {
+  readonly connectorId: string;
+  readonly startInContainer: Readonly<{ xPt: number; yPt: number }>;
+  readonly endInContainer: Readonly<{ xPt: number; yPt: number }>;
+  readonly startInSlide: Readonly<{ xPt: number; yPt: number }>;
+  readonly endInSlide: Readonly<{ xPt: number; yPt: number }>;
+  readonly boundsInSlide: Readonly<{
+    xPt: number;
+    yPt: number;
+    widthPt: number;
+    heightPt: number;
+  }>;
+}
+
 const safeFontFamily = (value: string, fallback: string): string =>
   /^[a-z0-9 ,"'-]{1,160}$/i.test(value.trim()) ? value.trim() : fallback;
+
+type ConnectorAnchor = NonNullable<ConnectorElement['start']['binding']['anchor']>;
+
+interface Point {
+  readonly xPt: number;
+  readonly yPt: number;
+}
+
+interface AffineTransform {
+  readonly a: number;
+  readonly b: number;
+  readonly c: number;
+  readonly d: number;
+  readonly e: number;
+  readonly f: number;
+}
+
+type AnchorPoints = Readonly<Record<ConnectorAnchor, Point>>;
+
+const IDENTITY_TRANSFORM: AffineTransform = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+
+const composeTransforms = (outer: AffineTransform, inner: AffineTransform): AffineTransform => ({
+  a: outer.a * inner.a + outer.c * inner.b,
+  b: outer.b * inner.a + outer.d * inner.b,
+  c: outer.a * inner.c + outer.c * inner.d,
+  d: outer.b * inner.c + outer.d * inner.d,
+  e: outer.a * inner.e + outer.c * inner.f + outer.e,
+  f: outer.b * inner.e + outer.d * inner.f + outer.f,
+});
+
+const applyTransform = (transform: AffineTransform, point: Point): Point => ({
+  xPt: transform.a * point.xPt + transform.c * point.yPt + transform.e,
+  yPt: transform.b * point.xPt + transform.d * point.yPt + transform.f,
+});
+
+const normalizeGeometryPoint = (point: Point): Point => ({
+  xPt: Math.abs(finiteOr(point.xPt, 0)) < 1e-10 ? 0 : finiteOr(point.xPt, 0),
+  yPt: Math.abs(finiteOr(point.yPt, 0)) < 1e-10 ? 0 : finiteOr(point.yPt, 0),
+});
+
+const frameTransform = (frame: RenderElement['frame']): AffineTransform => {
+  const radians = (finiteOr(frame.rotationDeg, 0) * Math.PI) / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  const xPt = finiteOr(frame.xPt, 0);
+  const yPt = finiteOr(frame.yPt, 0);
+  const centerX = Math.max(0, finiteOr(frame.widthPt, 0)) / 2;
+  const centerY = Math.max(0, finiteOr(frame.heightPt, 0)) / 2;
+  return {
+    a: cosine,
+    b: sine,
+    c: -sine,
+    d: cosine,
+    e: xPt + centerX - cosine * centerX + sine * centerY,
+    f: yPt + centerY - sine * centerX - cosine * centerY,
+  };
+};
+
+const scaleTransform = (scaleX: number, scaleY: number): AffineTransform => ({
+  a: scaleX,
+  b: 0,
+  c: 0,
+  d: scaleY,
+  e: 0,
+  f: 0,
+});
+
+const inverseTransform = (transform: AffineTransform): AffineTransform | undefined => {
+  const determinant = transform.a * transform.d - transform.b * transform.c;
+  if (!Number.isFinite(determinant) || determinant === 0) return undefined;
+  const inverse = {
+    a: transform.d / determinant,
+    b: -transform.b / determinant,
+    c: -transform.c / determinant,
+    d: transform.a / determinant,
+    e: (transform.c * transform.f - transform.d * transform.e) / determinant,
+    f: (transform.b * transform.e - transform.a * transform.f) / determinant,
+  };
+  return Object.values(inverse).every(Number.isFinite) ? inverse : undefined;
+};
+
+const anchorPointsForElement = (
+  element: RenderElement,
+  containerToSlide: AffineTransform,
+): AnchorPoints => {
+  const elementToSlide = composeTransforms(containerToSlide, frameTransform(element.frame));
+  const width = Math.max(0, finiteOr(element.frame.widthPt, 0));
+  const height = Math.max(0, finiteOr(element.frame.heightPt, 0));
+  return {
+    top: applyTransform(elementToSlide, { xPt: width / 2, yPt: 0 }),
+    right: applyTransform(elementToSlide, { xPt: width, yPt: height / 2 }),
+    bottom: applyTransform(elementToSlide, { xPt: width / 2, yPt: height }),
+    left: applyTransform(elementToSlide, { xPt: 0, yPt: height / 2 }),
+    center: applyTransform(elementToSlide, { xPt: width / 2, yPt: height / 2 }),
+  };
+};
+
+const childContainerToSlide = (
+  group: GroupElement,
+  containerToSlide: AffineTransform,
+): AffineTransform => {
+  const coordinateWidth = Math.max(0.001, finiteOr(group.coordinateSpace.widthPt, 0.001));
+  const coordinateHeight = Math.max(0.001, finiteOr(group.coordinateSpace.heightPt, 0.001));
+  const frameWidth = Math.max(0, finiteOr(group.frame.widthPt, 0));
+  const frameHeight = Math.max(0, finiteOr(group.frame.heightPt, 0));
+  const groupToContainer = composeTransforms(
+    frameTransform(group.frame),
+    scaleTransform(frameWidth / coordinateWidth, frameHeight / coordinateHeight),
+  );
+  return composeTransforms(containerToSlide, groupToContainer);
+};
+
+const buildAnchorIndex = (
+  elements: readonly RenderElement[],
+): ReadonlyMap<string, AnchorPoints> => {
+  const anchors = new Map<string, AnchorPoints>();
+  const visit = (current: readonly RenderElement[], containerToSlide: AffineTransform): void => {
+    for (const element of current) {
+      anchors.set(element.id, anchorPointsForElement(element, containerToSlide));
+      if (element.type === 'group') {
+        visit(element.children, childContainerToSlide(element, containerToSlide));
+      }
+    }
+  };
+  visit(elements, IDENTITY_TRANSFORM);
+  return anchors;
+};
+
+const resolveConnectorEndpoint = (
+  endpoint: ConnectorElement['start'],
+  anchors: ReadonlyMap<string, AnchorPoints>,
+  containerToSlide: AffineTransform,
+): Point => {
+  const targetId = endpoint.binding.elementId;
+  if (targetId === undefined) return endpoint;
+  const target = anchors.get(targetId);
+  const inverse = inverseTransform(containerToSlide);
+  if (target === undefined || inverse === undefined) return endpoint;
+  return applyTransform(inverse, target[endpoint.binding.anchor ?? 'center']);
+};
+
+const buildConnectorGeometryIndex = (
+  elements: readonly RenderElement[],
+  anchors = buildAnchorIndex(elements),
+): ReadonlyMap<string, ResolvedConnectorGeometry> => {
+  const geometries = new Map<string, ResolvedConnectorGeometry>();
+  const visit = (current: readonly RenderElement[], containerToSlide: AffineTransform): void => {
+    for (const element of current) {
+      if (element.type === 'connector') {
+        const startInContainer = normalizeGeometryPoint(
+          resolveConnectorEndpoint(element.start, anchors, containerToSlide),
+        );
+        const endInContainer = normalizeGeometryPoint(
+          resolveConnectorEndpoint(element.end, anchors, containerToSlide),
+        );
+        const startInSlide = normalizeGeometryPoint(
+          applyTransform(containerToSlide, startInContainer),
+        );
+        const endInSlide = normalizeGeometryPoint(applyTransform(containerToSlide, endInContainer));
+        geometries.set(element.id, {
+          connectorId: element.id,
+          startInContainer,
+          endInContainer,
+          startInSlide,
+          endInSlide,
+          boundsInSlide: {
+            xPt: Math.min(startInSlide.xPt, endInSlide.xPt),
+            yPt: Math.min(startInSlide.yPt, endInSlide.yPt),
+            widthPt: Math.abs(endInSlide.xPt - startInSlide.xPt),
+            heightPt: Math.abs(endInSlide.yPt - startInSlide.yPt),
+          },
+        });
+      }
+      if (element.type === 'group') {
+        visit(element.children, childContainerToSlide(element, containerToSlide));
+      }
+    }
+  };
+  visit(elements, IDENTITY_TRANSFORM);
+  return geometries;
+};
+
+/** Resolves every connector in one traversal, sharing the same anchor index. */
+export const resolveConnectorGeometries = (
+  elements: readonly RenderElement[],
+): ReadonlyMap<string, ResolvedConnectorGeometry> => buildConnectorGeometryIndex(elements);
+
+/** Compatibility helper for callers resolving a single connector. */
+export const resolveConnectorGeometry = (
+  elements: readonly RenderElement[],
+  connectorId: string,
+): ResolvedConnectorGeometry | undefined => resolveConnectorGeometries(elements).get(connectorId);
 
 const defaultTextStyle = (role: TextElement['styleRole'], theme: RenderTheme): TextStyle => ({
   role,
@@ -108,6 +315,19 @@ const renderRuns = (runs: readonly TextRun[], keyPrefix: string): ReactNode =>
     </span>
   ));
 
+const semanticHeadingStyle = (textAlign: TextStyle['alignment']): CSSProperties => ({
+  // Keep the semantic heading level in the accessibility tree without letting
+  // the browser's h1-h6 user-agent stylesheet change slide geometry.
+  fontFamily: 'inherit',
+  fontSize: 'inherit',
+  fontStyle: 'inherit',
+  fontWeight: 'inherit',
+  letterSpacing: 'inherit',
+  lineHeight: 'inherit',
+  margin: '0 0 0.35em',
+  textAlign,
+});
+
 const renderRichText = (
   content: RichTextDocument,
   keyPrefix: string,
@@ -125,7 +345,7 @@ const renderRichText = (
     if (block.type === 'heading') {
       return createElement(
         `h${block.level}`,
-        { key, className: 'hl-text-block', style: { textAlign: block.alignment } },
+        { key, className: 'hl-text-block', style: semanticHeadingStyle(block.alignment) },
         renderRuns(block.runs, key),
       );
     }
@@ -401,23 +621,25 @@ const ConnectorContent = ({
   pageWidthPt,
   pageHeightPt,
   zIndex,
+  geometry,
 }: {
   element: ConnectorElement;
   pageWidthPt: number;
   pageHeightPt: number;
   zIndex: number;
+  geometry: ResolvedConnectorGeometry | undefined;
 }): ReactElement => {
   const stroke = safeColor(element.stroke.color, '#000000');
   const strokeWidth = Math.max(0, finiteOr(element.stroke.widthPt, 0));
   const startId = `hl-start-${safeDomId(element.id)}`;
   const endId = `hl-end-${safeDomId(element.id)}`;
-  const midpointX = (element.start.xPt + element.end.xPt) / 2;
+  const start = geometry?.startInContainer ?? element.start;
+  const end = geometry?.endInContainer ?? element.end;
+  const midpointX = (start.xPt + end.xPt) / 2;
   const path =
     element.routing === 'elbow'
-      ? `M ${formatNumber(element.start.xPt)} ${formatNumber(element.start.yPt)} L ${formatNumber(midpointX)} ${formatNumber(element.start.yPt)} L ${formatNumber(midpointX)} ${formatNumber(element.end.yPt)} L ${formatNumber(element.end.xPt)} ${formatNumber(element.end.yPt)}`
-      : `M ${formatNumber(element.start.xPt)} ${formatNumber(element.start.yPt)} L ${formatNumber(element.end.xPt)} ${formatNumber(element.end.yPt)}`;
-  const centerX = element.frame.xPt + element.frame.widthPt / 2;
-  const centerY = element.frame.yPt + element.frame.heightPt / 2;
+      ? `M ${formatNumber(start.xPt)} ${formatNumber(start.yPt)} L ${formatNumber(midpointX)} ${formatNumber(start.yPt)} L ${formatNumber(midpointX)} ${formatNumber(end.yPt)} L ${formatNumber(end.xPt)} ${formatNumber(end.yPt)}`
+      : `M ${formatNumber(start.xPt)} ${formatNumber(start.yPt)} L ${formatNumber(end.xPt)} ${formatNumber(end.yPt)}`;
   return (
     <svg
       className="hl-element hl-connector"
@@ -445,7 +667,6 @@ const ConnectorContent = ({
         markerStart={element.startCap === 'arrow' ? `url(#${startId})` : undefined}
         markerEnd={element.endCap === 'arrow' ? `url(#${endId})` : undefined}
         vectorEffect="non-scaling-stroke"
-        transform={`rotate(${formatNumber(element.frame.rotationDeg)} ${formatNumber(centerX)} ${formatNumber(centerY)})`}
       />
     </svg>
   );
@@ -459,6 +680,8 @@ interface ElementRendererProps {
   readonly pageWidthPt: number;
   readonly pageHeightPt: number;
   readonly zIndex: number;
+  readonly connectorGeometries: ReadonlyMap<string, ResolvedConnectorGeometry>;
+  readonly containerToSlide: AffineTransform;
 }
 
 const GroupContent = ({
@@ -466,11 +689,15 @@ const GroupContent = ({
   mode,
   theme,
   resolveAsset,
+  connectorGeometries,
+  containerToSlide,
 }: {
   element: GroupElement;
   mode: RenderMode;
   theme: RenderTheme;
   resolveAsset?: AssetResolver | undefined;
+  connectorGeometries: ReadonlyMap<string, ResolvedConnectorGeometry>;
+  containerToSlide: AffineTransform;
 }): ReactElement => {
   const coordinateWidth = Math.max(0.001, finiteOr(element.coordinateSpace.widthPt, 0.001));
   const coordinateHeight = Math.max(0.001, finiteOr(element.coordinateSpace.heightPt, 0.001));
@@ -495,6 +722,8 @@ const GroupContent = ({
           pageWidthPt={coordinateWidth}
           pageHeightPt={coordinateHeight}
           zIndex={index}
+          connectorGeometries={connectorGeometries}
+          containerToSlide={childContainerToSlide(element, containerToSlide)}
         />
       ))}
     </div>
@@ -509,6 +738,8 @@ const ElementRenderer = ({
   pageWidthPt,
   pageHeightPt,
   zIndex,
+  connectorGeometries,
+  containerToSlide,
 }: ElementRendererProps): ReactElement | null => {
   if (!element.visible) return null;
   if (element.type === 'placeholder' && mode !== 'editor') return null;
@@ -519,6 +750,7 @@ const ElementRenderer = ({
         pageWidthPt={pageWidthPt}
         pageHeightPt={pageHeightPt}
         zIndex={zIndex}
+        geometry={connectorGeometries.get(element.id)}
       />
     );
   }
@@ -538,7 +770,14 @@ const ElementRenderer = ({
     );
   } else if (element.type === 'group') {
     content = (
-      <GroupContent element={element} mode={mode} theme={theme} resolveAsset={resolveAsset} />
+      <GroupContent
+        element={element}
+        mode={mode}
+        theme={theme}
+        resolveAsset={resolveAsset}
+        connectorGeometries={connectorGeometries}
+        containerToSlide={containerToSlide}
+      />
     );
   } else {
     content = (
@@ -568,6 +807,7 @@ export const SlideSurface = ({
   className,
 }: SlideSurfaceProps): ReactElement => {
   const slide = normalizeResolvedSlide(inputSlide);
+  const connectorGeometries = resolveConnectorGeometries(slide.elements);
   const pageWidthPt = Math.max(0.001, finiteOr(slide.page.widthPt, 0.001));
   const pageHeightPt = Math.max(0.001, finiteOr(slide.page.heightPt, 0.001));
   const backgroundSource =
@@ -624,6 +864,8 @@ export const SlideSurface = ({
           pageWidthPt={pageWidthPt}
           pageHeightPt={pageHeightPt}
           zIndex={index}
+          connectorGeometries={connectorGeometries}
+          containerToSlide={IDENTITY_TRANSFORM}
         />
       ))}
     </section>

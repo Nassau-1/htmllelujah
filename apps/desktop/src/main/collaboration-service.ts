@@ -9,6 +9,7 @@ import {
   CollaborationTransportClient,
   CollaborationTransportServer,
   COLLABORATION_PROTOCOL_VERSION,
+  DEFAULT_PRESENCE_TTL_MS,
   fingerprintSharedTargetBytes,
   isPrivateLanAddress,
   LanDiscoveryController,
@@ -18,6 +19,9 @@ import {
   type CommittedTransaction,
   type DurableCollaborationDocumentAdapter,
   type ManualInvitation,
+  type PendingJoinRequest,
+  type PresenceRecord,
+  type PresenceUpdate,
   type TextLease,
 } from '@htmllelujah/collaboration';
 import type {
@@ -33,7 +37,7 @@ import {
   type DocumentSessionSnapshot,
 } from '@htmllelujah/document-runtime';
 
-import type { CollaborationStatus } from '../shared/desktop-api.js';
+import type { CollaborationParticipant, CollaborationStatus } from '../shared/desktop-api.js';
 
 export interface CollaborationTransition {
   readonly previousSessionId: string;
@@ -52,6 +56,10 @@ export interface DesktopCollaborationCoordinatorOptions {
   readonly heartbeatIntervalMs?: number | undefined;
   readonly saveLeaseReservationMs?: number | undefined;
   readonly textLeaseTtlMs?: number | undefined;
+  readonly presenceTtlMs?: number | undefined;
+  readonly presenceHeartbeatIntervalMs?: number | undefined;
+  readonly joinApprovalTimeoutMs?: number | undefined;
+  readonly reconnectGrantTtlMs?: number | undefined;
 }
 
 export type DesktopTextLeaseStatus =
@@ -86,12 +94,18 @@ type StoredTextLease =
   | { readonly view: Extract<DesktopTextLeaseStatus, { status: 'held' }> };
 
 type CollaborationSafetyLatch = { failure?: Error };
+type LocalPresence = {
+  readonly slideId?: string | undefined;
+  readonly selectedElementIds: readonly string[];
+  readonly editingElementId?: string | undefined;
+};
 
 type HostState = {
   readonly mode: 'host';
   readonly sessionId: string;
   readonly targetPath: string;
   readonly clientId: string;
+  readonly displayName: string;
   readonly secret: Uint8Array;
   readonly engine: AuthoritativeSessionHost;
   readonly server: CollaborationTransportServer;
@@ -102,6 +116,10 @@ type HostState = {
   readonly discovery?: LanDiscoveryController | undefined;
   leaseQueue: Promise<void>;
   textLeaseQueue: Promise<void>;
+  presenceSequence: number;
+  presenceQueue: Promise<void>;
+  presence: LocalPresence;
+  stopPresenceHeartbeat: () => void;
   readonly textLeases: Map<string, StoredTextLease>;
   saveUnconfirmed: boolean;
   safeTransition?: Promise<void>;
@@ -112,12 +130,17 @@ type GuestState = {
   readonly sessionId: string;
   readonly targetPath: string;
   readonly clientId: string;
+  readonly displayName: string;
   readonly secret: Uint8Array;
   readonly invitation: ManualInvitation;
   readonly client: CollaborationTransportClient;
   lastSeq: number;
   applyQueue: Promise<void>;
   textLeaseQueue: Promise<void>;
+  presenceSequence: number;
+  presenceQueue: Promise<void>;
+  presence: LocalPresence;
+  stopPresenceHeartbeat: () => void;
   readonly textLeases: Map<string, StoredTextLease>;
   stopTransactionListener: () => void;
   stopDisconnectListener: () => void;
@@ -288,10 +311,50 @@ const invitationFromJoin = (
   };
 };
 
+const participantView = (
+  presence: PresenceRecord,
+  state: CollaborationState,
+): CollaborationParticipant => {
+  const isSelf = presence.clientId === state.clientId;
+  const hostClientId =
+    state.mode === 'host' ? state.clientId : state.client.authoritativeHostClientId;
+  const role: CollaborationParticipant['role'] =
+    presence.clientId === hostClientId ? 'host' : 'guest';
+  const connection: CollaborationParticipant['connection'] =
+    state.mode === 'host'
+      ? state.safety.failure === undefined
+        ? 'active'
+        : 'disconnected'
+      : !state.client.isConnected
+        ? state.reconnectPromise === undefined
+          ? 'disconnected'
+          : 'reconnecting'
+        : 'active';
+  return {
+    clientId: presence.clientId,
+    displayName: presence.displayName,
+    role,
+    isSelf,
+    connection,
+    selectedElementCount: presence.selectedElementIds.length,
+    ...(presence.slideId === undefined ? {} : { slideId: presence.slideId }),
+    ...(presence.editingElementId === undefined
+      ? {}
+      : { editingElementId: presence.editingElementId }),
+  };
+};
+
+const pendingJoinView = (request: PendingJoinRequest) => ({
+  joinRequestId: request.joinRequestId,
+  displayName: request.displayName,
+  expiresAtMs: request.expiresAtMs,
+});
+
 export class DesktopCollaborationCoordinator {
   readonly #runtime: DocumentSessionManager;
   readonly #options: DesktopCollaborationCoordinatorOptions;
   readonly #clock: () => number;
+  readonly #presenceHeartbeatIntervalMs: number;
   readonly #states = new Map<string, CollaborationState>();
 
   public constructor(
@@ -301,6 +364,21 @@ export class DesktopCollaborationCoordinator {
     this.#runtime = runtime;
     this.#options = options;
     this.#clock = options.clock ?? (() => Date.now());
+    const presenceTtlMs = options.presenceTtlMs ?? DEFAULT_PRESENCE_TTL_MS;
+    this.#presenceHeartbeatIntervalMs =
+      options.presenceHeartbeatIntervalMs ?? Math.min(8_000, Math.floor(presenceTtlMs / 2));
+    if (
+      !Number.isSafeInteger(presenceTtlMs) ||
+      presenceTtlMs < 2 ||
+      !Number.isSafeInteger(this.#presenceHeartbeatIntervalMs) ||
+      this.#presenceHeartbeatIntervalMs < 25 ||
+      this.#presenceHeartbeatIntervalMs >= presenceTtlMs
+    ) {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'Presence heartbeat must be at least 25 ms and shorter than the presence TTL.',
+      );
+    }
   }
 
   public mode(sessionId: string): CollaborationState['mode'] | 'offline' {
@@ -314,6 +392,8 @@ export class DesktopCollaborationCoordinator {
         mode: 'offline',
         connectedPeers: 0,
         discoveryEnabled: false,
+        participants: [],
+        pendingJoins: [],
         note: 'Open the same .hdeck from your shared drive, then host or join a LAN editing session.',
       };
     }
@@ -323,6 +403,10 @@ export class DesktopCollaborationCoordinator {
           mode: 'host',
           connectedPeers: 0,
           discoveryEnabled: false,
+          participants: state.engine
+            .listPresence()
+            .map((presence) => participantView(presence, state)),
+          pendingJoins: [],
           note: 'The writer lease failed. Editing and saving are disabled; end the session and recover explicitly.',
         };
       }
@@ -333,6 +417,10 @@ export class DesktopCollaborationCoordinator {
         hostFingerprint: state.invitation.certificateFingerprint,
         endpoint: invitationEndpoint(state.invitation),
         discoveryEnabled: state.discovery !== undefined,
+        participants: state.engine
+          .listPresence()
+          .map((presence) => participantView(presence, state)),
+        pendingJoins: state.server.listPendingJoins().map(pendingJoinView),
         note: `${state.server.authenticatedPeerCount} guest${state.server.authenticatedPeerCount === 1 ? '' : 's'} connected. You are the only shared-file writer.`,
       };
     }
@@ -342,6 +430,8 @@ export class DesktopCollaborationCoordinator {
       hostFingerprint: state.invitation.certificateFingerprint,
       endpoint: invitationEndpoint(state.invitation),
       discoveryEnabled: false,
+      participants: state.client.listPresence().map((presence) => participantView(presence, state)),
+      pendingJoins: [],
       note:
         state.failure !== undefined
           ? 'Replica convergence failed. This copy is read-only and disconnected; leave and rejoin.'
@@ -353,6 +443,79 @@ export class DesktopCollaborationCoordinator {
     };
   }
 
+  public async decideJoin(input: {
+    readonly sessionId: string;
+    readonly joinRequestId: string;
+    readonly decision: 'accept' | 'reject';
+  }): Promise<CollaborationStatus> {
+    const state = this.#states.get(input.sessionId);
+    if (state?.mode !== 'host') {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'Only the authoritative host can decide a join request.',
+      );
+    }
+    const decided =
+      input.decision === 'accept'
+        ? await state.server.approveJoin(input.joinRequestId)
+        : state.server.rejectJoin(input.joinRequestId);
+    if (!decided) {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'The join request expired or was already decided.',
+      );
+    }
+    return this.status(input.sessionId);
+  }
+
+  public updatePresence(input: {
+    readonly sessionId: string;
+    readonly slideId?: string | undefined;
+    readonly selectedElementIds: readonly string[];
+    readonly editingElementId?: string | undefined;
+  }): Promise<CollaborationStatus> {
+    const state = this.#states.get(input.sessionId);
+    if (state === undefined) return Promise.resolve(this.status(input.sessionId));
+    const presence: LocalPresence = {
+      selectedElementIds: [...input.selectedElementIds],
+      ...(input.slideId === undefined ? {} : { slideId: input.slideId }),
+      ...(input.editingElementId === undefined ? {} : { editingElementId: input.editingElementId }),
+    };
+    return this.#enqueuePresence(state, presence).then(() => this.status(input.sessionId));
+  }
+
+  #enqueuePresence(state: CollaborationState, requested?: LocalPresence): Promise<void> {
+    const operation = state.presenceQueue.then(async () => {
+      if (this.#states.get(state.sessionId) !== state) return;
+      if (state.mode === 'guest' && !state.client.isConnected) await this.#reconnectGuest(state);
+      this.#assertHealthy(state);
+      const presence = requested ?? state.presence;
+      const snapshot = this.#runtime.getSnapshot(state.sessionId);
+      const update: PresenceUpdate = {
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        sessionId: state.mode === 'host' ? state.engine.sessionId : state.invitation.sessionId,
+        documentId: snapshot.documentId,
+        clientId: state.clientId,
+        sequence: state.presenceSequence + 1,
+        displayName: state.displayName,
+        selectedElementIds: [...presence.selectedElementIds],
+        ...(presence.slideId === undefined ? {} : { slideId: presence.slideId }),
+        ...(presence.editingElementId === undefined
+          ? {}
+          : { editingElementId: presence.editingElementId }),
+      };
+      if (state.mode === 'host') await state.server.publishPresence(update);
+      else await state.client.updatePresence(update);
+      state.presenceSequence = update.sequence;
+      if (requested !== undefined) state.presence = presence;
+    });
+    state.presenceQueue = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
   async #failHost(state: HostState, error: Error): Promise<void> {
     if (state.safety.failure !== undefined) {
       await state.safeTransition;
@@ -360,6 +523,7 @@ export class DesktopCollaborationCoordinator {
     }
     state.safety.failure = error;
     state.stopHeartbeat();
+    state.stopPresenceHeartbeat();
     state.discovery?.destroy();
     state.textLeases.clear();
     state.engine.releaseTextLeasesForClient(state.clientId);
@@ -382,6 +546,7 @@ export class DesktopCollaborationCoordinator {
     state.failure = error;
     state.stopTransactionListener();
     state.stopDisconnectListener();
+    state.stopPresenceHeartbeat();
     state.textLeases.clear();
     state.safeTransition = (async () => {
       await state.client.close().catch(() => undefined);
@@ -473,6 +638,7 @@ export class DesktopCollaborationCoordinator {
       for (const delayMs of [0, 250, 750]) {
         if (this.#states.get(state.sessionId) !== state || state.failure !== undefined) return;
         if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+        if (this.#states.get(state.sessionId) !== state || state.failure !== undefined) return;
         try {
           await state.client.connect();
           const resync = state.applyQueue.then(() => this.#resyncGuest(state));
@@ -482,6 +648,14 @@ export class DesktopCollaborationCoordinator {
         } catch (error) {
           lastError = error instanceof Error ? error : new Error('Guest reconnect failed.');
           await state.client.close().catch(() => undefined);
+          if (
+            error instanceof RemoteTransportError &&
+            ['JOIN_REJECTED', 'JOIN_TIMEOUT', 'AUTH_FAILED', 'INVITATION_EXPIRED'].includes(
+              error.code,
+            )
+          ) {
+            break;
+          }
         }
       }
       await this.#failGuest(state, lastError);
@@ -505,6 +679,20 @@ export class DesktopCollaborationCoordinator {
       () => undefined,
     );
     return result;
+  }
+
+  #startPresenceHeartbeat(state: CollaborationState): () => void {
+    let stopped = false;
+    const timer = setInterval(() => {
+      if (stopped || this.#states.get(state.sessionId) !== state) return;
+      void this.#enqueuePresence(state).catch(() => undefined);
+    }, this.#presenceHeartbeatIntervalMs);
+    timer.unref?.();
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+    };
   }
 
   #startHostHeartbeat(state: HostState): () => void {
@@ -631,6 +819,18 @@ export class DesktopCollaborationCoordinator {
       ...(this.#options.textLeaseTtlMs === undefined
         ? {}
         : { textLeaseTtlMs: this.#options.textLeaseTtlMs }),
+      ...(this.#options.presenceTtlMs === undefined
+        ? {}
+        : { presenceTtlMs: this.#options.presenceTtlMs }),
+    });
+    engine.updatePresence({
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      sessionId: engine.sessionId,
+      documentId: engine.documentId,
+      clientId,
+      sequence: 0,
+      displayName: input.displayName,
+      selectedElementIds: [],
     });
     const writerLease = new WriterLeaseStore({
       targetPath: input.targetPath,
@@ -646,11 +846,13 @@ export class DesktopCollaborationCoordinator {
     let server: CollaborationTransportServer | undefined;
     let discovery: LanDiscoveryController | undefined;
     let stopHeartbeat: (() => void) | undefined;
+    let stopPresenceHeartbeat: (() => void) | undefined;
     try {
       await writerLease.claim({ allowExpiredTakeover: input.allowExpiredTakeover === true });
       server = new CollaborationTransportServer({
         engine,
         documentSecret: secret,
+        hostClientId: clientId,
         bindHost: this.#options.bindHost ?? '0.0.0.0',
         advertisedHost: this.#options.advertisedHost ?? advertisedLanAddress(),
         ...(this.#options.port === undefined ? {} : { port: this.#options.port }),
@@ -659,6 +861,12 @@ export class DesktopCollaborationCoordinator {
         ...(this.#options.invitationTtlMs === undefined
           ? {}
           : { invitationTtlMs: this.#options.invitationTtlMs }),
+        ...(this.#options.joinApprovalTimeoutMs === undefined
+          ? {}
+          : { joinApprovalTimeoutMs: this.#options.joinApprovalTimeoutMs }),
+        ...(this.#options.reconnectGrantTtlMs === undefined
+          ? {}
+          : { reconnectGrantTtlMs: this.#options.reconnectGrantTtlMs }),
       });
       const invitation = await server.start();
       if (input.enableDiscovery) {
@@ -670,6 +878,7 @@ export class DesktopCollaborationCoordinator {
         sessionId: detached.sessionId,
         targetPath: input.targetPath,
         clientId,
+        displayName: input.displayName,
         secret: cloneSecret(secret),
         engine,
         server,
@@ -679,11 +888,17 @@ export class DesktopCollaborationCoordinator {
         safety,
         leaseQueue: Promise.resolve(),
         textLeaseQueue: Promise.resolve(),
+        presenceSequence: 0,
+        presenceQueue: Promise.resolve(),
+        presence: { selectedElementIds: [] },
+        stopPresenceHeartbeat: () => undefined,
         textLeases: new Map(),
         saveUnconfirmed: false,
         ...(discovery === undefined ? {} : { discovery }),
       };
       this.#states.set(detached.sessionId, state);
+      state.stopPresenceHeartbeat = this.#startPresenceHeartbeat(state);
+      stopPresenceHeartbeat = state.stopPresenceHeartbeat;
       stopHeartbeat = this.#startHostHeartbeat(state);
       return {
         previousSessionId: input.sessionId,
@@ -696,6 +911,7 @@ export class DesktopCollaborationCoordinator {
       discovery?.destroy();
       await server?.close().catch(() => undefined);
       stopHeartbeat?.();
+      stopPresenceHeartbeat?.();
       await writerLease.close().catch(() => undefined);
       await this.#runtime
         .close(detached.sessionId, { discardUnsaved: true })
@@ -727,8 +943,12 @@ export class DesktopCollaborationCoordinator {
       invitation: decoded.invitation,
       documentId: source.documentId,
       clientId,
+      displayName: input.displayName,
       documentSecret: decoded.secret,
       clock: this.#clock,
+      ...(this.#options.joinApprovalTimeoutMs === undefined
+        ? {}
+        : { joinApprovalTimeoutMs: this.#options.joinApprovalTimeoutMs + 1_000 }),
     });
     try {
       await client.connect();
@@ -757,12 +977,17 @@ export class DesktopCollaborationCoordinator {
         sessionId: detached.sessionId,
         targetPath: input.targetPath,
         clientId,
+        displayName: input.displayName,
         secret: cloneSecret(decoded.secret),
         invitation: decoded.invitation,
         client,
         lastSeq,
         applyQueue: Promise.resolve(),
         textLeaseQueue: Promise.resolve(),
+        presenceSequence: 0,
+        presenceQueue: Promise.resolve(),
+        presence: { selectedElementIds: [] },
+        stopPresenceHeartbeat: () => undefined,
         textLeases: new Map(),
         stopTransactionListener: () => undefined,
         stopDisconnectListener: () => undefined,
@@ -773,6 +998,7 @@ export class DesktopCollaborationCoordinator {
         void this.#queueGuestTransaction(state, transaction).catch(() => undefined);
       });
       this.#states.set(detached.sessionId, state);
+      state.stopPresenceHeartbeat = this.#startPresenceHeartbeat(state);
       state.stopDisconnectListener = client.onDisconnect(() => {
         if (this.#states.get(state.sessionId) !== state || state.failure !== undefined) return;
         state.textLeases.clear();
@@ -1134,10 +1360,12 @@ export class DesktopCollaborationCoordinator {
         state.safety.failure !== undefined &&
         (state.saveUnconfirmed || snapshot.dirty)) ||
       (state.mode === 'guest' && snapshot.dirty);
-    await state.textLeaseQueue;
-    await this.#releaseOwnedTextLeases(state).catch(() => undefined);
-    this.#states.delete(sessionId);
+    state.stopPresenceHeartbeat();
     if (state.mode === 'host') {
+      await state.textLeaseQueue;
+      await state.presenceQueue;
+      await this.#releaseOwnedTextLeases(state).catch(() => undefined);
+      this.#states.delete(sessionId);
       state.stopHeartbeat();
       state.discovery?.destroy();
       await state.leaseQueue;
@@ -1147,8 +1375,16 @@ export class DesktopCollaborationCoordinator {
     } else {
       state.stopTransactionListener();
       state.stopDisconnectListener();
+      this.#states.delete(sessionId);
+      const reconnectPromise = state.reconnectPromise;
+      if (reconnectPromise !== undefined) {
+        await state.client.close().catch(() => undefined);
+        await reconnectPromise.catch(() => undefined);
+      }
+      await state.textLeaseQueue;
+      await state.presenceQueue;
+      await this.#releaseOwnedTextLeases(state).catch(() => undefined);
       await state.safeTransition;
-      await state.reconnectPromise?.catch(() => undefined);
       await state.client.close();
     }
     state.secret.fill(0);
@@ -1165,10 +1401,12 @@ export class DesktopCollaborationCoordinator {
   public async shutdown(sessionId: string): Promise<void> {
     const state = this.#states.get(sessionId);
     if (state === undefined) return;
-    await state.textLeaseQueue;
-    await this.#releaseOwnedTextLeases(state).catch(() => undefined);
-    this.#states.delete(sessionId);
+    state.stopPresenceHeartbeat();
     if (state.mode === 'host') {
+      await state.textLeaseQueue;
+      await state.presenceQueue;
+      await this.#releaseOwnedTextLeases(state).catch(() => undefined);
+      this.#states.delete(sessionId);
       state.stopHeartbeat();
       state.discovery?.destroy();
       await state.server.close().catch(() => undefined);
@@ -1180,8 +1418,16 @@ export class DesktopCollaborationCoordinator {
     } else {
       state.stopTransactionListener();
       state.stopDisconnectListener();
+      this.#states.delete(sessionId);
+      const reconnectPromise = state.reconnectPromise;
+      if (reconnectPromise !== undefined) {
+        await state.client.close().catch(() => undefined);
+        await reconnectPromise.catch(() => undefined);
+      }
+      await state.textLeaseQueue;
+      await state.presenceQueue;
+      await this.#releaseOwnedTextLeases(state).catch(() => undefined);
       await state.safeTransition;
-      await state.reconnectPromise?.catch(() => undefined);
       await state.client.close().catch(() => undefined);
     }
     state.secret.fill(0);

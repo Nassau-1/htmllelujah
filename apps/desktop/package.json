@@ -10,9 +10,9 @@
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "make": "pnpm build && electron-builder --win nsis --x64",
-    "package": "pnpm build && electron-builder --dir --win --x64",
+    "build": "node scripts/write-build-provenance.mjs --prepare && vite build && node scripts/write-build-provenance.mjs --embed",
+    "make": "node ../../scripts/build-windows-release.mjs",
+    "package": "node ../../scripts/build-windows-release.mjs",
     "preview": "vite preview",
     "smoke:electron:exports": "pnpm build && node scripts/smoke-system-exports-windows.mjs",
     "smoke:electron:exports:stress": "pnpm build && node scripts/smoke-system-exports-windows.mjs --stress",
@@ -104,6 +104,7 @@
       "verifyUpdateCodeSignature": true
     },
     "nsis": {
+      "guid": "7bf3c6ec-651b-477c-a0b7-399160cda612",
       "oneClick": false,
       "perMachine": false,
       "allowElevation": false,

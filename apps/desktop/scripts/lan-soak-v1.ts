@@ -14,7 +14,10 @@ import {
   type DocumentSessionSnapshot,
 } from '@htmllelujah/document-runtime';
 
-import { DesktopCollaborationCoordinator } from '../src/main/collaboration-service.js';
+import {
+  DesktopCollaborationCoordinator,
+  type CollaborationTransition,
+} from '../src/main/collaboration-service.js';
 
 const DEFAULT_DURATION_MINUTES = 30;
 const DEFAULT_COMMAND_DELAY_MS = 200;
@@ -283,6 +286,7 @@ const main = async (): Promise<void> => {
   let invitation:
     | { readonly endpoint: string; readonly sessionCode: string; readonly fingerprint: string }
     | undefined;
+  let authoritativeHostSessionId: string | undefined;
   let steadyStateStartedAt = 0;
   let steadyStateEndedAt = 0;
   let status: 'passed' | 'failed' | 'interrupted' = 'failed';
@@ -326,6 +330,33 @@ const main = async (): Promise<void> => {
     return count;
   };
 
+  const joinWithApproval = async (
+    coordinator: DesktopCollaborationCoordinator,
+    input: Parameters<DesktopCollaborationCoordinator['join']>[0],
+    expectedDisplayName: string,
+  ): Promise<CollaborationTransition> => {
+    const hostSessionId = authoritativeHostSessionId;
+    if (hostSessionId === undefined) {
+      throw new SoakInvariantError('HOST_SESSION_MISSING');
+    }
+    const joining = coordinator.join(input);
+    void joining.catch(() => undefined);
+    await waitFor(
+      () => hostCoordinator.status(hostSessionId).pendingJoins.length > 0,
+      'JOIN_APPROVAL_PENDING_TIMEOUT',
+    );
+    const pending = hostCoordinator.status(hostSessionId).pendingJoins;
+    if (pending.length !== 1 || pending[0]?.displayName !== expectedDisplayName) {
+      throw new SoakInvariantError('UNEXPECTED_PENDING_JOIN');
+    }
+    await hostCoordinator.decideJoin({
+      sessionId: hostSessionId,
+      joinRequestId: pending[0].joinRequestId,
+      decision: 'accept',
+    });
+    return joining;
+  };
+
   const verifyPersistence = async (): Promise<void> => {
     const host = hostParticipant();
     const hostSnapshot = host.runtime.getSnapshot(host.sessionId);
@@ -359,14 +390,18 @@ const main = async (): Promise<void> => {
     const left = await participant.coordinator.leave(oldSessionId);
     if (left?.mode !== 'guest') throw new SoakInvariantError('GUEST_LEAVE_FAILED');
     await waitFor(() => updatePeerRange() === 1, 'GUEST_LEAVE_PEER_TIMEOUT');
-    const joined = await participant.coordinator.join({
-      sessionId: oldSessionId,
-      targetPath,
-      endpoint: invitation.endpoint,
-      sessionCode: invitation.sessionCode,
-      expectedFingerprint: invitation.fingerprint,
-      displayName: participant.actor,
-    });
+    const joined = await joinWithApproval(
+      participant.coordinator,
+      {
+        sessionId: oldSessionId,
+        targetPath,
+        endpoint: invitation.endpoint,
+        sessionCode: invitation.sessionCode,
+        expectedFingerprint: invitation.fingerprint,
+        displayName: participant.actor,
+      },
+      participant.actor,
+    );
     participant.sessionId = joined.snapshot.sessionId;
     await participant.runtime.close(oldSessionId, { discardUnsaved: true });
     await waitFor(() => updatePeerRange() === 2, 'GUEST_REJOIN_PEER_TIMEOUT');
@@ -587,6 +622,7 @@ const main = async (): Promise<void> => {
       displayName: 'host',
       enableDiscovery: false,
     });
+    authoritativeHostSessionId = hosted.snapshot.sessionId;
     await hostRuntime.close(hostSource.sessionId, { discardUnsaved: true });
     const hostedStatus = hosted.status;
     if (
@@ -602,23 +638,31 @@ const main = async (): Promise<void> => {
       fingerprint: hostedStatus.hostFingerprint,
     };
 
-    const guestOneJoined = await guestOneCoordinator.join({
-      sessionId: guestOneSource.sessionId,
-      targetPath,
-      endpoint: invitation.endpoint,
-      sessionCode: invitation.sessionCode,
-      expectedFingerprint: invitation.fingerprint,
-      displayName: 'guest-1',
-    });
+    const guestOneJoined = await joinWithApproval(
+      guestOneCoordinator,
+      {
+        sessionId: guestOneSource.sessionId,
+        targetPath,
+        endpoint: invitation.endpoint,
+        sessionCode: invitation.sessionCode,
+        expectedFingerprint: invitation.fingerprint,
+        displayName: 'guest-1',
+      },
+      'guest-1',
+    );
     await guestOneRuntime.close(guestOneSource.sessionId, { discardUnsaved: true });
-    const guestTwoJoined = await guestTwoCoordinator.join({
-      sessionId: guestTwoSource.sessionId,
-      targetPath,
-      endpoint: invitation.endpoint,
-      sessionCode: invitation.sessionCode,
-      expectedFingerprint: invitation.fingerprint,
-      displayName: 'guest-2',
-    });
+    const guestTwoJoined = await joinWithApproval(
+      guestTwoCoordinator,
+      {
+        sessionId: guestTwoSource.sessionId,
+        targetPath,
+        endpoint: invitation.endpoint,
+        sessionCode: invitation.sessionCode,
+        expectedFingerprint: invitation.fingerprint,
+        displayName: 'guest-2',
+      },
+      'guest-2',
+    );
     await guestTwoRuntime.close(guestTwoSource.sessionId, { discardUnsaved: true });
 
     participants = [

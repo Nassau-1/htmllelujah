@@ -18,7 +18,9 @@ export interface AuthProofInput {
   readonly challengeId: string;
   readonly serverNonce: string;
   readonly clientId: string;
+  readonly displayName: string;
   readonly clientNonce: string;
+  readonly reconnectToken?: string;
   readonly expiresAtMs: number;
 }
 

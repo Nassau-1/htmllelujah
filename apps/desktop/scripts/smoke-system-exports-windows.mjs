@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { createNeutralDemoDeck } from '@htmllelujah/document-core';
 import { createHdeckArchive, parseHdeckArchive } from '@htmllelujah/hdeck';
@@ -81,6 +82,7 @@ const evidencePath = path.join(
   'evidence',
   `system-exports-v1${stressEvidenceSuffix}${pageEvidenceSuffix}.json`,
 );
+const evidenceDirectory = path.dirname(evidencePath);
 const dialogAutomationPath = path.join(import.meta.dirname, 'automate-save-dialog.ps1');
 const runtimeStabilitySamples = 2;
 const cdpCommandTimeoutMs = 5_000;
@@ -157,6 +159,69 @@ const run = (command, arguments_, options = {}) =>
         );
     });
   });
+
+const browserCandidates = [
+  process.env.HTMLLELUJAH_BROWSER_EXECUTABLE,
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+].filter((candidate) => typeof candidate === 'string' && candidate.trim() !== '');
+
+const findBrowserExecutable = async () => {
+  for (const candidate of browserCandidates) {
+    const resolved = path.resolve(candidate);
+    if (await exists(resolved)) return resolved;
+  }
+  throw new Error(
+    'No supported local Edge/Chrome executable was found for export visual evidence.',
+  );
+};
+
+const pngDimensions = (bytes) => {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (bytes.length < 24 || !bytes.subarray(0, 8).equals(signature)) {
+    throw new Error('The browser visual evidence is not a valid PNG.');
+  }
+  return { widthPx: bytes.readUInt32BE(16), heightPx: bytes.readUInt32BE(20) };
+};
+
+const captureLocalVisual = async ({
+  browserExecutable,
+  sourcePath,
+  screenshotPath,
+  profilePath,
+  fragment = '',
+}) => {
+  await mkdir(profilePath, { recursive: true });
+  await rm(screenshotPath, { force: true });
+  const target = `${pathToFileURL(sourcePath).href}${fragment}`;
+  await run(
+    browserExecutable,
+    [
+      '--headless=new',
+      '--disable-background-networking',
+      '--disable-component-update',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--hide-scrollbars',
+      '--metrics-recording-only',
+      '--no-first-run',
+      '--run-all-compositor-stages-before-draw',
+      '--virtual-time-budget=3000',
+      '--window-size=1280,800',
+      `--user-data-dir=${profilePath}`,
+      `--screenshot=${screenshotPath}`,
+      target,
+    ],
+    { label: `Visual capture for ${path.extname(sourcePath)}`, timeoutMs: 45_000 },
+  );
+  const bytes = await readFile(screenshotPath);
+  const dimensions = pngDimensions(bytes);
+  if (bytes.length < 5_000 || dimensions.widthPx !== 1_280 || dimensions.heightPx !== 800) {
+    throw new Error('The browser returned incomplete export visual evidence.');
+  }
+  return { bytes: bytes.length, sha256: sha256(bytes), ...dimensions };
+};
 
 const inspectRuntime = async (rootProcessId) => {
   const { stdout } = await run(
@@ -698,6 +763,7 @@ try {
 
   const exportRecords = [];
   const exportTargets = new Set();
+  const firstExportPathByFormat = new Map();
   const runtimeSamples = [];
   for (let index = 0; index < exportRun.exportCount; index += 1) {
     const ordinal = index + 1;
@@ -710,6 +776,7 @@ try {
       throw new Error(`Export ${ordinal} did not receive a unique empty destination.`);
     }
     exportTargets.add(targetPath);
+    if (!firstExportPathByFormat.has(format)) firstExportPathByFormat.set(format, targetPath);
     const startedAt = performance.now();
     await runSaveOperation({
       editor,
@@ -782,6 +849,37 @@ try {
     process.stdout.write(
       'Memory-growth limitation: Windows working-set data was unavailable for every sample.\n',
     );
+  }
+
+  let visualEvidence = null;
+  if (exportRun.mode === 'short') {
+    const htmlPath = firstExportPathByFormat.get('html');
+    const pdfPath = firstExportPathByFormat.get('pdf');
+    if (htmlPath === undefined || pdfPath === undefined) {
+      throw new Error('The short export run did not produce both visual source formats.');
+    }
+    const browserExecutable = await findBrowserExecutable();
+    await mkdir(evidenceDirectory, { recursive: true });
+    const htmlRelativePath = `artifacts/evidence/v1-standalone-html-${requestedPagePreset}.png`;
+    const pdfRelativePath = `artifacts/evidence/v1-pdf-${requestedPagePreset}.png`;
+    const htmlVisual = await captureLocalVisual({
+      browserExecutable,
+      sourcePath: htmlPath,
+      screenshotPath: path.join(repositoryRoot, htmlRelativePath),
+      profilePath: path.join(temporaryRoot, 'Profil visuel HTML'),
+    });
+    const pdfVisual = await captureLocalVisual({
+      browserExecutable,
+      sourcePath: pdfPath,
+      screenshotPath: path.join(repositoryRoot, pdfRelativePath),
+      profilePath: path.join(temporaryRoot, 'Profil visuel PDF'),
+      fragment: '#page=1&zoom=page-fit',
+    });
+    visualEvidence = {
+      browser: path.basename(browserExecutable),
+      standaloneHtml: { path: htmlRelativePath, ...htmlVisual },
+      pdfFirstPage: { path: pdfRelativePath, ...pdfVisual },
+    };
   }
 
   const firstApplicationPid = activeApplicationPid;
@@ -885,6 +983,7 @@ try {
       hdeckParsedAndValidated: true,
       savedHdeckReopenedInRealEditor: true,
       nativeDialogsClosedAfterEveryExport: true,
+      standaloneHtmlAndPdfVisualsCaptured: exportRun.mode === 'stress' || visualEvidence !== null,
       exactWindowHandlesAndVisibilityRestoredAfterEveryExport: true,
       processCountStable: runtimeGrowth.processCountStable,
       processTreesAndWindowsClosedAfterEditorsExit:
@@ -899,6 +998,7 @@ try {
     artifacts: {
       hdeck: { bytes: savedBytes.length, sha256: sha256(savedBytes) },
       exports: exportRecords,
+      visuals: visualEvidence,
     },
     performance: {
       allExports: summarizeDurations(exportRecords.map((record) => record.durationMs)),
@@ -925,7 +1025,7 @@ try {
       publicReportContainsLocalPaths: false,
     },
   };
-  await mkdir(path.dirname(evidencePath), { recursive: true });
+  await mkdir(evidenceDirectory, { recursive: true });
   await writeFile(evidencePath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
   process.stdout.write(
     `Windows system export smoke passed: ${exportRecords.length} mixed exports, parsing, runtime cleanup, and real reopen verified.\n`,

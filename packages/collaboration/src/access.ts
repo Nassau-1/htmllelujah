@@ -11,6 +11,7 @@ import type { CommandAccess } from './contracts.js';
 export const deckNameKey = 'deck:name';
 export const deckSlideOrderKey = 'deck:slide-order';
 export const deckPageKey = 'deck:page';
+export const deckExportSettingsKey = 'deck:export-settings';
 export const themeCollectionKey = 'deck:themes';
 export const masterCollectionKey = 'deck:masters';
 export const layoutCollectionKey = 'deck:layouts';
@@ -38,6 +39,7 @@ export const elementCollectionKey = (slideId: string, containerId?: string): str
 export const DOCUMENT_COMMAND_ACCESS_CLASSIFICATION = {
   'deck.rename': 'deck',
   'deck.set-page': 'deck',
+  'deck.set-export-options': 'deck',
   'theme.create': 'theme',
   'theme.update': 'theme',
   'theme.delete': 'theme',
@@ -226,6 +228,10 @@ export const analyzeCommandAccess = (
 
       case 'deck.set-page':
         writes.add(deckPageKey);
+        break;
+
+      case 'deck.set-export-options':
+        writes.add(deckExportSettingsKey);
         break;
 
       case 'theme.create':

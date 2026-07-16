@@ -1,4 +1,13 @@
-import type { DeckDocument, Element, Frame, Slide } from '@htmllelujah/document-core';
+import type {
+  DeckDocument,
+  Element,
+  Frame,
+  ResolvedElementSource,
+  ResolvedSlide,
+  Slide,
+  TextAlignment,
+  TextElement,
+} from '@htmllelujah/document-core';
 import { resolveSlide } from '@htmllelujah/document-core';
 import {
   boundsForFrames,
@@ -6,18 +15,39 @@ import {
   moveItems,
   moveItemsWithSnapping,
   resizeFrame,
+  rotationFromPointer,
   type ResizeHandle,
   type SmartGuide,
 } from '@htmllelujah/geometry';
-import { SlideSurface } from '@htmllelujah/renderer';
+import { resolveConnectorGeometries, SlideSurface } from '@htmllelujah/renderer';
 import {
   useEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
+  type ClipboardEvent as ReactClipboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
+
+import { inlineTextEditorKeyAction, rotationFrameForKeyboard } from '../editor/editor-interactions';
+
+export type InlineTextCanvasEditor = Readonly<{
+  elementId: string;
+  value: string;
+  disabled: boolean;
+  conflict: boolean;
+  maxLength: number;
+  fontFamily: string;
+  fontSizePt: number;
+  fontWeight: number;
+  italic: boolean;
+  color: string;
+  lineHeight: number;
+  letterSpacingPt: number;
+  alignment: TextAlignment;
+}>;
 
 type CanonicalSlideCanvasProps = {
   readonly document: DeckDocument;
@@ -25,15 +55,125 @@ type CanonicalSlideCanvasProps = {
   readonly assetUrls: Readonly<Record<string, string>>;
   readonly scale: number;
   readonly gridEnabled: boolean;
+  readonly editableElements?: readonly Element[] | undefined;
+  readonly editableSource?: 'slide' | 'layout' | 'master' | undefined;
+  readonly includeTemplatePlaceholders?: boolean | undefined;
+  readonly inlineTextEditor?: InlineTextCanvasEditor | null | undefined;
   readonly selectedIds: readonly string[];
   readonly onSelect: (ids: readonly string[]) => void;
   readonly onTransform: (
     frames: readonly { readonly elementId: string; readonly frame: Frame }[],
   ) => void;
   readonly onEditText: (elementId: string) => void;
+  readonly onInlineTextChange?: ((value: string) => void) | undefined;
+  readonly onInlineTextPaste?:
+    ((event: ReactClipboardEvent<HTMLTextAreaElement>) => void) | undefined;
+  readonly onInlineTextCommit?: (() => void) | undefined;
+  readonly onInlineTextCancel?: (() => void) | undefined;
+  readonly onInlineTextFocus?: (() => void) | undefined;
 };
 
 type DraftFrames = Readonly<Record<string, Frame>>;
+
+export type CanvasEditableElementProjection = Readonly<{
+  localElement: Element;
+  effectiveElement: Element;
+}>;
+
+const CONNECTOR_INTERACTION_MINIMUM_PT = 12;
+
+const connectorInteractionFrame = (
+  bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>,
+): Frame => {
+  const widthPt = Math.max(CONNECTOR_INTERACTION_MINIMUM_PT, bounds.widthPt);
+  const heightPt = Math.max(CONNECTOR_INTERACTION_MINIMUM_PT, bounds.heightPt);
+  return {
+    xPt: bounds.xPt - (widthPt - bounds.widthPt) / 2,
+    yPt: bounds.yPt - (heightPt - bounds.heightPt) / 2,
+    widthPt,
+    heightPt,
+    rotationDeg: 0,
+  };
+};
+
+/**
+ * Keeps local identities as the write target while using the fully resolved element for
+ * hit-testing. This matters for slide elements whose frame or visibility is inherited from a
+ * layout/master placeholder: their stored frame is intentionally not their on-canvas frame.
+ */
+export const resolveCanvasEditableElements = (
+  projection: ResolvedSlide,
+  editableSource: ResolvedElementSource,
+  localElements: readonly Element[],
+): readonly CanvasEditableElementProjection[] => {
+  const renderedElements = projection.elements.map((entry) => entry.element);
+  const connectorGeometries = resolveConnectorGeometries(renderedElements);
+  const effectiveById = new Map(
+    projection.elements
+      .filter((entry) => entry.source === editableSource)
+      .map((entry) => [entry.element.id, entry.element] as const),
+  );
+  return localElements.map((localElement) => {
+    const effectiveElement = effectiveById.get(localElement.id) ?? localElement;
+    if (effectiveElement.type !== 'connector') return { localElement, effectiveElement };
+    const geometry = connectorGeometries.get(effectiveElement.id);
+    return {
+      localElement,
+      effectiveElement:
+        geometry === undefined
+          ? effectiveElement
+          : { ...effectiveElement, frame: connectorInteractionFrame(geometry.boundsInSlide) },
+    };
+  });
+};
+
+export const MINIMUM_ROTATION_TOUCH_TARGET_PX = 44;
+const CANVAS_POINT_TO_CSS_PIXEL_SCALE = 0.75;
+const ROTATION_CONTROL_GAP_PX = 6;
+const ROTATION_CONTROL_STEM_PX = 28;
+const ROTATION_CONTROL_DOT_PX = 10;
+const ROTATION_CONTROL_LINE_PX = 1.5;
+
+export type RotationControlMetrics = Readonly<{
+  canvasTransformScale: number;
+  targetSizeCssPx: number;
+  targetHalfCssPx: number;
+  gapCssPx: number;
+  stemLengthCssPx: number;
+  dotSizeCssPx: number;
+  dotHalfCssPx: number;
+  lineWidthCssPx: number;
+  lineHalfCssPx: number;
+}>;
+
+const normalizedEditorScale = (scale: number): number =>
+  Number.isFinite(scale) && scale > 0 ? scale : 1;
+
+/** Converts fixed screen-pixel controls into pre-transform CSS dimensions. */
+export const rotationControlMetrics = (scale: number): RotationControlMetrics => {
+  const canvasTransformScale = normalizedEditorScale(scale) * CANVAS_POINT_TO_CSS_PIXEL_SCALE;
+  const toCssPixels = (screenPixels: number): number => screenPixels / canvasTransformScale;
+  return {
+    canvasTransformScale,
+    targetSizeCssPx: toCssPixels(MINIMUM_ROTATION_TOUCH_TARGET_PX),
+    targetHalfCssPx: toCssPixels(MINIMUM_ROTATION_TOUCH_TARGET_PX / 2),
+    gapCssPx: toCssPixels(ROTATION_CONTROL_GAP_PX),
+    stemLengthCssPx: toCssPixels(ROTATION_CONTROL_STEM_PX),
+    dotSizeCssPx: toCssPixels(ROTATION_CONTROL_DOT_PX),
+    dotHalfCssPx: toCssPixels(ROTATION_CONTROL_DOT_PX / 2),
+    lineWidthCssPx: toCssPixels(ROTATION_CONTROL_LINE_PX),
+    lineHalfCssPx: toCssPixels(ROTATION_CONTROL_LINE_PX / 2),
+  };
+};
+
+export type RotationControlPlacement = 'above' | 'inside-top';
+
+/** Keeps the whole 44 px target inside the canvas when an element touches the top edge. */
+export const rotationControlPlacement = (frame: Frame, scale: number): RotationControlPlacement =>
+  frame.yPt * normalizedEditorScale(scale) >=
+  MINIMUM_ROTATION_TOUCH_TARGET_PX + ROTATION_CONTROL_GAP_PX
+    ? 'above'
+    : 'inside-top';
 
 type MoveGesture = {
   readonly kind: 'move';
@@ -56,7 +196,15 @@ type ResizeGesture = {
   readonly fromCenter: boolean;
 };
 
-type Gesture = MoveGesture | ResizeGesture;
+type RotateGesture = {
+  readonly kind: 'rotate';
+  readonly pointerId: number;
+  readonly startPointer: { readonly xPt: number; readonly yPt: number };
+  readonly item: { readonly id: string; readonly frame: Frame };
+  readonly snapToIncrement: boolean;
+};
+
+type Gesture = MoveGesture | ResizeGesture | RotateGesture;
 
 const handles: readonly ResizeHandle[] = [
   'north-west',
@@ -76,6 +224,104 @@ const sameFrame = (left: Frame, right: Frame): boolean =>
   left.heightPt === right.heightPt &&
   left.rotationDeg === right.rotationDeg;
 
+const rotatePoint = (
+  point: Readonly<{ xPt: number; yPt: number }>,
+  center: Readonly<{ xPt: number; yPt: number }>,
+  rotationDeg: number,
+): Readonly<{ xPt: number; yPt: number }> => {
+  if (rotationDeg === 0) return point;
+  const radians = (rotationDeg * Math.PI) / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  const deltaX = point.xPt - center.xPt;
+  const deltaY = point.yPt - center.yPt;
+  return {
+    xPt: center.xPt + deltaX * cosine - deltaY * sine,
+    yPt: center.yPt + deltaX * sine + deltaY * cosine,
+  };
+};
+
+const frameCenter = (frame: Frame): Readonly<{ xPt: number; yPt: number }> => ({
+  xPt: frame.xPt + frame.widthPt / 2,
+  yPt: frame.yPt + frame.heightPt / 2,
+});
+
+/** Applies the editor's frame-to-frame gesture affine transform to an absolute point. */
+export const pointAfterInteractionFrameTransform = (
+  point: Readonly<{ xPt: number; yPt: number }>,
+  previousFrame: Frame,
+  nextFrame: Frame,
+): Readonly<{ xPt: number; yPt: number }> => {
+  const previousCenter = frameCenter(previousFrame);
+  const nextCenter = frameCenter(nextFrame);
+  const unrotated = rotatePoint(point, previousCenter, -previousFrame.rotationDeg);
+  const normalizedX = (unrotated.xPt - previousFrame.xPt) / previousFrame.widthPt;
+  const normalizedY = (unrotated.yPt - previousFrame.yPt) / previousFrame.heightPt;
+  return rotatePoint(
+    {
+      xPt: nextFrame.xPt + normalizedX * nextFrame.widthPt,
+      yPt: nextFrame.yPt + normalizedY * nextFrame.heightPt,
+    },
+    nextCenter,
+    nextFrame.rotationDeg,
+  );
+};
+
+const localConnectorFrameAfterInteraction = (
+  localFrame: Frame,
+  previousInteractionFrame: Frame,
+  nextInteractionFrame: Frame,
+): Frame => {
+  const center = pointAfterInteractionFrameTransform(
+    frameCenter(localFrame),
+    previousInteractionFrame,
+    nextInteractionFrame,
+  );
+  const widthPt =
+    localFrame.widthPt * (nextInteractionFrame.widthPt / previousInteractionFrame.widthPt);
+  const heightPt =
+    localFrame.heightPt * (nextInteractionFrame.heightPt / previousInteractionFrame.heightPt);
+  return {
+    xPt: center.xPt - widthPt / 2,
+    yPt: center.yPt - heightPt / 2,
+    widthPt,
+    heightPt,
+    rotationDeg:
+      localFrame.rotationDeg +
+      nextInteractionFrame.rotationDeg -
+      previousInteractionFrame.rotationDeg,
+  };
+};
+
+export const canvasTransformsToCommit = (
+  draftFrames: Readonly<Record<string, Frame>>,
+  startingItems: readonly { readonly id: string; readonly frame: Frame }[],
+  localElements: ReadonlyMap<string, Element>,
+): readonly { readonly elementId: string; readonly frame: Frame }[] => {
+  const startingById = new Map(startingItems.map((item) => [item.id, item.frame] as const));
+  return Object.entries(draftFrames)
+    .map(([elementId, frame]) => ({ elementId, frame }))
+    .filter(({ elementId, frame }) => {
+      const startingFrame = startingById.get(elementId);
+      return (
+        localElements.has(elementId) &&
+        startingFrame !== undefined &&
+        !sameFrame(startingFrame, frame)
+      );
+    })
+    .map(({ elementId, frame }) => {
+      const localElement = localElements.get(elementId);
+      const startingFrame = startingById.get(elementId);
+      return {
+        elementId,
+        frame:
+          localElement?.type === 'connector' && startingFrame !== undefined
+            ? localConnectorFrameAfterInteraction(localElement.frame, startingFrame, frame)
+            : frame,
+      };
+    });
+};
+
 const frameStyle = (frame: Frame): CSSProperties => ({
   left: `${frame.xPt}pt`,
   top: `${frame.yPt}pt`,
@@ -83,6 +329,88 @@ const frameStyle = (frame: Frame): CSSProperties => ({
   height: `${frame.heightPt}pt`,
   transform: `rotate(${frame.rotationDeg}deg)`,
 });
+
+export function InlineTextCanvasEditorOverlay({
+  element,
+  editor,
+  onChange,
+  onPaste,
+  onCommit,
+  onCancel,
+  onFocus,
+}: Readonly<{
+  element: TextElement;
+  editor: InlineTextCanvasEditor;
+  onChange: (value: string) => void;
+  onPaste: (event: ReactClipboardEvent<HTMLTextAreaElement>) => void;
+  onCommit: () => void;
+  onCancel: () => void;
+  onFocus: () => void;
+}>) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (!editor.disabled) textareaRef.current?.focus();
+  }, [editor.disabled]);
+
+  const conflictId = `inline-text-conflict-${element.id}`;
+  const helpId = `inline-text-help-${element.id}`;
+  return (
+    <div
+      className={`canonical-inline-text-editor${editor.conflict ? ' has-conflict' : ''}`}
+      style={frameStyle(element.frame)}
+      data-inline-text-element-id={element.id}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      <textarea
+        ref={textareaRef}
+        autoFocus={!editor.disabled}
+        aria-label={`Edit ${element.name} on slide`}
+        aria-describedby={`${helpId}${editor.conflict ? ` ${conflictId}` : ''}`}
+        aria-invalid={editor.conflict || undefined}
+        className="canonical-inline-text-input"
+        disabled={editor.disabled}
+        maxLength={editor.maxLength}
+        spellCheck
+        value={editor.value}
+        style={{
+          color: editor.color,
+          fontFamily: editor.fontFamily,
+          fontSize: `${editor.fontSizePt}pt`,
+          fontStyle: editor.italic ? 'italic' : 'normal',
+          fontWeight: editor.fontWeight,
+          letterSpacing: `${editor.letterSpacingPt}pt`,
+          lineHeight: editor.lineHeight,
+          textAlign: editor.alignment,
+        }}
+        onBlur={onCommit}
+        onChange={(event) => onChange(event.currentTarget.value)}
+        onFocus={onFocus}
+        onPaste={onPaste}
+        onKeyDown={(event) => {
+          const action = inlineTextEditorKeyAction(event.key, {
+            ctrlKey: event.ctrlKey,
+            metaKey: event.metaKey,
+            isComposing: event.nativeEvent.isComposing,
+          });
+          if (action === 'none') return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (action === 'commit') onCommit();
+          else onCancel();
+        }}
+      />
+      <span id={helpId} className="sr-only">
+        Press Control Enter to apply. Press Escape to cancel.
+      </span>
+      {editor.conflict ? (
+        <span id={conflictId} className="canonical-inline-text-conflict" role="alert">
+          Remote change detected. Your draft is preserved and will not overwrite it automatically.
+        </span>
+      ) : null}
+    </div>
+  );
+}
 
 const pageBounds = (document: DeckDocument) => ({
   leftPt: 0,
@@ -101,35 +429,111 @@ export function CanonicalSlideCanvas({
   assetUrls,
   scale,
   gridEnabled,
+  editableElements,
+  editableSource = 'slide',
+  includeTemplatePlaceholders = false,
+  inlineTextEditor,
   selectedIds,
   onSelect,
   onTransform,
   onEditText,
+  onInlineTextChange,
+  onInlineTextPaste,
+  onInlineTextCommit,
+  onInlineTextCancel,
+  onInlineTextFocus,
 }: CanonicalSlideCanvasProps) {
   const gesture = useRef<Gesture | null>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const draftFramesRef = useRef<DraftFrames>({});
   const [draftFrames, setDraftFrames] = useState<DraftFrames>({});
   const [smartGuides, setSmartGuides] = useState<readonly SmartGuide[]>([]);
-  const localElements = slide.elements;
+  const localElements = editableElements ?? slide.elements;
   const localById = useMemo(
     () => new Map(localElements.map((element) => [element.id, element])),
     [localElements],
   );
+  const baseProjection = useMemo(
+    () =>
+      resolveSlide(document, slide.id, {
+        includePlaceholders: includeTemplatePlaceholders,
+      }),
+    [document, includeTemplatePlaceholders, slide.id],
+  );
   const projection = useMemo(() => {
-    const resolved = resolveSlide(document, slide.id);
-    if (Object.keys(draftFrames).length === 0) return resolved;
+    if (Object.keys(draftFrames).length === 0) return baseProjection;
+    const startingFrames = new Map(
+      resolveCanvasEditableElements(baseProjection, editableSource, localElements).map((entry) => [
+        entry.localElement.id,
+        entry.effectiveElement.frame,
+      ]),
+    );
     return {
-      ...resolved,
-      elements: resolved.elements.map((entry) => {
-        const frame = entry.source === 'slide' ? draftFrames[entry.element.id] : undefined;
-        return frame === undefined ? entry : { ...entry, element: { ...entry.element, frame } };
+      ...baseProjection,
+      elements: baseProjection.elements.map((entry) => {
+        const nextFrame =
+          entry.source === editableSource ? draftFrames[entry.element.id] : undefined;
+        if (nextFrame === undefined) return entry;
+        if (entry.element.type !== 'connector') {
+          return { ...entry, element: { ...entry.element, frame: nextFrame } };
+        }
+        const previousFrame = startingFrames.get(entry.element.id);
+        if (previousFrame === undefined) {
+          return { ...entry, element: { ...entry.element, frame: nextFrame } };
+        }
+        const transformEndpoint = (endpoint: typeof entry.element.start) => ({
+          ...endpoint,
+          ...pointAfterInteractionFrameTransform(endpoint, previousFrame, nextFrame),
+        });
+        return {
+          ...entry,
+          element: {
+            ...entry.element,
+            frame: nextFrame,
+            start: transformEndpoint(entry.element.start),
+            end: transformEndpoint(entry.element.end),
+          },
+        };
       }),
     };
-  }, [document, draftFrames, slide.id]);
+  }, [baseProjection, draftFrames, editableSource, localElements]);
+  const editableProjection = useMemo(
+    () => resolveCanvasEditableElements(projection, editableSource, localElements),
+    [editableSource, localElements, projection],
+  );
+  const editableProjectionByLocalId = useMemo(
+    () => new Map(editableProjection.map((entry) => [entry.localElement.id, entry] as const)),
+    [editableProjection],
+  );
+
+  const updateDraftFrames = (next: DraftFrames): void => {
+    draftFramesRef.current = next;
+    setDraftFrames(next);
+  };
+
+  const pointFromClient = (clientX: number, clientY: number) => {
+    const bounds = wrapperRef.current?.getBoundingClientRect();
+    return {
+      xPt: bounds === undefined ? 0 : (clientX - bounds.left) / Math.max(scale, 0.01),
+      yPt: bounds === undefined ? 0 : (clientY - bounds.top) / Math.max(scale, 0.01),
+    };
+  };
 
   useEffect(() => {
     const onMove = (event: PointerEvent): void => {
       const active = gesture.current;
       if (active === null || event.pointerId !== active.pointerId) return;
+      if (active.kind === 'rotate') {
+        const rotationDeg = rotationFromPointer(
+          active.item.frame,
+          active.startPointer,
+          pointFromClient(event.clientX, event.clientY),
+          active.item.frame.rotationDeg,
+          event.shiftKey || active.snapToIncrement ? { snapIncrementDeg: 15 } : {},
+        );
+        updateDraftFrames({ [active.item.id]: { ...active.item.frame, rotationDeg } });
+        return;
+      }
       const dxPt = (event.clientX - active.startX) / Math.max(scale, 0.01);
       const dyPt = (event.clientY - active.startY) / Math.max(scale, 0.01);
       if (active.kind === 'move') {
@@ -168,7 +572,7 @@ export function CanonicalSlideCanvas({
             items = moveItems(items, { dxPt: correctionX, dyPt: correctionY });
           }
         }
-        setDraftFrames(Object.fromEntries(items.map((item) => [item.id, item.frame])));
+        updateDraftFrames(Object.fromEntries(items.map((item) => [item.id, item.frame])));
         setSmartGuides(snapped.guides);
         return;
       }
@@ -186,54 +590,64 @@ export function CanonicalSlideCanvas({
         ),
         pageBounds(document),
       );
-      setDraftFrames({ [active.item.id]: next });
+      updateDraftFrames({ [active.item.id]: next });
     };
 
-    const onUp = (event: PointerEvent): void => {
+    const finishGesture = (event: PointerEvent, commit: boolean): void => {
       const active = gesture.current;
       if (active === null || event.pointerId !== active.pointerId) return;
-      const transforms = Object.entries(draftFrames)
-        .map(([elementId, frame]) => ({ elementId, frame }))
-        .filter(({ elementId, frame }) => {
-          const original = localById.get(elementId);
-          return original !== undefined && !sameFrame(original.frame, frame);
-        });
+      const startingItems = active.kind === 'move' ? active.items : [active.item];
+      const transforms = commit
+        ? canvasTransformsToCommit(draftFramesRef.current, startingItems, localById)
+        : [];
       gesture.current = null;
       setSmartGuides([]);
-      setDraftFrames({});
+      updateDraftFrames({});
       if (transforms.length > 0) onTransform(transforms);
     };
+    const onUp = (event: PointerEvent): void => finishGesture(event, true);
+    const onCancel = (event: PointerEvent): void => finishGesture(event, false);
 
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onUp);
+    window.addEventListener('pointercancel', onCancel);
     return () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('pointercancel', onCancel);
     };
-  }, [document, draftFrames, gridEnabled, localById, onTransform, projection.guides, scale]);
+  }, [document, gridEnabled, localById, onTransform, projection.guides, scale]);
 
-  const beginMove = (event: ReactPointerEvent, element: Element): void => {
+  const beginMove = (event: ReactPointerEvent, editable: CanvasEditableElementProjection): void => {
+    const { localElement } = editable;
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     const nextSelection = event.shiftKey
-      ? selectedIds.includes(element.id)
-        ? selectedIds.filter((id) => id !== element.id)
-        : [...selectedIds, element.id]
-      : selectedIds.includes(element.id)
+      ? selectedIds.includes(localElement.id)
+        ? selectedIds.filter((id) => id !== localElement.id)
+        : [...selectedIds, localElement.id]
+      : selectedIds.includes(localElement.id)
         ? selectedIds
-        : [element.id];
-    const stableSelection = nextSelection.length === 0 ? [element.id] : nextSelection;
+        : [localElement.id];
+    const stableSelection = nextSelection.length === 0 ? [localElement.id] : nextSelection;
     onSelect(stableSelection);
-    if (element.locked) return;
-    const items = localElements
-      .filter((candidate) => stableSelection.includes(candidate.id) && !candidate.locked)
-      .map((candidate) => ({ id: candidate.id, frame: candidate.frame }));
-    const objects = localElements
-      .filter((candidate) => !stableSelection.includes(candidate.id))
-      .map((candidate) => ({ id: candidate.id, frame: candidate.frame }));
+    if (localElement.locked) return;
+    const items = editableProjection
+      .filter(
+        (candidate) =>
+          stableSelection.includes(candidate.localElement.id) && !candidate.localElement.locked,
+      )
+      .map((candidate) => ({
+        id: candidate.localElement.id,
+        frame: candidate.effectiveElement.frame,
+      }));
+    const objects = editableProjection
+      .filter((candidate) => !stableSelection.includes(candidate.localElement.id))
+      .map((candidate) => ({
+        id: candidate.localElement.id,
+        frame: candidate.effectiveElement.frame,
+      }));
     gesture.current = {
       kind: 'move',
       pointerId: event.pointerId,
@@ -245,34 +659,84 @@ export function CanonicalSlideCanvas({
     };
   };
 
-  const beginResize = (event: ReactPointerEvent, element: Element, handle: ResizeHandle): void => {
+  const beginResize = (
+    event: ReactPointerEvent,
+    editable: CanvasEditableElementProjection,
+    handle: ResizeHandle,
+  ): void => {
     event.preventDefault();
     event.stopPropagation();
-    if (element.locked) return;
+    if (editable.localElement.locked) return;
     gesture.current = {
       kind: 'resize',
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      item: { id: element.id, frame: element.frame },
+      item: { id: editable.localElement.id, frame: editable.effectiveElement.frame },
       handle,
       preserveAspectRatio: event.shiftKey,
       fromCenter: event.altKey,
     };
   };
 
+  const beginRotate = (
+    event: ReactPointerEvent,
+    editable: CanvasEditableElementProjection,
+  ): void => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (editable.localElement.locked) return;
+    gesture.current = {
+      kind: 'rotate',
+      pointerId: event.pointerId,
+      startPointer: pointFromClient(event.clientX, event.clientY),
+      item: { id: editable.localElement.id, frame: editable.effectiveElement.frame },
+      snapToIncrement: event.shiftKey,
+    };
+  };
+
+  const rotateWithKeyboard = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    editable: CanvasEditableElementProjection,
+  ): void => {
+    const frame = rotationFrameForKeyboard(
+      editable.effectiveElement.frame,
+      event.key,
+      event.shiftKey,
+    );
+    if (frame === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    onTransform([{ elementId: editable.localElement.id, frame }]);
+  };
+
   const wrapperStyle = {
     width: `${document.page.widthPt * scale}px`,
     height: `${document.page.heightPt * scale}px`,
   } as CSSProperties;
+  const rotationMetrics = rotationControlMetrics(scale);
   const scaledStyle = {
     width: `${document.page.widthPt}pt`,
     height: `${document.page.heightPt}pt`,
     transform: `scale(${scale * 0.75})`,
+    '--canvas-rotation-target-size': `${rotationMetrics.targetSizeCssPx}px`,
+    '--canvas-rotation-target-half': `${rotationMetrics.targetHalfCssPx}px`,
+    '--canvas-rotation-gap': `${rotationMetrics.gapCssPx}px`,
+    '--canvas-rotation-stem-length': `${rotationMetrics.stemLengthCssPx}px`,
+    '--canvas-rotation-dot-size': `${rotationMetrics.dotSizeCssPx}px`,
+    '--canvas-rotation-dot-half': `${rotationMetrics.dotHalfCssPx}px`,
+    '--canvas-rotation-line-width': `${rotationMetrics.lineWidthCssPx}px`,
+    '--canvas-rotation-line-half': `${rotationMetrics.lineHalfCssPx}px`,
   } as CSSProperties;
 
   return (
-    <div className="canonical-canvas-wrapper" style={wrapperStyle} data-testid="editor-canvas-root">
+    <div
+      ref={wrapperRef}
+      className="canonical-canvas-wrapper"
+      style={wrapperStyle}
+      data-testid="editor-canvas-root"
+    >
       <div
         className={`canonical-canvas-scaled${gridEnabled ? ' has-grid' : ''}`}
         style={scaledStyle}
@@ -287,53 +751,94 @@ export function CanonicalSlideCanvas({
           className="canonical-slide-surface"
         />
         <div className="canvas-hit-layer" aria-label="Editable slide objects">
-          {localElements
-            .filter((element) => element.visible)
-            .map((element) => {
-              const frame = draftFrames[element.id] ?? element.frame;
-              const selected = selectedIds.includes(element.id);
-              const primary = selectedIds.at(-1) === element.id;
+          {editableProjection
+            .filter((editable) => editable.effectiveElement.visible)
+            .map((editable) => {
+              const { localElement, effectiveElement } = editable;
+              const frame = draftFrames[localElement.id] ?? effectiveElement.frame;
+              const selected = selectedIds.includes(localElement.id);
+              const primary = selectedIds.at(-1) === localElement.id;
+              const rotationPlacement = rotationControlPlacement(frame, scale);
               return (
                 <div
-                  key={element.id}
-                  className={`canonical-hitbox${selected ? ' is-selected' : ''}${element.locked ? ' is-locked' : ''}`}
+                  key={localElement.id}
+                  className={`canonical-hitbox${selected ? ' is-selected' : ''}${localElement.locked ? ' is-locked' : ''}`}
                   style={frameStyle(frame)}
                   role="button"
                   tabIndex={0}
-                  aria-label={`${element.name}, ${element.type}${element.locked ? ', locked' : ''}`}
+                  aria-label={`${effectiveElement.name}, ${effectiveElement.type}${localElement.locked ? ', locked' : ''}`}
                   aria-pressed={selected}
-                  data-canvas-element-id={element.id}
-                  onPointerDown={(event) => beginMove(event, element)}
+                  data-canvas-element-id={localElement.id}
+                  onPointerDown={(event) => beginMove(event, editable)}
                   onDoubleClick={(event) => {
                     event.stopPropagation();
-                    if (element.type === 'text') onEditText(element.id);
+                    if (localElement.type === 'text') onEditText(localElement.id);
                   }}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter') {
                       event.preventDefault();
-                      onSelect([element.id]);
-                      if (element.type === 'text') onEditText(element.id);
+                      onSelect([localElement.id]);
+                      if (localElement.type === 'text') onEditText(localElement.id);
                     } else if (event.key === ' ') {
                       event.preventDefault();
-                      onSelect([element.id]);
+                      onSelect([localElement.id]);
                     }
                   }}
                 >
-                  {selected && primary && !element.locked
-                    ? handles.map((handle) => (
-                        <button
-                          key={handle}
-                          type="button"
-                          tabIndex={-1}
+                  {selected && primary && !localElement.locked
+                    ? [
+                        <span
+                          key="rotation-stem"
+                          className={`canonical-rotation-stem placement-${rotationPlacement}`}
                           aria-hidden="true"
-                          className={`canonical-resize-handle handle-${handle}`}
-                          onPointerDown={(event) => beginResize(event, element, handle)}
-                        />
-                      ))
+                        />,
+                        <button
+                          key="rotation"
+                          type="button"
+                          className={`canonical-rotation-handle placement-${rotationPlacement}`}
+                          aria-label={`Rotate ${effectiveElement.name}`}
+                          title="Rotate. Hold Shift to snap to 15 degrees; use Left or Right arrow for keyboard rotation."
+                          data-rotation-placement={rotationPlacement}
+                          onPointerDown={(event) => beginRotate(event, editable)}
+                          onKeyDown={(event) => rotateWithKeyboard(event, editable)}
+                        />,
+                        ...handles.map((handle) => (
+                          <button
+                            key={handle}
+                            type="button"
+                            tabIndex={-1}
+                            aria-hidden="true"
+                            className={`canonical-resize-handle handle-${handle}`}
+                            onPointerDown={(event) => beginResize(event, editable, handle)}
+                          />
+                        )),
+                      ]
                     : null}
                 </div>
               );
             })}
+          {inlineTextEditor !== null && inlineTextEditor !== undefined
+            ? (() => {
+                const editable = editableProjectionByLocalId.get(inlineTextEditor.elementId);
+                return editable?.localElement.type === 'text' &&
+                  editable.effectiveElement.type === 'text' &&
+                  onInlineTextChange !== undefined &&
+                  onInlineTextPaste !== undefined &&
+                  onInlineTextCommit !== undefined &&
+                  onInlineTextCancel !== undefined &&
+                  onInlineTextFocus !== undefined ? (
+                  <InlineTextCanvasEditorOverlay
+                    element={editable.effectiveElement}
+                    editor={inlineTextEditor}
+                    onChange={onInlineTextChange}
+                    onPaste={onInlineTextPaste}
+                    onCommit={onInlineTextCommit}
+                    onCancel={onInlineTextCancel}
+                    onFocus={onInlineTextFocus}
+                  />
+                ) : null;
+              })()
+            : null}
           {smartGuides.map((guide, index) => (
             <span
               key={`${guide.axis}-${guide.positionPt}-${index}`}

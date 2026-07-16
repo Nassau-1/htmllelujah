@@ -83,21 +83,28 @@ separately against the candidate artifact.
 
 ## Windows packaging
 
-Build an unpacked directory for fast inspection:
-
-```powershell
-pnpm package:win
-```
-
-Build the per-user NSIS installer:
+Build the per-user NSIS installer and its exact unpacked companion:
 
 ```powershell
 pnpm make:win
 ```
 
-Outputs are written under `apps/desktop/out/`. Do not publish an artifact merely
-because packaging completed. Inspect the effective package contents and run the
-installed application.
+`pnpm package:win` is an alias for the same release-safe pipeline. The pipeline
+refuses a dirty index or worktree, checks out the exact commit into a detached
+temporary worktree, installs the locked dependencies offline, removes every
+workspace package `dist/`, rebuilds all workspace packages sequentially, captures
+provenance before the build, and revalidates source and package-output hashes after
+packaging. If the pnpm store was intentionally not primed, use
+`node scripts/build-windows-release.mjs --online-install` explicitly.
+
+Electron Builder writes only into the detached staging worktree. The exact installer,
+blockmap, and complete `win-unpacked/` inventory are attested before a transaction
+promotes `apps/desktop/out/` and `artifacts/release-evidence/`. A failed build or
+attestation never promotes a partial candidate. The candidate manifest lives at
+`artifacts/release-evidence/release-candidate-v1.json`, outside the artifact root, so
+the artifact root contains only publishable payload. Do not publish an artifact merely
+because packaging completed; run the installed-application lifecycle smoke against
+the promoted candidate.
 
 The packaged Electron fuses keep cookie encryption, embedded ASAR integrity,
 ASAR-only loading, disabled `NODE_OPTIONS`, disabled CLI inspection, and restricted
@@ -136,6 +143,28 @@ For the local MCP bridge, the desktop package exposes a focused Electron smoke:
 pnpm --filter @htmllelujah/desktop smoke:electron:mcp
 ```
 
+The release gate must exercise the exact packaged companions, not the source fallback:
+
+```powershell
+$env:HTMLLELUJAH_EXECUTABLE = 'C:\path\to\HTMLlelujah.exe'
+$env:HTMLLELUJAH_MCP_LAUNCHER = 'C:\path\to\HTMLlelujah-MCP.cmd'
+node .\apps\desktop\scripts\smoke-mcp-electron.mjs
+```
+
+The harness performs valid launcher shutdown and restart, isolated authentication
+failures, the complete V1 tool-catalogue check, bounded reads, non-mutating proposals,
+approved commit and undo, stale and atomic rejection, capability denial, renderer/MCP
+convergence, and the 64-proposal and 32-approval capacity boundaries. It atomically
+writes `artifacts/evidence/mcp-v1.json`; a failed run replaces any prior success with a
+redacted failure marker and exits non-zero. Evidence contains artifact hashes and
+assertion summaries only, never document/session/revision IDs, endpoint material,
+approval values, local paths, or stderr.
+
+Long wall-clock TTL purge, execution from a distinct Windows account, and successful
+native chooser import/export remain separate deterministic or Windows system gates.
+The packaged MCP smoke verifies their fail-closed descriptor/capability paths without
+waiting several minutes or opening a native chooser.
+
 The native Save As, HTML, and PDF dialog workflow and the Electron accessibility and
 scaling workflow have dedicated Windows harnesses:
 
@@ -153,10 +182,9 @@ spoken output, a real GPU/monitor combination, Narrator, or NVDA. A recorded man
 Narrator or NVDA pass remains necessary for release-level assistive-technology
 confidence; if it is not performed, the release record must say so as a limitation.
 
-These harnesses are not a substitute for invoking the installed
-`HTMLlelujah-MCP.cmd` from an external MCP client and confirming stdout purity,
-approvals, stale revisions, undo, import/export dialogs, desktop absence, and process
-teardown.
+The exact installed-launcher invocation above is still not a substitute for the
+separate native import/export chooser smoke or a different-account Windows boundary
+test.
 
 ## Installer and file-association tests
 

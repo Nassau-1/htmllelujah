@@ -21,6 +21,8 @@ export const DESKTOP_IPC = Object.freeze({
   collaborationStatus: 'htmllelujah:v1:collaboration-status',
   collaborationHost: 'htmllelujah:v1:collaboration-host',
   collaborationJoin: 'htmllelujah:v1:collaboration-join',
+  collaborationDecideJoin: 'htmllelujah:v1:collaboration-decide-join',
+  collaborationUpdatePresence: 'htmllelujah:v1:collaboration-update-presence',
   collaborationLeave: 'htmllelujah:v1:collaboration-leave',
   collaborationTextLeaseStatus: 'htmllelujah:v1:collaboration-text-lease-status',
   collaborationTextLeaseBegin: 'htmllelujah:v1:collaboration-text-lease-begin',
@@ -119,7 +121,26 @@ export interface CollaborationStatus {
   readonly hostFingerprint?: string | undefined;
   readonly endpoint?: string | undefined;
   readonly discoveryEnabled: boolean;
+  readonly participants: readonly CollaborationParticipant[];
+  readonly pendingJoins: readonly CollaborationPendingJoin[];
   readonly note: string;
+}
+
+export interface CollaborationParticipant {
+  readonly clientId: string;
+  readonly displayName: string;
+  readonly role: 'host' | 'guest';
+  readonly isSelf: boolean;
+  readonly connection: 'active' | 'reconnecting' | 'disconnected';
+  readonly slideId?: string | undefined;
+  readonly selectedElementCount: number;
+  readonly editingElementId?: string | undefined;
+}
+
+export interface CollaborationPendingJoin {
+  readonly joinRequestId: string;
+  readonly displayName: string;
+  readonly expiresAtMs: number;
 }
 
 export interface CollaborationHostInput {
@@ -134,6 +155,17 @@ export interface CollaborationJoinInput {
   readonly sessionCode: string;
   readonly expectedFingerprint: string;
   readonly displayName: string;
+}
+
+export interface CollaborationJoinDecisionInput extends SessionInput {
+  readonly joinRequestId: string;
+  readonly decision: 'accept' | 'reject';
+}
+
+export interface CollaborationPresenceInput extends SessionInput {
+  readonly slideId?: string | undefined;
+  readonly selectedElementIds: readonly string[];
+  readonly editingElementId?: string | undefined;
 }
 
 export interface CollaborationTextLeaseInput extends SessionInput {
@@ -217,6 +249,12 @@ export interface HtmllelujahDesktopApi {
   collaborationStatus(input: SessionInput): Promise<DesktopResult<CollaborationStatus>>;
   collaborationHost(input: CollaborationHostInput): Promise<DesktopResult<CollaborationStatus>>;
   collaborationJoin(input: CollaborationJoinInput): Promise<DesktopResult<CollaborationStatus>>;
+  collaborationDecideJoin(
+    input: CollaborationJoinDecisionInput,
+  ): Promise<DesktopResult<CollaborationStatus>>;
+  collaborationUpdatePresence(
+    input: CollaborationPresenceInput,
+  ): Promise<DesktopResult<CollaborationStatus>>;
   collaborationLeave(input: SessionInput): Promise<DesktopResult<CollaborationStatus>>;
   collaborationTextLeaseStatus(
     input: CollaborationTextLeaseInput,

@@ -10,6 +10,8 @@ import {
   formatPoint,
   isoCountryCodeToFlag,
   normalizeResolvedSlide,
+  resolveConnectorGeometries,
+  resolveConnectorGeometry,
   resolveSlideFromDeck,
   safeAssetUrl,
   safeColor,
@@ -82,6 +84,23 @@ describe('SlideSurface', () => {
     expect(html).toContain('&lt;script&gt;globalThis.compromised = true&lt;/script&gt; &amp; safe');
   });
 
+  it('keeps h1-h6 semantic while neutralizing user-agent heading typography', () => {
+    const html = renderSlide('editor');
+    const inheritedHeadingStyle =
+      'font-family:inherit;font-size:inherit;font-style:inherit;font-weight:inherit;letter-spacing:inherit;line-height:inherit;margin:0 0 0.35em;text-align:left';
+
+    for (let level = 1; level <= 6; level += 1) {
+      const match = html.match(new RegExp(`<h${level}[^>]*style="([^"]+)"[^>]*>`));
+
+      expect(match?.[1]).toBe(inheritedHeadingStyle);
+      expect(html).toContain(`Heading ${level}</span></h${level}>`);
+    }
+
+    expect(html).toContain('<h1 class="hl-text-block"');
+    expect(html).toContain('Heading 1</span></h1>');
+    expect(html).toContain('font-weight:700');
+  });
+
   it('renders native tables, spans, vectors, connectors, groups, icons and flags', () => {
     const html = renderSlide('editor');
 
@@ -99,11 +118,163 @@ describe('SlideSurface', () => {
     expect(html).toContain('marker-end="url(#hl-arrow-shape-arrow)"');
     expect(html).toContain('data-element-id="connector-straight"');
     expect(html).toContain('data-element-id="connector-elbow"');
-    expect(html).toContain('L 525 270 L 525 305');
+    expect(html).toContain('d="M 400 240 L 360 171"');
+    expect(html).toContain('d="M 400 270 L 380 270 L 380 171 L 360 171"');
     expect(html).toContain('data-element-id="group-inner"');
     expect(html).toContain('data-element-id="nested-shape"');
     expect(html).toContain(isoCountryCodeToFlag('FR'));
     expect(html).toContain('data-render-warning="ICON_UNKNOWN"');
+  });
+
+  it('resolves multiple connector identities in one shared geometry index', () => {
+    const geometries = resolveConnectorGeometries(fixtureSlide.elements);
+    const straight = geometries.get('connector-straight');
+    const elbow = geometries.get('connector-elbow');
+
+    expect([...geometries.keys()]).toEqual(['connector-straight', 'connector-elbow']);
+    expect(straight).toMatchObject({
+      connectorId: 'connector-straight',
+      startInSlide: { xPt: 400, yPt: 240 },
+      endInSlide: { xPt: 360, yPt: 171 },
+    });
+    expect(elbow).toMatchObject({
+      connectorId: 'connector-elbow',
+      startInSlide: { xPt: 400, yPt: 270 },
+      endInSlide: { xPt: 360, yPt: 171 },
+    });
+    expect(straight).not.toBe(elbow);
+    expect(resolveConnectorGeometry(fixtureSlide.elements, 'connector-straight')).toEqual(straight);
+    expect(resolveConnectorGeometry(fixtureSlide.elements, 'missing-connector')).toBeUndefined();
+  });
+
+  it('resolves a bound endpoint from the effective rotated target frame', () => {
+    const target: RenderElement = {
+      id: 'rotated-target',
+      name: 'Rotated target',
+      type: 'shape',
+      frame: { xPt: 100, yPt: 100, widthPt: 80, heightPt: 40, rotationDeg: 90 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const connector: RenderElement = {
+      id: 'bound-connector',
+      name: 'Bound connector',
+      type: 'connector',
+      frame: { xPt: 300, yPt: 300, widthPt: 20, heightPt: 20, rotationDeg: 90 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 10, yPt: 20, binding: {} },
+      end: { xPt: 99, yPt: 88, binding: { elementId: target.id, anchor: 'left' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const projection: DocumentResolvedSlideProjection = {
+      documentId: 'effective-frame-deck',
+      page: fixtureSlide.page,
+      slide: { id: 'effective-frame-slide', name: 'Effective frame' },
+      theme: fixtureSlide.theme,
+      background: { type: 'solid', color: '#ffffff' },
+      elements: [
+        { source: 'layout', element: target },
+        { source: 'slide', element: connector },
+      ],
+    };
+    const html = renderToStaticMarkup(<SlideSurface slide={projection} mode="editor" />);
+    const connectorPath = html.match(/<path d="M 10 20 L 140 80"([^>]*)>/);
+
+    expect(connectorPath).not.toBeNull();
+    expect(connectorPath?.[1]).not.toContain('transform=');
+    expect(html).not.toContain('L 99 88');
+    expect(resolveConnectorGeometry([target, connector], connector.id)).toMatchObject({
+      startInSlide: { xPt: 10, yPt: 20 },
+      endInSlide: { xPt: 140, yPt: 80 },
+      boundsInSlide: { xPt: 10, yPt: 20, widthPt: 130, heightPt: 60 },
+    });
+  });
+
+  it('resolves bindings across scaled and rotated nested group coordinate spaces', () => {
+    const target: RenderElement = {
+      id: 'nested-bound-target',
+      name: 'Nested bound target',
+      type: 'shape',
+      frame: { xPt: 10, yPt: 10, widthPt: 20, heightPt: 10, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'ellipse',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const nestedConnector: RenderElement = {
+      id: 'nested-bound-connector',
+      name: 'Nested bound connector',
+      type: 'connector',
+      frame: { xPt: 0, yPt: 0, widthPt: 30, heightPt: 15, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 0, yPt: 0, binding: {} },
+      end: { xPt: 1, yPt: 1, binding: { elementId: target.id, anchor: 'right' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'none',
+    };
+    const group: RenderElement = {
+      id: 'scaled-rotated-group',
+      name: 'Scaled rotated group',
+      type: 'group',
+      frame: { xPt: 100, yPt: 50, widthPt: 200, heightPt: 100, rotationDeg: 90 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      coordinateSpace: { widthPt: 100, heightPt: 50 },
+      children: [target, nestedConnector],
+    };
+    const rootConnector: RenderElement = {
+      id: 'root-bound-connector',
+      name: 'Root bound connector',
+      type: 'connector',
+      frame: { xPt: 5, yPt: 5, widthPt: 215, heightPt: 55, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 5, yPt: 5, binding: {} },
+      end: { xPt: 2, yPt: 2, binding: { elementId: target.id, anchor: 'right' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const html = renderToStaticMarkup(
+      <SlideSurface
+        slide={{
+          ...fixtureSlide,
+          background: { type: 'solid', color: '#ffffff' },
+          elements: [group, rootConnector],
+        }}
+        mode="presentation"
+      />,
+    );
+
+    expect(html).toContain('d="M 0 0 L 30 15"');
+    expect(html).toContain('d="M 5 5 L 220 60"');
+    expect(resolveConnectorGeometry([group, rootConnector], nestedConnector.id)).toMatchObject({
+      startInContainer: { xPt: 0, yPt: 0 },
+      endInContainer: { xPt: 30, yPt: 15 },
+      startInSlide: { xPt: 250, yPt: 0 },
+      endInSlide: { xPt: 220, yPt: 60 },
+      boundsInSlide: { xPt: 220, yPt: 0, widthPt: 30, heightPt: 60 },
+    });
   });
 
   it('accepts only opaque local raster asset sources and never emits a remote URL', () => {

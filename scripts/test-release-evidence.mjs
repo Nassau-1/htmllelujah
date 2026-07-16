@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -11,13 +12,26 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const GENERATOR = path.join(SCRIPT_DIR, 'generate-release-evidence.mjs');
 const VERIFIER = path.join(SCRIPT_DIR, 'verify-release-evidence.mjs');
 
+const aggregateInventory = (entries) => {
+  const digest = createHash('sha256');
+  for (const entry of entries) {
+    digest.update(entry.path);
+    digest.update('\0');
+    digest.update(String(entry.size));
+    digest.update('\0');
+    digest.update(entry.sha256);
+    digest.update('\n');
+  }
+  return digest.digest('hex');
+};
+
 function run(script, arguments_, expectedStatus, expectedText) {
   const result = spawnSync(process.execPath, [script, ...arguments_], {
     encoding: 'utf8',
     timeout: 60_000,
     windowsHide: true,
   });
-  const combined = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  const combined = `${result.stdout ?? ''}\n${result.stderr ?? ''}\n${result.error?.message ?? ''}`;
   if (result.status !== expectedStatus) {
     throw new Error(
       `${path.basename(script)} exited ${result.status}, expected ${expectedStatus}:\n${combined}`,
@@ -59,8 +73,9 @@ async function main() {
     }
     const installerPath = path.join(artifactDir, 'HTMLlelujah-1.0.0-test-x64-unsigned-Setup.exe');
     await writeFile(installerPath, 'synthetic NSIS installer fixture\n');
+    await writeFile(`${installerPath}.blockmap`, '{"synthetic":true}\n');
 
-    const sharedArguments = [
+    const baseArguments = [
       '--artifact-dir',
       artifactDir,
       '--output-dir',
@@ -68,12 +83,94 @@ async function main() {
       '--version',
       '1.0.0-test',
     ];
+    run(GENERATOR, baseArguments, 0, 'Installer detected: yes');
+    const inventory = JSON.parse(
+      await readFile(path.join(evidenceDir, 'content-inventory.json'), 'utf8'),
+    );
+    const commitResult = spawnSync('git', ['rev-parse', '--verify', 'HEAD'], {
+      cwd: path.resolve(SCRIPT_DIR, '..'),
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    if (commitResult.status !== 0) throw new Error('Unable to resolve fixture source commit.');
+    const sourceCommit = commitResult.stdout.trim();
+    const unpacked = inventory.files
+      .filter((entry) => entry.path.startsWith('win-unpacked/'))
+      .map((entry) => ({ ...entry, path: entry.path.slice('win-unpacked/'.length) }));
+    const installer = inventory.files.find((entry) => entry.path === path.basename(installerPath));
+    const blockmap = inventory.files.find(
+      (entry) => entry.path === `${path.basename(installerPath)}.blockmap`,
+    );
+    const candidatePath = path.join(temporaryRoot, 'release-candidate-v1.json');
+    const sourceTreeSha256 = 'a'.repeat(64);
+    const lockfileSha256 = 'b'.repeat(64);
+    const workspacePackages = [
+      {
+        name: '@htmllelujah/fixture',
+        path: 'packages/fixture',
+        buildOrder: 1,
+        dist: { fileCount: 1, totalSize: 1, aggregateSha256: 'c'.repeat(64), files: [] },
+      },
+    ];
+    await writeFile(
+      candidatePath,
+      `${JSON.stringify(
+        {
+          schemaVersion: 2,
+          productName: 'HTMLlelujah',
+          version: '1.0.0-test',
+          buildId: 'synthetic-build',
+          source: {
+            commit: sourceCommit,
+            dirty: false,
+            treeSha256: sourceTreeSha256,
+            fileCount: 1,
+            bytes: 1,
+          },
+          lockfile: { sha256: lockfileSha256 },
+          build: {
+            embeddedProvenance: {
+              schemaVersion: 2,
+              buildId: 'synthetic-build',
+              sourceCommit,
+              sourceDirty: false,
+              sourceTreeSha256,
+              lockfileSha256,
+              workspacePackages,
+            },
+            workspacePackages,
+          },
+          artifact: {
+            fileCount: inventory.fileCount,
+            totalSize: inventory.totalSize,
+            aggregateSha256: inventory.aggregateSha256,
+            installer,
+            blockmap,
+            winUnpacked: {
+              fileCount: unpacked.length,
+              totalSize: unpacked.reduce((sum, entry) => sum + entry.size, 0),
+              aggregateSha256: aggregateInventory(unpacked),
+              files: unpacked,
+            },
+            files: inventory.files,
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const sharedArguments = [
+      ...baseArguments,
+      '--candidate-manifest',
+      candidatePath,
+      '--require-candidate-manifest',
+    ];
     run(GENERATOR, sharedArguments, 0, 'Installer detected: yes');
     run(
       VERIFIER,
       ['--artifact-dir', artifactDir, '--evidence-dir', evidenceDir],
       0,
-      'Verified 9 artifact files.',
+      'Verified 10 artifact files.',
     );
 
     const manifestPath = path.join(evidenceDir, 'release-manifest.json');

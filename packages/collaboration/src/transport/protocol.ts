@@ -16,9 +16,16 @@ import {
 
 const identifierSchema = z.string().uuid();
 const clientIdSchema = z.string().trim().min(1).max(128);
+export const collaborationDisplayNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .refine((value) => !/[\p{Cc}\p{Cf}]/u.test(value), 'Display name contains control characters.');
 const nonceSchema = z.string().regex(/^[A-Za-z0-9_-]{22,128}$/);
 export const certificateFingerprintSchema = z.string().regex(/^sha256-[A-Za-z0-9_-]{43}$/);
 const proofSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+const reconnectTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const chunkDataSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
 
 export const authChallengeSchema = z
@@ -41,8 +48,24 @@ export const authResponseSchema = z
     documentId: identifierSchema,
     challengeId: identifierSchema,
     clientId: clientIdSchema,
+    displayName: collaborationDisplayNameSchema,
     clientNonce: nonceSchema,
+    reconnectToken: reconnectTokenSchema.optional(),
     proof: proofSchema,
+  })
+  .strict();
+
+export const authPendingSchema = z
+  .object({
+    type: z.literal('auth.pending'),
+    protocolVersion: z.literal(COLLABORATION_PROTOCOL_VERSION),
+    joinRequestId: identifierSchema,
+    expiresAtMs: z.number().int().positive(),
+    timeoutMs: z
+      .number()
+      .int()
+      .positive()
+      .max(5 * 60_000),
   })
   .strict();
 
@@ -51,9 +74,11 @@ export const authAcceptedSchema = z
     type: z.literal('auth.accepted'),
     protocolVersion: z.literal(COLLABORATION_PROTOCOL_VERSION),
     sessionId: identifierSchema,
+    hostClientId: clientIdSchema.optional(),
     clientId: clientIdSchema,
     sessionSeq: z.number().int().nonnegative(),
     revision: z.string().trim().min(1).max(160),
+    reconnectToken: reconnectTokenSchema,
   })
   .strict();
 
@@ -67,6 +92,8 @@ export const authRejectedSchema = z
       'AUTH_REPLAY',
       'CLIENT_ID_IN_USE',
       'INVITATION_EXPIRED',
+      'JOIN_REJECTED',
+      'JOIN_TIMEOUT',
       'PENDING_LIMIT',
       'PEER_LIMIT',
       'PROTOCOL_ERROR',
@@ -170,6 +197,20 @@ export const presenceBroadcastSchema = z
     payload: presenceRecordSchema,
   })
   .strict();
+export const presenceRemovedBroadcastSchema = z
+  .object({
+    protocolVersion: z.literal(COLLABORATION_PROTOCOL_VERSION),
+    type: z.literal('presence.removed'),
+    clientId: clientIdSchema,
+  })
+  .strict();
+export const presenceSnapshotSchema = z
+  .object({
+    protocolVersion: z.literal(COLLABORATION_PROTOCOL_VERSION),
+    type: z.literal('presence.snapshot'),
+    participants: z.array(presenceRecordSchema).max(33),
+  })
+  .strict();
 
 export const transportChunkSchema = z
   .object({
@@ -193,6 +234,7 @@ export const transportChunkSchema = z
 
 export const serverMessageSchema = z.discriminatedUnion('type', [
   authChallengeSchema,
+  authPendingSchema,
   authAcceptedSchema,
   authRejectedSchema,
   commandResultMessageSchema,
@@ -203,6 +245,8 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
   requestErrorMessageSchema,
   transactionBroadcastSchema,
   presenceBroadcastSchema,
+  presenceRemovedBroadcastSchema,
+  presenceSnapshotSchema,
 ]);
 
 export const manualInvitationSchema = z
@@ -218,6 +262,7 @@ export const manualInvitationSchema = z
 
 export type AuthChallenge = z.infer<typeof authChallengeSchema>;
 export type AuthResponse = z.infer<typeof authResponseSchema>;
+export type AuthPending = z.infer<typeof authPendingSchema>;
 export type AuthAccepted = z.infer<typeof authAcceptedSchema>;
 export type ClientRequestMessage = z.infer<typeof clientRequestMessageSchema>;
 export type ServerMessage = z.infer<typeof serverMessageSchema>;

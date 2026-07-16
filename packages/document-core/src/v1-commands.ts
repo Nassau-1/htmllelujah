@@ -44,6 +44,11 @@ export interface SetDeckPageCommand {
   readonly page: PageSize;
 }
 
+export interface SetDeckExportOptionsCommand {
+  readonly type: 'deck.set-export-options';
+  readonly includeHiddenSlidesInExport: boolean;
+}
+
 export interface CreateThemeCommand {
   readonly type: 'theme.create';
   readonly theme: Theme;
@@ -239,6 +244,7 @@ export interface UpdateConnectorEndpointCommand extends ContainerTarget {
 export type V1DocumentCommand =
   | RenameDeckCommand
   | SetDeckPageCommand
+  | SetDeckExportOptionsCommand
   | CreateThemeCommand
   | UpdateThemeCommand
   | DeleteThemeCommand
@@ -389,6 +395,12 @@ const updateTableStyle = z
 export const v1DocumentCommandSchema: z.ZodType<V1DocumentCommand> = z.union([
   z.object({ type: z.literal('deck.rename'), name }).strict(),
   z.object({ type: z.literal('deck.set-page'), page: pageSchema }).strict(),
+  z
+    .object({
+      type: z.literal('deck.set-export-options'),
+      includeHiddenSlidesInExport: z.boolean(),
+    })
+    .strict(),
   z
     .object({ type: z.literal('theme.create'), theme: themeSchema, index: index.optional() })
     .strict(),

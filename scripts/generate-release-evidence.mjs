@@ -2,13 +2,14 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { access, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import { artifactFreshness, sourceProvenance } from './release-source-state.mjs';
+import { assertCandidateManifest } from './release-candidate-manifest.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
@@ -21,9 +22,11 @@ function usage() {
 Options:
   --artifact-dir <path>   electron-builder output (default: apps/desktop/out)
   --output-dir <path>     evidence output (default: artifacts/release-evidence)
+  --candidate-manifest <path>  attested candidate manifest outside artifact root
   --version <version>     release version (default: apps/desktop/package.json)
   --repository-url <url>  source repository recorded in the SBOM
   --require-fresh         fail after writing evidence when the artifact is stale
+  --require-candidate-manifest  fail unless the candidate manifest validates
   --help                  show this help
 
 Outputs:
@@ -36,9 +39,11 @@ Outputs:
 function parseArgs(argv) {
   const result = {
     artifactDir: DEFAULT_ARTIFACT_DIR,
+    candidateManifest: undefined,
     outputDir: DEFAULT_OUTPUT_DIR,
     repositoryUrl: 'https://github.com/Nassau-1/htmllelujah',
     requireFresh: false,
+    requireCandidateManifest: false,
     version: undefined,
   };
 
@@ -52,8 +57,13 @@ function parseArgs(argv) {
       result.requireFresh = true;
       continue;
     }
+    if (argument === '--require-candidate-manifest') {
+      result.requireCandidateManifest = true;
+      continue;
+    }
     if (
       argument === '--artifact-dir' ||
+      argument === '--candidate-manifest' ||
       argument === '--output-dir' ||
       argument === '--repository-url' ||
       argument === '--version'
@@ -65,6 +75,7 @@ function parseArgs(argv) {
       index += 1;
       const key = {
         '--artifact-dir': 'artifactDir',
+        '--candidate-manifest': 'candidateManifest',
         '--output-dir': 'outputDir',
         '--repository-url': 'repositoryUrl',
         '--version': 'version',
@@ -77,6 +88,9 @@ function parseArgs(argv) {
 
   result.artifactDir = path.resolve(result.artifactDir);
   result.outputDir = path.resolve(result.outputDir);
+  result.candidateManifest = path.resolve(
+    result.candidateManifest ?? path.join(result.outputDir, 'release-candidate-v1.json'),
+  );
   return result;
 }
 
@@ -294,6 +308,12 @@ async function validateCandidatePolicy({ artifactDir, grouped, inventory, versio
     candidateErrors.push(
       `installer filename must be ${expectedInstaller}, found ${grouped.installers[0].path}`,
     );
+  }
+  if (grouped.installers.length === 1) {
+    const exactBlockmaps = grouped.blockmaps.filter((entry) => entry.path === expectedBlockmap);
+    if (exactBlockmaps.length !== 1 || grouped.blockmaps.length !== 1) {
+      candidateErrors.push(`expected exactly one installer blockmap named ${expectedBlockmap}`);
+    }
   }
   if (forbiddenMetadataFiles.length > 0) {
     candidateErrors.push(`forbidden build metadata: ${forbiddenMetadataFiles.join(', ')}`);
@@ -676,6 +696,14 @@ async function main() {
       `Packaging staging directory detected (${stagingDirectories.join(', ')}); wait for packaging to finish and remove abandoned staging output.`,
     );
   }
+  const unexpectedRootDirectories = rootEntries
+    .filter((entry) => entry.isDirectory() && entry.name !== 'win-unpacked')
+    .map((entry) => entry.name);
+  if (unexpectedRootDirectories.length > 0) {
+    throw new Error(
+      `Unexpected artifact-root directories: ${unexpectedRootDirectories.join(', ')}.`,
+    );
+  }
   const outputRelativeToArtifact = path.relative(options.artifactDir, options.outputDir);
   if (!outputRelativeToArtifact.startsWith('..') && outputRelativeToArtifact !== '') {
     throw new Error('Output directory must not be nested inside the artifact directory.');
@@ -705,6 +733,18 @@ async function main() {
   });
   const generatedAt = new Date().toISOString();
   const source = sourceProvenance(REPO_ROOT);
+  let candidateManifest = null;
+  if (await exists(options.candidateManifest)) {
+    candidateManifest = await readJson(options.candidateManifest);
+    assertCandidateManifest({
+      manifest: candidateManifest,
+      inventory: files,
+      version,
+      source,
+    });
+  } else if (options.requireCandidateManifest) {
+    throw new Error(`Required candidate manifest does not exist: ${options.candidateManifest}`);
+  }
   const codeSigning = signingEvidence(options.artifactDir, files, grouped.installers);
   const inventory = {
     schemaVersion: 1,
@@ -728,12 +768,20 @@ async function main() {
   const inventoryPath = path.join(options.outputDir, 'content-inventory.json');
   const checksumsPath = path.join(options.outputDir, 'checksums-sha256.txt');
   const sbomPath = path.join(options.outputDir, 'build-sbom.cdx.json');
+  const candidateEvidencePath = path.join(options.outputDir, 'release-candidate-v1.json');
   await writeFile(inventoryPath, canonicalJson(inventory), 'utf8');
   await writeFile(checksumsPath, checksums, 'utf8');
   await writeFile(sbomPath, canonicalJson(sbom), 'utf8');
+  if (candidateManifest !== null) {
+    await writeFile(candidateEvidencePath, canonicalJson(candidateManifest), 'utf8');
+  } else {
+    await rm(candidateEvidencePath, { force: true });
+  }
 
   const evidenceFiles = [];
-  for (const evidencePath of [inventoryPath, checksumsPath, sbomPath]) {
+  const evidencePaths = [inventoryPath, checksumsPath, sbomPath];
+  if (candidateManifest !== null) evidencePaths.push(candidateEvidencePath);
+  for (const evidencePath of evidencePaths) {
     const evidenceStat = await stat(evidencePath);
     evidenceFiles.push({
       path: path.basename(evidencePath),
@@ -770,9 +818,11 @@ async function main() {
       unpackedApplicationPresent,
       stale: freshness.stale,
       cleanSource: source.dirty === false,
+      candidateManifestPresent: candidateManifest !== null,
       releaseReady:
         installerPresent &&
         unpackedApplicationPresent &&
+        candidateManifest !== null &&
         candidatePolicy.passed &&
         !freshness.stale &&
         source.dirty === false,
@@ -790,6 +840,9 @@ async function main() {
         ...(source.dirty === false
           ? []
           : ['The source worktree was dirty or its state could not be established.']),
+        ...(candidateManifest !== null
+          ? []
+          : ['No validated pre-promotion release candidate manifest was supplied.']),
       ],
     },
   };

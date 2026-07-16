@@ -7,7 +7,12 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { artifactFreshness, sourceProvenance } from './release-source-state.mjs';
+import {
+  artifactFreshness,
+  sourceProvenance,
+  trackedSourceIdentity,
+} from './release-source-state.mjs';
+import { assertCandidateManifest } from './release-candidate-manifest.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
@@ -111,6 +116,9 @@ const revalidateCandidateShape = (entries, version) => {
       `expected exactly ${expectedInstaller}, found ${installers.map((entry) => entry.path).join(', ') || 'none'}`,
     );
   }
+  if (!entries.some((entry) => entry.path === expectedBlockmap)) {
+    errors.push(`missing required installer blockmap: ${expectedBlockmap}`);
+  }
   const unexpectedRootFiles = entries
     .filter(
       (entry) =>
@@ -166,6 +174,13 @@ async function main() {
   const artifactDir = options.artifactDir ?? path.resolve(REPO_ROOT, manifest.artifact.root);
 
   const errors = [];
+  const artifactRootEntries = await readdir(artifactDir, { withFileTypes: true });
+  const unexpectedRootDirectories = artifactRootEntries
+    .filter((entry) => entry.isDirectory() && entry.name !== 'win-unpacked')
+    .map((entry) => entry.name);
+  if (unexpectedRootDirectories.length > 0) {
+    errors.push(`Unexpected artifact-root directories: ${unexpectedRootDirectories.join(', ')}`);
+  }
   if (manifest.schemaVersion !== 1 || inventory.schemaVersion !== 1) {
     errors.push('Unsupported release evidence schema version');
   }
@@ -174,6 +189,10 @@ async function main() {
     'checksums-sha256.txt',
     'content-inventory.json',
   ];
+  if (manifest.quality?.candidateManifestPresent === true) {
+    requiredEvidenceFiles.push('release-candidate-v1.json');
+  }
+  requiredEvidenceFiles.sort((left, right) => left.localeCompare(right, 'en'));
   const recordedEvidenceFiles = (manifest.evidenceFiles ?? [])
     .map((entry) => entry.path)
     .sort((left, right) => left.localeCompare(right, 'en'));
@@ -241,6 +260,22 @@ async function main() {
     errors.push('checksums-sha256.txt does not exactly match content-inventory.json');
   }
 
+  let candidateManifest = null;
+  if (manifest.quality?.candidateManifestPresent === true) {
+    try {
+      candidateManifest = await readJson(
+        path.join(options.evidenceDir, 'release-candidate-v1.json'),
+      );
+      assertCandidateManifest({
+        manifest: candidateManifest,
+        inventory: inventory.files,
+        version: manifest.release.version,
+      });
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+
   if (errors.length > 0) {
     for (const error of errors) console.error(`FAIL: ${error}`);
     throw new Error(`${errors.length} release evidence verification error(s)`);
@@ -260,6 +295,9 @@ async function main() {
     if (manifest.quality.candidatePolicy?.passed !== true) {
       readinessErrors.push('the manifest lacks a passing current candidate policy');
     }
+    if (candidateManifest === null) {
+      readinessErrors.push('the evidence lacks a validated release candidate manifest');
+    }
     if (manifest.release.version !== currentVersion) {
       readinessErrors.push(
         `manifest version ${manifest.release.version ?? 'missing'} does not match package version ${currentVersion}`,
@@ -276,6 +314,30 @@ async function main() {
     }
     if (currentSource.dirty !== false) {
       readinessErrors.push('the current source worktree is dirty or could not be inspected');
+    }
+    if (candidateManifest !== null) {
+      try {
+        const currentTree = await trackedSourceIdentity(REPO_ROOT);
+        if (
+          currentTree.sha256 !== candidateManifest.source.treeSha256 ||
+          currentTree.fileCount !== candidateManifest.source.fileCount ||
+          currentTree.bytes !== candidateManifest.source.bytes
+        ) {
+          readinessErrors.push('the current tracked source snapshot differs from the candidate');
+        }
+        const currentLockfileSha256 = await sha256(path.join(REPO_ROOT, 'pnpm-lock.yaml'));
+        if (currentLockfileSha256 !== candidateManifest.lockfile.sha256) {
+          readinessErrors.push('the current lockfile differs from the candidate provenance');
+        }
+        assertCandidateManifest({
+          manifest: candidateManifest,
+          inventory: actualEntries,
+          version: currentVersion,
+          source: currentSource,
+        });
+      } catch (error) {
+        readinessErrors.push(error.message);
+      }
     }
     const candidateShape = revalidateCandidateShape(actualEntries, currentVersion);
     readinessErrors.push(...candidateShape.errors);

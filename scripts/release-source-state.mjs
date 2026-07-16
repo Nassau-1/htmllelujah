@@ -1,4 +1,6 @@
-import { access, readdir, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { access, lstat, readdir, stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 
@@ -121,24 +123,170 @@ export const artifactFreshness = async ({ artifactDir, inventory, installers, re
   };
 };
 
-const runGit = (repositoryRoot, arguments_) => {
+const runGitProcess = (repositoryRoot, arguments_, allowedStatuses = [0]) => {
   const result = spawnSync('git', arguments_, {
     cwd: repositoryRoot,
-    encoding: 'utf8',
+    encoding: null,
     timeout: 15_000,
     windowsHide: true,
+    maxBuffer: 32 * 1024 * 1024,
   });
-  return result.status === 0 ? result.stdout.trim() : null;
+  if (result.error || result.signal || !allowedStatuses.includes(result.status)) {
+    const stderr = Buffer.isBuffer(result.stderr)
+      ? result.stderr.toString('utf8').trim()
+      : String(result.stderr ?? '').trim();
+    throw new Error(
+      `Git command failed closed (git ${arguments_.join(' ')}): ${stderr || result.error?.message || `exit ${result.status ?? 'unknown'}`}`,
+    );
+  }
+  return result;
+};
+
+export const runGitText = (repositoryRoot, arguments_, allowedStatuses = [0]) =>
+  runGitProcess(repositoryRoot, arguments_, allowedStatuses).stdout.toString('utf8').trim();
+
+export const gitSourceState = (repositoryRoot, runner = runGitProcess) => {
+  const runText = (arguments_, allowedStatuses = [0]) =>
+    runner(repositoryRoot, arguments_, allowedStatuses).stdout.toString('utf8').trim();
+  const hasChanges = (arguments_) => runner(repositoryRoot, arguments_, [0, 1]).status === 1;
+  if (runText(['rev-parse', '--is-inside-work-tree']) !== 'true') {
+    throw new Error('The release source is not a Git worktree.');
+  }
+  const commit = runText(['rev-parse', '--verify', 'HEAD^{commit}']);
+  if (!/^[0-9a-f]{40,64}$/u.test(commit)) {
+    throw new Error('Git HEAD did not resolve to an exact commit.');
+  }
+  const staged = hasChanges(['diff', '--cached', '--quiet', '--no-ext-diff', 'HEAD', '--']);
+  const unstaged = hasChanges(['diff-files', '--quiet', '--no-ext-diff', '--']);
+  const untrackedOutput = runner(repositoryRoot, [
+    'ls-files',
+    '--others',
+    '--exclude-standard',
+    '-z',
+  ]).stdout;
+  const untracked = untrackedOutput.length > 0;
+  const statusOutput = runner(repositoryRoot, [
+    'status',
+    '--porcelain=v1',
+    '-z',
+    '--untracked-files=all',
+  ]).stdout;
+  const dirty = staged || unstaged || untracked;
+  const statusDirty = statusOutput.length > 0;
+  if (statusDirty !== dirty) {
+    throw new Error('Git cleanliness checks disagreed; refusing an ambiguous source state.');
+  }
+  let branch = null;
+  const branchResult = runner(repositoryRoot, ['symbolic-ref', '-q', '--short', 'HEAD'], [0, 1]);
+  if (branchResult.status === 0) branch = branchResult.stdout.toString('utf8').trim() || null;
+  const exactTagResult = runner(
+    repositoryRoot,
+    ['describe', '--tags', '--exact-match', 'HEAD'],
+    [0, 128],
+  );
+  const exactTag =
+    exactTagResult.status === 0 ? exactTagResult.stdout.toString('utf8').trim() || null : null;
+  return {
+    commit,
+    branch,
+    exactTag,
+    dirty,
+    staged,
+    unstaged,
+    untracked,
+  };
+};
+
+const sha256File = (filePath) =>
+  new Promise((resolve, reject) => {
+    const digest = createHash('sha256');
+    const stream = createReadStream(filePath);
+    stream.on('data', (chunk) => digest.update(chunk));
+    stream.once('error', reject);
+    stream.once('end', () => resolve(digest.digest('hex')));
+  });
+
+export const trackedSourceIdentity = async (repositoryRoot) => {
+  const output = runGitProcess(repositoryRoot, ['ls-files', '--cached', '-z']).stdout;
+  const files = output
+    .toString('utf8')
+    .split('\0')
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right, 'en'));
+  if (files.length === 0 || files.length > 100_000) {
+    throw new Error('The tracked source set is outside the supported provenance bounds.');
+  }
+  const digest = createHash('sha256');
+  let bytes = 0;
+  for (const relativePath of files) {
+    const absolutePath = path.resolve(repositoryRoot, ...relativePath.split('/'));
+    const relation = path.relative(repositoryRoot, absolutePath);
+    if (relation.startsWith('..') || path.isAbsolute(relation)) {
+      throw new Error(`Tracked source path escaped the repository: ${relativePath}.`);
+    }
+    const metadata = await lstat(absolutePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`Tracked provenance entry is not a regular file: ${relativePath}.`);
+    }
+    const fileSha256 = await sha256File(absolutePath);
+    bytes += metadata.size;
+    digest.update(relativePath);
+    digest.update('\0');
+    digest.update(String(metadata.size));
+    digest.update('\0');
+    digest.update(fileSha256);
+    digest.update('\n');
+  }
+  return { sha256: digest.digest('hex'), fileCount: files.length, bytes };
+};
+
+const sameIdentity = (left, right) =>
+  left.sha256 === right.sha256 && left.fileCount === right.fileCount && left.bytes === right.bytes;
+
+export const captureSourceSnapshot = async (repositoryRoot, { requireClean = false } = {}) => {
+  const before = gitSourceState(repositoryRoot);
+  if (requireClean && before.dirty) {
+    throw new Error('A release source snapshot requires a clean index and worktree.');
+  }
+  const tree = await trackedSourceIdentity(repositoryRoot);
+  const after = gitSourceState(repositoryRoot);
+  if (before.commit !== after.commit || before.dirty !== after.dirty) {
+    throw new Error('Source state changed while the provenance snapshot was captured.');
+  }
+  const confirmation = await trackedSourceIdentity(repositoryRoot);
+  if (!sameIdentity(tree, confirmation)) {
+    throw new Error('Tracked source changed while the provenance snapshot was captured.');
+  }
+  return { ...after, tree };
+};
+
+export const assertSourceSnapshot = async (
+  repositoryRoot,
+  expected,
+  { requireClean = false } = {},
+) => {
+  const current = await captureSourceSnapshot(repositoryRoot, { requireClean });
+  assertSourceSnapshotIdentity(current, expected);
+  return current;
+};
+
+export const assertSourceSnapshotIdentity = (current, expected) => {
+  if (
+    current.commit !== expected.commit ||
+    current.dirty !== expected.dirty ||
+    !sameIdentity(current.tree, expected.tree)
+  ) {
+    throw new Error('The source commit or tracked source snapshot changed during the build.');
+  }
 };
 
 export const sourceProvenance = (repositoryRoot) => {
-  const status = runGit(repositoryRoot, ['status', '--porcelain=v1', '--untracked-files=normal']);
-  const dirtyEntries = status ? status.split(/\r?\n/u).filter(Boolean) : [];
+  const source = gitSourceState(repositoryRoot);
   return {
-    commit: runGit(repositoryRoot, ['rev-parse', '--verify', 'HEAD']),
-    branch: runGit(repositoryRoot, ['branch', '--show-current']),
-    exactTag: runGit(repositoryRoot, ['describe', '--tags', '--exact-match', 'HEAD']),
-    dirty: status === null ? null : dirtyEntries.length > 0,
-    dirtyEntryCount: status === null ? null : dirtyEntries.length,
+    commit: source.commit,
+    branch: source.branch,
+    exactTag: source.exactTag,
+    dirty: source.dirty,
+    dirtyEntryCount: Number(source.staged) + Number(source.unstaged) + Number(source.untracked),
   };
 };

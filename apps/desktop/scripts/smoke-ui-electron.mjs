@@ -3,14 +3,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import electronPath from 'electron';
-
 import { assessInteractiveReadiness, assertInteractiveReadiness } from './ui-smoke-performance.mjs';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
 const evidenceDirectory = path.join(repositoryRoot, 'artifacts', 'evidence');
 const screenshotPath = path.join(evidenceDirectory, 'v1-editor-electron.png');
+const presentationScreenshotPath = path.join(evidenceDirectory, 'v1-presentation-electron.png');
 const reportPath = path.join(evidenceDirectory, 'v1-editor-electron.json');
 const dialogAutomationPath = path.join(import.meta.dirname, 'automate-save-dialog.ps1');
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -252,13 +251,19 @@ const evaluateCdp = async (session, expression, userGesture = false) => {
   return response.result?.value;
 };
 
-const warmUpApplication = async ({ launchCommand, launchArguments, userData }) => {
+const warmUpApplication = async ({
+  launchCommand,
+  launchArguments,
+  launchEnvironment,
+  userData,
+}) => {
   const debuggingPortPath = path.join(userData, 'DevToolsActivePort');
   await rm(debuggingPortPath, { force: true });
 
   const startedAt = performance.now();
   const warmup = spawn(launchCommand, launchArguments, {
     cwd: desktopRoot,
+    env: launchEnvironment,
     windowsHide: true,
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -322,7 +327,14 @@ await writeFile(
 const executable = process.env.HTMLLELUJAH_EXECUTABLE;
 const openPath = process.env.HTMLLELUJAH_OPEN_PATH;
 const expectedDeckName = process.env.HTMLLELUJAH_EXPECTED_DECK_NAME;
-const launchCommand = executable === undefined ? electronPath : path.resolve(executable);
+const launchEnvironment = {
+  ...process.env,
+  ...(executable === undefined
+    ? {}
+    : { VITE_DEV_SERVER_URL: 'https://packaged-renderer-override.invalid/' }),
+};
+const launchCommand =
+  executable === undefined ? (await import('electron')).default : path.resolve(executable);
 const createLaunchArguments = (includeOpenPath) => [
   ...(executable === undefined ? ['.'] : []),
   ...(includeOpenPath && openPath !== undefined ? [path.resolve(openPath)] : []),
@@ -336,6 +348,7 @@ try {
   warmupEvidence = await warmUpApplication({
     launchCommand,
     launchArguments: createLaunchArguments(false),
+    launchEnvironment,
     userData,
   });
 } catch (error) {
@@ -346,6 +359,7 @@ try {
 const launchStartedAt = performance.now();
 const application = spawn(launchCommand, createLaunchArguments(true), {
   cwd: desktopRoot,
+  env: launchEnvironment,
   windowsHide: true,
   stdio: ['ignore', 'ignore', 'pipe'],
 });
@@ -675,7 +689,9 @@ try {
     'Presentation renderer target',
   );
   const presentationCdp = await CdpSession.connect(presentationTarget.webSocketDebuggerUrl);
+  let presentationScreenshotBytes;
   try {
+    await presentationCdp.send('Page.enable');
     await presentationCdp.send('Runtime.enable');
     await waitFor(
       async () => {
@@ -689,6 +705,18 @@ try {
       10_000,
       'Presentation surface',
     );
+    const presentationScreenshot = await presentationCdp.send('Page.captureScreenshot', {
+      format: 'png',
+      fromSurface: true,
+      captureBeyondViewport: false,
+    });
+    if (
+      typeof presentationScreenshot.data !== 'string' ||
+      presentationScreenshot.data.length < 1_000
+    ) {
+      throw new Error('The presentation window returned an invalid screenshot.');
+    }
+    presentationScreenshotBytes = Buffer.from(presentationScreenshot.data, 'base64');
     try {
       await presentationCdp.send('Input.dispatchKeyEvent', {
         type: 'keyDown',
@@ -723,6 +751,131 @@ try {
     `[...document.querySelectorAll('.inspector-section h3')].some((heading) => heading.textContent === 'Layout editor') && [...document.querySelectorAll('.inspector-section h3')].some((heading) => heading.textContent === 'Master editor')`,
     'Master and layout editors',
   );
+
+  await click('.design-breadcrumb button:nth-child(3)', 'Master design surface');
+  await waitForRenderer(
+    `document.querySelector('.canvas-context-badge')?.textContent?.includes('Master:') === true`,
+    'Master canvas context',
+  );
+  const masterObjectCountBefore = await evaluate(
+    `document.querySelectorAll('.master-object-row').length`,
+  );
+  const addedMasterShape = await evaluate(`(() => {
+    const controls = document.querySelector('[aria-label="Add master objects"]');
+    const button = [...(controls?.querySelectorAll('button') ?? [])].find(
+      (candidate) => candidate.textContent?.trim().endsWith('shape'),
+    );
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!addedMasterShape) throw new Error('The dedicated master-shape action was unavailable.');
+  await waitForRenderer(
+    `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore + 1}`,
+    'Master shape insertion',
+  );
+  const selectedMasterObject = await evaluate(`(() => {
+    const button = [...document.querySelectorAll('.master-object-select')].at(-1);
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!selectedMasterObject) throw new Error('The inserted master object could not be selected.');
+  await waitForRenderer(
+    `[...document.querySelectorAll('.toolbar .add-tools button')].length >= 7 && [...document.querySelectorAll('.toolbar .add-tools button')].every((button) => button instanceof HTMLButtonElement && button.disabled)`,
+    'Slide-only toolbar disabled on master surface',
+  );
+  await clickButtonWithText('Edit', 'Edit menu on master surface');
+  await waitForRenderer(
+    `(() => {
+      const menu = document.querySelector('[role="menu"][aria-label="Edit menu"]');
+      const actions = [...(menu?.querySelectorAll('button') ?? [])].filter((button) =>
+        ['Duplicate', 'Delete'].some((label) => button.textContent?.includes(label)),
+      );
+      return actions.length === 2 && actions.every((button) => button instanceof HTMLButtonElement && button.disabled);
+    })()`,
+    'Slide-only Edit actions disabled on master surface',
+  );
+  await clickButtonWithText('Edit', 'Edit menu close on master surface');
+  await click('[aria-label="Undo"]', 'Undo master shape insertion');
+  await waitForRenderer(
+    `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore}`,
+    'Undo master shape insertion',
+  );
+
+  await click('.design-breadcrumb button:nth-child(2)', 'Layout design surface');
+  await waitForRenderer(
+    `document.querySelector('.canvas-context-badge')?.textContent?.includes('Layout:') === true`,
+    'Layout canvas context',
+  );
+  await waitForRenderer(
+    `[...document.querySelectorAll('.toolbar .add-tools button')].every((button) => button instanceof HTMLButtonElement && button.disabled)`,
+    'Slide-only toolbar disabled on layout surface',
+  );
+  const layoutPlaceholderFrames = await evaluate(`(() => {
+    const frame = (name) => {
+      const element = [...document.querySelectorAll('.canonical-hitbox')].find((candidate) =>
+        candidate.getAttribute('aria-label')?.startsWith(name),
+      );
+      if (!(element instanceof HTMLElement)) return null;
+      return {
+        left: element.style.left,
+        top: element.style.top,
+        width: element.style.width,
+        height: element.style.height,
+      };
+    };
+    return { title: frame('Title placeholder'), body: frame('Body placeholder') };
+  })()`);
+  if (layoutPlaceholderFrames.title === null || layoutPlaceholderFrames.body === null) {
+    throw new Error('The active layout did not expose title and body placeholder frames.');
+  }
+  const slideCountBeforeLayoutInstantiation = await evaluate(
+    `document.querySelectorAll('.canonical-thumbnail').length`,
+  );
+  await click('[aria-label="Add slide"]', 'Add layout-aware slide');
+  await waitForRenderer(
+    `document.querySelectorAll('.canonical-thumbnail').length === ${slideCountBeforeLayoutInstantiation + 1}`,
+    'Layout-aware slide insertion',
+  );
+  await click('.design-breadcrumb button:nth-child(1)', 'Slide design surface');
+  await waitForRenderer(
+    `document.querySelector('.canvas-context-badge')?.textContent?.includes('Slide:') === true`,
+    'New slide canvas context',
+  );
+  const instantiatedFrames = await evaluate(`(() => {
+    const frame = (name) => {
+      const element = [...document.querySelectorAll('.canonical-hitbox')].find((candidate) =>
+        candidate.getAttribute('aria-label')?.startsWith(name),
+      );
+      if (!(element instanceof HTMLElement)) return null;
+      return {
+        left: element.style.left,
+        top: element.style.top,
+        width: element.style.width,
+        height: element.style.height,
+      };
+    };
+    return {
+      title: frame('Title, text'),
+      body: frame('Body, text'),
+      canvasText: document.querySelector('.canonical-slide-surface')?.textContent ?? '',
+    };
+  })()`);
+  if (
+    JSON.stringify(instantiatedFrames.title) !== JSON.stringify(layoutPlaceholderFrames.title) ||
+    JSON.stringify(instantiatedFrames.body) !== JSON.stringify(layoutPlaceholderFrames.body) ||
+    !instantiatedFrames.canvasText.includes('New slide') ||
+    !instantiatedFrames.canvasText.includes('Add your content')
+  ) {
+    throw new Error('A new slide did not instantiate the active layout placeholders exactly.');
+  }
+  await click('[aria-label="Undo"]', 'Undo layout-aware slide insertion');
+  await waitForRenderer(
+    `document.querySelectorAll('.canonical-thumbnail').length === ${slideCountBeforeLayoutInstantiation}`,
+    'Undo layout-aware slide insertion',
+  );
+
   const changedPageFormat = await evaluate(`(() => {
     const heading = [...document.querySelectorAll('.inspector-section h3')].find(
       (candidate) => candidate.textContent === 'Page format',
@@ -781,6 +934,19 @@ try {
     'Properties inspector tab',
   );
 
+  const finalReselected = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].at(-1);
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+    return true;
+  })()`);
+  if (!finalReselected) throw new Error('The final slide object could not be selected.');
+  await waitForRenderer(
+    `document.querySelectorAll('.canonical-hitbox.is-selected').length === 1`,
+    'Final stable slide selection',
+  );
+
   await evaluate(`(() => {
     const toastClose = document.querySelector('.toast button[aria-label="Dismiss"]');
     if (toastClose instanceof HTMLButtonElement) toastClose.click();
@@ -813,6 +979,9 @@ try {
   if (typeof screenshot.data !== 'string' || screenshot.data.length < 1_000) {
     throw new Error('Electron returned an invalid screenshot.');
   }
+  if (presentationScreenshotBytes === undefined) {
+    throw new Error('Presentation visual evidence was not captured.');
+  }
 
   const report = {
     passed: true,
@@ -824,6 +993,9 @@ try {
     final: finalState,
     checks: [
       'real Electron renderer opened through the secure app protocol',
+      ...(executable === undefined
+        ? []
+        : ['packaged application ignored a hostile development-renderer environment override']),
       'one unmeasured warm-up and one measured launch reused the same user-data profile',
       'essential editor surfaces rendered',
       'shape insertion, undo, and redo converged',
@@ -834,19 +1006,24 @@ try {
       'Codex MCP dialog opened and closed',
       'LAN collaboration dialog opened and closed',
       'page format changed through the Design inspector and undid cleanly',
+      'master and layout scopes disabled slide-only toolbar and menu mutations',
+      'dedicated master-object insertion and undo stayed inside the master',
+      'new slide instantiated title/body frames from the active layout exactly',
       'Design and Properties inspector tabs switched',
       'stable PNG screenshot captured from the real window',
+      'stable PNG screenshot captured from the real presentation window',
     ],
   };
   await mkdir(evidenceDirectory, { recursive: true });
   await Promise.all([
     writeFile(screenshotPath, Buffer.from(screenshot.data, 'base64')),
+    writeFile(presentationScreenshotPath, presentationScreenshotBytes),
     writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8'),
   ]);
 
   process.stdout.write(
     `Electron UI smoke passed: real window edited, undo/redo verified, dialogs exercised.\n` +
-      `Screenshot: ${screenshotPath}\nReport: ${reportPath}\n`,
+      `Screenshots: ${screenshotPath}, ${presentationScreenshotPath}\nReport: ${reportPath}\n`,
   );
 } catch (error) {
   if (evaluateRenderer !== undefined) {

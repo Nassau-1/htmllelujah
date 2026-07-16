@@ -1,22 +1,26 @@
-import type {
-  ConnectorElement,
-  Element,
-  IconElement,
-  ImageElement,
-  RichTextDocument,
-  ShapeElement,
-  ShapeKind,
-  Slide,
-  TableCell,
-  TableElement,
-  TextAlignment,
-  TextElement,
-  TextMarks,
-  TextRun,
-  TextStyleRole,
+import {
+  DOCUMENT_LIMITS,
+  type ConnectorElement,
+  type DeckDocument,
+  type Element,
+  type IconElement,
+  type ImageElement,
+  type RichTextDocument,
+  type ShapeElement,
+  type ShapeKind,
+  type Slide,
+  type TableCell,
+  type TableElement,
+  type TextAlignment,
+  type TextElement,
+  type TextMarks,
+  type TextRun,
+  type TextStyleRole,
 } from '@htmllelujah/document-core';
 
 const id = (): string => crypto.randomUUID();
+
+export type HeadingLevel = 1 | 2 | 3 | 4 | 5 | 6;
 
 export const emptyMarks = (): TextMarks => ({
   bold: false,
@@ -24,6 +28,34 @@ export const emptyMarks = (): TextMarks => ({
   underline: false,
   strikethrough: false,
 });
+
+const safeChunkEnd = (text: string, start: number): number => {
+  let end = Math.min(text.length, start + DOCUMENT_LIMITS.maxTextRunLength);
+  if (
+    end < text.length &&
+    end > start &&
+    /[\uD800-\uDBFF]/u.test(text[end - 1] ?? '') &&
+    /[\uDC00-\uDFFF]/u.test(text[end] ?? '')
+  ) {
+    end -= 1;
+  }
+  return end;
+};
+
+export const boundedTextRuns = (
+  text: string,
+  marks: TextMarks = emptyMarks(),
+): readonly TextRun[] => {
+  if (text.length === 0) return [{ text: '', marks: { ...marks } }];
+  const runs: TextRun[] = [];
+  let start = 0;
+  while (start < text.length) {
+    const end = safeChunkEnd(text, start);
+    runs.push({ text: text.slice(start, end), marks: { ...marks } });
+    start = end;
+  }
+  return runs;
+};
 
 export const plainParagraph = (
   text: string,
@@ -35,7 +67,7 @@ export const plainParagraph = (
       id: id(),
       type: 'paragraph',
       alignment,
-      runs: [{ text, marks }],
+      runs: boundedTextRuns(text, marks),
     },
   ],
 });
@@ -48,6 +80,27 @@ export const contentToPlainText = (content: RichTextDocument): string =>
         : [block.runs.map((run) => run.text).join('')],
     )
     .join('\n');
+
+export const headingLevelOf = (content: RichTextDocument): HeadingLevel => {
+  const heading = content.blocks.find((block) => block.type === 'heading');
+  return heading?.type === 'heading' ? heading.level : 1;
+};
+
+export const updateHeadingLevel = (
+  content: RichTextDocument,
+  level: HeadingLevel,
+): RichTextDocument => ({
+  blocks: content.blocks.map((block) => (block.type === 'heading' ? { ...block, level } : block)),
+});
+
+const boundedPlainTextLines = (text: string): readonly string[] => {
+  const rawLines = text.replace(/\r\n?/g, '\n').split('\n');
+  if (rawLines.length <= DOCUMENT_LIMITS.maxRichTextBlocks) return rawLines;
+  return [
+    ...rawLines.slice(0, DOCUMENT_LIMITS.maxRichTextBlocks - 1),
+    rawLines.slice(DOCUMENT_LIMITS.maxRichTextBlocks - 1).join('\n'),
+  ];
+};
 
 const marksEqual = (left: TextMarks, right: TextMarks): boolean =>
   left.bold === right.bold &&
@@ -62,11 +115,17 @@ const marksEqual = (left: TextMarks, right: TextMarks): boolean =>
 const mergeAdjacentRuns = (runs: readonly TextRun[]): readonly TextRun[] => {
   const merged: TextRun[] = [];
   for (const run of runs) {
-    const previous = merged.at(-1);
-    if (previous !== undefined && marksEqual(previous.marks, run.marks)) {
-      merged[merged.length - 1] = { ...previous, text: previous.text + run.text };
-    } else {
-      merged.push({ text: run.text, marks: { ...run.marks } });
+    for (const chunk of boundedTextRuns(run.text, run.marks)) {
+      const previous = merged.at(-1);
+      if (
+        previous !== undefined &&
+        marksEqual(previous.marks, chunk.marks) &&
+        previous.text.length + chunk.text.length <= DOCUMENT_LIMITS.maxTextRunLength
+      ) {
+        merged[merged.length - 1] = { ...previous, text: previous.text + chunk.text };
+      } else {
+        merged.push({ text: chunk.text, marks: { ...chunk.marks } });
+      }
     }
   }
   return merged.length > 0 ? merged : [{ text: '', marks: emptyMarks() }];
@@ -77,7 +136,7 @@ const replaceRunsText = (runs: readonly TextRun[], nextText: string): readonly T
   const previousText = runs.map((run) => run.text).join('');
   if (previousText === nextText) return runs.map((run) => ({ ...run, marks: { ...run.marks } }));
   if (runs.length <= 1) {
-    return [{ text: nextText, marks: { ...(runs[0]?.marks ?? emptyMarks()) } }];
+    return boundedTextRuns(nextText, runs[0]?.marks ?? emptyMarks());
   }
 
   const boundaries = [0];
@@ -118,60 +177,66 @@ export const replacePlainTextPreservingStyles = (
   content: RichTextDocument,
   text: string,
 ): RichTextDocument => {
-  const lines = text.replace(/\r\n?/g, '\n').split('\n');
-  const onlyBlock = content.blocks.length === 1 ? content.blocks[0] : undefined;
-  if (onlyBlock?.type === 'list') {
-    const fallback = onlyBlock.items.at(-1);
-    return {
-      blocks: [
-        {
-          ...onlyBlock,
-          items: lines.map((line, index) => {
-            const existing = onlyBlock.items[index];
-            return existing === undefined
-              ? {
-                  id: id(),
-                  level: fallback?.level ?? 0,
-                  runs: replaceRunsText(fallback?.runs ?? [], line),
-                }
-              : { ...existing, runs: replaceRunsText(existing.runs, line) };
-          }),
-        },
-      ],
-    };
+  const lines = boundedPlainTextLines(text);
+  type LineTemplate =
+    | Readonly<{
+        kind: 'list';
+        block: Extract<RichTextDocument['blocks'][number], { type: 'list' }>;
+        item: Extract<RichTextDocument['blocks'][number], { type: 'list' }>['items'][number];
+      }>
+    | Readonly<{
+        kind: 'text';
+        block: Exclude<RichTextDocument['blocks'][number], { type: 'list' }>;
+      }>;
+  const templates: LineTemplate[] = [];
+  for (const block of content.blocks) {
+    if (block.type === 'list') {
+      for (const item of block.items) templates.push({ kind: 'list', block, item });
+    } else {
+      templates.push({ kind: 'text', block });
+    }
   }
-
-  const textBlocks = content.blocks.filter((block) => block.type !== 'list');
-  const fallback = textBlocks.at(-1);
-  if (textBlocks.length !== content.blocks.length || fallback === undefined) {
+  const fallback = templates.at(-1);
+  if (fallback === undefined) {
     return contentFromPlainText(text, {
       kind: 'paragraph',
       alignment: 'left',
       marks: firstRunMarks(content),
     });
   }
-  return {
-    blocks: lines.map((line, index) => {
-      const existing = textBlocks[index];
-      if (existing !== undefined) {
-        return { ...existing, runs: replaceRunsText(existing.runs, line) };
+
+  const blocks: RichTextDocument['blocks'][number][] = [];
+  let previousListSourceId: string | undefined;
+  lines.forEach((line, index) => {
+    const template = templates[index] ?? fallback;
+    const existing = templates[index];
+    if (template.kind === 'list') {
+      const item = {
+        ...(existing?.kind === 'list' ? existing.item : template.item),
+        ...(existing === undefined ? { id: id() } : {}),
+        runs: replaceRunsText(template.item.runs, line),
+      };
+      const previous = blocks.at(-1);
+      if (previous?.type === 'list' && previousListSourceId === template.block.id) {
+        blocks[blocks.length - 1] = { ...previous, items: [...previous.items, item] };
+      } else {
+        blocks.push({
+          ...template.block,
+          ...(existing === undefined ? { id: id() } : {}),
+          items: [item],
+        });
       }
-      return fallback.type === 'heading'
-        ? {
-            id: id(),
-            type: 'heading' as const,
-            level: fallback.level,
-            alignment: fallback.alignment,
-            runs: replaceRunsText(fallback.runs, line),
-          }
-        : {
-            id: id(),
-            type: 'paragraph' as const,
-            alignment: fallback.alignment,
-            runs: replaceRunsText(fallback.runs, line),
-          };
-    }),
-  };
+      previousListSourceId = template.block.id;
+      return;
+    }
+    blocks.push({
+      ...template.block,
+      ...(existing === undefined ? { id: id() } : {}),
+      runs: replaceRunsText(template.block.runs, line),
+    });
+    previousListSourceId = undefined;
+  });
+  return { blocks };
 };
 
 const firstRunMarks = (content: RichTextDocument): TextMarks => {
@@ -210,10 +275,10 @@ export const contentFromPlainText = (
     readonly kind: 'paragraph' | 'heading' | 'bullets' | 'numbered';
     readonly alignment: TextAlignment;
     readonly marks: TextMarks;
-    readonly headingLevel?: 1 | 2 | 3 | 4 | 5 | 6;
+    readonly headingLevel?: HeadingLevel;
   },
 ): RichTextDocument => {
-  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const lines = boundedPlainTextLines(text);
   if (options.kind === 'bullets' || options.kind === 'numbered') {
     return {
       blocks: [
@@ -224,7 +289,7 @@ export const contentFromPlainText = (
           items: lines.map((line) => ({
             id: id(),
             level: 0,
-            runs: [{ text: line, marks: options.marks }],
+            runs: boundedTextRuns(line, options.marks),
           })),
         },
       ],
@@ -238,13 +303,13 @@ export const contentFromPlainText = (
             type: 'heading' as const,
             level: options.headingLevel ?? 1,
             alignment: options.alignment,
-            runs: [{ text: line, marks: options.marks }],
+            runs: boundedTextRuns(line, options.marks),
           }
         : {
             id: id(),
             type: 'paragraph' as const,
             alignment: options.alignment,
-            runs: [{ text: line, marks: options.marks }],
+            runs: boundedTextRuns(line, options.marks),
           },
     ),
   };
@@ -368,15 +433,69 @@ export const createConnectorElement = (): ConnectorElement => ({
   endCap: 'arrow',
 });
 
-export const createSlide = (layoutId: string, index: number): Slide => ({
+const textRoleForPlaceholder = (
+  role: 'title' | 'subtitle' | 'body' | 'media' | 'table' | 'footer' | 'slide-number',
+): TextStyleRole => {
+  if (role === 'title' || role === 'subtitle' || role === 'body') return role;
+  return 'caption';
+};
+
+const initialPlaceholderText = (
+  role: 'title' | 'subtitle' | 'body' | 'media' | 'table' | 'footer' | 'slide-number',
+  prompt: string,
+  document: DeckDocument,
+  index: number,
+): string => {
+  if (role === 'title') return 'New slide';
+  if (role === 'body') return 'Add your content';
+  if (role === 'footer') return document.name;
+  if (role === 'slide-number') return String(index + 1);
+  return prompt;
+};
+
+const textPlaceholdersForLayout = (
+  document: DeckDocument,
+  layoutId: string,
+): readonly Extract<Element, { readonly type: 'placeholder' }>[] => {
+  const layout = document.layouts.find((candidate) => candidate.id === layoutId);
+  if (layout === undefined)
+    throw new Error(`Cannot create a slide: layout ${layoutId} is missing.`);
+  const master = document.masters.find((candidate) => candidate.id === layout.masterId);
+  const placeholders: Extract<Element, { readonly type: 'placeholder' }>[] = [];
+  const visit = (elements: readonly Element[]): void => {
+    for (const element of elements) {
+      if (element.type === 'placeholder' && element.accepts.includes('text')) {
+        placeholders.push(element);
+      }
+      if (element.type === 'group') visit(element.children);
+    }
+  };
+  if (master !== undefined) visit(master.elements);
+  visit(layout.elements);
+  return placeholders;
+};
+
+/** Creates a slide by instantiating every text-compatible placeholder in its layout/master. */
+export const createSlide = (document: DeckDocument, layoutId: string, index: number): Slide => ({
   id: id(),
   name: `Slide ${index + 1}`,
   layoutId,
   hidden: false,
-  elements: [
-    createTextElement('title', 'New slide'),
-    createTextElement('body', 'Add your content'),
-  ],
+  elements: textPlaceholdersForLayout(document, layoutId).map((placeholder) => ({
+    ...createTextElement(
+      textRoleForPlaceholder(placeholder.role),
+      initialPlaceholderText(placeholder.role, placeholder.prompt, document, index),
+    ),
+    name: placeholder.name.replace(/\s+placeholder$/iu, '') || placeholder.name,
+    frame: { ...placeholder.frame },
+    visible: placeholder.visible,
+    opacity: placeholder.opacity,
+    placeholderBinding: { placeholderId: placeholder.id, overrides: [] },
+    verticalAlignment:
+      placeholder.role === 'body' || placeholder.role === 'table' || placeholder.role === 'media'
+        ? 'top'
+        : 'middle',
+  })),
 });
 
 const cloneContent = (content: RichTextDocument): RichTextDocument => ({
@@ -402,13 +521,19 @@ const collectElementIds = (
   return output;
 };
 
-const cloneElement = (element: Element, ids: ReadonlyMap<string, string>): Element => {
+const cloneElement = (
+  element: Element,
+  ids: ReadonlyMap<string, string>,
+  preserveGeometryAndName: boolean,
+): Element => {
   const nextId = ids.get(element.id);
   if (nextId === undefined) throw new Error('Could not duplicate an object identifier.');
   const common = {
     id: nextId,
-    name: `${element.name} copy`,
-    frame: { ...element.frame, xPt: element.frame.xPt + 18, yPt: element.frame.yPt + 18 },
+    name: preserveGeometryAndName ? element.name : `${element.name} copy`,
+    frame: preserveGeometryAndName
+      ? { ...element.frame }
+      : { ...element.frame, xPt: element.frame.xPt + 18, yPt: element.frame.yPt + 18 },
   };
   switch (element.type) {
     case 'text':
@@ -443,7 +568,9 @@ const cloneElement = (element: Element, ids: ReadonlyMap<string, string>): Eleme
       return {
         ...structuredClone(element),
         ...common,
-        children: element.children.map((child) => cloneElement(child, ids)),
+        children: element.children.map((child) =>
+          cloneElement(child, ids, preserveGeometryAndName),
+        ),
       };
     case 'image':
     case 'shape':
@@ -455,5 +582,11 @@ const cloneElement = (element: Element, ids: ReadonlyMap<string, string>): Eleme
 
 export const duplicateElements = (elements: readonly Element[]): readonly Element[] => {
   const ids = collectElementIds(elements);
-  return elements.map((element) => cloneElement(element, ids));
+  return elements.map((element) => cloneElement(element, ids, false));
+};
+
+/** Deep-clones reusable master/layout objects without visually moving or renaming them. */
+export const duplicateTemplateElements = (elements: readonly Element[]): readonly Element[] => {
+  const ids = collectElementIds(elements);
+  return elements.map((element) => cloneElement(element, ids, true));
 };

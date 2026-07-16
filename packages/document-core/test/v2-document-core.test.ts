@@ -195,6 +195,380 @@ describe('projection and placeholders', () => {
     expect(undoTransaction(reset.document, reset)).toEqual(overridden);
   });
 
+  it('remaps layout bindings deterministically by placeholder role and accepted element type', () => {
+    const source = createDefaultDeck({
+      idFactory: idFactory(),
+      now: () => '2026-01-01T00:00:00.000Z',
+    });
+    const layout = source.layouts[0];
+    const slide = source.slides[0];
+    const title = slide?.elements[0];
+    const body = slide?.elements[1];
+    const titlePlaceholder = layout?.elements.find(
+      (element) => element.type === 'placeholder' && element.role === 'title',
+    );
+    const bodyPlaceholder = layout?.elements.find(
+      (element) => element.type === 'placeholder' && element.role === 'body',
+    );
+    if (
+      layout === undefined ||
+      slide === undefined ||
+      title === undefined ||
+      body === undefined ||
+      titlePlaceholder?.type !== 'placeholder' ||
+      bodyPlaceholder?.type !== 'placeholder'
+    ) {
+      throw new Error('Missing layout fixture.');
+    }
+
+    const targetLayoutId = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000001';
+    const incompatibleBodyId = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000002';
+    const targetTitleId = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000003';
+    const targetBodyId = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000004';
+    const fallbackBodyId = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000005';
+    const deck: DeckDocument = {
+      ...source,
+      layouts: [
+        ...source.layouts,
+        {
+          ...layout,
+          id: targetLayoutId,
+          name: 'Alternative',
+          elements: [
+            {
+              ...bodyPlaceholder,
+              id: incompatibleBodyId,
+              name: 'Image-only body',
+              accepts: ['image'],
+            },
+            {
+              ...titlePlaceholder,
+              id: targetTitleId,
+              name: 'Alternative title',
+              frame: { ...titlePlaceholder.frame, yPt: 36 },
+            },
+            {
+              ...bodyPlaceholder,
+              id: targetBodyId,
+              name: 'Alternative body',
+              accepts: ['text'],
+              frame: { ...bodyPlaceholder.frame, yPt: 180 },
+            },
+            {
+              ...bodyPlaceholder,
+              id: fallbackBodyId,
+              name: 'Fallback body',
+              accepts: ['text'],
+            },
+          ],
+        },
+      ],
+    };
+    const before = JSON.stringify(deck);
+
+    const result = applyTransaction(
+      deck,
+      [{ type: 'slide.set-layout', slideId: slide.id, layoutId: targetLayoutId }],
+      metadata('2'),
+    );
+    const changedSlide = result.document.slides[0];
+    const changedTitle = changedSlide?.elements.find((element) => element.id === title.id);
+    const changedBody = changedSlide?.elements.find((element) => element.id === body.id);
+
+    expect(changedSlide?.layoutId).toBe(targetLayoutId);
+    expect(changedTitle?.placeholderBinding).toEqual({
+      ...title.placeholderBinding,
+      placeholderId: targetTitleId,
+    });
+    expect(changedBody?.placeholderBinding).toEqual({
+      ...body.placeholderBinding,
+      placeholderId: targetBodyId,
+    });
+    expect(changedTitle?.frame).toEqual(title.frame);
+    expect(changedBody?.frame).toEqual(body.frame);
+    if (changedTitle?.type !== 'text' || title.type !== 'text') {
+      throw new Error('Missing mapped title.');
+    }
+    if (changedBody?.type !== 'text' || body.type !== 'text') {
+      throw new Error('Missing mapped body.');
+    }
+    expect(changedTitle.content).toEqual(title.content);
+    expect(changedBody.content).toEqual(body.content);
+    expect(validateDeck(result.document)).toMatchObject({ success: true });
+    expect(JSON.stringify(deck)).toBe(before);
+    expect(undoTransaction(result.document, result)).toEqual(deck);
+  });
+
+  it('keeps unmatched content local when the new layout has no role-and-type compatible placeholder', () => {
+    const source = createDefaultDeck({
+      idFactory: idFactory(),
+      now: () => '2026-01-01T00:00:00.000Z',
+    });
+    const layout = source.layouts[0];
+    const slide = source.slides[0];
+    const title = slide?.elements[0];
+    const body = slide?.elements[1];
+    const titlePlaceholder = layout?.elements.find(
+      (element) => element.type === 'placeholder' && element.role === 'title',
+    );
+    const bodyPlaceholder = layout?.elements.find(
+      (element) => element.type === 'placeholder' && element.role === 'body',
+    );
+    if (
+      layout === undefined ||
+      slide === undefined ||
+      title === undefined ||
+      body === undefined ||
+      titlePlaceholder?.type !== 'placeholder' ||
+      bodyPlaceholder?.type !== 'placeholder'
+    ) {
+      throw new Error('Missing layout fixture.');
+    }
+
+    const targetLayoutId = 'cccccccc-cccc-4ccc-8ccc-000000000001';
+    const targetTitleId = 'cccccccc-cccc-4ccc-8ccc-000000000002';
+    const deck: DeckDocument = {
+      ...source,
+      layouts: [
+        ...source.layouts,
+        {
+          ...layout,
+          id: targetLayoutId,
+          name: 'Title and image',
+          elements: [
+            { ...titlePlaceholder, id: targetTitleId },
+            {
+              ...bodyPlaceholder,
+              id: 'cccccccc-cccc-4ccc-8ccc-000000000003',
+              accepts: ['image'],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = applyCommand(
+      deck,
+      { type: 'slide.set-layout', slideId: slide.id, layoutId: targetLayoutId },
+      metadata('3'),
+    );
+    const changedTitle = result.document.slides[0]?.elements.find(
+      (element) => element.id === title.id,
+    );
+    const changedBody = result.document.slides[0]?.elements.find(
+      (element) => element.id === body.id,
+    );
+    const { placeholderBinding: _bodyBinding, ...expectedLocalBody } = body;
+
+    expect(changedTitle?.placeholderBinding?.placeholderId).toBe(targetTitleId);
+    expect(changedBody).toEqual(expectedLocalBody);
+    expect(validateDeck(result.document)).toMatchObject({ success: true });
+  });
+
+  it('treats resetting a valid but unused placeholder as a successful no-op', () => {
+    const source = createDefaultDeck({
+      idFactory: idFactory(),
+      now: () => '2026-01-01T00:00:00.000Z',
+    });
+    const layout = source.layouts[0];
+    const slide = source.slides[0];
+    const titlePlaceholder = layout?.elements.find(
+      (element) => element.type === 'placeholder' && element.role === 'title',
+    );
+    if (layout === undefined || slide === undefined || titlePlaceholder?.type !== 'placeholder') {
+      throw new Error('Missing placeholder fixture.');
+    }
+    const unusedPlaceholderId = 'dddddddd-dddd-4ddd-8ddd-000000000001';
+    const partial: DeckDocument = {
+      ...source,
+      layouts: [
+        {
+          ...layout,
+          elements: [
+            ...layout.elements,
+            {
+              ...titlePlaceholder,
+              id: unusedPlaceholderId,
+              name: 'Optional subtitle',
+              role: 'subtitle',
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = applyCommand(
+      partial,
+      {
+        type: 'slide.reset-placeholder',
+        slideId: slide.id,
+        placeholderId: unusedPlaceholderId,
+      },
+      metadata('4'),
+    );
+
+    expect(result.document.slides[0]?.elements).toEqual(slide.elements);
+    expect(result.document.metadata.modifiedAt).toBe(metadata('4').metadata.timestamp);
+    expect(validateDeck(result.document)).toMatchObject({ success: true });
+    expect(undoTransaction(result.document, result)).toEqual(partial);
+  });
+
+  it('remaps live slide bindings when a layout is updated or deleted with a replacement', () => {
+    const source = createDefaultDeck({
+      idFactory: idFactory(),
+      now: () => '2026-01-01T00:00:00.000Z',
+    });
+    const layout = source.layouts[0]!;
+    const slide = source.slides[0]!;
+    const replacementIds = new Map<string, string>();
+    const replacementElements = layout.elements.map((element, index) => {
+      const nextId = `e1000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
+      replacementIds.set(element.id, nextId);
+      return { ...element, id: nextId };
+    });
+    const updated = applyCommand(
+      source,
+      {
+        type: 'layout.update',
+        layoutId: layout.id,
+        replacement: { ...layout, elements: replacementElements },
+      },
+      metadata('5'),
+    ).document;
+    for (const element of slide.elements) {
+      const oldPlaceholderId = element.placeholderBinding?.placeholderId;
+      if (oldPlaceholderId !== undefined) {
+        expect(
+          updated.slides[0]?.elements.find((candidate) => candidate.id === element.id)
+            ?.placeholderBinding?.placeholderId,
+        ).toBe(replacementIds.get(oldPlaceholderId));
+      }
+    }
+    expect(validateDeck(updated)).toMatchObject({ success: true });
+
+    const alternateLayoutId = 'e1000000-0000-4000-8000-000000000100';
+    const alternateIds = new Map<string, string>();
+    const alternate = {
+      ...layout,
+      id: alternateLayoutId,
+      name: 'Replacement layout',
+      elements: layout.elements.map((element, index) => {
+        const nextId = `e1000000-0000-4000-8000-${String(index + 101).padStart(12, '0')}`;
+        alternateIds.set(element.id, nextId);
+        return { ...element, id: nextId };
+      }),
+    };
+    const deleted = applyCommand(
+      { ...source, layouts: [...source.layouts, alternate] },
+      {
+        type: 'layout.delete',
+        layoutId: layout.id,
+        replacementLayoutId: alternateLayoutId,
+      },
+      metadata('6'),
+    ).document;
+    expect(deleted.slides[0]?.layoutId).toBe(alternateLayoutId);
+    for (const element of slide.elements) {
+      const oldPlaceholderId = element.placeholderBinding?.placeholderId;
+      if (oldPlaceholderId !== undefined) {
+        expect(
+          deleted.slides[0]?.elements.find((candidate) => candidate.id === element.id)
+            ?.placeholderBinding?.placeholderId,
+        ).toBe(alternateIds.get(oldPlaceholderId));
+      }
+    }
+    expect(validateDeck(deleted)).toMatchObject({ success: true });
+  });
+
+  it('remaps master placeholder bindings when a master is updated or replaced', () => {
+    const source = createDefaultDeck({
+      idFactory: idFactory(),
+      now: () => '2026-01-01T00:00:00.000Z',
+    });
+    const master = source.masters[0]!;
+    const layout = source.layouts[0]!;
+    const slide = source.slides[0]!;
+    const titlePlaceholder = layout.elements.find(
+      (element) => element.type === 'placeholder' && element.role === 'title',
+    );
+    const title = slide.elements.find((element) => element.type === 'text');
+    if (titlePlaceholder?.type !== 'placeholder' || title?.type !== 'text') {
+      throw new Error('Missing title fixture.');
+    }
+    const oldMasterPlaceholderId = 'e2000000-0000-4000-8000-000000000001';
+    const masterPlaceholder = { ...titlePlaceholder, id: oldMasterPlaceholderId };
+    const deck: DeckDocument = {
+      ...source,
+      masters: [{ ...master, elements: [...master.elements, masterPlaceholder] }],
+      layouts: [
+        {
+          ...layout,
+          elements: layout.elements.filter((element) => element.id !== titlePlaceholder.id),
+        },
+      ],
+      slides: [
+        {
+          ...slide,
+          elements: slide.elements.map((element) =>
+            element.id === title.id
+              ? {
+                  ...element,
+                  placeholderBinding: {
+                    placeholderId: oldMasterPlaceholderId,
+                    overrides: element.placeholderBinding?.overrides ?? [],
+                  },
+                }
+              : element,
+          ),
+        },
+      ],
+    };
+    expect(validateDeck(deck)).toMatchObject({ success: true });
+
+    const updatedPlaceholderId = 'e2000000-0000-4000-8000-000000000002';
+    const updated = applyCommand(
+      deck,
+      {
+        type: 'master.update',
+        masterId: master.id,
+        replacement: {
+          ...deck.masters[0]!,
+          elements: [{ ...masterPlaceholder, id: updatedPlaceholderId }],
+        },
+      },
+      metadata('7'),
+    ).document;
+    expect(
+      updated.slides[0]?.elements.find((element) => element.id === title.id)?.placeholderBinding
+        ?.placeholderId,
+    ).toBe(updatedPlaceholderId);
+    expect(validateDeck(updated)).toMatchObject({ success: true });
+
+    const replacementMasterId = 'e2000000-0000-4000-8000-000000000003';
+    const replacementPlaceholderId = 'e2000000-0000-4000-8000-000000000004';
+    const replacementMaster = {
+      ...master,
+      id: replacementMasterId,
+      name: 'Replacement master',
+      elements: [{ ...masterPlaceholder, id: replacementPlaceholderId }],
+    };
+    const deleted = applyCommand(
+      { ...deck, masters: [...deck.masters, replacementMaster] },
+      {
+        type: 'master.delete',
+        masterId: master.id,
+        replacementMasterId,
+      },
+      metadata('8'),
+    ).document;
+    expect(deleted.layouts[0]?.masterId).toBe(replacementMasterId);
+    expect(
+      deleted.slides[0]?.elements.find((element) => element.id === title.id)?.placeholderBinding
+        ?.placeholderId,
+    ).toBe(replacementPlaceholderId);
+    expect(validateDeck(deleted)).toMatchObject({ success: true });
+  });
+
   it('records placeholder overrides automatically when a user moves, styles, or hides bound content', () => {
     const source = createDefaultDeck({
       idFactory: idFactory(),
@@ -279,7 +653,7 @@ describe('strict V1 command contract and CRUD', () => {
     ).toBe(false);
   });
 
-  it('renames, resizes, and updates modifiedAt without mutating the input', () => {
+  it('renames, resizes, updates export options, and modifiedAt without mutating the input', () => {
     const source = createNeutralDemoDeck();
     const json = JSON.stringify(source);
     const result = applyTransaction(
@@ -287,11 +661,13 @@ describe('strict V1 command contract and CRUD', () => {
       [
         { type: 'deck.rename', name: 'Renamed deck' },
         { type: 'deck.set-page', page: { widthPt: 720, heightPt: 540 } },
+        { type: 'deck.set-export-options', includeHiddenSlidesInExport: true },
       ],
       metadata(),
     );
     expect(result.document.name).toBe('Renamed deck');
     expect(result.document.page.widthPt).toBe(720);
+    expect(result.document.settings.includeHiddenSlidesInExport).toBe(true);
     expect(result.document.metadata.modifiedAt).toBe(metadata().metadata.timestamp);
     expect(JSON.stringify(source)).toBe(json);
   });
@@ -595,6 +971,301 @@ describe('element, text, table, asset, and connector commands', () => {
     expect(updated?.type === 'connector' ? updated.end.binding.elementId : undefined).toBe(
       target.id,
     );
+  });
+
+  it('moves, resizes, and rotates connector fallback endpoints with their frame', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const target = slide.elements[0]!;
+    const connector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000410',
+      type: 'connector',
+      name: 'Transformable connector',
+      frame: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 50, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 10, yPt: 20, binding: {} },
+      end: { xPt: 110, yPt: 70, binding: { elementId: target.id, anchor: 'right' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const inserted = applyCommand(
+      source,
+      { type: 'element.insert', slideId: slide.id, element: connector },
+      metadata(),
+    );
+    const transform = (document: DeckDocument, frame: Element['frame'], suffix: string) =>
+      applyCommand(
+        document,
+        {
+          type: 'element.transform',
+          slideId: slide.id,
+          transforms: [{ elementId: connector.id, frame }],
+        },
+        metadata(suffix),
+      );
+    const requireConnector = (document: DeckDocument) => {
+      const element = document.slides[2]!.elements.find(
+        (candidate) => candidate.id === connector.id,
+      );
+      if (element?.type !== 'connector') throw new Error('Missing connector fixture.');
+      return element;
+    };
+
+    const moved = transform(
+      inserted.document,
+      { xPt: 30, yPt: 40, widthPt: 100, heightPt: 50, rotationDeg: 0 },
+      '2',
+    );
+    expect(requireConnector(moved.document)).toMatchObject({
+      start: { xPt: 30, yPt: 40, binding: {} },
+      end: { xPt: 130, yPt: 90, binding: { elementId: target.id, anchor: 'right' } },
+    });
+
+    const resized = transform(
+      moved.document,
+      { xPt: 30, yPt: 40, widthPt: 200, heightPt: 100, rotationDeg: 0 },
+      '3',
+    );
+    expect(requireConnector(resized.document)).toMatchObject({
+      start: { xPt: 30, yPt: 40, binding: {} },
+      end: { xPt: 230, yPt: 140, binding: { elementId: target.id, anchor: 'right' } },
+    });
+
+    const rotated = transform(
+      resized.document,
+      { xPt: 30, yPt: 40, widthPt: 200, heightPt: 100, rotationDeg: 90 },
+      '4',
+    );
+    const result = requireConnector(rotated.document);
+    expect(result.start.xPt).toBeCloseTo(180, 10);
+    expect(result.start.yPt).toBeCloseTo(-10, 10);
+    expect(result.end.xPt).toBeCloseTo(80, 10);
+    expect(result.end.yPt).toBeCloseTo(190, 10);
+    expect(result.end.binding).toEqual({ elementId: target.id, anchor: 'right' });
+    expect(undoTransaction(rotated.document, rotated)).toEqual(resized.document);
+  });
+
+  it('preserves connector geometry while grouping, transforming, and ungrouping', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const filler: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000421',
+      type: 'shape',
+      name: 'Grouping target',
+      frame: { xPt: 50, yPt: 30, widthPt: 10, heightPt: 10, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const connector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000420',
+      type: 'connector',
+      name: 'Grouped connector',
+      frame: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 50, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 10, yPt: 20, binding: {} },
+      end: { xPt: 110, yPt: 70, binding: { elementId: filler.id, anchor: 'center' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const groupId = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000422';
+    const inserted = applyTransaction(
+      source,
+      [
+        { type: 'element.insert', slideId: slide.id, element: connector },
+        { type: 'element.insert', slideId: slide.id, element: filler },
+      ],
+      metadata(),
+    );
+    const grouped = applyCommand(
+      inserted.document,
+      {
+        type: 'element.group',
+        slideId: slide.id,
+        elementIds: [connector.id, filler.id],
+        groupId,
+        name: 'Connector group',
+      },
+      metadata('2'),
+    );
+    const group = grouped.document.slides[2]!.elements.find((element) => element.id === groupId);
+    const groupedConnector =
+      group?.type === 'group'
+        ? group.children.find((element) => element.id === connector.id)
+        : undefined;
+    expect(groupedConnector?.type === 'connector' ? groupedConnector.start : null).toEqual({
+      xPt: 0,
+      yPt: 0,
+      binding: {},
+    });
+    expect(groupedConnector?.type === 'connector' ? groupedConnector.end : null).toEqual({
+      xPt: 100,
+      yPt: 50,
+      binding: { elementId: filler.id, anchor: 'center' },
+    });
+
+    const transformed = applyCommand(
+      grouped.document,
+      {
+        type: 'element.transform',
+        slideId: slide.id,
+        transforms: [
+          {
+            elementId: groupId,
+            frame: { xPt: 30, yPt: 40, widthPt: 200, heightPt: 100, rotationDeg: 90 },
+          },
+        ],
+      },
+      metadata('3'),
+    );
+    const ungrouped = applyCommand(
+      transformed.document,
+      { type: 'element.ungroup', slideId: slide.id, groupId },
+      metadata('4'),
+    );
+    const result = ungrouped.document.slides[2]!.elements.find(
+      (element) => element.id === connector.id,
+    );
+    if (result?.type !== 'connector') throw new Error('Missing ungrouped connector.');
+    expect(result.start.xPt).toBeCloseTo(180, 10);
+    expect(result.start.yPt).toBeCloseTo(-10, 10);
+    expect(result.end.xPt).toBeCloseTo(80, 10);
+    expect(result.end.yPt).toBeCloseTo(190, 10);
+    expect(result.end.binding).toEqual({ elementId: filler.id, anchor: 'center' });
+    expect(validateDeck(ungrouped.document)).toMatchObject({ success: true });
+    expect(undoTransaction(ungrouped.document, ungrouped)).toEqual(transformed.document);
+  });
+
+  it('releases connector bindings recursively when a target or its group is deleted', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const target: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000501',
+      type: 'shape',
+      name: 'Nested target',
+      frame: { xPt: 10, yPt: 10, widthPt: 40, heightPt: 30, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const nestedConnector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000502',
+      type: 'connector',
+      name: 'Nested connector',
+      frame: { xPt: 0, yPt: 0, widthPt: 100, heightPt: 60, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 7, yPt: 8, binding: { elementId: target.id, anchor: 'left' } },
+      end: { xPt: 90, yPt: 50, binding: {} },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'none',
+    };
+    const filler: Element = {
+      ...target,
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000504',
+      name: 'Nested filler',
+      frame: { xPt: 60, yPt: 10, widthPt: 30, heightPt: 30, rotationDeg: 0 },
+    };
+    const group: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000500',
+      type: 'group',
+      name: 'Target group',
+      frame: { xPt: 100, yPt: 100, widthPt: 120, heightPt: 80, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      coordinateSpace: { widthPt: 120, heightPt: 80 },
+      children: [target, filler, nestedConnector],
+    };
+    const rootConnector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000503',
+      type: 'connector',
+      name: 'Root connector',
+      frame: { xPt: 0, yPt: 0, widthPt: 300, heightPt: 200, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 1, yPt: 2, binding: {} },
+      end: { xPt: 203, yPt: 104, binding: { elementId: target.id, anchor: 'center' } },
+      routing: 'elbow',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const withBindings = applyTransaction(
+      source,
+      [
+        { type: 'element.insert', slideId: slide.id, element: group },
+        { type: 'element.insert', slideId: slide.id, element: rootConnector },
+      ],
+      metadata(),
+    );
+
+    const targetDeleted = applyCommand(
+      withBindings.document,
+      {
+        type: 'element.delete',
+        slideId: slide.id,
+        containerId: group.id,
+        elementIds: [target.id],
+      },
+      metadata('2'),
+    );
+    const changedGroup = targetDeleted.document.slides[2]!.elements.find(
+      (element) => element.id === group.id,
+    );
+    const changedNestedConnector =
+      changedGroup?.type === 'group'
+        ? changedGroup.children.find((element) => element.id === nestedConnector.id)
+        : undefined;
+    const changedRootConnector = targetDeleted.document.slides[2]!.elements.find(
+      (element) => element.id === rootConnector.id,
+    );
+    expect(
+      changedNestedConnector?.type === 'connector' ? changedNestedConnector.start : null,
+    ).toEqual({ xPt: 7, yPt: 8, binding: {} });
+    expect(changedRootConnector?.type === 'connector' ? changedRootConnector.end : null).toEqual({
+      xPt: 203,
+      yPt: 104,
+      binding: {},
+    });
+    expect(validateDeck(targetDeleted.document)).toMatchObject({ success: true });
+    expect(undoTransaction(targetDeleted.document, targetDeleted)).toEqual(withBindings.document);
+
+    const groupDeleted = applyCommand(
+      withBindings.document,
+      { type: 'element.delete', slideId: slide.id, elementIds: [group.id] },
+      metadata('3'),
+    );
+    const survivingConnector = groupDeleted.document.slides[2]!.elements.find(
+      (element) => element.id === rootConnector.id,
+    );
+    expect(survivingConnector?.type === 'connector' ? survivingConnector.end : null).toEqual({
+      xPt: 203,
+      yPt: 104,
+      binding: {},
+    });
+    expect(validateDeck(groupDeleted.document)).toMatchObject({ success: true });
+    expect(undoTransaction(groupDeleted.document, groupDeleted)).toEqual(withBindings.document);
   });
 
   it('rolls back an earlier valid command when a later command fails', () => {

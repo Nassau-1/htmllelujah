@@ -1,6 +1,6 @@
 import { once } from 'node:events';
 import { createHmac } from 'node:crypto';
-import { connect as connectTcp } from 'node:net';
+import { connect as connectTcp, type Socket } from 'node:net';
 import { connect as connectTls } from 'node:tls';
 
 import {
@@ -14,13 +14,15 @@ import WebSocket from 'ws';
 import {
   AuthoritativeSessionHost,
   CollaborationTransportClient,
-  CollaborationTransportServer,
+  CollaborationTransportServer as ApprovalRequiredTransportServer,
   ChunkReassembler,
   COLLABORATION_PROTOCOL_VERSION,
+  createAuthProof,
   encodeLogicalMessage,
   RemoteTransportError,
   TransportFramingError,
   type CommandBatchRequest,
+  type AuthChallenge,
   type ManualInvitation,
   type PresenceUpdate,
   type TransportChunk,
@@ -28,6 +30,16 @@ import {
 
 const SESSION_ID = '94000000-0000-4000-8000-000000000001';
 const SECRET = Buffer.alloc(32, 0x42);
+
+/** Most transport tests exercise the post-approval channel; approval-specific cases use the real class. */
+class CollaborationTransportServer extends ApprovalRequiredTransportServer {
+  public constructor(options: ConstructorParameters<typeof ApprovalRequiredTransportServer>[0]) {
+    super(options);
+    this.onPendingJoin((request) => {
+      void this.approveJoin(request.joinRequestId).catch(() => undefined);
+    });
+  }
+}
 
 const requestId = (suffix: number): string =>
   `94100000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
@@ -128,6 +140,7 @@ const createClient = (
     invitation,
     documentId: engine.documentId,
     clientId,
+    displayName: clientId,
     documentSecret: options.secret ?? SECRET,
     ...(options.nonceFactory === undefined ? {} : { nonceFactory: options.nonceFactory }),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
@@ -156,6 +169,13 @@ const waitFor = async (predicate: () => boolean): Promise<void> => {
   }
 };
 
+const waitForSocketClose = (socket: Socket): Promise<void> => {
+  socket.on('error', () => undefined);
+  return new Promise((resolve) => {
+    socket.once('close', () => resolve());
+  });
+};
+
 const rawUrl = (invitation: ManualInvitation): string =>
   `wss://${invitation.host}:${invitation.port}/v1/session/${invitation.sessionId}`;
 
@@ -180,7 +200,9 @@ const connectRaw = async (
       }
     });
   });
-  const closed = once(socket, 'close') as Promise<[number, Buffer]>;
+  const closed = new Promise<[number, Buffer]>((resolve) => {
+    socket.once('close', (code, reason) => resolve([code, reason]));
+  });
   await once(socket, 'open');
   return { socket, firstMessage, closed };
 };
@@ -255,6 +277,15 @@ describe('WSS collaboration transport', () => {
         }),
     ).toThrowError(expect.objectContaining({ code: 'INVALID_REQUEST' }));
 
+    expect(
+      () =>
+        new CollaborationTransportServer({
+          engine,
+          documentSecret: SECRET,
+          maxPeers: 33,
+        }),
+    ).toThrowError(expect.objectContaining({ code: 'INVALID_REQUEST' }));
+
     const server = new CollaborationTransportServer({ engine, documentSecret: SECRET });
     await server.start();
     await server.close();
@@ -283,6 +314,463 @@ describe('WSS collaboration transport', () => {
     } finally {
       await wrongSecret.close();
       await wrongFingerprint.close();
+      await server.close();
+    }
+  });
+
+  it('withholds authentication and snapshots until the host explicitly accepts', async () => {
+    const engine = createEngine();
+    engine.updatePresence({
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      sessionId: engine.sessionId,
+      documentId: engine.documentId,
+      clientId: 'authoritative-host',
+      sequence: 0,
+      displayName: 'Authoritative host',
+      selectedElementIds: [],
+    });
+    const server = new ApprovalRequiredTransportServer({
+      engine,
+      documentSecret: SECRET,
+      hostClientId: 'authoritative-host',
+      joinApprovalTimeoutMs: 2_000,
+    });
+    const invitation = await server.start();
+    const client = createClient(invitation, engine, 'approval-gated');
+    const spoofedHost = createClient(invitation, engine, 'authoritative-host');
+    try {
+      await expectRemoteCode(spoofedHost.connect(), 'CLIENT_ID_IN_USE');
+      await waitFor(() => server.connectionCount === 0);
+      const connecting = client.connect();
+      await waitFor(() => server.listPendingJoins().length === 1);
+      expect(client.isConnected).toBe(false);
+      expect(server.authenticatedPeerCount).toBe(0);
+      expect(engine.listPresence()).toMatchObject([
+        { clientId: 'authoritative-host', displayName: 'Authoritative host' },
+      ]);
+      const pending = server.listPendingJoins()[0]!;
+      expect(pending).toMatchObject({
+        clientId: 'approval-gated',
+        displayName: 'approval-gated',
+      });
+
+      let resyncSettled = false;
+      const resync = client
+        .getResync({
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: engine.sessionId,
+          documentId: engine.documentId,
+          afterSeq: 0,
+          knownRevision: engine.revision,
+        })
+        .finally(() => {
+          resyncSettled = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(resyncSettled).toBe(false);
+      expect(await server.approveJoin(pending.joinRequestId)).toBe(true);
+      await connecting;
+      const snapshot = await resync;
+      expect(snapshot.sessionId).toBe(engine.sessionId);
+      expect(server.authenticatedPeerCount).toBe(1);
+      expect(engine.listPresence()).toMatchObject([
+        { clientId: 'approval-gated', displayName: 'approval-gated' },
+        { clientId: 'authoritative-host', displayName: 'Authoritative host' },
+      ]);
+      expect(client.authoritativeHostClientId).toBe('authoritative-host');
+    } finally {
+      await client.close();
+      await spoofedHost.close();
+      await server.close();
+    }
+  });
+
+  it('queues the initial snapshot before broadcasts and accepts the first request immediately', async () => {
+    const engine = createEngine();
+    engine.updatePresence({
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      sessionId: engine.sessionId,
+      documentId: engine.documentId,
+      clientId: 'bootstrap-host',
+      sequence: 0,
+      displayName: 'Bootstrap host',
+      selectedElementIds: [],
+    });
+    const server = new ApprovalRequiredTransportServer({
+      engine,
+      documentSecret: SECRET,
+      hostClientId: 'bootstrap-host',
+      joinApprovalTimeoutMs: 2_000,
+    });
+    const invitation = await server.start();
+    const client = createClient(invitation, engine, 'bootstrap-guest');
+    let releaseAccepted!: () => void;
+    let releaseSnapshotCompletion!: () => void;
+    const acceptedGate = new Promise<void>((resolve) => {
+      releaseAccepted = resolve;
+    });
+    const snapshotCompletionGate = new Promise<void>((resolve) => {
+      releaseSnapshotCompletion = resolve;
+    });
+    const connecting = client.connect();
+    void connecting.catch(() => undefined);
+    try {
+      await waitFor(() => server.listPendingJoins().length === 1);
+      type BootstrapState = {
+        authenticated: boolean;
+        operationalReady: boolean;
+        sender: {
+          sendRaw: (frame: string) => Promise<void>;
+          sendLogical: (value: unknown) => Promise<void>;
+        };
+      };
+      const state = [
+        ...(
+          server as unknown as {
+            connections: Map<WebSocket, BootstrapState>;
+          }
+        ).connections.values(),
+      ][0]!;
+      const originalSendRaw = state.sender.sendRaw.bind(state.sender);
+      const originalSendLogical = state.sender.sendLogical.bind(state.sender);
+      const logicalTypes: string[] = [];
+      let acceptedBlocked = false;
+      let snapshotEnqueued = false;
+
+      state.sender.sendRaw = async (frame: string): Promise<void> => {
+        const message = JSON.parse(frame) as { readonly type?: unknown };
+        if (message.type === 'auth.accepted') {
+          acceptedBlocked = true;
+          await acceptedGate;
+        }
+        await originalSendRaw(frame);
+      };
+      state.sender.sendLogical = (value: unknown): Promise<void> => {
+        const type =
+          typeof value === 'object' && value !== null && 'type' in value
+            ? (value as { readonly type?: unknown }).type
+            : undefined;
+        if (typeof type === 'string') logicalTypes.push(type);
+        const operation = originalSendLogical(value);
+        if (type !== 'presence.snapshot') return operation;
+        snapshotEnqueued = true;
+        return operation.then(() => snapshotCompletionGate);
+      };
+
+      const pending = server.listPendingJoins()[0]!;
+      const approval = server.approveJoin(pending.joinRequestId);
+      void approval.catch(() => undefined);
+      await waitFor(() => acceptedBlocked && state.authenticated && !state.operationalReady);
+
+      await server.publishPresence({
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        sessionId: engine.sessionId,
+        documentId: engine.documentId,
+        clientId: 'bootstrap-host',
+        sequence: 1,
+        displayName: 'Bootstrap host',
+        selectedElementIds: [],
+      });
+      expect(logicalTypes).toEqual([]);
+
+      releaseAccepted();
+      await waitFor(() => snapshotEnqueued);
+      await connecting;
+      expect(state.operationalReady).toBe(true);
+      await expect(
+        client.updatePresence({
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: engine.sessionId,
+          documentId: engine.documentId,
+          clientId: 'bootstrap-guest',
+          sequence: 1,
+          displayName: 'bootstrap-guest',
+          selectedElementIds: [],
+        }),
+      ).resolves.toMatchObject({ sequence: 1 });
+
+      releaseSnapshotCompletion();
+      await expect(approval).resolves.toBe(true);
+      expect(logicalTypes[0]).toBe('presence.snapshot');
+      expect(client.listPresence()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ clientId: 'bootstrap-host', sequence: 1 }),
+          expect.objectContaining({ clientId: 'bootstrap-guest', sequence: 1 }),
+        ]),
+      );
+    } finally {
+      releaseAccepted();
+      releaseSnapshotCompletion();
+      await client.close();
+      await server.close();
+    }
+  }, 10_000);
+
+  it('fails closed if operational data arrives while host approval is pending', async () => {
+    const engine = createEngine();
+    const server = new ApprovalRequiredTransportServer({
+      engine,
+      documentSecret: SECRET,
+      joinApprovalTimeoutMs: 2_000,
+    });
+    const invitation = await server.start();
+    const client = createClient(invitation, engine, 'pending-protocol-guard');
+    const connecting = client.connect();
+    void connecting.catch(() => undefined);
+    try {
+      await waitFor(() => server.listPendingJoins().length === 1);
+      const state = [
+        ...(
+          server as unknown as {
+            connections: Map<WebSocket, { sender: { sendRaw: (value: string) => Promise<void> } }>;
+          }
+        ).connections.values(),
+      ][0]!;
+      await state.sender.sendRaw(
+        JSON.stringify({
+          type: 'presence.snapshot',
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          participants: [],
+        }),
+      );
+      await expectRemoteCode(connecting, 'PROTOCOL_ERROR');
+      await waitFor(() => server.connectionCount === 0);
+      expect(engine.listPresence()).toEqual([]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('rejects and expires unconfirmed joins without granting authenticated access', async () => {
+    const engine = createEngine();
+    const server = new ApprovalRequiredTransportServer({
+      engine,
+      documentSecret: SECRET,
+      joinApprovalTimeoutMs: 120,
+    });
+    const invitation = await server.start();
+    const rejected = createClient(invitation, engine, 'join-rejected');
+    const timedOut = createClient(invitation, engine, 'join-timeout');
+    try {
+      const rejectedConnection = rejected.connect();
+      await waitFor(() => server.listPendingJoins().length === 1);
+      expect(server.rejectJoin(server.listPendingJoins()[0]!.joinRequestId)).toBe(true);
+      await expectRemoteCode(rejectedConnection, 'JOIN_REJECTED');
+      await waitFor(() => server.connectionCount === 0);
+
+      const timedConnection = timedOut.connect();
+      await waitFor(() => server.listPendingJoins().length === 1);
+      await expectRemoteCode(timedConnection, 'JOIN_TIMEOUT');
+      await waitFor(() => server.connectionCount === 0);
+      expect(server.authenticatedPeerCount).toBe(0);
+      expect(engine.listPresence()).toEqual([]);
+    } finally {
+      await rejected.close();
+      await timedOut.close();
+      await server.close();
+    }
+  });
+
+  it('bounds secret-correct pending floods and rejects hostile display names server-side', async () => {
+    const engine = createEngine();
+    const server = new ApprovalRequiredTransportServer({
+      engine,
+      documentSecret: SECRET,
+      maxPendingConnections: 2,
+      maxPendingPerAddress: 2,
+      joinApprovalTimeoutMs: 2_000,
+    });
+    const invitation = await server.start();
+    const first = createClient(invitation, engine, 'pending-one');
+    const second = createClient(invitation, engine, 'pending-two');
+    const overflow = createClient(invitation, engine, 'pending-three');
+    try {
+      const connections = Promise.allSettled([first.connect(), second.connect()]);
+      await waitFor(() => server.listPendingJoins().length === 2);
+      await expect(overflow.connect()).rejects.toBeInstanceOf(Error);
+      expect(server.listPendingJoins()).toHaveLength(2);
+      expect(server.authenticatedPeerCount).toBe(0);
+      await first.close();
+      await second.close();
+      await connections;
+    } finally {
+      await first.close();
+      await second.close();
+      await overflow.close();
+      await server.close();
+    }
+
+    const namesEngine = createEngine();
+    const namesServer = new ApprovalRequiredTransportServer({
+      engine: namesEngine,
+      documentSecret: SECRET,
+    });
+    const namesInvitation = await namesServer.start();
+    const raw = await connectRaw(namesInvitation);
+    try {
+      const challenge = (await raw.firstMessage) as AuthChallenge;
+      const clientNonce = 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+      const displayName = `hidden\n${'x'.repeat(60)}`;
+      const proof = createAuthProof(SECRET, {
+        sessionId: challenge.sessionId,
+        documentId: namesEngine.documentId,
+        certificateFingerprint: challenge.certificateFingerprint,
+        challengeId: challenge.challengeId,
+        serverNonce: challenge.serverNonce,
+        clientId: 'hostile-name',
+        displayName,
+        clientNonce,
+        expiresAtMs: challenge.expiresAtMs,
+      });
+      const rejection = new Promise<unknown>((resolve) => {
+        raw.socket.once('message', (data) => resolve(JSON.parse(data.toString())));
+      });
+      raw.socket.send(
+        JSON.stringify({
+          type: 'auth.response',
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: challenge.sessionId,
+          documentId: namesEngine.documentId,
+          challengeId: challenge.challengeId,
+          clientId: 'hostile-name',
+          displayName,
+          clientNonce,
+          proof,
+        }),
+      );
+      await expect(rejection).resolves.toMatchObject({
+        type: 'auth.rejected',
+        code: 'PROTOCOL_ERROR',
+      });
+      expect(namesServer.listPendingJoins()).toEqual([]);
+    } finally {
+      raw.socket.terminate();
+      await namesServer.close();
+    }
+  });
+  it('binds the bounded display name into the authentication proof', async () => {
+    const engine = createEngine();
+    const server = new ApprovalRequiredTransportServer({ engine, documentSecret: SECRET });
+    const invitation = await server.start();
+    const raw = await connectRaw(invitation);
+    try {
+      const challenge = (await raw.firstMessage) as AuthChallenge;
+      const clientNonce = 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC';
+      const proof = createAuthProof(SECRET, {
+        sessionId: challenge.sessionId,
+        documentId: engine.documentId,
+        certificateFingerprint: challenge.certificateFingerprint,
+        challengeId: challenge.challengeId,
+        serverNonce: challenge.serverNonce,
+        clientId: 'display-name-binding',
+        displayName: 'Approved name',
+        clientNonce,
+        expiresAtMs: challenge.expiresAtMs,
+      });
+      const rejection = new Promise<unknown>((resolve) => {
+        raw.socket.once('message', (data) => resolve(JSON.parse(data.toString())));
+      });
+      raw.socket.send(
+        JSON.stringify({
+          type: 'auth.response',
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: challenge.sessionId,
+          documentId: engine.documentId,
+          challengeId: challenge.challengeId,
+          clientId: 'display-name-binding',
+          displayName: 'Tampered name',
+          clientNonce,
+          proof,
+        }),
+      );
+      await expect(rejection).resolves.toMatchObject({
+        type: 'auth.rejected',
+        code: 'AUTH_FAILED',
+      });
+      expect(server.listPendingJoins()).toEqual([]);
+    } finally {
+      raw.socket.terminate();
+      await server.close();
+    }
+  });
+
+  it('reconnects only with the rotated post-approval token and cleans presence on loss', async () => {
+    const engine = createEngine();
+    const server = new ApprovalRequiredTransportServer({
+      engine,
+      documentSecret: SECRET,
+      reconnectGrantTtlMs: 2_000,
+    });
+    const invitation = await server.start();
+    const client = createClient(invitation, engine, 'approved-rejoin');
+    try {
+      const firstConnection = client.connect();
+      await waitFor(() => server.listPendingJoins().length === 1);
+      await server.approveJoin(server.listPendingJoins()[0]!.joinRequestId);
+      await firstConnection;
+      const presence = {
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        sessionId: engine.sessionId,
+        documentId: engine.documentId,
+        clientId: 'approved-rejoin',
+        sequence: 1,
+        displayName: 'approved-rejoin',
+        selectedElementIds: [],
+      };
+      await expectRemoteCode(
+        client.updatePresence({ ...presence, displayName: 'Unapproved rename' }),
+        'CLIENT_MISMATCH',
+      );
+      await client.updatePresence(presence);
+      expect(client.listPresence()).toMatchObject([
+        { clientId: 'approved-rejoin', displayName: 'approved-rejoin' },
+      ]);
+      const socket = (client as unknown as { socket: WebSocket }).socket;
+      socket.terminate();
+      await waitFor(() => server.connectionCount === 0);
+      expect(engine.listPresence()).toEqual([]);
+
+      await client.connect();
+      expect(server.listPendingJoins()).toEqual([]);
+      expect(server.authenticatedPeerCount).toBe(1);
+      expect(client.listPresence()).toMatchObject([
+        { clientId: 'approved-rejoin', displayName: 'approved-rejoin' },
+      ]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+  it('requires fresh host approval after the reconnect grant expires', async () => {
+    let now = 1_000;
+    const engine = createEngine();
+    const server = new ApprovalRequiredTransportServer({
+      engine,
+      documentSecret: SECRET,
+      reconnectGrantTtlMs: 100,
+      clock: () => now,
+    });
+    const invitation = await server.start();
+    const client = createClient(invitation, engine, 'expired-rejoin', { clock: () => now });
+    try {
+      const firstConnection = client.connect();
+      await waitFor(() => server.listPendingJoins().length === 1);
+      await server.approveJoin(server.listPendingJoins()[0]!.joinRequestId);
+      await firstConnection;
+      await client.close();
+      await waitFor(() => server.connectionCount === 0);
+
+      now += 101;
+      const reconnecting = client.connect();
+      void reconnecting.catch(() => undefined);
+      await waitFor(() => server.listPendingJoins().length === 1);
+      expect(server.authenticatedPeerCount).toBe(0);
+      await server.approveJoin(server.listPendingJoins()[0]!.joinRequestId);
+      await reconnecting;
+      expect(server.authenticatedPeerCount).toBe(1);
+    } finally {
+      await client.close();
       await server.close();
     }
   });
@@ -489,7 +977,7 @@ describe('WSS collaboration transport', () => {
       documentId: rateEngine.documentId,
       clientId: 'client-rate',
       sequence: 1,
-      displayName: 'Rate test',
+      displayName: 'client-rate',
       selectedElementIds: [],
     };
     try {
@@ -527,11 +1015,10 @@ describe('WSS collaboration transport', () => {
           documentId: engine.documentId,
           clientId: 'client-chunk-rate',
           sequence: 1,
-          displayName: 'A'.repeat(64),
+          displayName: 'client-chunk-rate',
           selectedElementIds: Array.from(
             { length: 100 },
-            (_, index) =>
-              `95000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+            (_, index) => `95000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
           ),
         }),
       ).rejects.toBeInstanceOf(Error);
@@ -650,7 +1137,7 @@ describe('WSS collaboration transport', () => {
           documentId: engine.documentId,
           clientId: 'client-logical-limit',
           sequence: 1,
-          displayName: 'Still connected',
+          displayName: 'client-logical-limit',
           selectedElementIds: [],
         }),
       ).toMatchObject({ sequence: 1 });
@@ -763,17 +1250,11 @@ describe('WSS collaboration transport', () => {
     const addressInvitation = await addressServer.start();
     const firstPending = await connectRaw(addressInvitation);
     await firstPending.firstMessage;
-    const rejectedPending = await connectRaw(addressInvitation);
     try {
-      expect(await rejectedPending.firstMessage).toMatchObject({
-        type: 'auth.rejected',
-        code: 'PENDING_LIMIT',
-      });
-      const [closeCode] = await rejectedPending.closed;
-      expect(closeCode).toBe(1013);
+      await expect(connectRaw(addressInvitation)).rejects.toMatchObject({ code: 'ECONNRESET' });
+      expect(addressServer.connectionCount).toBe(1);
     } finally {
       firstPending.socket.terminate();
-      rejectedPending.socket.terminate();
       await addressServer.close();
     }
   });
@@ -793,13 +1274,13 @@ describe('WSS collaboration transport', () => {
     try {
       const first = connectTcp({ host: invitation.host, port: invitation.port });
       sockets.push(first);
-      const firstClosed = once(first, 'close');
+      const firstClosed = waitForSocketClose(first);
       await once(first, 'connect');
       await waitFor(() => server.pendingHandshakeCount === 1);
 
       const rejected = connectTcp({ host: invitation.host, port: invitation.port });
       sockets.push(rejected);
-      const rejectedClosed = once(rejected, 'close');
+      const rejectedClosed = waitForSocketClose(rejected);
       await once(rejected, 'connect');
       await rejectedClosed;
       expect(server.pendingHandshakeCount).toBe(1);
@@ -813,7 +1294,7 @@ describe('WSS collaboration transport', () => {
         rejectUnauthorized: false,
       });
       sockets.push(partialTls);
-      const partialClosed = once(partialTls, 'close');
+      const partialClosed = waitForSocketClose(partialTls);
       await once(partialTls, 'secureConnect');
       await waitFor(() => server.pendingHandshakeCount === 1);
       await partialClosed;

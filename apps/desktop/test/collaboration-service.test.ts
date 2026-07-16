@@ -2,15 +2,67 @@ import { mkdtemp, readFile, rm as remove, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { CollaborationTransportServer } from '@htmllelujah/collaboration';
 import {
   defaultArchiveDurability,
   DocumentSessionManager,
   type ArchiveDurabilityCapability,
 } from '@htmllelujah/document-runtime';
 import { createHdeckArchive, parseHdeckArchive } from '@htmllelujah/hdeck';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { DesktopCollaborationCoordinator } from '../src/main/collaboration-service.js';
+import {
+  DesktopCollaborationCoordinator as ApprovalRequiredDesktopCollaborationCoordinator,
+  type CollaborationTransition,
+} from '../src/main/collaboration-service.js';
+
+/** Existing convergence cases opt into deterministic approval; dedicated cases exercise the gate. */
+class DesktopCollaborationCoordinator extends ApprovalRequiredDesktopCollaborationCoordinator {
+  readonly #approvalTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+  public override async host(
+    input: Parameters<ApprovalRequiredDesktopCollaborationCoordinator['host']>[0],
+  ): Promise<CollaborationTransition> {
+    const hosted = await super.host(input);
+    const timer = setInterval(() => {
+      const pending = this.status(hosted.snapshot.sessionId).pendingJoins;
+      pending.forEach((request) => {
+        void this.decideJoin({
+          sessionId: hosted.snapshot.sessionId,
+          joinRequestId: request.joinRequestId,
+          decision: 'accept',
+        });
+      });
+    }, 5);
+    timer.unref?.();
+    this.#approvalTimers.set(hosted.snapshot.sessionId, timer);
+    return hosted;
+  }
+
+  public override async leave(
+    sessionId: string,
+  ): ReturnType<ApprovalRequiredDesktopCollaborationCoordinator['leave']> {
+    this.#clearApprovalTimer(sessionId);
+    return super.leave(sessionId);
+  }
+
+  public override async shutdown(sessionId: string): Promise<void> {
+    this.#clearApprovalTimer(sessionId);
+    return super.shutdown(sessionId);
+  }
+
+  public override async shutdownAll(): Promise<void> {
+    this.#approvalTimers.forEach((timer) => clearInterval(timer));
+    this.#approvalTimers.clear();
+    return super.shutdownAll();
+  }
+
+  #clearApprovalTimer(sessionId: string): void {
+    const timer = this.#approvalTimers.get(sessionId);
+    if (timer !== undefined) clearInterval(timer);
+    this.#approvalTimers.delete(sessionId);
+  }
+}
 
 const rm = (target: string, options: { readonly recursive: true; readonly force: true }) =>
   remove(target, { ...options, maxRetries: 5, retryDelay: 100 });
@@ -46,6 +98,174 @@ describe('DesktopCollaborationCoordinator', () => {
     if (errors.length > 0) throw new AggregateError(errors, 'Collaboration test cleanup failed.');
   });
 
+  it('keeps a valid guest read-only outside the session until the host decides', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-join-gate-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'host-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const guestRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'guest-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const host = new ApprovalRequiredDesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+      joinApprovalTimeoutMs: 2_000,
+    });
+    const guest = new ApprovalRequiredDesktopCollaborationCoordinator(guestRuntime, {
+      joinApprovalTimeoutMs: 2_000,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(guestRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => guest.shutdownAll());
+    cleanup.push(() => host.shutdownAll());
+
+    const hostSource = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(hostSource.sessionId, {
+      targetPath,
+      expectedFingerprint: null,
+    });
+    const guestSource = await guestRuntime.openMainOnly({ targetPath });
+    const hosted = await host.host({
+      sessionId: hostSource.sessionId,
+      targetPath,
+      displayName: 'Host approver',
+      enableDiscovery: false,
+    });
+    const joinInput = {
+      sessionId: guestSource.sessionId,
+      targetPath,
+      endpoint: hosted.status.endpoint!,
+      sessionCode: hosted.status.sessionCode!,
+      expectedFingerprint: hosted.status.hostFingerprint!,
+      displayName: 'Guest pending',
+    } as const;
+
+    const rejectedJoin = guest.join(joinInput);
+    await waitFor(() => host.status(hosted.snapshot.sessionId).pendingJoins.length === 1);
+    expect(host.status(hosted.snapshot.sessionId)).toMatchObject({
+      connectedPeers: 0,
+      pendingJoins: [{ displayName: 'Guest pending' }],
+    });
+    expect(guest.mode(guestSource.sessionId)).toBe('offline');
+    const rejectedRequest = host.status(hosted.snapshot.sessionId).pendingJoins[0]!;
+    await host.decideJoin({
+      sessionId: hosted.snapshot.sessionId,
+      joinRequestId: rejectedRequest.joinRequestId,
+      decision: 'reject',
+    });
+    await expect(rejectedJoin).rejects.toMatchObject({ code: 'JOIN_REJECTED' });
+    expect(host.status(hosted.snapshot.sessionId).connectedPeers).toBe(0);
+
+    const acceptedJoin = guest.join(joinInput);
+    await waitFor(() => host.status(hosted.snapshot.sessionId).pendingJoins.length === 1);
+    const acceptedRequest = host.status(hosted.snapshot.sessionId).pendingJoins[0]!;
+    await host.decideJoin({
+      sessionId: hosted.snapshot.sessionId,
+      joinRequestId: acceptedRequest.joinRequestId,
+      decision: 'accept',
+    });
+    const joined = await acceptedJoin;
+    expect(joined.status).toMatchObject({
+      mode: 'guest',
+      connectedPeers: 1,
+      participants: expect.arrayContaining([
+        expect.objectContaining({ displayName: 'Host approver', role: 'host' }),
+        expect.objectContaining({ displayName: 'Guest pending', role: 'guest', isSelf: true }),
+      ]),
+    });
+    await guest.leave(joined.snapshot.sessionId);
+    await waitFor(() => host.status(hosted.snapshot.sessionId).connectedPeers === 0);
+    expect(
+      host
+        .status(hosted.snapshot.sessionId)
+        .participants.some((participant) => participant.displayName === 'Guest pending'),
+    ).toBe(false);
+  }, 20_000);
+
+  it('leaves promptly and cancels an approval-pending reconnect after token expiry', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-leave-reconnect-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    let now = Date.now();
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'host-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const guestRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'guest-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const serverStart = vi.spyOn(CollaborationTransportServer.prototype, 'start');
+    const host = new ApprovalRequiredDesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+      clock: () => now,
+      joinApprovalTimeoutMs: 2_000,
+      reconnectGrantTtlMs: 100,
+    });
+    const guest = new ApprovalRequiredDesktopCollaborationCoordinator(guestRuntime, {
+      clock: () => now,
+      joinApprovalTimeoutMs: 2_000,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(guestRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => guest.shutdownAll());
+    cleanup.push(() => host.shutdownAll());
+    cleanup.push(async () => serverStart.mockRestore());
+
+    const hostSource = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(hostSource.sessionId, {
+      targetPath,
+      expectedFingerprint: null,
+    });
+    const guestSource = await guestRuntime.openMainOnly({ targetPath });
+    const hosted = await host.host({
+      sessionId: hostSource.sessionId,
+      targetPath,
+      displayName: 'Reconnect host',
+      enableDiscovery: false,
+    });
+    const joining = guest.join({
+      sessionId: guestSource.sessionId,
+      targetPath,
+      endpoint: hosted.status.endpoint!,
+      sessionCode: hosted.status.sessionCode!,
+      expectedFingerprint: hosted.status.hostFingerprint!,
+      displayName: 'Leaving guest',
+    });
+    await waitFor(() => host.status(hosted.snapshot.sessionId).pendingJoins.length === 1);
+    await host.decideJoin({
+      sessionId: hosted.snapshot.sessionId,
+      joinRequestId: host.status(hosted.snapshot.sessionId).pendingJoins[0]!.joinRequestId,
+      decision: 'accept',
+    });
+    const joined = await joining;
+    const server = serverStart.mock.instances.at(-1)!;
+    const connections = (
+      server as unknown as {
+        readonly connections: Map<{ terminate: () => void }, unknown>;
+      }
+    ).connections;
+    expect(connections.size).toBe(1);
+
+    now += 101;
+    connections.keys().next().value!.terminate();
+    await waitFor(() => host.status(hosted.snapshot.sessionId).pendingJoins.length === 1);
+    expect(guest.status(joined.snapshot.sessionId).note).toContain('Reconnecting');
+
+    const leaveStartedAt = Date.now();
+    const ended = await guest.leave(joined.snapshot.sessionId);
+    const leaveDurationMs = Date.now() - leaveStartedAt;
+    expect(leaveDurationMs).toBeLessThan(1_500);
+    expect(ended).toMatchObject({ mode: 'guest' });
+    expect(guest.mode(joined.snapshot.sessionId)).toBe('offline');
+    await waitFor(() => host.status(hosted.snapshot.sessionId).pendingJoins.length === 0);
+  }, 20_000);
+
   it('keeps a host and guest converged while only the host writes the shared file', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-collaboration-'));
     const targetPath = path.join(directory, 'shared.hdeck');
@@ -64,8 +284,13 @@ describe('DesktopCollaborationCoordinator', () => {
     const host = new DesktopCollaborationCoordinator(hostRuntime, {
       bindHost: '127.0.0.1',
       advertisedHost: '127.0.0.1',
+      presenceTtlMs: 120,
+      presenceHeartbeatIntervalMs: 30,
     });
-    const guest = new DesktopCollaborationCoordinator(guestRuntime);
+    const guest = new DesktopCollaborationCoordinator(guestRuntime, {
+      presenceTtlMs: 120,
+      presenceHeartbeatIntervalMs: 30,
+    });
     cleanup.push(async () => rm(directory, { recursive: true, force: true }));
     cleanup.push(() => closeRuntime(verifierRuntime));
     cleanup.push(() => closeRuntime(guestRuntime));
@@ -102,6 +327,32 @@ describe('DesktopCollaborationCoordinator', () => {
     });
     expect(joined.status).toMatchObject({ mode: 'guest', connectedPeers: 1 });
     expect(host.status(hosted.snapshot.sessionId).connectedPeers).toBe(1);
+    expect(host.status(hosted.snapshot.sessionId).participants).toMatchObject([
+      { displayName: 'Guest', role: 'guest', isSelf: false, connection: 'active' },
+      { displayName: 'Host', role: 'host', isSelf: true, connection: 'active' },
+    ]);
+    await guest.updatePresence({
+      sessionId: joined.snapshot.sessionId,
+      slideId: joined.snapshot.document.slides[0]!.id,
+      selectedElementIds: [joined.snapshot.document.slides[0]!.elements[0]!.id],
+      editingElementId: joined.snapshot.document.slides[0]!.elements[0]!.id,
+    });
+    await waitFor(() =>
+      host
+        .status(hosted.snapshot.sessionId)
+        .participants.some(
+          (participant) =>
+            participant.displayName === 'Guest' &&
+            participant.selectedElementCount === 1 &&
+            participant.editingElementId !== undefined,
+        ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(host.status(hosted.snapshot.sessionId).participants).toMatchObject([
+      { displayName: 'Guest', selectedElementCount: 1, editingElementId: expect.any(String) },
+      { displayName: 'Host', selectedElementCount: 0 },
+    ]);
+    expect(guest.status(joined.snapshot.sessionId).participants).toHaveLength(2);
 
     const renamedByHost = await host.execute({
       sessionId: hosted.snapshot.sessionId,

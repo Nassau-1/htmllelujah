@@ -16,18 +16,16 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { createDefaultDeck } from '@htmllelujah/document-core';
-import { DocumentSessionManager } from '@htmllelujah/document-runtime';
-import { createHdeckArchive } from '@htmllelujah/hdeck';
-
 import {
   INSTALLER_SMOKE_TEMP_PREFIXES,
   assertCleanSourceState,
   assertOwnedTemporaryPath,
+  assertReleaseCandidateManifest,
   assertSourceStateUnchanged,
   assertStableArtifact,
   assertStableHarnessManifest,
   captureCreatedProductRegistryIdentities,
+  expectedInstallerRegistryKeys,
   expectedUnsignedInstallerName,
   newTemporaryEntries,
   normalizeJsonArray,
@@ -36,18 +34,37 @@ import {
   selectOwnedProcessRecords,
   sameAssociationState,
 } from './installer-smoke-support.mjs';
+import {
+  assertBuildProvenance,
+  gitSourceState as inspectGitSourceState,
+  readPackagedBuildProvenance,
+  regularFileIdentity,
+  trackedSourceIdentity,
+} from './build-provenance-support.mjs';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
 const evidencePath = path.join(repositoryRoot, 'artifacts', 'evidence', 'installer-v1.json');
+const fixturePath = path.join(desktopRoot, 'test', 'fixtures', 'installer-smoke-v1.hdeck.base64');
 const harnessPaths = [
   import.meta.filename,
   path.join(import.meta.dirname, 'installer-smoke-support.mjs'),
+  path.join(import.meta.dirname, 'build-provenance-support.mjs'),
+  path.join(import.meta.dirname, 'write-build-provenance.mjs'),
+  path.join(import.meta.dirname, 'write-release-manifest.mjs'),
   path.join(import.meta.dirname, 'smoke-ui-electron.mjs'),
   path.join(import.meta.dirname, 'ui-smoke-performance.mjs'),
   path.join(import.meta.dirname, 'automate-save-dialog.ps1'),
   path.join(import.meta.dirname, 'smoke-mcp-electron.mjs'),
+  path.join(import.meta.dirname, 'mcp-smoke-support.mjs'),
   path.join(import.meta.dirname, 'mcp-json-line-router.mjs'),
+  path.join(repositoryRoot, 'scripts', 'build-windows-release.mjs'),
+  path.join(repositoryRoot, 'scripts', 'windows-release-pipeline-support.mjs'),
+  path.join(repositoryRoot, 'scripts', 'release-candidate-manifest.mjs'),
+  path.join(repositoryRoot, 'scripts', 'release-source-state.mjs'),
+  path.join(repositoryRoot, 'scripts', 'generate-release-evidence.mjs'),
+  path.join(repositoryRoot, 'scripts', 'verify-release-evidence.mjs'),
+  fixturePath,
 ];
 const productProgId = 'HTMLlelujah presentation';
 const temporaryPrefix = 'htmllelujah-installer-smoke-';
@@ -102,7 +119,7 @@ const artifactIdentity = async (filePath) => {
 };
 
 const harnessIdentity = async () => {
-  if (harnessPaths.length === 0 || harnessPaths.length > 16) {
+  if (harnessPaths.length === 0 || harnessPaths.length > 24) {
     throw new Error('The release harness file set is invalid.');
   }
   const digest = createHash('sha256');
@@ -125,13 +142,54 @@ const harnessIdentity = async () => {
   return { sha256: digest.digest('hex'), files };
 };
 
-const terminateProcessTree = (processId) => {
-  if (process.platform !== 'win32' || processId === undefined) return;
-  spawnSync('taskkill', ['/PID', String(processId), '/T', '/F'], {
-    windowsHide: true,
-    stdio: 'ignore',
-    timeout: 10_000,
-  });
+const terminateSpawnedProcess = (child) => {
+  if (process.platform !== 'win32' || child.pid === undefined || child.exitCode !== null) return;
+  // ChildProcess.kill uses the already-open process handle on Windows, avoiding PID-reuse races.
+  child.kill('SIGKILL');
+};
+
+const terminateExactProductProcess = (record, installedExecutable) => {
+  const result = spawnSync(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      [
+        '$expectedPid = [int]$env:HTMLLELUJAH_EXPECTED_PID',
+        '$expectedPath = [IO.Path]::GetFullPath($env:HTMLLELUJAH_EXPECTED_EXECUTABLE)',
+        '$expectedCreatedAtMs = [long]$env:HTMLLELUJAH_EXPECTED_CREATED_AT_MS',
+        '$process = Get-Process -Id $expectedPid -ErrorAction SilentlyContinue',
+        'if ($null -eq $process) { exit 0 }',
+        'try {',
+        '  $actualPath = $process.Path',
+        '  $actualCreatedAtMs = ([DateTimeOffset]$process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()',
+        '  $samePath = [string]::Equals($actualPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)',
+        '  if (-not $samePath -or [Math]::Abs($actualCreatedAtMs - $expectedCreatedAtMs) -gt 5) { exit 42 }',
+        '  $process.Kill()',
+        '  if (-not $process.WaitForExit(10000)) { exit 43 }',
+        '} finally { $process.Dispose() }',
+      ].join('\n'),
+    ],
+    {
+      windowsHide: true,
+      stdio: 'ignore',
+      timeout: 15_000,
+      env: {
+        ...process.env,
+        HTMLLELUJAH_EXPECTED_PID: String(record.processId),
+        HTMLLELUJAH_EXPECTED_EXECUTABLE: installedExecutable,
+        HTMLLELUJAH_EXPECTED_CREATED_AT_MS: String(record.createdAtMs),
+      },
+    },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `Refused to terminate product PID ${record.processId}: its exact identity was not stable.`,
+    );
+  }
 };
 
 const run = (command, arguments_, options = {}) =>
@@ -159,7 +217,7 @@ const run = (command, arguments_, options = {}) =>
     });
     const timer = setTimeout(() => {
       settle(() => reject(new Error(`${options.label ?? path.basename(command)} timed out.`)));
-      terminateProcessTree(child.pid);
+      terminateSpawnedProcess(child);
     }, options.timeoutMs ?? 120_000);
     child.once('error', (error) => settle(() => reject(error)));
     child.once('exit', (code, signal) => {
@@ -205,6 +263,36 @@ const tokenProfile = () =>
       '[ordered]@{ isElevated = $isElevated; isSystem = $identity.IsSystem } | ConvertTo-Json -Compress',
     ].join('\n'),
   );
+
+const expectedRegistryCollisionState = (keys) =>
+  powershellJson(
+    [
+      '$installKey = $env:HTMLLELUJAH_EXPECTED_INSTALL_KEY',
+      '$uninstallKey = $env:HTMLLELUJAH_EXPECTED_UNINSTALL_KEY',
+      'function Test-RegistryKey([Microsoft.Win32.RegistryKey]$hive, [string]$key) {',
+      '  $opened = $hive.OpenSubKey($key)',
+      '  try { return $null -ne $opened } finally { if ($null -ne $opened) { $opened.Dispose() } }',
+      '}',
+      '[ordered]@{',
+      '  currentUserInstall = Test-RegistryKey ([Microsoft.Win32.Registry]::CurrentUser) $installKey',
+      '  currentUserUninstall = Test-RegistryKey ([Microsoft.Win32.Registry]::CurrentUser) $uninstallKey',
+      '  localMachineInstall = Test-RegistryKey ([Microsoft.Win32.Registry]::LocalMachine) $installKey',
+      '  localMachineUninstall = Test-RegistryKey ([Microsoft.Win32.Registry]::LocalMachine) $uninstallKey',
+      '} | ConvertTo-Json -Compress',
+    ].join('\n'),
+    {
+      HTMLLELUJAH_EXPECTED_INSTALL_KEY: keys.install,
+      HTMLLELUJAH_EXPECTED_UNINSTALL_KEY: keys.uninstall,
+    },
+  );
+
+const assertNoExpectedRegistryCollisions = (state) => {
+  if (Object.values(state).some(Boolean)) {
+    throw new Error(
+      'An exact installer registry key already exists; the lifecycle smoke refused all mutation.',
+    );
+  }
+};
 
 const registryState = (installDirectory) => {
   const state = powershellJson(
@@ -313,12 +401,20 @@ const shortcutState = (installedExecutable) => {
 const productProcesses = (installedExecutable) => {
   const state = powershellJson(
     [
-      '$matches = Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {',
-      '  [pscustomobject]@{',
-      '    processId = [int]$_.ProcessId',
-      '    parentProcessId = [int]$_.ParentProcessId',
-      '    executablePath = if ([string]::IsNullOrWhiteSpace($_.ExecutablePath)) { $null } else { [string]$_.ExecutablePath }',
+      '$matches = Get-Process -ErrorAction Stop | ForEach-Object {',
+      '  try {',
+      '    $createdAtMs = ([DateTimeOffset]$_.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()',
+      '    $executablePath = $_.Path',
+      '  } catch {',
+      '    $createdAtMs = $null',
+      '    $executablePath = $null',
       '  }',
+      '  [pscustomobject]@{',
+      '    processId = [int]$_.Id',
+      '    createdAtMs = $createdAtMs',
+      '    executablePath = if ([string]::IsNullOrWhiteSpace($executablePath)) { $null } else { [string]$executablePath }',
+      '  }',
+      '  $_.Dispose()',
       '}',
       'ConvertTo-Json -InputObject @($matches) -Compress',
     ].join('\n'),
@@ -329,7 +425,7 @@ const productProcesses = (installedExecutable) => {
 const namedProductProcesses = () => {
   const state = powershellJson(
     [
-      "$matches = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -ieq 'HTMLlelujah.exe' } | ForEach-Object { [pscustomobject]@{ processId = [int]$_.ProcessId } }",
+      "$matches = Get-Process -Name 'HTMLlelujah' -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ processId = [int]$_.Id }; $_.Dispose() }",
       'ConvertTo-Json -InputObject @($matches) -Compress',
     ].join('\n'),
   );
@@ -338,7 +434,7 @@ const namedProductProcesses = () => {
 
 const terminateOwnedProcesses = (installedExecutable) => {
   for (const entry of productProcesses(installedExecutable)) {
-    if (Number.isSafeInteger(entry.processId)) terminateProcessTree(entry.processId);
+    terminateExactProductProcess(entry, installedExecutable);
   }
 };
 
@@ -357,6 +453,7 @@ const temporaryEntries = async () =>
 const snapshotTree = async (root) => {
   if (!(await exists(root))) return { rootExists: false, entries: [] };
   const entries = [];
+  let totalBytes = 0;
   const pending = [{ absolute: root, relative: '' }];
   while (pending.length > 0) {
     const current = pending.pop();
@@ -365,10 +462,18 @@ const snapshotTree = async (root) => {
       const relative = path.join(current.relative, entry.name);
       const metadata = await lstat(absolute);
       const kind = entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other';
+      if (kind === 'file') {
+        totalBytes += metadata.size;
+        if (metadata.size > 100 * 1024 * 1024 || totalBytes > 512 * 1024 * 1024) {
+          throw new Error('The application-data snapshot exceeds its byte budget.');
+        }
+      }
       entries.push({
         path: relative,
         kind,
-        ...(kind === 'file' ? { size: metadata.size, mtimeMs: metadata.mtimeMs } : {}),
+        ...(kind === 'file'
+          ? { size: metadata.size, mtimeMs: metadata.mtimeMs, sha256: await sha256(absolute) }
+          : {}),
       });
       if (entry.isDirectory()) pending.push({ absolute, relative });
       if (entries.length > 10_000) throw new Error('The application-data snapshot is unbounded.');
@@ -483,79 +588,31 @@ const hashFiles = async (filePaths) =>
 
 const sameHashes = (before, after) => JSON.stringify(before) === JSON.stringify(after);
 
-const seedRecoveryCandidate = async (recoveryDirectory) => {
-  const manager = new DocumentSessionManager({ recoveryDirectory, autosaveDelayMs: 0 });
-  const initial = await manager.createMainOnly({
-    document: createDefaultDeck({
-      name: 'Installer recovery base',
-      creator: 'HTMLlelujah release smoke',
-    }),
-  });
-  const expectedName = 'Recovered after installer lifecycle';
-  await manager.execute(initial.sessionId, {
-    expectedRevision: initial.revision,
-    commands: [{ type: 'deck.rename', name: expectedName }],
-    metadata: {
-      transactionId: randomUUID(),
-      actorId: 'installer-smoke',
-      origin: 'user',
-      label: 'Create durable recovery proof',
-      timestamp: new Date().toISOString(),
-    },
-  });
-  const files = [
-    path.join(recoveryDirectory, `${initial.sessionId}.base.hdeck`),
-    path.join(recoveryDirectory, `${initial.sessionId}.journal`),
-    path.join(recoveryDirectory, `${initial.sessionId}.meta.json`),
-  ];
+const seedRecoverySentinel = async (recoveryDirectory) => {
+  await mkdir(recoveryDirectory, { recursive: true });
+  const files = [path.join(recoveryDirectory, `installer-preservation-${randomUUID()}.sentinel`)];
+  await writeFile(files[0], `opaque recovery sentinel ${randomUUID()}\n`, 'utf8');
   return {
-    candidateId: initial.sessionId,
-    expectedName,
     files,
     hashes: await hashFiles(files),
   };
 };
 
-const inspectRecoveryCandidate = async (recoveryDirectory, recovery, consume = false) => {
-  const manager = new DocumentSessionManager({ recoveryDirectory, autosaveDelayMs: 0 });
-  const candidate = (await manager.listRecoveryCandidatesMainOnly()).find(
-    (entry) => entry.candidateId === recovery.candidateId,
-  );
-  if (candidate === undefined || candidate.recordCount < 1 || !candidate.complete) {
-    throw new Error('The durable recovery candidate is not complete and actionable.');
+const inspectRecoverySentinel = async (recovery, consume = false) => {
+  if (!sameHashes(recovery.hashes, await hashFiles(recovery.files))) {
+    throw new Error('The installer changed the opaque recovery sentinel.');
   }
-  const recovered = await manager.recoverMainOnly(recovery.candidateId);
-  if (recovered.document.name !== recovery.expectedName || !recovered.dirty) {
-    throw new Error('The preserved recovery candidate did not replay the expected edit.');
+  if (consume) {
+    for (const filePath of recovery.files) await rm(filePath, { force: true });
   }
-  if (consume) await manager.close(recovery.candidateId, { discardUnsaved: true });
-  return candidate.recordCount;
-};
-
-const gitSourceState = () => {
-  const commitResult = spawnSync('git', ['rev-parse', 'HEAD'], {
-    cwd: repositoryRoot,
-    windowsHide: true,
-    encoding: 'utf8',
-    timeout: 10_000,
-  });
-  const statusResult = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
-    cwd: repositoryRoot,
-    windowsHide: true,
-    encoding: 'utf8',
-    timeout: 10_000,
-  });
-  const commit = commitResult.status === 0 ? commitResult.stdout.trim() : '';
-  return {
-    commit: /^[0-9a-f]{40}$/u.test(commit) ? commit : null,
-    dirty: statusResult.status === 0 ? statusResult.stdout.trim() !== '' : null,
-  };
 };
 
 if (process.platform !== 'win32') throw new Error('The installer smoke requires Windows.');
 
-const sourceBefore = gitSourceState();
+const sourceBefore = inspectGitSourceState(repositoryRoot);
 assertCleanSourceState(sourceBefore);
+const sourceTreeBefore = await trackedSourceIdentity(repositoryRoot);
+const lockfileBefore = await regularFileIdentity(path.join(repositoryRoot, 'pnpm-lock.yaml'));
 const harnessBefore = await harnessIdentity();
 
 await mkdir(path.dirname(evidencePath), { recursive: true });
@@ -575,6 +632,59 @@ if (path.basename(installer) !== expectedUnsignedInstallerName(desktopPackage.ve
 }
 
 const artifactBefore = await artifactIdentity(installer);
+const candidateManifestPath = path.join(
+  repositoryRoot,
+  'artifacts',
+  'release-evidence',
+  'release-candidate-v1.json',
+);
+const companionRoot = path.join(desktopRoot, 'out', 'win-unpacked');
+const companionExecutablePath = path.join(companionRoot, 'HTMLlelujah.exe');
+const companionAsarPath = path.join(companionRoot, 'resources', 'app.asar');
+const blockmapPath = path.join(
+  desktopRoot,
+  'out',
+  `${expectedUnsignedInstallerName(desktopPackage.version)}.blockmap`,
+);
+const companionExecutableBefore = await regularFileIdentity(companionExecutablePath, 1_048_576);
+const companionAsarBefore = await regularFileIdentity(companionAsarPath, 1_048_576);
+const blockmapBefore = await regularFileIdentity(blockmapPath);
+const embeddedProvenance = readPackagedBuildProvenance(companionAsarPath, desktopRoot);
+const expectedProvenance = {
+  productName: 'HTMLlelujah',
+  version: desktopPackage.version,
+  sourceCommit: sourceBefore.commit,
+  sourceTree: sourceTreeBefore,
+  lockfileSha256: lockfileBefore.sha256,
+};
+assertBuildProvenance(embeddedProvenance, expectedProvenance);
+const candidateManifest = JSON.parse(await readFile(candidateManifestPath, 'utf8'));
+const candidateManifestBefore = await regularFileIdentity(candidateManifestPath);
+assertReleaseCandidateManifest(candidateManifest, {
+  productName: 'HTMLlelujah',
+  version: desktopPackage.version,
+  source: {
+    commit: sourceBefore.commit,
+    treeSha256: sourceTreeBefore.sha256,
+    fileCount: sourceTreeBefore.fileCount,
+    bytes: sourceTreeBefore.bytes,
+  },
+  lockfileSha256: lockfileBefore.sha256,
+  embeddedProvenance,
+  installer: {
+    path: path.basename(installer),
+    ...artifactBefore,
+  },
+  blockmap: {
+    path: path.basename(blockmapPath),
+    ...blockmapBefore,
+  },
+  companion: {
+    executable: companionExecutableBefore,
+    appAsar: companionAsarBefore,
+  },
+});
+const expectedRegistryKeys = expectedInstallerRegistryKeys(desktopPackage.build.nsis.guid);
 const startedAt = new Date();
 const token = tokenProfile();
 if (token.isElevated || token.isSystem) {
@@ -602,12 +712,13 @@ const recoveryBlobsDirectory = path.join(recoveryDirectory, 'blobs');
 const marker = path.join(applicationData, `installer-smoke-${randomUUID()}.txt`);
 
 let installed = false;
+let installationMutationStarted = false;
+let registryKeysWereCollisionFree = false;
 let recovery;
 let recoveryConsumed = false;
 let lifecycleError;
 const cleanupErrors = [];
 const stageDurationsMs = {};
-let recoveryRecordCount = 0;
 let applicationDataBaselineCaptured = false;
 let applicationDataExisted = false;
 let recoveryDirectoryExisted = false;
@@ -633,7 +744,7 @@ const verifyPreservedState = async (deckHash, markerHash, recoveryState) => {
   if (!sameHashes(recoveryState.hashes, await hashFiles(recoveryState.files))) {
     throw new Error('Installer maintenance changed the durable recovery files.');
   }
-  recoveryRecordCount = await inspectRecoveryCandidate(recoveryDirectory, recoveryState);
+  await inspectRecoverySentinel(recoveryState);
 };
 
 try {
@@ -644,6 +755,8 @@ try {
   applicationDataBaselineCaptured = true;
   registryBefore = registryState(installDirectory);
   shortcutsBefore = shortcutState(installedExecutable);
+  assertNoExpectedRegistryCollisions(expectedRegistryCollisionState(expectedRegistryKeys));
+  registryKeysWereCollisionFree = true;
 
   if (
     registryBefore.productClassRegistered ||
@@ -663,13 +776,14 @@ try {
     );
   }
 
-  const document = createDefaultDeck({
-    name: 'Installed V1 verification',
-    creator: 'HTMLlelujah release smoke',
-  });
-  await writeFile(deckPath, createHdeckArchive({ document }));
+  const deckBytes = Buffer.from((await readFile(fixturePath, 'utf8')).trim(), 'base64');
+  if (deckBytes.length < 1_024 || deckBytes.subarray(0, 2).toString('ascii') !== 'PK') {
+    throw new Error('The tracked installer smoke deck fixture is invalid.');
+  }
+  await writeFile(deckPath, deckBytes);
   const deckHash = await sha256(deckPath);
 
+  installationMutationStarted = true;
   await stage('install', () =>
     run(installer, ['/S', `/D=${installDirectory}`], {
       label: 'NSIS standard-user install',
@@ -687,6 +801,22 @@ try {
   );
   assertInstalledShortcuts(shortcutState(installedExecutable));
   const installedExecutableHash = await sha256(installedExecutable);
+  const installedExecutableIdentity = await regularFileIdentity(installedExecutable, 1_048_576);
+  const installedAsarPath = path.join(installDirectory, 'resources', 'app.asar');
+  const installedAsarIdentity = await regularFileIdentity(installedAsarPath, 1_048_576);
+  if (
+    installedExecutableIdentity.sha256 !== companionExecutableBefore.sha256 ||
+    installedExecutableIdentity.size !== companionExecutableBefore.size ||
+    installedAsarIdentity.sha256 !== companionAsarBefore.sha256 ||
+    installedAsarIdentity.size !== companionAsarBefore.size
+  ) {
+    throw new Error('The installer payload differs from the attested companion application.');
+  }
+  const installedProvenance = readPackagedBuildProvenance(installedAsarPath, desktopRoot);
+  assertBuildProvenance(installedProvenance, expectedProvenance);
+  if (JSON.stringify(installedProvenance) !== JSON.stringify(embeddedProvenance)) {
+    throw new Error('The installed application contains unexpected build provenance.');
+  }
 
   await stage('installedEditor', () =>
     run(process.execPath, [path.join(desktopRoot, 'scripts', 'smoke-ui-electron.mjs')], {
@@ -696,7 +826,7 @@ try {
         ...process.env,
         HTMLLELUJAH_EXECUTABLE: installedExecutable,
         HTMLLELUJAH_OPEN_PATH: deckPath,
-        HTMLLELUJAH_EXPECTED_DECK_NAME: document.name,
+        HTMLLELUJAH_EXPECTED_DECK_NAME: 'Installed V1 verification',
       },
     }),
   );
@@ -729,7 +859,7 @@ try {
   await mkdir(applicationData, { recursive: true });
   await writeFile(marker, 'installer preservation marker\n', 'utf8');
   const markerHash = await sha256(marker);
-  recovery = await seedRecoveryCandidate(recoveryDirectory);
+  recovery = await seedRecoverySentinel(recoveryDirectory);
   await verifyPreservedState(deckHash, markerHash, recovery);
 
   await rm(noticePath, { force: true });
@@ -802,7 +932,7 @@ try {
   );
   assertNoShortcuts(shortcutState(installedExecutable));
   await verifyPreservedState(deckHash, markerHash, recovery);
-  recoveryRecordCount = await inspectRecoveryCandidate(recoveryDirectory, recovery, true);
+  await inspectRecoverySentinel(recovery, true);
   recoveryConsumed = true;
 } catch (error) {
   lifecycleError = error;
@@ -819,7 +949,12 @@ try {
   }
 
   try {
-    if ((installed || (await exists(installedExecutable))) && (await exists(uninstaller))) {
+    if (
+      registryKeysWereCollisionFree &&
+      installationMutationStarted &&
+      (installed || (await exists(installedExecutable))) &&
+      (await exists(uninstaller))
+    ) {
       await run(uninstaller, ['/S'], { label: 'NSIS cleanup uninstall', timeoutMs: 180_000 });
       installed = false;
     }
@@ -832,7 +967,7 @@ try {
 
   if (recovery !== undefined && !recoveryConsumed) {
     try {
-      await inspectRecoveryCandidate(recoveryDirectory, recovery, true);
+      await inspectRecoverySentinel(recovery, true);
       recoveryConsumed = true;
     } catch (error) {
       cleanupErrors.push(error);
@@ -892,8 +1027,31 @@ try {
   }
   const harnessAfter = await harnessIdentity();
   assertStableHarnessManifest(harnessBefore.files, harnessAfter.files);
-  assertSourceStateUnchanged(sourceBefore, gitSourceState());
+  assertSourceStateUnchanged(sourceBefore, inspectGitSourceState(repositoryRoot));
+  const sourceTreeAfter = await trackedSourceIdentity(repositoryRoot);
+  if (JSON.stringify(sourceTreeBefore) !== JSON.stringify(sourceTreeAfter)) {
+    throw new Error('The tracked source tree changed while the installer smoke was running.');
+  }
   assertStableArtifact(artifactBefore, await artifactIdentity(installer));
+  assertStableArtifact(candidateManifestBefore, await regularFileIdentity(candidateManifestPath));
+  assertStableArtifact(blockmapBefore, await regularFileIdentity(blockmapPath));
+  assertStableArtifact(
+    lockfileBefore,
+    await regularFileIdentity(path.join(repositoryRoot, 'pnpm-lock.yaml')),
+  );
+  assertStableArtifact(
+    companionExecutableBefore,
+    await regularFileIdentity(companionExecutablePath, 1_048_576),
+  );
+  assertStableArtifact(
+    companionAsarBefore,
+    await regularFileIdentity(companionAsarPath, 1_048_576),
+  );
+  const finalEmbeddedProvenance = readPackagedBuildProvenance(companionAsarPath, desktopRoot);
+  assertBuildProvenance(finalEmbeddedProvenance, expectedProvenance);
+  if (JSON.stringify(finalEmbeddedProvenance) !== JSON.stringify(embeddedProvenance)) {
+    throw new Error('The companion build provenance changed during the installer smoke.');
+  }
 } catch (error) {
   cleanupErrors.push(error);
 }
@@ -908,7 +1066,7 @@ if (lifecycleError !== undefined || cleanupErrors.length > 0) {
 
 const completedAt = new Date();
 const report = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   passed: true,
   startedAt: startedAt.toISOString(),
   completedAt: completedAt.toISOString(),
@@ -916,6 +1074,8 @@ const report = {
   platform: `${process.platform}-${process.arch}`,
   sourceCommit: sourceBefore.commit,
   sourceCleanAndStable: true,
+  sourceTree: sourceTreeBefore,
+  lockfileSha256: lockfileBefore.sha256,
   harness: {
     ...harnessBefore,
     finalArtifactGate: true,
@@ -928,6 +1088,16 @@ const report = {
     mtimeUtc: artifactBefore.mtimeUtc,
     hashReverifiedAfterCleanup: true,
     labelledUnsigned: true,
+  },
+  releaseCandidateManifest: {
+    fileName: path.basename(candidateManifestPath),
+    sha256: candidateManifestBefore.sha256,
+    sourceAndPayloadBindingVerified: true,
+    embeddedBuildProvenanceVerified: true,
+    blockmapSha256: blockmapBefore.sha256,
+    companionExecutableSha256: companionExecutableBefore.sha256,
+    companionAppAsarSha256: companionAsarBefore.sha256,
+    installedPayloadMatchedCompanion: true,
   },
   stageDurationsMs,
   checks: {
@@ -960,11 +1130,10 @@ const report = {
     priorApplicationDataTreeRestored: true,
   },
   recoveryWorkspace: {
-    validationScope: 'repository-source-runtime-format-and-file-preservation',
+    validationScope: 'installer-file-preservation-only',
     installedExecutableRecoveryExecution: 'not-tested',
-    formatAndFilePreservationVerified: true,
-    sourceRuntimeReplayAfterUninstallVerified: true,
-    journalRecordCount: recoveryRecordCount,
+    opaqueRecoverySentinelPreserved: true,
+    recoveryReplayCoveredByRuntimeTests: true,
   },
 };
 const evidenceTemporary = `${evidencePath}.${randomUUID()}.tmp`;

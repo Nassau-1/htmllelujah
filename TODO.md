@@ -32,6 +32,22 @@ reported as passed until their results are recorded.
 
 ## Release-candidate verification
 
+### Active audit blockers (checkpoint 2026-07-16)
+
+- [ ] Preserve selected master/layout objects after accepted document revisions and
+      cover drag/resize persistence in the opened-app smoke.
+- [ ] Define one backward-compatible connector geometry invariant, then make
+      rendering, hit testing, align/distribute, grouping, ungrouping, bindings, and
+      V2 archive reopening use it without clipping or double rotation.
+- [ ] Promote the candidate payload and its evidence with crash-consistent recovery;
+      the current two-directory rename rollback handles exceptions but not process or
+      machine termination between renames.
+- [ ] Compare the complete installed payload against the attested unpacked inventory
+      after install, repair, and upgrade-like reinstall.
+- [ ] Bind the public tag and release upload to the candidate manifest's exact source
+      commit, and generate the final observed release record as an artifact so
+      recording hashes cannot change the commit that produced them.
+
 - [ ] Run the complete clean-checkout `pnpm verify` gate and record the exact commit,
       environment, command, and result.
 - [ ] Complete unit, integration, adversarial archive/recovery, IPC, MCP, and LAN

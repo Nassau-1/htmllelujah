@@ -20,8 +20,12 @@ export type {
   RenderReadyWarning,
   RenderReadyWarningCode,
 } from './readiness.js';
-export { SlideSurface } from './SlideSurface.js';
-export type { SlideSurfaceProps } from './SlideSurface.js';
+export {
+  resolveConnectorGeometries,
+  resolveConnectorGeometry,
+  SlideSurface,
+} from './SlideSurface.js';
+export type { ResolvedConnectorGeometry, SlideSurfaceProps } from './SlideSurface.js';
 export { RENDERER_CSS } from './styles.js';
 export type * from './types.js';
 export {

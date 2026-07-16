@@ -67,35 +67,92 @@ const normalizeWindowsExecutablePath = (value) =>
     ? path.win32.normalize(value).toLocaleLowerCase('en-US')
     : null;
 
-/** Selects only the exact installed executable and its observed process descendants. */
+/** Selects only exact product executables with a trustworthy creation timestamp. */
 export const selectOwnedProcessRecords = (records, installedExecutable) => {
   const expected = normalizeWindowsExecutablePath(installedExecutable);
   if (expected === null) throw new Error('The installed executable path is invalid.');
-  const byPid = new Map(
-    records
-      .filter((record) => Number.isSafeInteger(record?.processId) && record.processId > 0)
-      .map((record) => [record.processId, record]),
-  );
-  const owned = new Set(
-    [...byPid.values()]
-      .filter((record) => normalizeWindowsExecutablePath(record.executablePath) === expected)
-      .map((record) => record.processId),
-  );
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const record of byPid.values()) {
-      if (
-        !owned.has(record.processId) &&
-        Number.isSafeInteger(record.parentProcessId) &&
-        owned.has(record.parentProcessId)
-      ) {
-        owned.add(record.processId);
-        changed = true;
-      }
-    }
+  return [
+    ...new Map(
+      records
+        .filter(
+          (record) =>
+            Number.isSafeInteger(record?.processId) &&
+            record.processId > 0 &&
+            Number.isSafeInteger(record.createdAtMs) &&
+            record.createdAtMs > 0 &&
+            normalizeWindowsExecutablePath(record.executablePath) === expected,
+        )
+        .map((record) => [record.processId, record]),
+    ).values(),
+  ].sort((left, right) => left.processId - right.processId);
+};
+
+export const expectedInstallerRegistryKeys = (guid) => {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(guid)) {
+    throw new Error('The NSIS GUID is invalid.');
   }
-  return [...owned].sort((left, right) => left - right).map((processId) => byPid.get(processId));
+  return {
+    install: `Software\\${guid}`,
+    uninstall: `Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${guid}`,
+  };
+};
+
+const sameIdentity = (left, right) =>
+  left?.sha256 === right?.sha256 && left?.size === right?.size && left?.mtimeMs === right?.mtimeMs;
+
+const samePayloadIdentity = (left, right) =>
+  left?.sha256 === right?.sha256 && left?.size === right?.size;
+
+export const assertReleaseCandidateManifest = (manifest, expected) => {
+  const artifactFiles = Array.isArray(manifest?.artifact?.files) ? manifest.artifact.files : [];
+  const artifactEntry = (entryPath) => artifactFiles.find((entry) => entry.path === entryPath);
+  const unpackedFiles = Array.isArray(manifest?.artifact?.winUnpacked?.files)
+    ? manifest.artifact.winUnpacked.files
+    : [];
+  const unpackedEntry = (entryPath) => unpackedFiles.find((entry) => entry.path === entryPath);
+  const workspacePackages = manifest?.build?.workspacePackages;
+  if (
+    manifest?.schemaVersion !== 2 ||
+    manifest.productName !== expected.productName ||
+    manifest.version !== expected.version ||
+    manifest.source?.commit !== expected.source.commit ||
+    manifest.source?.dirty !== false ||
+    manifest.source?.treeSha256 !== expected.source.treeSha256 ||
+    manifest.source?.fileCount !== expected.source.fileCount ||
+    manifest.source?.bytes !== expected.source.bytes ||
+    manifest.lockfile?.path !== 'pnpm-lock.yaml' ||
+    manifest.lockfile?.sha256 !== expected.lockfileSha256 ||
+    JSON.stringify(manifest.build?.embeddedProvenance) !==
+      JSON.stringify(expected.embeddedProvenance) ||
+    !Array.isArray(workspacePackages) ||
+    workspacePackages.length === 0 ||
+    JSON.stringify(workspacePackages) !==
+      JSON.stringify(expected.embeddedProvenance.workspacePackages) ||
+    !samePayloadIdentity(manifest.artifact?.installer, expected.installer) ||
+    manifest.artifact?.installer?.path !== expected.installer.path ||
+    !samePayloadIdentity(manifest.artifact?.blockmap, expected.blockmap) ||
+    manifest.artifact?.blockmap?.path !== expected.blockmap.path ||
+    !samePayloadIdentity(artifactEntry(expected.installer.path), expected.installer) ||
+    !samePayloadIdentity(artifactEntry(expected.blockmap.path), expected.blockmap) ||
+    !samePayloadIdentity(
+      artifactEntry('win-unpacked/HTMLlelujah.exe'),
+      expected.companion.executable,
+    ) ||
+    !samePayloadIdentity(
+      artifactEntry('win-unpacked/resources/app.asar'),
+      expected.companion.appAsar,
+    ) ||
+    !samePayloadIdentity(unpackedEntry('HTMLlelujah.exe'), expected.companion.executable) ||
+    !samePayloadIdentity(unpackedEntry('resources/app.asar'), expected.companion.appAsar) ||
+    manifest.artifact?.fileCount !== artifactFiles.length ||
+    manifest.artifact?.winUnpacked?.fileCount !== unpackedFiles.length ||
+    !/^[0-9a-f]{64}$/u.test(manifest.artifact?.aggregateSha256 ?? '') ||
+    !/^[0-9a-f]{64}$/u.test(manifest.artifact?.winUnpacked?.aggregateSha256 ?? '')
+  ) {
+    throw new Error(
+      'The release-candidate manifest is not bound to this exact source and payload.',
+    );
+  }
 };
 
 export const assertCleanSourceState = (state) => {
