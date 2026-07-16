@@ -25,6 +25,7 @@ const DEFAULT_SAVE_INTERVAL_SECONDS = 60;
 const DEFAULT_REJOIN_INTERVAL_SECONDS = 300;
 const CONVERGENCE_TIMEOUT_MS = 10_000;
 const TEXT_LEASE_INTERVAL_MS = 5 * 60_000;
+const MAX_LOOP_HIATUS_MS = 30_000;
 const EMBEDDED_PNG = Uint8Array.from(
   Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
@@ -289,6 +290,8 @@ const main = async (): Promise<void> => {
   let authoritativeHostSessionId: string | undefined;
   let steadyStateStartedAt = 0;
   let steadyStateEndedAt = 0;
+  let lastLoopCheckpoint = 0;
+  let maximumLoopHiatusMs = 0;
   let status: 'passed' | 'failed' | 'interrupted' = 'failed';
   let failure: FailureDescriptor | undefined;
   let cleanupFailures = 0;
@@ -693,7 +696,8 @@ const main = async (): Promise<void> => {
     await insertExistingAsset(participants[1]!);
     await exerciseTextLease(0);
 
-    steadyStateStartedAt = Date.now();
+    steadyStateStartedAt = performance.now();
+    lastLoopCheckpoint = steadyStateStartedAt;
     const deadline = steadyStateStartedAt + options.durationMs;
     let nextSaveAt = steadyStateStartedAt + options.saveIntervalMs;
     let nextRejoinAt = steadyStateStartedAt + options.rejoinIntervalMs;
@@ -703,7 +707,10 @@ const main = async (): Promise<void> => {
 
     console.log(JSON.stringify({ event: 'steady-state-started', connectedGuests: 2 }));
 
-    while (Date.now() < deadline && !stopRequested) {
+    while (performance.now() < deadline && !stopRequested) {
+      const loopCheckpoint = performance.now();
+      maximumLoopHiatusMs = Math.max(maximumLoopHiatusMs, loopCheckpoint - lastLoopCheckpoint);
+      lastLoopCheckpoint = loopCheckpoint;
       const actor = participants[commandCount % participants.length];
       if (actor === undefined) throw new SoakInvariantError('ACTOR_MISSING');
       const before = actor.runtime.getSnapshot(actor.sessionId);
@@ -725,7 +732,7 @@ const main = async (): Promise<void> => {
       if (command.type === 'element.transform') objectEdits += 1;
       updatePeerRange();
 
-      const now = Date.now();
+      const now = performance.now();
       if (now >= nextSaveAt) {
         await verifyPersistence();
         nextSaveAt = now + options.saveIntervalMs;
@@ -737,11 +744,11 @@ const main = async (): Promise<void> => {
         }
         await rejoinGuest(guest);
         rejoinGuestIndex = rejoinGuestIndex === 1 ? 2 : 1;
-        nextRejoinAt = Date.now() + options.rejoinIntervalMs;
+        nextRejoinAt = performance.now() + options.rejoinIntervalMs;
       }
       if (now >= nextTextLeaseAt) {
         await exerciseTextLease(textLeaseEdits);
-        nextTextLeaseAt = Date.now() + TEXT_LEASE_INTERVAL_MS;
+        nextTextLeaseAt = performance.now() + TEXT_LEASE_INTERVAL_MS;
       }
       if (now >= nextProgressAt) {
         console.log(
@@ -758,12 +765,16 @@ const main = async (): Promise<void> => {
       }
       await delay(options.commandDelayMs);
     }
-    steadyStateEndedAt = Date.now();
+    steadyStateEndedAt = performance.now();
+    maximumLoopHiatusMs = Math.max(maximumLoopHiatusMs, steadyStateEndedAt - lastLoopCheckpoint);
 
     if (stopRequested) {
       status = 'interrupted';
       failure = { name: 'Signal', code: 'INTERRUPTED' };
     } else {
+      if (maximumLoopHiatusMs >= MAX_LOOP_HIATUS_MS) {
+        throw new SoakInvariantError('LOOP_HIATUS_EXCEEDED');
+      }
       await waitForConvergence(participants);
       convergenceChecks += 1;
       await verifyPersistence();
@@ -790,7 +801,7 @@ const main = async (): Promise<void> => {
   } catch (error) {
     failure = describeFailure(error);
     status = stopRequested ? 'interrupted' : 'failed';
-    steadyStateEndedAt ||= Date.now();
+    steadyStateEndedAt ||= performance.now();
   } finally {
     process.removeListener('SIGINT', requestStop);
     process.removeListener('SIGTERM', requestStop);
@@ -822,8 +833,8 @@ const main = async (): Promise<void> => {
   }
 
   const endedAt = new Date();
-  const effectiveStart = steadyStateStartedAt || requestedStart.getTime();
-  const effectiveEnd = steadyStateEndedAt || endedAt.getTime();
+  const effectiveStart = steadyStateStartedAt;
+  const effectiveEnd = steadyStateEndedAt || performance.now();
   const report = {
     schemaVersion: 1,
     test: 'desktop-collaboration-lan-wss-soak',
@@ -831,7 +842,7 @@ const main = async (): Promise<void> => {
     startedAt: requestedStart.toISOString(),
     endedAt: endedAt.toISOString(),
     configuredDurationMs: options.durationMs,
-    steadyStateDurationMs: Math.max(0, effectiveEnd - effectiveStart),
+    steadyStateDurationMs: effectiveStart > 0 ? Math.max(0, effectiveEnd - effectiveStart) : 0,
     topology: {
       hosts: 1,
       guests: 2,
@@ -856,6 +867,12 @@ const main = async (): Promise<void> => {
       textLeaseTransfers,
     },
     commandRoundTripMs: summarizeLatency(commandRoundTripMs),
+    continuity: {
+      maximumLoopHiatusMs: Number(maximumLoopHiatusMs.toFixed(3)),
+      thresholdExclusiveMs: MAX_LOOP_HIATUS_MS,
+      passed:
+        steadyStateStartedAt > 0 && maximumLoopHiatusMs < MAX_LOOP_HIATUS_MS && status === 'passed',
+    },
     persistence: {
       hostSaves,
       persistedSnapshotVerifications,

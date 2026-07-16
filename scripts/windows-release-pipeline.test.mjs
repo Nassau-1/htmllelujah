@@ -172,6 +172,20 @@ test('Windows Corepack resolves to a JavaScript entry instead of a cmd shim', ()
   assert.equal(invocation.command.toLowerCase().endsWith('.cmd'), false);
 });
 
+test('Windows Corepack resolver supports a userland PATH installation', () => {
+  const executable = path.join('C:\\', 'Node', 'node.exe');
+  const userlandBin = path.join('C:\\', 'Users', 'fixture', 'AppData', 'Roaming', 'npm');
+  const userlandEntry = path.join(userlandBin, 'node_modules', 'corepack', 'dist', 'corepack.js');
+  const invocation = resolveCorepackInvocation({
+    executable,
+    environment: { Path: userlandBin },
+    platform: 'win32',
+    pathExists: (entry) => path.resolve(entry) === path.resolve(userlandEntry),
+  });
+  assert.equal(invocation.command, executable);
+  assert.deepEqual(invocation.argsPrefix, [path.resolve(userlandEntry)]);
+});
+
 test(
   'resolved Windows Corepack entry launches without a shell',
   { skip: process.platform !== 'win32' },

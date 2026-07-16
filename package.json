@@ -20,11 +20,13 @@
     "package:win": "node scripts/build-windows-release.mjs",
     "sbom:generate": "node scripts/generate-sbom.mjs",
     "test": "pnpm build:packages && pnpm --workspace-concurrency=1 -r --if-present test --pool=threads --maxWorkers=1",
+    "test:candidate-validation": "node --test --test-isolation=none scripts/windows-candidate-validation.test.mjs",
     "test:release-evidence": "node scripts/test-release-evidence.mjs",
     "test:release-pipeline": "node --test --test-isolation=none scripts/windows-release-pipeline.test.mjs",
     "test:sbom-generate": "node --test scripts/generate-sbom.test.mjs",
     "typecheck": "pnpm build:packages && pnpm --workspace-concurrency=1 -r --if-present typecheck",
-    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:release-evidence && pnpm test:release-pipeline && pnpm test:sbom-generate && pnpm build && pnpm licenses:check"
+    "validate:candidate": "node scripts/run-windows-candidate-validation.mjs",
+    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:candidate-validation && pnpm test:release-evidence && pnpm test:release-pipeline && pnpm test:sbom-generate && pnpm build && pnpm licenses:check"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
