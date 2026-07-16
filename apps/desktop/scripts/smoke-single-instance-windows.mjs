@@ -122,9 +122,10 @@ const associationContract = (installedExecutable) => {
         "if ($null -eq $commandKey) { throw 'Missing association command.' }",
         "$command = [string]$commandKey.GetValue('')",
         '$commandKey.Dispose()',
+        '$expectedCommand = (\'"{0}" "%1"\' -f $env:HTMLLELUJAH_ASSOCIATION_TARGET)',
         '$value = [ordered]@{',
-        '  executableRegistered = $command.IndexOf($env:HTMLLELUJAH_ASSOCIATION_TARGET, [System.StringComparison]::OrdinalIgnoreCase) -ge 0',
-        '  quotedFilePlaceholder = $command.Contains(\'"%1"\')',
+        "  exactProgId = $progId -eq 'HTMLlelujah presentation'",
+        '  exactCommand = [string]::Equals($command, $expectedCommand, [System.StringComparison]::OrdinalIgnoreCase)',
         '}',
         '$value | ConvertTo-Json -Compress',
       ].join('\n'),
@@ -150,10 +151,16 @@ const productAssociationState = () => {
         "$extension = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\Classes\\.hdeck')",
         "$extensionDefault = if ($null -eq $extension) { $null } else { [string]$extension.GetValue('') }",
         'if ($null -ne $extension) { $extension.Dispose() }',
+        "$openWith = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\Classes\\.hdeck\\OpenWithProgids')",
+        '$openWithProgIds = if ($null -eq $openWith) { @() } else { @($openWith.GetValueNames()) }',
+        'if ($null -ne $openWith) { $openWith.Dispose() }',
         "$productClass = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\Classes\\HTMLlelujah presentation')",
         '$value = [ordered]@{',
+        '  extensionKeyRegistered = $null -ne $extension',
         '  extensionDefaultRegistered = -not [string]::IsNullOrWhiteSpace($extensionDefault)',
         "  extensionTargetsProduct = $extensionDefault -eq 'HTMLlelujah presentation'",
+        '  openWithKeyRegistered = $null -ne $openWith',
+        '  openWithProgIds = $openWithProgIds',
         '  productClassRegistered = $null -ne $productClass',
         '}',
         'if ($null -ne $productClass) { $productClass.Dispose() }',
@@ -168,7 +175,7 @@ const productAssociationState = () => {
   return JSON.parse(result.stdout.trim());
 };
 
-const removeTestAssociation = () => {
+const removeTestAssociation = (installedExecutable) => {
   const result = spawnSync(
     'powershell.exe',
     [
@@ -177,14 +184,74 @@ const removeTestAssociation = () => {
       [
         "$extensionPath = 'Software\\Classes\\.hdeck'",
         "$productClassPath = 'Software\\Classes\\HTMLlelujah presentation'",
-        '$extension = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($extensionPath)',
-        "$owned = $null -ne $extension -and [string]$extension.GetValue('') -eq 'HTMLlelujah presentation'",
-        'if ($null -ne $extension) { $extension.Dispose() }',
-        'if ($owned) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($extensionPath, $false) }',
-        '[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($productClassPath, $false)',
+        "$productProgId = 'HTMLlelujah presentation'",
+        '$extension = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($extensionPath, $true)',
+        'if ($null -ne $extension) {',
+        "  $currentDefault = [string]$extension.GetValue('')",
+        '  if ([string]::Equals($currentDefault, $productProgId, [System.StringComparison]::OrdinalIgnoreCase)) {',
+        "    $extension.DeleteValue('', $false)",
+        '    $extension.Flush()',
+        '  }',
+        '  $extension.Dispose()',
+        '}',
+        "$openWith = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($extensionPath + '\\OpenWithProgids'), $true)",
+        'if ($null -ne $openWith) {',
+        '  $ownedValueName = @($openWith.GetValueNames()) | Where-Object {',
+        '    [string]::Equals($_, $productProgId, [System.StringComparison]::OrdinalIgnoreCase)',
+        '  } | Select-Object -First 1',
+        '  if ($null -ne $ownedValueName) {',
+        '    $openWith.DeleteValue([string]$ownedValueName, $false)',
+        '    $openWith.Flush()',
+        '  }',
+        '  $openWith.Dispose()',
+        '}',
+        '# Never remove the extension tree: another application may have added values after the pristine preflight.',
+        "$commandPath = $productClassPath + '\\shell\\open\\command'",
+        '$commandKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($commandPath, $true)',
+        'if ($null -ne $commandKey) {',
+        "  $command = [string]$commandKey.GetValue('')",
+        '  if (',
+        '    $command.IndexOf($env:HTMLLELUJAH_ASSOCIATION_TARGET, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and',
+        '    $command.Contains(\'"%1"\')',
+        '  ) {',
+        "    $commandKey.DeleteValue('', $false)",
+        '    $commandKey.Flush()',
+        '  }',
+        '  $commandKey.Dispose()',
+        '}',
+        "$openKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($productClassPath + '\\shell\\open'), $true)",
+        'if ($null -ne $openKey) {',
+        "  if ([string]$openKey.GetValue('') -eq 'Open with HTMLlelujah') { $openKey.DeleteValue('', $false); $openKey.Flush() }",
+        '  $openKey.Dispose()',
+        '}',
+        "$shellKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($productClassPath + '\\shell'), $true)",
+        'if ($null -ne $shellKey) {',
+        "  if ([string]$shellKey.GetValue('') -eq 'open') { $shellKey.DeleteValue('', $false); $shellKey.Flush() }",
+        '  $shellKey.Dispose()',
+        '}',
+        "$iconKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($productClassPath + '\\DefaultIcon'), $true)",
+        'if ($null -ne $iconKey) {',
+        "  $icon = [string]$iconKey.GetValue('')",
+        '  if ($icon.IndexOf([System.IO.Path]::GetDirectoryName($env:HTMLLELUJAH_ASSOCIATION_TARGET), [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {',
+        "    $iconKey.DeleteValue('', $false)",
+        '    $iconKey.Flush()',
+        '  }',
+        '  $iconKey.Dispose()',
+        '}',
+        '$productClass = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($productClassPath, $true)',
+        'if ($null -ne $productClass) {',
+        "  if ([string]$productClass.GetValue('') -eq $productProgId) { $productClass.DeleteValue('', $false); $productClass.Flush() }",
+        '  $productClass.Dispose()',
+        '}',
+        '# Empty keys are deliberately retained on a failed uninstall; deleting a tree cannot be made foreign-state safe.',
       ].join('\n'),
     ],
-    { windowsHide: true, encoding: 'utf8', timeout: 15_000 },
+    {
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 15_000,
+      env: { ...process.env, HTMLLELUJAH_ASSOCIATION_TARGET: installedExecutable },
+    },
   );
   if (result.status !== 0) throw new Error('The test-scoped .hdeck association cleanup failed.');
 };
@@ -245,10 +312,16 @@ const invokeAssociationSecondary = async ({ executable, profile, targetPath }) =
         "if ($null -eq $extension) { throw 'Missing extension association.' }",
         "$progId = [string]$extension.GetValue('')",
         '$extension.Dispose()',
+        "if ($progId -ne 'HTMLlelujah presentation') { throw 'Unexpected extension ProgID; no registry value was changed.' }",
         "$keyPath = 'Software\\Classes\\{0}\\shell\\open\\command' -f $progId",
         '$commandKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($keyPath, $true)',
         "if ($null -eq $commandKey) { throw 'Missing writable association command.' }",
         "$original = [string]$commandKey.GetValue('')",
+        "$originalKind = $commandKey.GetValueKind('')",
+        'if (',
+        '  $original.IndexOf($env:HTMLLELUJAH_ASSOCIATION_EXECUTABLE, [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or',
+        '  -not $original.Contains(\'"%1"\')',
+        ") { $commandKey.Dispose(); throw 'The association command is not owned by this test installation.' }",
         '$testCommand = (\'"{0}" --user-data-dir="{1}" "%1"\' -f $env:HTMLLELUJAH_ASSOCIATION_EXECUTABLE, $env:HTMLLELUJAH_ASSOCIATION_PROFILE)',
         'try {',
         "  $commandKey.SetValue('', $testCommand, [Microsoft.Win32.RegistryValueKind]::String)",
@@ -263,9 +336,17 @@ const invokeAssociationSecondary = async ({ executable, profile, targetPath }) =
         '  if ($null -ne $commandKey) { $commandKey.Dispose() }',
         '  $restoreKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($keyPath, $true)',
         "  if ($null -eq $restoreKey) { throw 'Association command could not be restored.' }",
-        "  $restoreKey.SetValue('', $original, [Microsoft.Win32.RegistryValueKind]::String)",
-        '  $restoreKey.Flush()',
-        '  $restoreKey.Dispose()',
+        '  try {',
+        "    $current = [string]$restoreKey.GetValue('')",
+        '    if ([string]::Equals($current, $testCommand, [System.StringComparison]::Ordinal)) {',
+        "      $restoreKey.SetValue('', $original, $originalKind)",
+        '      $restoreKey.Flush()',
+        '    }',
+        '    elseif (-not [string]::Equals($current, $original, [System.StringComparison]::Ordinal)) {',
+        "      throw 'Association command changed concurrently; the foreign value was preserved.'",
+        '    }',
+        '  }',
+        '  finally { $restoreKey.Dispose() }',
         '}',
       ].join('\n'),
     ],
@@ -407,6 +488,7 @@ const finalArtifact = process.argv.slice(3).includes('--final-artifact');
 if (!path.basename(installer).includes('-unsigned-Setup.exe') || !(await exists(installer))) {
   throw new Error('A labelled unsigned HTMLlelujah NSIS installer is required.');
 }
+await rm(evidencePath, { force: true });
 
 const temporaryRoot = await mkdtemp(path.join(tmpdir(), 'htmllelujah-single-instance-smoke-'));
 const safePrefix = path.join(path.resolve(tmpdir()), 'htmllelujah-single-instance-smoke-');
@@ -429,8 +511,10 @@ let cleanAssociationBaseline = false;
 
 try {
   const associationBefore = productAssociationState();
-  if (associationBefore.extensionDefaultRegistered || associationBefore.productClassRegistered) {
-    throw new Error('The installer smoke requires an isolated .hdeck association state.');
+  if (associationBefore.extensionKeyRegistered || associationBefore.productClassRegistered) {
+    throw new Error(
+      'The installer smoke requires the .hdeck extension key and product ProgID to be entirely absent; no existing registry state was changed.',
+    );
   }
   cleanAssociationBaseline = true;
   const documentA = createDefaultDeck({
@@ -458,12 +542,8 @@ try {
     throw new Error('The installed application executable is invalid.');
   }
   const association = associationContract(installedExecutable);
-  if (
-    association === undefined ||
-    !association.executableRegistered ||
-    !association.quotedFilePlaceholder
-  ) {
-    throw new Error('The installed .hdeck shell association command is incomplete.');
+  if (association === undefined || !association.exactProgId || !association.exactCommand) {
+    throw new Error('The installed .hdeck ProgID or quoted shell command is not exact.');
   }
   if (electronProcessIds().length !== 0) {
     throw new Error('The single-instance smoke requires an isolated product process state.');
@@ -573,8 +653,8 @@ try {
   const restoredAssociation = associationContract(installedExecutable);
   if (
     restoredAssociation === undefined ||
-    !restoredAssociation.executableRegistered ||
-    !restoredAssociation.quotedFilePlaceholder
+    !restoredAssociation.exactProgId ||
+    !restoredAssociation.exactCommand
   ) {
     throw new Error('The scoped shell invocation did not restore the installed association.');
   }
@@ -646,8 +726,8 @@ try {
   installed = false;
   await waitFor(async () => !(await exists(installedExecutable)), 30_000, 'Application removal');
   const associationAfter = productAssociationState();
-  if (associationAfter.extensionTargetsProduct || associationAfter.productClassRegistered) {
-    throw new Error('Uninstall left a product-owned .hdeck association behind.');
+  if (associationAfter.extensionKeyRegistered || associationAfter.productClassRegistered) {
+    throw new Error('Uninstall did not restore the pristine .hdeck registry baseline.');
   }
   if (
     (await sha256(deckAPath)) !== validHashesBefore[0] ||
@@ -670,8 +750,8 @@ try {
     },
     checks: {
       perUserSilentInstall: true,
-      registeredShellCommandTargetsInstalledExecutable: true,
-      registeredShellCommandQuotesFilePlaceholder: true,
+      exactProductProgIdRegistered: true,
+      exactQuotedShellCommandRegistered: true,
       hdeckOpenedThroughWindowsShellAssociation: true,
       installedAssociationRestoredAfterScopedIsolation: true,
       quotedUnicodeCommandLinePathOpened: true,
@@ -687,7 +767,7 @@ try {
       sourceDecksUnchangedWithoutSave: true,
       allInstalledProcessesExitedBeforeUninstall: true,
       silentUninstallRemovedApplication: true,
-      uninstallRemovedProductAssociation: true,
+      uninstallRestoredPristineAssociationBaseline: true,
     },
   };
   await mkdir(path.dirname(evidencePath), { recursive: true });
@@ -707,6 +787,6 @@ try {
       timeoutMs: 180_000,
     }).catch(() => undefined);
   }
-  if (cleanAssociationBaseline) removeTestAssociation();
+  if (cleanAssociationBaseline) removeTestAssociation(installedExecutable);
   await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
