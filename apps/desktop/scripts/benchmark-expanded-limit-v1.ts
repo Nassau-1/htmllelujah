@@ -117,6 +117,7 @@ try {
   }
   await verifier.close(reopened.sessionId, { discardUnsaved: true });
   peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+  await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 
   const report = {
     schemaVersion: 1,
