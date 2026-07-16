@@ -10,7 +10,23 @@ import electronPath from 'electron';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
-const evidencePath = path.join(repositoryRoot, 'artifacts', 'evidence', 'system-exports-v1.json');
+const pagePresets = {
+  widescreen: { widthPt: 960, heightPt: 540 },
+  standard: { widthPt: 720, heightPt: 540 },
+  'a4-landscape': { widthPt: 841.89, heightPt: 595.28 },
+};
+const requestedPagePreset = process.env.HTMLLELUJAH_EXPORT_PAGE_PRESET ?? 'widescreen';
+if (!(requestedPagePreset in pagePresets)) {
+  throw new Error('HTMLLELUJAH_EXPORT_PAGE_PRESET must be widescreen, standard, or a4-landscape.');
+}
+const evidencePath = path.join(
+  repositoryRoot,
+  'artifacts',
+  'evidence',
+  process.env.HTMLLELUJAH_EXPORT_PAGE_PRESET === undefined
+    ? 'system-exports-v1.json'
+    : `system-exports-v1-${requestedPagePreset}.json`,
+);
 const dialogAutomationPath = path.join(import.meta.dirname, 'automate-save-dialog.ps1');
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -452,7 +468,11 @@ let editor;
 try {
   await mkdir(workingDirectory, { recursive: true });
   const baseDocument = createNeutralDemoDeck();
-  const document = { ...baseDocument, name: 'Vérification système V1' };
+  const document = {
+    ...baseDocument,
+    name: 'Vérification système V1',
+    page: pagePresets[requestedPagePreset],
+  };
   await writeFile(sourcePath, createHdeckArchive({ document }));
   const sourceBytes = await readFile(sourcePath);
 
@@ -532,6 +552,7 @@ try {
       process.env.HTMLLELUJAH_EXECUTABLE === undefined ? 'source-build' : 'packaged-executable',
     fixture: {
       unicodeAndSpaces: true,
+      pagePreset: requestedPagePreset,
       slideCount: document.slides.length,
       page: document.page,
     },
