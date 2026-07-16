@@ -51,16 +51,40 @@ import {
   buildCommandPlan,
   createReleaseEnvironment,
   discoverWorkspacePackages,
+  isReleaseWorktreeName,
   promoteDirectoriesAtomically,
   recoverPendingReleasePromotions,
   recoverReleasePromotion,
+  releaseWorktreeName,
   releaseReleaseLock,
   RELEASE_PROMOTION_PREFIX,
   resolveCorepackInvocation,
   runSequentialPlan,
+  WINDOWS_RELEASE_WORKTREE_ROOT_MAX_LENGTH,
 } from './windows-release-pipeline-support.mjs';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..');
+
+test('release worktree names preserve NSIS legacy path headroom', () => {
+  const name = releaseWorktreeName('d1d6aa98-0197-41c0-8df5-f81a1912b7e2');
+  assert.equal(name, '.hlw-d1d6aa98019741c08df5f81a1912b7e2');
+  assert.equal(isReleaseWorktreeName(name), true);
+  assert.equal(isReleaseWorktreeName('.hlw-fixture'), false);
+  assert.throws(() => releaseWorktreeName('../unsafe'), /build ID is invalid/iu);
+
+  const representativeNsisTail = path.win32.join(
+    'node_modules',
+    '.pnpm',
+    `app-builder-lib@26.15.3_dmg_${'f'.repeat(32)}`,
+    'node_modules',
+    'app-builder-lib',
+    'templates',
+    'nsis',
+    'include',
+    'allowOnlyOneInstallerInstance.nsh',
+  );
+  assert.ok(WINDOWS_RELEASE_WORKTREE_ROOT_MAX_LENGTH + 1 + representativeNsisTail.length < 260);
+});
 
 const aggregateInventory = (entries) => {
   const digest = createHash('sha256');
@@ -1061,7 +1085,7 @@ test('post-promotion validation failure rolls back and ambiguous recovery stays 
 
 test('startup recovery scans only safe release worktrees and exact final destinations', async () => {
   await withTemporaryRoot('htmllelujah-promotion-startup-', async (root, releaseLock) => {
-    const worktreeRoot = path.join(root, '.htmllelujah-release-worktree-fixture');
+    const worktreeRoot = path.join(root, `.hlw-${'f'.repeat(32)}`);
     const sourceOne = path.join(worktreeRoot, 'apps', 'desktop', 'out');
     const sourceTwo = path.join(worktreeRoot, 'artifacts', 'release-evidence');
     const destinationOne = path.join(root, 'repository', 'apps', 'desktop', 'out');

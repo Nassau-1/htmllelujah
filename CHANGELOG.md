@@ -76,6 +76,8 @@ No user-facing change is queued after the V1 release candidate.
 - Made clean-source provenance hash canonical Git blob contents so safe LF/CRLF
   checkout policies cannot split one commit identity, while refusing replacement
   refs, grafts, hidden index flags, and content-transforming checkout attributes.
+- Bounded detached release-worktree names so locked pnpm and NSIS include paths stay
+  within the legacy Windows path budget used by the unsigned V1 builder.
 
 ### Known V1 boundaries
 

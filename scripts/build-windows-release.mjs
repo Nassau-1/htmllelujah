@@ -20,11 +20,14 @@ import {
   clearWorkspacePackageOutputs,
   createReleaseEnvironment,
   discoverWorkspacePackages,
+  isReleaseWorktreeName,
   promoteDirectoriesAtomically,
   recoverPendingReleasePromotions,
+  releaseWorktreeName,
   releaseReleaseLock,
   RELEASE_PROMOTION_PREFIX,
   resolveCorepackInvocation,
+  WINDOWS_RELEASE_WORKTREE_ROOT_MAX_LENGTH,
 } from './windows-release-pipeline-support.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -92,9 +95,17 @@ const assertSafeWorktree = (worktreeRoot) => {
   if (
     relation.startsWith('..') ||
     path.isAbsolute(relation) ||
-    !path.basename(worktreeRoot).startsWith('.htmllelujah-release-worktree-')
+    !isReleaseWorktreeName(path.basename(worktreeRoot))
   ) {
     throw new Error(`Refusing unsafe release worktree path: ${worktreeRoot}.`);
+  }
+  if (
+    process.platform === 'win32' &&
+    worktreeRoot.length > WINDOWS_RELEASE_WORKTREE_ROOT_MAX_LENGTH
+  ) {
+    throw new Error(
+      `Release worktree root is too long for the NSIS path budget (${worktreeRoot.length} > ${WINDOWS_RELEASE_WORKTREE_ROOT_MAX_LENGTH}): ${worktreeRoot}.`,
+    );
   }
 };
 
@@ -102,10 +113,7 @@ const options = parseArgs(process.argv.slice(2));
 const packageBlueprint = await discoverWorkspacePackages(repositoryRoot);
 const dryRunId = '00000000-0000-4000-8000-000000000000';
 const buildId = options.dryRun ? dryRunId : randomUUID();
-const worktreeRoot = path.join(
-  path.dirname(repositoryRoot),
-  `.htmllelujah-release-worktree-${buildId}`,
-);
+const worktreeRoot = path.join(path.dirname(repositoryRoot), releaseWorktreeName(buildId));
 const paths = {
   buildId,
   session: path.join(worktreeRoot, 'artifacts', 'build-provenance-session.json'),
@@ -201,7 +209,7 @@ try {
       for (const record of journal.records) {
         const relative = path.relative(promotionParent, record.source);
         const firstSegment = relative.split(path.sep)[0];
-        if (firstSegment.startsWith('.htmllelujah-release-worktree-')) {
+        if (isReleaseWorktreeName(firstSegment)) {
           recoveredWorktrees.add(path.join(promotionParent, firstSegment));
         }
       }

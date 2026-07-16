@@ -100,6 +100,11 @@ provenance before the build, and revalidates source and package-output hashes af
 packaging. If the pnpm store was intentionally not primed, use
 `node scripts/build-windows-release.mjs --online-install` explicitly.
 
+The detached worktree uses a bounded `.hlw-<compact UUID>` basename and the Windows
+builder rejects a staging root longer than 80 characters. This preserves headroom for
+pnpm's nested dependency paths and NSIS's legacy path limit; use a shallower checkout
+location if that explicit preflight fails.
+
 For a clean worktree, the source identity hashes canonical Git blob bytes rather than
 checkout-specific line endings, so an allowed LF/CRLF materialization does not change
 the identity of one commit. A dirty development build still hashes the tracked files

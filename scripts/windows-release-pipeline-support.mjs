@@ -47,6 +47,8 @@ const RELEASE_ENVIRONMENT_KEYS_TO_REMOVE = [
 
 export const RELEASE_PROMOTION_PREFIX = '.htmllelujah-release-promotion-';
 export const RELEASE_PREPARATION_PREFIX = '.htmllelujah-release-preparation-';
+export const RELEASE_WORKTREE_PREFIX = '.hlw-';
+export const WINDOWS_RELEASE_WORKTREE_ROOT_MAX_LENGTH = 80;
 const RELEASE_CLEANUP_PREFIX = '.htmllelujah-release-cleanup-';
 const RELEASE_LOCK_NAME = '.htmllelujah-release-lock';
 const RELEASE_LOCK_PREPARATION_PREFIX = '.htmllelujah-release-lock-preparation-';
@@ -64,6 +66,20 @@ const pathKey = (value, platform = process.platform) => {
   const resolved = path.resolve(value);
   return platform === 'win32' ? resolved.toLocaleLowerCase('en-US') : resolved;
 };
+
+export const releaseWorktreeName = (buildId) => {
+  if (typeof buildId !== 'string') throw new Error('Release worktree build ID is invalid.');
+  const compactId = buildId.replaceAll('-', '').toLowerCase();
+  if (!/^[0-9a-f]{32}$/u.test(compactId)) {
+    throw new Error('Release worktree build ID is invalid.');
+  }
+  return `${RELEASE_WORKTREE_PREFIX}${compactId}`;
+};
+
+export const isReleaseWorktreeName = (value) =>
+  typeof value === 'string' &&
+  value.startsWith(RELEASE_WORKTREE_PREFIX) &&
+  /^[0-9a-f]{32}$/u.test(value.slice(RELEASE_WORKTREE_PREFIX.length));
 
 export const createReleaseEnvironment = (source = process.env) => {
   const environment = { ...source };
@@ -601,7 +617,7 @@ const validateJournal = async ({
         relation === '' ||
         relation.startsWith('..') ||
         path.isAbsolute(relation) ||
-        !firstSegment.startsWith('.htmllelujah-release-worktree-')
+        !isReleaseWorktreeName(firstSegment)
       ) {
         throw new Error('Release promotion journal references an unsafe staging worktree.');
       }
