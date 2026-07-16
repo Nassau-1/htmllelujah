@@ -71,11 +71,19 @@ describe('MCP destructive command classification', () => {
 
   it('fails closed for complete replacements that can silently remove nested content', () => {
     const deck = createDefaultDeck();
+    const theme = deck.themes[0];
     const master = deck.masters[0];
     const layout = deck.layouts[0];
-    if (master === undefined || layout === undefined) throw new Error('Missing default styles.');
+    if (theme === undefined || master === undefined || layout === undefined) {
+      throw new Error('Missing default styles.');
+    }
 
     const replacementCommands: readonly DocumentCommand[] = [
+      {
+        type: 'theme.update',
+        themeId: theme.id,
+        replacement: { ...theme, name: 'Replacement theme' },
+      },
       {
         type: 'master.update',
         masterId: master.id,

@@ -101,6 +101,7 @@ const APPROVAL_REQUIRED_COMMANDS = new Set<DocumentCommand['type']>([
   // These commands carry complete replacement values. Without the previous
   // document, this boundary cannot prove that nested elements or group
   // children were preserved, so MCP must classify them as destructive.
+  'theme.update',
   'master.update',
   'layout.update',
   'element.update',

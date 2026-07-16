@@ -115,6 +115,27 @@ describe('DesktopMcpBridge', () => {
       layout.elements.length,
     );
 
+    const beforeThemeReplacement = runtime.getSnapshot(source.sessionId);
+    const theme = beforeThemeReplacement.document.themes[0];
+    if (theme === undefined) throw new Error('Missing default theme.');
+    const themeProposal = await bridge.proposeCommands({
+      documentId: source.documentId,
+      expectedRevision: beforeThemeReplacement.revision,
+      label: 'Submit complete theme replacement',
+      commands: [
+        {
+          type: 'theme.update',
+          themeId: theme.id,
+          replacement: { ...theme, name: 'Agent replacement theme' },
+        },
+      ],
+    });
+    expect(themeProposal.requiresApproval).toBe(true);
+    await expect(
+      bridge.commitProposal({ proposalId: themeProposal.proposalId }),
+    ).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
+    expect(runtime.getSnapshot(source.sessionId).document.themes[0]?.name).toBe(theme.name);
+
     const beforePage = runtime.getSnapshot(source.sessionId);
     const destructive = await bridge.proposeCommands({
       documentId: source.documentId,
