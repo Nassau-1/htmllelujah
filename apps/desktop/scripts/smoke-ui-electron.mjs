@@ -10,6 +10,7 @@ const repositoryRoot = path.resolve(desktopRoot, '..', '..');
 const evidenceDirectory = path.join(repositoryRoot, 'artifacts', 'evidence');
 const screenshotPath = path.join(evidenceDirectory, 'v1-editor-electron.png');
 const reportPath = path.join(evidenceDirectory, 'v1-editor-electron.json');
+const dialogAutomationPath = path.join(import.meta.dirname, 'automate-save-dialog.ps1');
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const waitFor = async (operation, timeoutMs, label) => {
@@ -45,6 +46,46 @@ const terminate = async (child) => {
     sleep(3_000).then(() => child.kill('SIGKILL')),
   ]);
 };
+
+const automateFileDialog = (rootProcessId, windowTitle, targetPath) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        dialogAutomationPath,
+        '-RootProcessId',
+        String(rootProcessId),
+        '-WindowTitle',
+        windowTitle,
+        '-TargetPath',
+        targetPath,
+        '-TimeoutSeconds',
+        '30',
+      ],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString('utf8')).slice(-2_000);
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('Native file-dialog automation timed out.'));
+    }, 45_000);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`Native file-dialog automation exited ${code ?? signal}. ${stderr}`));
+    });
+  });
 
 class CdpSession {
   #nextId = 1;
@@ -114,6 +155,14 @@ class CdpSession {
 }
 
 const userData = await mkdtemp(path.join(tmpdir(), 'htmllelujah-ui-smoke-'));
+const imageFixturePath = path.join(userData, 'native-image-import.png');
+await writeFile(
+  imageFixturePath,
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  ),
+);
 const executable = process.env.HTMLLELUJAH_EXECUTABLE;
 const openPath = process.env.HTMLLELUJAH_OPEN_PATH;
 const expectedDeckName = process.env.HTMLLELUJAH_EXPECTED_DECK_NAME;
@@ -350,6 +399,30 @@ try {
     'Redone shape keyboard selection',
   );
 
+  if (application.pid === undefined) throw new Error('The Electron process ID is unavailable.');
+  const imageDialog = automateFileDialog(application.pid, 'Insert image', imageFixturePath);
+  await click('[aria-label="Add image"]', 'Add image');
+  await imageDialog;
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 2}`,
+    'Native image insertion',
+    15_000,
+  );
+  await waitForRenderer(
+    `document.querySelector('.canonical-hitbox.is-selected')?.getAttribute('aria-label')?.includes(', image') === true`,
+    'Imported image selection',
+  );
+  await click('[aria-label="Undo"]', 'Undo image import');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 1}`,
+    'Undo native image import',
+  );
+  await click('[aria-label="Redo"]', 'Redo image import');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 2}`,
+    'Redo native image import',
+  );
+
   await clickButtonWithText('File', 'File menu');
   await waitForRenderer(
     `document.querySelector('[role="menu"][aria-label="File menu"]') !== null`,
@@ -520,7 +593,7 @@ try {
     activeInspectorTab:
       document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() ?? '',
   }))()`);
-  if (finalState.elementCount !== initial.elementCount + 1 || finalState.selectedCount !== 1) {
+  if (finalState.elementCount !== initial.elementCount + 2 || finalState.selectedCount !== 1) {
     throw new Error('The user edit was not preserved after undo and redo.');
   }
   if (finalState.openDialogs !== 0 || finalState.activeInspectorTab !== 'Properties') {
@@ -552,6 +625,7 @@ try {
       'real Electron renderer opened through the secure app protocol',
       'essential editor surfaces rendered',
       'shape insertion, undo, and redo converged',
+      'native image chooser imported one decoded image with atomic undo and redo',
       'File menu opened and closed',
       'Codex MCP dialog opened and closed',
       'LAN collaboration dialog opened and closed',
