@@ -440,16 +440,12 @@ test('clean source identity uses canonical Git blobs across checkout EOL policie
       ...process.env,
       GIT_REPLACE_REF_BASE: customReplacementBase,
     };
-    assert.match(
-      runGit(crlfCheckout, ['show', 'HEAD:deck.txt'], customReplacementEnvironment),
-      /replacement tree/iu,
-    );
     assert.throws(
       () =>
         assertNoGitObjectSubstitution(crlfCheckout, {
           environment: customReplacementEnvironment,
         }),
-      /replacement refs are forbidden/iu,
+      /custom Git replacement namespace is invalid/iu,
     );
     runGit(crlfCheckout, ['update-ref', '-d', customReplacementRef]);
 

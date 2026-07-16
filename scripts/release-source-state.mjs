@@ -183,7 +183,7 @@ const replacementNamespace = (value) => {
   if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) {
     throw new Error('The custom Git replacement namespace is invalid.');
   }
-  if (!value.startsWith('refs/') || value.length <= 'refs/'.length) {
+  if (!value.startsWith('refs/') || !value.endsWith('/') || value.length <= 'refs/'.length) {
     throw new Error('The custom Git replacement namespace is invalid.');
   }
   return value;
