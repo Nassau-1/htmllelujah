@@ -316,6 +316,91 @@ describe('authoritative collaboration host', () => {
     expect(secondTransaction.sessionSeq).toBe(2);
   });
 
+  it('evicts the oldest idempotency result and keeps accepting commands past many capacities', () => {
+    const idempotencyLimit = 3;
+    const { host } = createHost({ idempotencyLimit });
+    const element = host.getSnapshot().document.slides[0]!.elements[0]!;
+    const retained: Array<{
+      request: CommandBatchRequest;
+      transaction: ReturnType<AuthoritativeSessionHost['submit']>;
+    }> = [];
+
+    for (let sequence = 1; sequence <= idempotencyLimit * 10; sequence += 1) {
+      const request = createRequest(host, {
+        clientId: CLIENT_A,
+        clientRequestId: requestId(1_000 + sequence),
+        commands: [
+          transformCommand(element.id, {
+            ...element.frame,
+            xPt: element.frame.xPt + sequence,
+          }),
+        ],
+      });
+      const transaction = host.submit(request);
+
+      expect(host.submit(structuredClone(request))).toEqual(transaction);
+      expect(host.sessionSeq).toBe(sequence);
+      retained.push({ request, transaction });
+      if (retained.length > idempotencyLimit) retained.shift();
+    }
+
+    retained.forEach(({ request, transaction }) => {
+      expect(host.submit(structuredClone(request))).toEqual(transaction);
+    });
+    expect(host.sessionSeq).toBe(idempotencyLimit * 10);
+
+    const reusedEvictedKey = createRequest(host, {
+      clientId: CLIENT_A,
+      clientRequestId: requestId(1_001),
+      commands: [transformCommand(element.id, { ...element.frame, xPt: 999 })],
+    });
+    expect(host.submit(reusedEvictedKey).sessionSeq).toBe(idempotencyLimit * 10 + 1);
+  });
+
+  it('does not evict a retained idempotency result when a new submission fails', () => {
+    const { host } = createHost({ idempotencyLimit: 1 });
+    const element = host.getSnapshot().document.slides[0]!.elements[0]!;
+    const retainedRequest = createRequest(host, {
+      clientId: CLIENT_A,
+      clientRequestId: requestId(2_001),
+      commands: [transformCommand(element.id, { ...element.frame, xPt: 123 })],
+    });
+    const retainedTransaction = host.submit(retainedRequest);
+
+    expectCollaborationError(
+      () =>
+        host.submit(
+          createRequest(host, {
+            clientId: CLIENT_B,
+            clientRequestId: requestId(2_002),
+            baseRevision: retainedTransaction.beforeRevision,
+            baseSeq: 0,
+            commands: [transformCommand(element.id, { ...element.frame, xPt: 456 })],
+          }),
+        ),
+      'REVISION_CONFLICT',
+    );
+
+    expect(host.submit(structuredClone(retainedRequest))).toEqual(retainedTransaction);
+    expect(host.sessionSeq).toBe(1);
+  });
+
+  it.each([
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+    null,
+    '3',
+  ])('rejects an invalid idempotency limit (%s)', (idempotencyLimit) => {
+    expectCollaborationError(
+      () => createHost({ idempotencyLimit: idempotencyLimit as number }),
+      'INVALID_REQUEST',
+    );
+  });
+
   it('enforces, renews, releases, and expires 15-second text leases', () => {
     let now = 1_000;
     const { host } = createHost({ clock: () => now });

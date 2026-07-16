@@ -185,7 +185,8 @@ export class AuthoritativeSessionHost {
     this.idFactory = options.idFactory ?? (() => globalThis.crypto.randomUUID());
     this.sessionId = options.sessionId ?? this.idFactory();
     this.tailLimit = options.tailLimit ?? DEFAULT_TAIL_LIMIT;
-    this.idempotencyLimit = options.idempotencyLimit ?? DEFAULT_IDEMPOTENCY_LIMIT;
+    this.idempotencyLimit =
+      options.idempotencyLimit === undefined ? DEFAULT_IDEMPOTENCY_LIMIT : options.idempotencyLimit;
     this.maxCommandsPerBatch = options.maxCommandsPerBatch ?? 100;
     this.maxCommandPayloadBytes =
       options.maxCommandPayloadBytes ?? DEFAULT_MAX_COMMAND_PAYLOAD_BYTES;
@@ -290,12 +291,6 @@ export class AuthoritativeSessionHost {
       }
       return clone(previous.transaction);
     }
-    if (this.idempotency.size >= this.idempotencyLimit) {
-      throw new CollaborationError(
-        'IDEMPOTENCY_CAPACITY',
-        'The session idempotency registry reached its configured limit.',
-      );
-    }
 
     this.assertAdapterRevision();
     if (request.baseSeq > this.sessionSequence) {
@@ -365,10 +360,23 @@ export class AuthoritativeSessionHost {
     access.writeSet.forEach((key) => this.lastModifiedSeq.set(key, nextSeq));
     this.tail.push(transaction);
     if (this.tail.length > this.tailLimit) this.tail.shift();
-    this.idempotency.set(idempotencyKey, { fingerprint, transaction });
+    this.rememberIdempotentResult(idempotencyKey, { fingerprint, transaction });
     this.removeInvalidTextLeases(result.document);
 
     return clone(transaction);
+  }
+
+  private rememberIdempotentResult(key: string, entry: IdempotencyEntry): void {
+    this.idempotency.set(key, entry);
+
+    // Map iteration follows insertion order. Keeping retries at their original position gives us
+    // a deterministic window of the most recently committed requests and prevents an old retry
+    // from pinning itself indefinitely. Eviction happens only after a successful transaction.
+    while (this.idempotency.size > this.idempotencyLimit) {
+      const oldest = this.idempotency.keys().next();
+      if (oldest.done) return;
+      this.idempotency.delete(oldest.value);
+    }
   }
 
   public getResync(rawRequest: unknown): ResyncResponse {
