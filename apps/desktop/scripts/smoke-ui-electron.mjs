@@ -126,6 +126,7 @@ const launchArguments = [
   '--remote-debugging-port=0',
   '--force-device-scale-factor=1',
 ];
+const launchStartedAt = performance.now();
 const application = spawn(launchCommand, launchArguments, {
   cwd: desktopRoot,
   windowsHide: true,
@@ -243,6 +244,7 @@ try {
     15_000,
   );
   await evaluate(`document.fonts.ready.then(() => true)`);
+  const interactiveReadyMs = Number((performance.now() - launchStartedAt).toFixed(3));
 
   const initial = await evaluate(`(() => ({
     title: document.title,
@@ -517,6 +519,11 @@ try {
     passed: true,
     testedAt: new Date().toISOString(),
     launchMode: executable === undefined ? 'source-build' : 'packaged-executable',
+    performance: {
+      interactiveReadyMs,
+      warmStartBudgetMs: 3_000,
+      withinWarmStartBudget: interactiveReadyMs < 3_000,
+    },
     rendererTitle: initial.title,
     initial,
     final: finalState,
