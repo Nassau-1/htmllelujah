@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-15
+- Last reviewed: 2026-07-16
 
 ## Context
 
@@ -39,6 +40,12 @@ revision-bound, expires after two minutes, and is single-use. Tool results expos
 revisions, counts, dimensions, warnings, and stable safe error codes rather than paths
 or unrestricted bytes. V1 pauses MCP mutations during live LAN collaboration to avoid
 a second command-ordering authority.
+
+The MCP contract accepts at most 100 commands per proposal and 2 MiB frames/results.
+The desktop runtime issues one-minute proposals and retains at most 64 pending
+proposals. It retains at most 32 unconsumed two-minute approvals and 64 consumed
+receipts for 30 seconds. Capacity is reserved before asynchronous proposal work and
+expired state is purged before admission or use.
 
 The server exposes no arbitrary path, raw file, shell, URL fetch, raw HTML/CSS/SVG,
 script execution, internal document-state replacement, secret retrieval, collaboration

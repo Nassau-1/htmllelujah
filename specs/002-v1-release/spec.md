@@ -4,7 +4,10 @@
 
 **Created**: 2026-07-15
 
-**Status**: Approved for implementation
+**Last reviewed**: 2026-07-16
+
+**Status**: Implemented release candidate; exact artifact evidence and publication
+remain pending
 
 **Input**: Deliver a robust, offline-first Windows presentation editor whose
 structured documents can be edited by people, automated through a local MCP server,
@@ -39,17 +42,18 @@ V1 includes:
   alignment, and line spacing;
 - versioned themes, slide masters, layouts, placeholders, reusable style roles,
   layout switching, and reset-to-layout behavior that preserves user content;
-- embedded PNG, JPEG, and WebP images with crop, fit, alt text, replacement, and
-  bounded decoding;
+- embedded PNG, JPEG, and WebP images with crop, fit, alt text, replacement, bounded
+  pre-decode header validation, and atomic import plus insertion or replacement;
 - native editable tables with rows, columns, cells, header styling, fills, borders,
   alignment, and tab-separated clipboard interchange;
 - rectangles, rounded rectangles, ellipses, triangles, diamonds, lines, arrows,
-  straight and elbow connectors, groups, and a licensed built-in icon catalog based
-  on Lucide plus a reviewed round-flag asset catalog;
+  straight and elbow connectors, groups, a small original local vector-icon catalog,
+  and round flags rendered from validated Unicode regional-indicator characters;
 - one shared DOM/SVG renderer for the editor, thumbnails, presentation, standalone
   HTML, and exact-page PDF;
-- versioned `.hdeck` files, atomic save, autosave, migration, read-only handling of
-  newer formats, crash recovery, and synchronized-folder conflict detection;
+- versioned `.hdeck` files, explicit atomic snapshot save, automatic local recovery
+  journaling, migration, typed refusal of newer formats, crash recovery, and
+  synchronized-folder conflict detection;
 - a local stdio MCP server with typed, revision-aware, attributable document tools;
 - authenticated same-LAN collaboration with one authoritative host, object-level
   concurrent editing, same-text soft locks, presence, reconnect, and one snapshot
@@ -108,8 +112,9 @@ connectors, group objects, and edit the master and layout.
 
 **Acceptance Scenarios**:
 
-1. Mixed text styles survive caret movement, selection changes, undo, save, reopen,
-   standalone HTML export, and PDF export.
+1. Element- and block-level text styles survive selection changes, undo, save,
+   reopen, standalone HTML export, and PDF export. Caret-range mixed-run formatting is
+   a post-V1 feature.
 2. Rich clipboard input is normalized into supported blocks and marks; scripts,
    remote references, arbitrary styles, and unknown nodes are discarded.
 3. Pasted TSV creates or fills a rectangular table without formulas or live links.
@@ -132,8 +137,9 @@ state without overwriting a changed source file.
 
 1. Committed transactions enter a checksummed local recovery journal before the UI
    reports them as locally durable.
-2. Autosave writes a verified temporary sibling and atomically replaces the target;
-   it never modifies an archive in place.
+2. Recovery autosave journals committed edits locally. Only explicit Save or Save As
+   writes a verified temporary sibling and atomically replaces a file target; no
+   archive is modified in place.
 3. A truncated journal replays through its final complete valid record and ignores
    only the incomplete tail.
 4. If the target fingerprint changed externally, save stops in `conflict` and offers
@@ -184,6 +190,8 @@ batch, render a preview, validate, and request an approved export.
 5. MCP cannot submit raw HTML, scripts, arbitrary paths, arbitrary URLs, or untyped
    document patches.
 6. The user's undo history identifies MCP transactions and can undo them as batches.
+7. Proposals, approvals, frames, results, and command batches enforce their documented
+   TTL and capacity limits before asynchronous work is admitted.
 
 ### User Story 6 - Collaborate on the same LAN (Priority: P2)
 
@@ -270,15 +278,18 @@ non-administrator accounts.
 - **FR-017**: The MCP server MUST use local stdio, bounded message sizes, typed tools,
   revision checks, attributable transactions, and desktop-issued approvals.
 - **FR-018**: LAN collaboration MUST use an authenticated encrypted private-network
-  channel with one authoritative host and one shared-file writer.
+  channel with one authoritative host and one shared-file writer inside the session.
+  Cross-machine writer-lease enforcement requires a coherent shared filesystem;
+  consumer cloud-sync replicas are snapshot transport only.
 - **FR-019**: Collaboration discovery MUST disclose only an ephemeral service identity
   and document proof that cannot be reused after expiry.
 - **FR-020**: V1 MUST NOT merge edits made while disconnected or accept concurrent
   direct editing of the same text element.
 - **FR-021**: The application MUST remain fully usable for local authoring,
   presentation, save, recovery, HTML export, and PDF export without internet access.
-- **FR-022**: Runtime dependencies, fonts, icons, and flag assets MUST pass license,
-  provenance, notice, and SBOM gates before distribution.
+- **FR-022**: Runtime dependencies, bundled assets, local icon source, system-font
+  usage, and Unicode flag rendering MUST pass applicable license, provenance, notice,
+  and SBOM gates before distribution.
 
 ## Non-functional requirements
 
@@ -286,17 +297,19 @@ non-administrator accounts.
   under 100 ms locally; p95 gesture preview under 16.7 ms; p95 LAN accepted-command
   round trip under 250 ms on the reference private network.
 - **NFR-002 Capacity**: a supported deck contains up to 500 slides, 10,000 elements,
-  2,048 archive entries, 500 MiB expanded archive data, 50 MiB per asset, 20 MiB
-  document JSON, group depth 16, and image dimensions up to 100 megapixels.
+  2,048 archive entries, 500 MiB expanded archive data, 50 MiB per asset, 32 MiB
+  document JSON, group depth 16, and image dimensions up to 16,384 pixels per edge
+  and 64 Mi pixels. The desktop image picker applies a narrower 25 MiB input limit.
 - **NFR-003 Reliability**: 100 sequential saves and 50 sequential exports leave no
   partial targets, stale hidden windows, orphaned processes, or unrecoverable journal.
-- **NFR-004 Accessibility**: editor chrome and critical flows meet WCAG 2.2 AA keyboard,
-  focus, name, contrast, reduced-motion, and screen-reader smoke requirements.
+- **NFR-004 Accessibility**: editor chrome and critical flows meet WCAG 2.2 AA
+  keyboard, focus, name, contrast, and reduced-motion requirements. Electron/DOM
+  automation does not substitute for a recorded manual Narrator or NVDA smoke.
 - **NFR-005 Security**: renderers stay sandboxed, context-isolated, without Node.js;
   document content cannot navigate, open popups, request permissions, or fetch remote
   resources.
 - **NFR-006 Compatibility**: V1 supports Windows 11 x64 and handles 100%, 125%, 150%,
-  and 200% display scaling.
+  and 200% display scaling in a desktop workspace at least 1080 CSS pixels wide.
 - **NFR-007 Public hygiene**: every fixture, screenshot, log sample, and document is
   synthetic, public-safe, and free of private organization or user context.
 
@@ -317,7 +330,8 @@ non-administrator accounts.
 - Read-only, vanished, renamed, cloud-locked, externally changed, and full-disk save
   targets; application termination at every write stage.
 - Presentation on portrait and ultrawide displays; unavailable display; render-ready
-  timeout; missing bundled font; hidden slide; no slides eligible to present.
+  timeout; unavailable requested system font; hidden slide; no slides eligible to
+  present.
 - MCP partial frames, oversized messages, invalid JSON-RPC, unknown tools, stale
   revisions, expired approvals, client termination, and stdout contamination.
 - LAN duplicate host, expired join code, clock skew, reconnect expiry, conflicting text
@@ -350,7 +364,7 @@ V1 MUST NOT ship if any of the following remains:
 
 - an editor action mutates fixture or renderer state outside the command layer;
 - a surface uses an independent slide renderer;
-- save can overwrite an externally changed file without approval;
+- save can overwrite an externally changed file instead of returning a typed conflict;
 - a corrupt or hostile archive crosses configured limits or escapes its logical root;
 - a crash can remove both the last verified snapshot and all valid recovery records;
 - a renderer, MCP tool, collaborator, or document asset obtains arbitrary filesystem,

@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-15
+- Last reviewed: 2026-07-16
 
 ## Context
 
@@ -36,6 +37,11 @@ Every accepted transaction enters a checksummed length-prefixed journal in the c
 user's local application-data recovery area. The journal is not stored beside the deck
 and is not synchronized as a collaboration transport. A truncated tail does not
 invalidate its preceding valid records.
+
+That journal is V1's recovery autosave; it does not replace the selected `.hdeck` on
+an idle timer. Bounded recovery-blob garbage collection preserves references reachable
+from documents, journals, history, staged imports, and active sessions. A base snapshot
+with no subsequent journal record is not shown as a recovery candidate.
 
 Save writes a unique temporary sibling, flushes it, reopens and validates it, compares
 the destination fingerprint with the opened file, and atomically replaces the target.

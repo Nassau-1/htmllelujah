@@ -1,6 +1,6 @@
 # Operations Guide
 
-Status: V1 development, packaging, and operator guidance, 2026-07-15.
+Status: V1 release-candidate packaging and operator guidance, 2026-07-16.
 
 ## Supported environment
 
@@ -53,6 +53,10 @@ Add verification at the same boundary as the change. A document change needs mod
 and command tests; a visual change needs renderer and opened-app evidence; a desktop
 capability needs validated IPC and packaged Electron coverage; a release change needs
 inspection of the exact artifact.
+
+The current release record template is
+[`releases/v1.0.0.md`](releases/v1.0.0.md). `PENDING` fields in that record are release
+blockers or explicit residual limitations; do not replace them with inferred results.
 
 ## Source verification
 
@@ -132,9 +136,27 @@ For the local MCP bridge, the desktop package exposes a focused Electron smoke:
 pnpm --filter @htmllelujah/desktop smoke:electron:mcp
 ```
 
-This is not a substitute for invoking the installed `HTMLlelujah-MCP.cmd` from an
-external MCP client and confirming stdout purity, approvals, stale revisions, undo,
-import/export dialogs, desktop absence, and process teardown.
+The native Save As, HTML, and PDF dialog workflow and the Electron accessibility and
+scaling workflow have dedicated Windows harnesses:
+
+```powershell
+pnpm --filter @htmllelujah/desktop smoke:electron:exports
+pnpm --filter @htmllelujah/desktop build
+node .\apps\desktop\scripts\smoke-accessibility-scaling-windows.mjs
+```
+
+For an unpacked or installed candidate, set `HTMLLELUJAH_EXECUTABLE` to its exact
+`HTMLlelujah.exe` before the accessibility command. The harness checks semantic
+controls, keyboard focus, reduced motion, containment at a compact 1120 by 720
+viewport, and 100%, 125%, 150%, and 200% forced device scaling. It does not simulate
+spoken output, a real GPU/monitor combination, Narrator, or NVDA. A recorded manual
+Narrator or NVDA pass remains necessary for release-level assistive-technology
+confidence; if it is not performed, the release record must say so as a limitation.
+
+These harnesses are not a substitute for invoking the installed
+`HTMLlelujah-MCP.cmd` from an external MCP client and confirming stdout purity,
+approvals, stale revisions, undo, import/export dialogs, desktop absence, and process
+teardown.
 
 ## Installer and file-association tests
 
@@ -161,6 +183,17 @@ state is rooted under `%APPDATA%\HTMLlelujah` and includes:
 
 - `recovery/` for base snapshots, checksummed journals, metadata, and asset blobs; and
 - `mcp/endpoint-v1.json` for the expiring local MCP endpoint while the desktop runs.
+
+Every committed edit is appended to the private recovery journal before local
+durability is acknowledged. Recovery blob cleanup uses bounded mark-and-sweep passes
+that preserve document, journal, history, staged, and current-session references. The
+journal is the recovery autosave; it does not silently replace the user-selected
+`.hdeck`. Explicit Save or Save As creates the verified file snapshot.
+
+Image import reads at most 25 MiB, parses a bounded PNG/JPEG/WebP header before pixel
+decode, and requires decoded dimensions to match. Asset registration plus insertion
+or replacement is one durable command transaction and one undo step; failed imports
+do not leave an orphaned document reference.
 
 Do not ask a user to delete recovery data as the first troubleshooting step. Preserve
 the original `.hdeck`, list recovery candidates in the app, open the candidate, verify
@@ -209,6 +242,11 @@ the desktop Codex panel for destructive commit, agent undo, import, HTML export,
 PDF export. Approval IDs and the endpoint descriptor are secrets: do not paste them
 into logs, configuration examples, or issue reports.
 
+V1 accepts at most 100 commands in a proposal and 2 MiB per MCP frame or encoded
+result. The desktop retains at most 64 proposals (one-minute default expiry), 32
+unconsumed approvals (two-minute expiry), and 64 consumed receipts (30-second expiry).
+New work is rejected at capacity; expired entries are purged instead of accumulating.
+
 If the bridge reports unavailable:
 
 1. confirm the desktop is running under the same Windows account;
@@ -237,6 +275,9 @@ Dependency additions and upgrades must:
 production graph. LGPL remains blocked for npm runtime dependencies; Electron's
 separate unmodified FFmpeg binary has its own narrow review in
 [`docs/legal/electron-runtime-license-review.md`](legal/electron-runtime-license-review.md).
+That document is an engineering compliance record, not legal advice. Qualified legal
+approval of the corresponding-source mechanism remains pending and is required before
+commercial distribution.
 
 The installer and installed directory must contain `EULA.txt`, the project source
 notice, `THIRD_PARTY_NOTICES.md`, `LICENSE.electron.txt`, and

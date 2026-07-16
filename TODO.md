@@ -18,13 +18,15 @@ reported as passed until their results are recorded.
 - [x] Use one DOM/SVG renderer for editor, thumbnails, presentation, standalone HTML,
       and PDF.
 - [x] Implement bounded `.hdeck` archives, content-addressed assets, durable journals,
-      recovery candidates, external-change detection, and atomic explicit save.
+      recovery candidates, recovery-blob garbage collection, external-change
+      detection, and atomic explicit save.
 - [x] Implement offline presentation, standalone HTML export, and PDF export.
 - [x] Implement authenticated local stdio MCP with typed proposal/commit, revision
-      conflicts, attribution, undo, one-time approvals, import, and export.
+      conflicts, attribution, undo, bounded proposal/approval state, one-time
+      approvals, import, and export.
 - [x] Implement encrypted private-LAN authoritative-host collaboration, optional
-      discovery, soft text locks, reconnect handling, detached guest recovery, and
-      one shared-file writer.
+      discovery, soft text locks with an owner/read-only editor state, reconnect
+      handling, detached guest recovery, and one shared-file writer.
 - [x] Implement Windows x64 packaging, `.hdeck` association, second-instance file
       opening, hardened Electron fuses, application icon, and console MCP launcher.
 
@@ -39,7 +41,8 @@ reported as passed until their results are recorded.
 - [ ] Review editor, presentation, standalone HTML, and rasterized PDF visual evidence
       at supported page formats and display scales.
 - [ ] Complete keyboard, focus, reduced-motion, contrast, and screen-reader smoke
-      checks on Windows 11 x64.
+      checks on Windows 11 x64. The source-build CDP/DOM scaling smoke is preliminary;
+      the exact installed candidate and a manual Narrator or NVDA pass remain pending.
 - [ ] Run the multi-instance LAN convergence and reconnect soak required by
       [`specs/002-v1-release/test-matrix.md`](specs/002-v1-release/test-matrix.md).
 - [ ] Record warm-start, command acknowledgement, export, large-deck, repeated-save,

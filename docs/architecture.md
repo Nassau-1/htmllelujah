@@ -1,6 +1,6 @@
 # Architecture
 
-Status: V1 implementation baseline, 2026-07-15.
+Status: V1 release-candidate implementation baseline, 2026-07-16.
 
 ## System objective
 
@@ -91,6 +91,11 @@ rows, columns, cells, and style data. Images reference embedded content-addresse
 assets. The model never stores arbitrary HTML, JavaScript, active remote URLs,
 unrestricted CSS, or shell instructions.
 
+Human image import validates a bounded header before pixel decode, verifies decoded
+dimensions, then registers the content-addressed bytes and inserts or replaces the
+image in one runtime transaction. The document revision, recovery journal, asset
+reference, and undo history therefore advance together or not at all.
+
 ## Shared rendering
 
 `packages/renderer` resolves a canonical slide projection and renders semantic text,
@@ -107,6 +112,12 @@ Round flags are Unicode regional-indicator glyphs inside a circular frame, not a
 bundled image catalog. Interface icons come from the reviewed Lucide dependency;
 slide-content vector paths are local project source. See
 [`legal/asset-provenance.md`](legal/asset-provenance.md).
+
+The desktop shell keeps a three-pane editor at a supported minimum width of 1080 CSS
+pixels, compacts panel widths and toolbar labels below 1260 pixels, and sizes slide
+thumbnails from their observed container. Semantic controls, natural tab order,
+visible focus, reduced motion, contained overflow, and Windows scaling are tested at
+the Electron boundary; CDP/DOM checks do not substitute for Narrator or NVDA.
 
 ## `.hdeck`, persistence, and recovery
 
@@ -126,6 +137,11 @@ Every committed edit is appended to a checksummed private recovery journal. The 
 acknowledges local durability only after the journal write completes. Recovery data
 lives under the current user's application-data directory and is not the shared file
 transport.
+
+Recovery asset blobs are collected by bounded mark-and-sweep passes. The collector
+marks assets referenced by current documents, journals, history, staged imports, and
+active sessions, and removes only old unreferenced blobs. A persisted base with no
+new journal record is not surfaced as a false recovery candidate.
 
 V1 deliberately separates recovery autosave from shared-file replacement: edits are
 journaled immediately, while replacing a user-selected `.hdeck` requires explicit
@@ -158,9 +174,11 @@ information, not titles, filenames, paths, slide text, assets, or reusable secre
 
 Guests maintain a detached local session and recovery record. Independent objects
 may be edited concurrently through host ordering. A soft lock prevents concurrent
-direct editing of the same text element. V1 does not queue disconnected edits,
-elect a new writer, or merge divergent text. If the host becomes unavailable, the
-guest becomes non-editing until an explicit rejoin or independent copy flow.
+direct editing of the same text element. Focusing the editor requests the lease;
+the text inspector exposes owned, pending, or peer-held state and disables controls
+while a peer owns it. V1 does not queue disconnected edits, elect a new writer, or
+merge divergent text. If the host becomes unavailable, the guest becomes non-editing
+until an explicit rejoin or independent copy flow.
 
 ## Local MCP architecture
 
@@ -182,6 +200,12 @@ actor attribution, and transaction label. Destructive commit, undo, import, and
 export require a single-use desktop approval bound to action, document, and revision.
 MCP edits are paused during a live LAN session in V1; reads and redacted collaboration
 status remain available.
+
+The V1 MCP boundary accepts at most 100 commands per proposal and 2 MiB frames/results.
+Desktop proposals expire after one minute and are capped at 64; desktop approvals
+expire after two minutes and are capped at 32; at most 64 consumed receipts remain
+for 30 seconds. Capacity is reserved before asynchronous proposal work so concurrent
+requests cannot overrun the limit.
 
 The packaged launcher requires Electron's `RunAsNode` fuse. `NODE_OPTIONS` and CLI
 inspection remain disabled, embedded ASAR integrity validation and ASAR-only loading

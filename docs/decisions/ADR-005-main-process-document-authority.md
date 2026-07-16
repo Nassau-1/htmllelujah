@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-15
+- Last reviewed: 2026-07-16
 
 ## Context
 
@@ -23,6 +24,11 @@ a versioned runtime-validated preload bridge. They retain only ephemeral UI stat
 as selection, zoom, scroll, caret, inspector view, pointer previews, and uncommitted
 text composition. A completed user action is submitted as one revision-checked typed
 command batch.
+
+Image import is one such completed action: the main process validates selected bytes
+before decode and commits asset registration plus image insertion or replacement as
+one durable transaction. Pending agent proposals and desktop approvals are likewise
+bounded and expire inside the main-owned session boundary.
 
 The MCP process, recovery engine, imports, and LAN transport submit the same command
 contract to the same session. No caller receives a generic IPC sender, arbitrary path,

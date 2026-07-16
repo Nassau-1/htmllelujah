@@ -7,6 +7,9 @@
 code that resembles a requirement does not count. `001-platform-fidelity` remains open
 until its own tasks and evidence are complete.
 
+**Last reviewed**: 2026-07-16. Implementation may be present while every checkbox
+remains open pending exact release evidence.
+
 Each task names its primary surface, observable acceptance, required edge coverage,
 and containment point. `[P]` means it may proceed in parallel after dependencies.
 
@@ -139,10 +142,10 @@ projections and geometry operations.
   - **Containment**: No independent surface renderer; failing object type blocks release.
 
 - [ ] **V1-031 Implement render readiness and asset capability loading**.
-  - **Acceptance**: Ready requires bundled fonts, decoded images, two stable frames, and
-    measured page geometry before its deadline.
-  - **Edges**: Slow/decode-failed image, missing font, expired/cross-session asset URL,
-    deadline and window close.
+  - **Acceptance**: Ready requires the browser's system font set and fallbacks, decoded
+    images, two stable frames, and measured page geometry before its deadline.
+  - **Edges**: Slow/decode-failed image, unavailable system font, expired/cross-session
+    asset URL, deadline and window close.
   - **Containment**: Typed `RENDER_NOT_READY`; never export partial output.
 
 - [ ] **V1-032 Separate interaction overlay from slide content root**.
@@ -203,18 +206,20 @@ and visual gates on Windows.
 **Checkpoint 4 — hard**: The main process is the only document authority and every
 persistent edit route shares its revision-aware command bus.
 
-## Phase 5: `.hdeck`, assets, save, autosave, and recovery
+## Phase 5: `.hdeck`, assets, explicit save, recovery autosave, and recovery
 
 - [ ] **V1-050 Implement bounded `.hdeck` codec** under `packages/hdeck/`.
   - **Acceptance**: Manifest/document/assets round-trip with deterministic entry order,
-    SHA-256 verification, supported limits, and typed newer-version result.
+    SHA-256 verification, supported limits, and typed refusal of a newer version while
+    leaving the source unchanged.
   - **Edges**: Traversal, absolute/NUL/backslash, symlink, duplicate/case collision,
     bomb, undeclared/missing entry, corrupt CRC/hash.
   - **Containment**: Reject before authoritative session creation.
 
 - [ ] **V1-051 Implement image import and asset store** in desktop main/runtime.
   - **Acceptance**: PNG/JPEG/WebP signature, byte, dimension, decode, and hash validation;
-    duplicates reuse content; original path is forgotten.
+    header inspection precedes decode; duplicates reuse content; original path is
+    forgotten; registration plus insertion or replacement is one durable undo step.
   - **Edges**: Wrong extension, extreme dimension, alpha, color profile, truncated data,
     cross-session capability.
   - **Containment**: Failed import creates neither asset ref nor element.
@@ -234,12 +239,14 @@ persistent edit route shares its revision-aware command bus.
     changed hash, user cancellation, existing target.
   - **Containment**: Keep target and journal; return conflict or retryable safe error.
 
-- [ ] **V1-054 Implement autosave, compaction, recovery UX, and close decisions**.
-  - **Acceptance**: Idle and max interval saves, durability labels, recovery candidate
-    selection, Save/Discard/Cancel, and compaction-after-verified-snapshot work.
+- [ ] **V1-054 Implement recovery autosave, compaction, recovery UX, and close decisions**.
+  - **Acceptance**: Committed edits reach the private journal, durability labels,
+    recovery-candidate selection, Save/Discard/Cancel, and
+    compaction-after-verified-snapshot work. No idle timer replaces the `.hdeck`.
   - **Edges**: Continuous typing, presentation, active collaboration peer, crash during
     compaction, multiple candidates.
-  - **Containment**: Autosave pauses in conflict/read-only; journal remains recoverable.
+  - **Containment**: Explicit snapshot save pauses in conflict/read-only; the local
+    journal remains recoverable.
 
 - [ ] **V1-055 Add archive, save, and recovery adversarial suites**.
   - **Acceptance**: ARC-001–005, SAV-001–005, and REC-001–004 pass, including 100 saves
@@ -296,8 +303,8 @@ source of truth and pointer previews never bypass transactions.
 ## Phase 7: Rich text and native content tools
 
 - [ ] **V1-070 Integrate bounded headless rich-text editing** in the canvas overlay.
-  - **Acceptance**: Paragraphs, H1–H6, lists, marks, bundled fonts, sizes, weights,
-    alignment, and line spacing map losslessly to canonical rich text.
+  - **Acceptance**: Paragraphs, H1–H6, lists, marks, supported system-font families,
+    sizes, weights, alignment, and line spacing map losslessly to canonical rich text.
   - **Edges**: IME, emoji, RTL, long unbroken text, nested lists, active external update.
   - **Containment**: Cancel invalid local state; preserve last committed content.
 
@@ -321,8 +328,8 @@ source of truth and pointer previews never bypass transactions.
   - **Containment**: Preserve old asset until replacement commits.
 
 - [ ] **V1-074 Implement shapes, connectors, groups, layers, icons, and flags**.
-  - **Acceptance**: Every V1 vector/catalog object inserts, edits, binds, reorders,
-    groups, saves, and renders identically across modes.
+  - **Acceptance**: Every V1 vector object, original local slide icon, and Unicode flag
+    inserts, edits, binds, reorders, groups, saves, and renders identically across modes.
   - **Edges**: Target delete/hide/group/rotate, missing catalog item, nested group.
   - **Containment**: Missing built-in becomes typed warning, never remote fallback.
 
@@ -334,7 +341,8 @@ source of truth and pointer previews never bypass transactions.
 
 - [ ] **V1-076 Complete content, accessibility, and visual suites**.
   - **Acceptance**: TXT, MST, AST, TBL, VEC, UI, and A11Y matrix rows pass.
-  - **Edges**: Full keyboard and screen-reader smoke with every critical content type.
+  - **Edges**: Full keyboard and scaling automation plus a separately recorded manual
+    Narrator or NVDA smoke with every critical content type.
   - **Containment**: A content type does not ship if its round-trip/export gate fails.
 
 **Checkpoint 7 — hard**: Every promised authoring feature works without code editing,
@@ -373,13 +381,14 @@ ready-gated, and failure-clean.
 
 ## Phase 9: Local stdio MCP
 
-- [ ] **V1-090 Define and generate MCP runtime schemas** in `packages/mcp-contracts`.
+- [ ] **V1-090 Define and generate MCP runtime schemas** in `packages/mcp-server`.
   - **Acceptance**: Read/mutation/output tools match `contracts.md`, have size limits,
     safe results, and no raw path/URL/HTML/shell/state capability.
   - **Edges**: Unknown tools/fields, oversized batches, closed/read-only document.
   - **Containment**: Schema mismatch fails before desktop connection or mutation.
 
-- [ ] **V1-091 Implement packaged stdio server** in `apps/mcp`.
+- [ ] **V1-091 Implement the packaged Electron stdio entrypoint and launcher** in
+      `apps/desktop`.
   - **Acceptance**: Initialize/list/call/shutdown works; stdout is protocol-only; stderr
     is redacted; partial and invalid frames do not desynchronize subsequent requests.
   - **Edges**: Client termination, concurrent calls, oversized/invalid JSON-RPC.
@@ -398,13 +407,14 @@ ready-gated, and failure-clean.
   - **Containment**: Atomic rejection; no alternate patch path.
 
 - [ ] **V1-094 Implement desktop approval capabilities**.
-  - **Acceptance**: Delete, overwrite, import, save, HTML, and PDF approvals are purpose-
-    bound, document-bound, expiring, single-use, and visible to the user.
+  - **Acceptance**: Classified destructive commit, agent undo, import, HTML, and PDF
+    approvals are purpose-bound, document-bound, revision-bound, expiring, single-use,
+    visible to the user, and held within bounded maps. V1 exposes no MCP save tool.
   - **Edges**: Reuse, operation mismatch, app close, revision change after approval.
   - **Containment**: Default deny and revoke all outstanding approvals on restart.
 
 - [ ] **V1-095 Complete MCP protocol, security, undo, and redaction tests**.
-  - **Acceptance**: MCP-001 through MCP-008 pass against packaged binaries.
+  - **Acceptance**: MCP-001 through MCP-009 pass against packaged binaries.
   - **Edges**: Fuzz framing and schemas; assert stdout and diagnostics content.
   - **Containment**: MCP mutations remain release-disabled until hard cases pass.
 
@@ -434,7 +444,8 @@ machine or document internals access.
 
 - [ ] **V1-103 Implement presence and direct-text soft locks**.
   - **Acceptance**: Presence is ephemeral/rate-limited; one actor owns a text edit lease;
-    lock owner/expiry is visible; conflicting editor is read-only.
+    the inspector requests/renews/releases it; owner/expiry is visible; a conflicting
+    editor is read-only.
   - **Edges**: Simultaneous lock request, lease renewal, host/peer sleep, clock skew.
   - **Containment**: Expire lock and discard unaccepted draft, never merge same text.
 
@@ -446,7 +457,8 @@ machine or document internals access.
 
 - [ ] **V1-105 Enforce the single shared-file writer**.
   - **Acceptance**: Only host can save shared target; peer save requires leave/copy;
-    fingerprint conflict still blocks host overwrite.
+    fingerprint conflict still blocks host overwrite. Cross-machine sidecar enforcement
+    is claimed only for a coherent shared namespace such as SMB/NAS.
   - **Edges**: Peer invokes Ctrl+S/MCP save, host disappears, two hosts attempt same doc.
   - **Containment**: Read-only/copy decision, never dual writer.
 
@@ -502,8 +514,9 @@ files safely, upgrades, rolls back when compatible, and uninstalls without user-
     never silently truncate.
 
 - [ ] **V1-121 Complete license, asset provenance, notices, and SBOM review**.
-  - **Acceptance**: Locked runtime/build graphs pass policy; every font/icon/round flag
-    has license, provenance, notice, version, and SHA-256; CycloneDX matches distribution.
+  - **Acceptance**: Locked runtime/build graphs pass policy; every bundled asset and
+    local icon source has applicable license/provenance/notice/version/SHA-256 evidence;
+    system-font and Unicode-flag non-bundling is recorded; CycloneDX matches distribution.
   - **Edges**: Generated code, optional binary, transitive license, duplicate asset.
   - **Containment**: Remove or replace unapproved component before release.
 
@@ -523,7 +536,8 @@ files safely, upgrades, rolls back when compatible, and uninstalls without user-
   - **Acceptance**: README, security, architecture, operations, recovery, collaboration,
     MCP, installer, shortcuts, accessibility, changelog, roadmap, and notices describe
     actual shipped behavior and limitations.
-  - **Edges**: Offline docs bundled; no private or competitive narrative.
+  - **Edges**: Offline docs bundled; Narrator/NVDA and Electron/FFmpeg legal-review
+    status are explicit; no private or competitive narrative.
   - **Containment**: Do not publish claims without recorded evidence.
 
 - [ ] **V1-125 Tag and publish the verified V1 release**.

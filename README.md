@@ -4,11 +4,12 @@ HTMLlelujah is a Windows presentation editor where people edit visually and loca
 agents edit the same safe, structured document. Slides render with web technologies,
 but generated HTML is never the authoring source.
 
-**Current version: 1.0.0. Supported target: Windows 11 x64.** The application is
+**Current release candidate: 1.0.0. Supported target: Windows 11 x64.** The application is
 offline-first: creating, editing, saving, recovering, presenting, and exporting a
-local deck require no account, API key, or internet connection. Official release
-artifacts are published on the repository's Releases page with SHA-256 checksums. An
-installer built without an Authenticode certificate is explicitly labelled unsigned.
+local deck require no account, API key, or internet connection. Once V1 is published,
+official release artifacts are available only from the repository's Releases page
+with SHA-256 checksums. An installer built without an Authenticode certificate is
+explicitly labelled unsigned.
 
 ## What V1 includes
 
@@ -18,8 +19,9 @@ installer built without an Authenticode certificate is explicitly labelled unsig
 - typed rich text, headings and lists, font controls, colors, and paragraph alignment;
 - themes, masters, layouts, placeholders, page presets, backgrounds, hidden slides,
   and reusable style roles;
-- embedded images, editable native tables with TSV paste, shapes, connectors, local
-  vector icons, and round Unicode flags;
+- embedded images whose registration and placement or replacement commit atomically,
+  editable native tables with TSV paste, shapes, connectors, local vector icons, and
+  round Unicode flags;
 - one shared DOM/SVG renderer for editor canvas, thumbnails, presentation,
   standalone HTML, and PDF;
 - versioned `.hdeck` files with bounded archive validation, content-addressed assets,
@@ -63,6 +65,11 @@ transaction. Destructive commits, agent undo, imports, and exports require a
 single-use approval issued in the desktop **Codex** panel. Approvals are bound to the
 document, action, and revision and expire after two minutes.
 
+The V1 boundary accepts at most 100 typed commands per proposal, 2 MiB MCP frames and
+results, 64 pending proposals, 32 pending desktop approvals, and 64 consumed approval
+receipts. Desktop proposals expire after one minute; the protocol rejects any proposal
+whose expiry exceeds five minutes. Consumed approval receipts expire after 30 seconds.
+
 The MCP process receives no arbitrary shell, URL-fetch, HTML-injection, or filesystem
 tool. Reads remain available during LAN collaboration, but V1 pauses MCP mutations
 while a collaboration session is active so the host's command sequence remains
@@ -80,8 +87,9 @@ used as the live-edit protocol.
    the endpoint, session code, and displayed certificate fingerprint through
    a trusted channel.
 3. Other participants join from the same private LAN and verify the fingerprint.
-4. Edit independent objects normally. A direct text edit uses a soft lock so two
-   people do not edit the same text element simultaneously.
+4. Edit independent objects normally. Focusing a text editor requests an expiring
+   soft lock; the inspector shows the reservation or peer owner and remains read-only
+   while another participant owns that text element.
 5. The host is the only participant that writes the shared `.hdeck`. A guest can
    leave and explicitly save an independent copy.
 
@@ -123,6 +131,9 @@ session, or expose the authenticated local MCP bridge. See
   does not merge edits made while disconnected.
 - Filesystem writer leases require a coherent shared filesystem. Consumer cloud-sync
   replicas transport snapshots but are not a distributed locking service.
+- The desktop editor is designed for a minimum 1080 CSS-pixel-wide workspace and is
+  exercised at Windows display scaling from 100% through 200%; smaller viewports are
+  not a supported V1 layout.
 - Advanced freeform paths, boolean vector operations, and simultaneous editing of one
   text range are outside V1.
 
@@ -184,4 +195,6 @@ Official compiled applications are available under the separate binary terms in
 [`EULA.txt`](EULA.txt), which permit personal and internal business use and sharing
 of user-created exported presentations. Third-party licenses and asset provenance
 are recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
-[`docs/legal`](docs/legal/asset-provenance.md).
+[`docs/legal`](docs/legal/asset-provenance.md). The Electron/FFmpeg record is an
+engineering compliance review, not legal advice; qualified approval of the
+corresponding-source mechanism remains required before commercial distribution.

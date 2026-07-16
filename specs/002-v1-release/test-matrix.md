@@ -1,6 +1,6 @@
 # V1 Test Matrix
 
-Status: Normative release matrix, 2026-07-15.
+Status: Normative release matrix, last reviewed 2026-07-16.
 
 Passing unit tests or browser preview is insufficient. Every release candidate must
 exercise the packaged Windows application and the exact installer artifact.
@@ -22,6 +22,8 @@ exercise the packaged Windows application and the exact installer artifact.
 
 - Windows 11 x64, current supported update, standard non-administrator user.
 - Display scaling at 100%, 125%, 150%, and 200%.
+- Desktop editor viewport at or above the supported 1080 CSS-pixel minimum; include a
+  compact 1120 by 720 window and the below-1260 responsive panel breakpoint.
 - 1440 × 900, 1920 × 1080, portrait, and ultrawide display configurations.
 - Offline mode with all network adapters disabled.
 - Private same-LAN mode with two physical or virtual Windows machines.
@@ -78,15 +80,15 @@ negative size, spacing collapse, nondeterministic snap, or input mutation.
 
 ## Rich text and clipboard
 
-| ID      | Scenario                 | Oracle                                         | Edge coverage                                 | Gate    |
-| ------- | ------------------------ | ---------------------------------------------- | --------------------------------------------- | ------- |
-| TXT-001 | Blocks and marks         | Canonical typed content round-trip             | Mixed marks, H1–H6, nested lists              | Release |
-| TXT-002 | Element/block formatting | Typed marks apply without flattening structure | Mixed runs, lists, heading, entire element    | Release |
-| TXT-003 | IME                      | No duplicate/lost composition                  | Accents, CJK, emoji, RTL                      | Release |
-| TXT-004 | Undo boundary            | Local edit session becomes one document group  | Undo during edit and after blur               | Release |
-| TXT-005 | Rich paste               | Allowlisted semantics only                     | Scripts, remote images, styles, unknown nodes | Hard    |
-| TXT-006 | Long text                | Bounded behavior and visible overflow warning  | Unbroken string, maximum blocks/runs          | Release |
-| TXT-007 | Font fallback            | Bundled font or explicit warning               | Missing or corrupt font asset                 | Release |
+| ID      | Scenario                 | Oracle                                            | Edge coverage                                 | Gate    |
+| ------- | ------------------------ | ------------------------------------------------- | --------------------------------------------- | ------- |
+| TXT-001 | Blocks and marks         | Canonical typed content round-trip                | Mixed marks, H1–H6, nested lists              | Release |
+| TXT-002 | Element/block formatting | Typed marks apply without flattening structure    | Mixed runs, lists, heading, entire element    | Release |
+| TXT-003 | IME                      | No duplicate/lost composition                     | Accents, CJK, emoji, RTL                      | Release |
+| TXT-004 | Undo boundary            | Local edit session becomes one document group     | Undo during edit and after blur               | Release |
+| TXT-005 | Rich paste               | Allowlisted semantics only                        | Scripts, remote images, styles, unknown nodes | Hard    |
+| TXT-006 | Long text                | Bounded behavior and visible overflow warning     | Unbroken string, maximum blocks/runs          | Release |
+| TXT-007 | Font fallback            | Deterministic system fallback or explicit warning | Requested system font unavailable             | Release |
 
 ## Themes, masters, and layouts
 
@@ -101,38 +103,38 @@ negative size, spacing collapse, nondeterministic snap, or input mutation.
 
 ## Images, tables, shapes, connectors, icons, and flags
 
-| ID      | Scenario             | Oracle                                    | Edge coverage                                   | Gate    |
-| ------- | -------------------- | ----------------------------------------- | ----------------------------------------------- | ------- |
-| AST-001 | Import PNG/JPEG/WebP | Correct signature, hash, size, dimensions | Wrong extension, alpha, color profile           | Release |
-| AST-002 | Invalid image        | Atomic rejection and no asset entry       | Truncated, huge dimensions, decode failure      | Hard    |
-| AST-003 | Asset deduplication  | Same bytes reuse one content entry        | Different original names                        | Release |
-| AST-004 | Crop/fit/replace     | Editor/export parity and stable alt text  | Extreme crop and aspect ratios                  | Release |
-| TBL-001 | Native table editing | Cell text/style persists                  | Empty cells, header, large bounded table        | Release |
-| TBL-002 | TSV paste            | Literal rectangular result                | Uneven rows, quotes, newlines, formula prefixes | Release |
-| TBL-003 | Row/column mutation  | Spans and dimensions remain valid         | Delete final row/column and merged cells        | Release |
-| VEC-001 | Shape catalog        | DOM/SVG parity across modes               | Every shape, stroke, fill, opacity              | Release |
-| VEC-002 | Connectors           | Endpoint follows bound object             | Target delete, hide, group, rotate              | Release |
-| VEC-003 | Built-in catalogs    | Correct ID/version and bundled asset      | Missing ID and catalog mismatch                 | Hard    |
-| VEC-004 | Asset licensing      | Hash and notice match provenance ledger   | Icon and every round-flag entry                 | Hard    |
+| ID      | Scenario             | Oracle                                                      | Edge coverage                                   | Gate    |
+| ------- | -------------------- | ----------------------------------------------------------- | ----------------------------------------------- | ------- |
+| AST-001 | Import PNG/JPEG/WebP | Header checked before decode; one asset/element transaction | Wrong extension, alpha, color profile           | Release |
+| AST-002 | Invalid image        | Atomic rejection and no asset or element entry              | Truncated, huge dimensions, decode mismatch     | Hard    |
+| AST-003 | Asset deduplication  | Same bytes reuse one content entry                          | Different original names                        | Release |
+| AST-004 | Crop/fit/replace     | Editor/export parity and stable alt text                    | Extreme crop and aspect ratios                  | Release |
+| TBL-001 | Native table editing | Cell text/style persists                                    | Empty cells, header, large bounded table        | Release |
+| TBL-002 | TSV paste            | Literal rectangular result                                  | Uneven rows, quotes, newlines, formula prefixes | Release |
+| TBL-003 | Row/column mutation  | Spans and dimensions remain valid                           | Delete final row/column and merged cells        | Release |
+| VEC-001 | Shape catalog        | DOM/SVG parity across modes                                 | Every shape, stroke, fill, opacity              | Release |
+| VEC-002 | Connectors           | Endpoint follows bound object                               | Target delete, hide, group, rotate              | Release |
+| VEC-003 | Built-in catalogs    | Correct ID/version; local icon or Unicode flag renders      | Missing ID and catalog mismatch                 | Hard    |
+| VEC-004 | Provenance           | Local icon source hash and Unicode-flag basis match ledger  | Changed path source and invalid country code    | Hard    |
 
 ## `.hdeck`, save, and recovery
 
-| ID      | Scenario              | Oracle                                         | Edge coverage                                     | Gate    |
-| ------- | --------------------- | ---------------------------------------------- | ------------------------------------------------- | ------- |
-| ARC-001 | Archive round-trip    | Exact document and asset hashes                | Optional preview/notices absent                   | Release |
-| ARC-002 | Hostile names/types   | Reject before extraction/use                   | Traversal, absolute, NUL, symlink, case collision | Hard    |
-| ARC-003 | Zip bomb/limits       | Bounded rejection without memory spike         | Count, size, ratio, nested compression            | Hard    |
-| ARC-004 | Corrupt integrity     | Stable rejection                               | CRC, SHA, size, missing/extra entry               | Hard    |
-| ARC-005 | Deterministic output  | Same logical input gives stable entries/hashes | Timestamps and entry ordering                     | Release |
-| SAV-001 | Manual save           | Verified archive and clean durability          | Existing/new target                               | Release |
-| SAV-002 | Autosave              | Idle and maximum interval respected            | Continuous typing and presentation                | Release |
-| SAV-003 | Atomic failure matrix | Last target or valid recovery always remains   | Fail every write/flush/verify/replace step        | Hard    |
-| SAV-004 | Windows locks         | Bounded retry and safe failure                 | Antivirus/sync lock, `EPERM`, `EBUSY`             | Release |
-| SAV-005 | External change       | Conflict; no overwrite                         | Same timestamp/different hash                     | Hard    |
-| REC-001 | Truncated journal     | Replay valid prefix only                       | Truncate every byte position of final frame       | Hard    |
-| REC-002 | Recovery mismatch     | Independent recovered copy                     | Document ID/base revision mismatch                | Release |
-| REC-003 | Compaction            | Only after verified snapshot                   | Crash during compaction                           | Hard    |
-| REC-004 | Repeated reliability  | No leaked temp/journal corruption              | 100 saves and 25 forced terminations              | Hard    |
+| ID      | Scenario              | Oracle                                                                     | Edge coverage                                     | Gate    |
+| ------- | --------------------- | -------------------------------------------------------------------------- | ------------------------------------------------- | ------- |
+| ARC-001 | Archive round-trip    | Exact document and asset hashes                                            | Optional preview/notices absent                   | Release |
+| ARC-002 | Hostile names/types   | Reject before extraction/use                                               | Traversal, absolute, NUL, symlink, case collision | Hard    |
+| ARC-003 | Zip bomb/limits       | Bounded rejection without memory spike                                     | Count, size, ratio, nested compression            | Hard    |
+| ARC-004 | Corrupt integrity     | Stable rejection                                                           | CRC, SHA, size, missing/extra entry               | Hard    |
+| ARC-005 | Deterministic output  | Same logical input gives stable entries/hashes                             | Timestamps and entry ordering                     | Release |
+| SAV-001 | Manual save           | Verified archive and clean durability                                      | Existing/new target                               | Release |
+| SAV-002 | Recovery autosave     | Every committed edit reaches the local journal; no silent `.hdeck` replace | Continuous typing and presentation                | Release |
+| SAV-003 | Atomic failure matrix | Last target or valid recovery always remains                               | Fail every write/flush/verify/replace step        | Hard    |
+| SAV-004 | Windows locks         | Bounded retry and safe failure                                             | Antivirus/sync lock, `EPERM`, `EBUSY`             | Release |
+| SAV-005 | External change       | Conflict; no overwrite                                                     | Same timestamp/different hash                     | Hard    |
+| REC-001 | Truncated journal     | Replay valid prefix only                                                   | Truncate every byte position of final frame       | Hard    |
+| REC-002 | Recovery mismatch     | Independent recovered copy                                                 | Document ID/base revision mismatch                | Release |
+| REC-003 | Compaction            | Only after verified snapshot                                               | Crash during compaction                           | Hard    |
+| REC-004 | Repeated reliability  | No leaked temp/journal corruption                                          | 100 saves and 25 forced terminations              | Hard    |
 
 ## Shared renderer, presentation, HTML, and PDF
 
@@ -164,16 +166,17 @@ negative size, spacing collapse, nondeterministic snap, or input mutation.
 
 ## MCP
 
-| ID      | Scenario          | Oracle                                          | Edge coverage                      | Gate    |
-| ------- | ----------------- | ----------------------------------------------- | ---------------------------------- | ------- |
-| MCP-001 | Stdio lifecycle   | Initialize/list/call/shutdown succeeds          | Client exit and restart            | Release |
-| MCP-002 | Stdout purity     | Protocol frames only                            | Warnings, crash, validation errors | Hard    |
-| MCP-003 | Authentication    | Current launch nonce and user required          | Reuse, wrong user, expired nonce   | Hard    |
-| MCP-004 | Read tools        | Correct bounded projections                     | Empty, large, closed document      | Release |
-| MCP-005 | Mutation tools    | Revision-aware attributable one-batch edit      | Stale/invalid/mixed batch          | Hard    |
-| MCP-006 | Approvals         | Purpose/session/expiry/single use enforced      | Reuse and operation mismatch       | Hard    |
-| MCP-007 | Capability denial | No path, URL, shell, raw HTML, raw state access | Fuzzed tool names and schemas      | Hard    |
-| MCP-008 | Undo parity       | MCP batch appears and undoes as one action      | Later human edit and stale undo    | Release |
+| ID      | Scenario          | Oracle                                               | Edge coverage                                        | Gate    |
+| ------- | ----------------- | ---------------------------------------------------- | ---------------------------------------------------- | ------- |
+| MCP-001 | Stdio lifecycle   | Initialize/list/call/shutdown succeeds               | Client exit and restart                              | Release |
+| MCP-002 | Stdout purity     | Protocol frames only                                 | Warnings, crash, validation errors                   | Hard    |
+| MCP-003 | Authentication    | Current launch nonce and user required               | Reuse, wrong user, expired nonce                     | Hard    |
+| MCP-004 | Read tools        | Correct bounded projections                          | Empty, large, closed document                        | Release |
+| MCP-005 | Mutation tools    | Revision-aware attributable one-batch edit           | Stale/invalid/mixed batch                            | Hard    |
+| MCP-006 | Approvals         | Purpose/session/expiry/single use enforced           | Reuse and operation mismatch                         | Hard    |
+| MCP-007 | Capability denial | No path, URL, shell, raw HTML, raw state access      | Fuzzed tool names and schemas                        | Hard    |
+| MCP-008 | Undo parity       | MCP batch appears and undoes as one action           | Later human edit and stale undo                      | Release |
+| MCP-009 | State quotas      | Atomic capacity reservation, TTL purge, bounded maps | Concurrent 65th proposal, 33rd approval, receipt cap | Hard    |
 
 ## Authoritative-host LAN collaboration
 
@@ -183,7 +186,7 @@ negative size, spacing collapse, nondeterministic snap, or input mutation.
 | LAN-002 | Join authentication  | Confirmed actor and encrypted channel                                   | Invalid/expired/replayed capability      | Hard    |
 | LAN-003 | Ordered commands     | Identical host sequence and revision on peers                           | Simultaneous independent commands        | Hard    |
 | LAN-004 | Stale peer command   | Atomic rejection and resync                                             | Gap, duplicate, reordered frame          | Hard    |
-| LAN-005 | Text lock            | One editor; visible owner; lease expiry                                 | Race, disconnect, clock skew             | Hard    |
+| LAN-005 | Text lock            | One editor; inspector owner/read-only state; lease expiry               | Race, disconnect, clock skew             | Hard    |
 | LAN-006 | Presence             | Rate-limited and not persisted                                          | Slow peer and malformed presence         | Release |
 | LAN-007 | Reconnect            | Resume acknowledged sequence within window                              | Missed transactions and snapshot refresh | Release |
 | LAN-008 | Reconnect expiry     | Peer becomes read-only; no queued edit merge                            | Local draft and active composition       | Hard    |
@@ -202,9 +205,15 @@ final canonical hash, and host snapshot must agree.
 | -------- | --------------------------- | ------------------------------------------------------ | ------- |
 | A11Y-001 | Keyboard-only full workflow | No trap; visible focus; all critical actions reachable | Hard    |
 | A11Y-002 | Accessible names/states     | Automated scan plus manual inspection                  | Hard    |
-| A11Y-003 | Screen-reader smoke         | Create/open/edit/save/export/recovery announcements    | Release |
+| A11Y-003 | Screen-reader smoke         | Manual Narrator or NVDA critical-flow announcements    | Release |
 | A11Y-004 | Contrast and scaling        | WCAG 2.2 AA at all supported scaling                   | Hard    |
 | A11Y-005 | Reduced motion              | No essential motion or inaccessible animation          | Release |
+
+Run the automated Electron accessibility-tree, DOM, keyboard, overflow, reduced-motion,
+and 100%-200% scaling harness against the exact packaged executable. It cannot verify
+spoken output or real assistive-technology interaction. Record a manual Narrator or
+NVDA pass separately; if unavailable, the release record must identify that untested
+surface explicitly rather than treating the automated smoke as equivalent evidence.
 
 ## Packaging, upgrade, and uninstall
 
@@ -237,8 +246,9 @@ unresponsive recovery, watchdog termination, or memory exhaustion.
 ## License, provenance, SBOM, and public hygiene
 
 - Production and build dependency license scans pass the repository policy.
-- Every bundled font, icon, and round-flag asset has source, license, notice, version,
-  and SHA-256 in the provenance ledger.
+- Every bundled asset and local slide-icon source has provenance and SHA-256. The
+  ledger records that presentation fonts are system-provided and round flags use
+  Unicode/Windows emoji rather than bundled third-party files.
 - CycloneDX SBOM matches the locked distributable dependency graph.
 - No production dependency is fetched at runtime.
 - Secret and private-context scans cover source, fixtures, screenshots, logs, symbols,
@@ -263,6 +273,8 @@ The release candidate record must contain:
 - thirty-minute LAN soak result;
 - performance measurements;
 - SBOM, license report, asset provenance, and notices;
+- Electron/FFmpeg engineering-review status and the still-pending qualified legal
+  decision required before commercial distribution;
 - all deviations, waived tests, baseline changes, or residual risks.
 
 No hard-gate waiver is permitted for V1. A failed hard gate returns the release to

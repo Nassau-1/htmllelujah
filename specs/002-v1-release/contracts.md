@@ -1,6 +1,6 @@
 # V1 Contracts
 
-Status: Normative design contract, 2026-07-15.
+Status: Normative release-candidate contract, last reviewed 2026-07-16.
 
 This document defines the stable boundaries implementation must satisfy. TypeScript
 snippets are descriptive public contracts; runtime schemas are mandatory at every
@@ -90,7 +90,7 @@ type DesktopDocumentsV1 = Readonly<{
   save(input: SaveRequest): Promise<SaveResult>;
   chooseAndSaveAs(input: SaveAsRequest): Promise<SaveResult | null>;
   close(input: CloseRequest): Promise<void>;
-  importImage(input: ImportImageRequest): Promise<ImportedAssetResult | null>;
+  importImage(input: ImportImageRequest): Promise<ImportedImageResult | null>;
   subscribe(listener: (event: DocumentEvent) => void): () => void;
 }>;
 ```
@@ -98,6 +98,9 @@ type DesktopDocumentsV1 = Readonly<{
 `chooseAndOpen`, `chooseAndSaveAs`, and `importImage` own their native dialogs. No API
 accepts a renderer-supplied path. `openAssociated` accepts a short-lived capability
 created by the single-instance main process, not a raw command-line string.
+`ImportImageRequest` also carries the destination slide and optional image element to
+replace. Asset registration and insertion or replacement commit as one revision and
+one undo step; cancellation or rejection commits neither.
 
 ### Document events
 
@@ -152,15 +155,17 @@ type TextMarks = Readonly<{
   underline: boolean;
   strikethrough: boolean;
   color?: HexColor;
-  fontFamily?: BundledFontId;
+  fontFamily?: SupportedSystemFontFamily;
   fontSizePt?: number;
   fontWeight?: number;
 }>;
 ```
 
-Heading levels are 1–6. List nesting is 0–8. Font IDs reference the bundled catalog,
-not arbitrary family strings or files. Clipboard conversion normalizes supported
-nodes and marks into this contract and drops unsupported content.
+Heading levels are 1–6. List nesting is 0–8. Font-family values are bounded strings
+selected from the supported desktop UI catalog and resolve through the operating
+system's installed fonts and explicit CSS fallbacks; V1 bundles no presentation font
+files. Clipboard conversion normalizes supported nodes and marks into this contract
+and drops unsupported content.
 
 ## Theme, master, layout, and placeholder contract
 
@@ -240,9 +245,10 @@ type RenderResult = Readonly<{
 ```
 
 The slide content root is deterministic and never reads desktop state. Editor overlays
-are outside that root. `renderReady` requires bundled fonts, decoded images, two stable
-frames, and measured page geometry. Failure is typed; export never proceeds on a
-partial render.
+are outside that root. `renderReady` requires the browser font set, decoded images, two stable
+frames, and measured page geometry. In V1, font readiness means the browser's system
+font set and fallbacks have settled; the application bundles no presentation fonts.
+Failure is typed; export never proceeds on a partial render.
 
 ## `.hdeck` container contract
 
@@ -307,12 +313,16 @@ type HdeckOpenResult =
       document: DeckDocument;
       steps: readonly MigrationStep[];
     }>
-  | Readonly<{ status: 'read-only-newer'; documentId?: string; previewAvailable: boolean }>
-  | Readonly<{ status: 'rejected'; code: ArchiveErrorCode }>;
+  | Readonly<{
+      status: 'rejected';
+      code: ArchiveErrorCode | 'UNSUPPORTED_VERSION';
+    }>;
 ```
 
 Migrations are pure, ordered, deterministic, and validate after every step. The
 original archive is retained in recovery before an editable migrated snapshot exists.
+V1 has no future-schema preview projection: it returns `UNSUPPORTED_VERSION` and
+leaves the original unchanged.
 
 ## Persistence and recovery contract
 
@@ -350,6 +360,12 @@ type SaveResult =
 The final target is replaced only after temporary output is flushed, reopened,
 validated, and matched to the expected destination fingerprint.
 
+Journal append is the automatic recovery write. V1 does not replace the selected
+`.hdeck` on an idle timer; only explicit Save or Save As enters the snapshot-replace
+contract. Recovery candidates require at least one valid journal record after their
+base. Bounded blob garbage collection preserves every hash reachable from a current
+document, journal, history entry, staged import, or active session.
+
 ## Asset contract
 
 ```ts
@@ -361,11 +377,20 @@ type ImportedAssetResult = Readonly<{
   widthPx: number;
   heightPx: number;
 }>;
+
+type ImportedImageResult = Readonly<{
+  session: DocumentSnapshotEnvelope;
+  assetId: string;
+  elementId: string;
+}>;
 ```
 
 The import service validates magic bytes, extension-independent media type, byte
-limit, image dimensions, decode success, and hash before registering an asset.
-Duplicate bytes reuse the existing asset. The source path is never persisted.
+limit, image dimensions, decode success, and hash before registering an asset. Header
+inspection occurs before pixel decode and decoded dimensions must agree. Duplicate
+bytes reuse the existing asset. The source path is never persisted. Human insertion
+or replacement registers the asset and changes the slide in one durable transaction;
+the MCP asset tool registers bytes only for a later typed proposal.
 
 ## TSV table contract
 
@@ -383,31 +408,36 @@ contains redacted diagnostics. Maximum frame size and request concurrency are bo
 ### Read tools
 
 ```text
-documents.list
-documents.get_outline
-slides.get
-slides.list_elements
-slides.render_preview
-documents.validate
-documents.get_revision
+app_status
+documents_list
+documents_get_outline
+slides_get
+documents_get_styles
+documents_validate
+collaboration_status
 ```
 
 ### Mutation and output tools
 
 ```text
-documents.apply_commands
-documents.undo_transaction
-documents.redo_transaction
-documents.request_save
-documents.request_export_html
-documents.request_export_pdf
-assets.request_import
+documents_propose_commands
+documents_commit_proposal
+documents_undo_agent_transaction
+assets_request_import
+documents_request_export
 ```
 
-`apply_commands` accepts only `ExecuteCommandsRequest`. Destructive delete batches,
-save overwrite, imports, and exports require an unexpired single-purpose desktop
-approval ID. Tool results return IDs, revisions, counts, dimensions, warnings, and
-safe error codes, not paths or complete asset bytes.
+`documents_propose_commands` accepts at most 100 typed commands and creates a
+revision-bound proposal. Delete, full replacement, layout/reset, and other classified
+destructive batches require an unexpired `commit-destructive` approval at commit;
+agent undo, imports, and exports require their own unexpired single-purpose approval.
+V1 exposes no MCP save tool. Tool results return IDs, revisions, counts, dimensions,
+warnings, and safe error codes, not paths or complete asset bytes.
+
+Frames and encoded results are capped at 2 MiB. The desktop default proposal lifetime
+is one minute and at most 64 proposals may be pending. At most 32 unconsumed desktop
+approvals may exist for two minutes, and at most 64 consumed receipts are retained for
+30 seconds. Admission reserves capacity before awaiting proposal work.
 
 The MCP server exposes no raw file resource, shell tool, URL fetch, HTML injection,
 script execution, arbitrary document patch, collaboration administration, or secret
@@ -470,9 +500,17 @@ Presence and pointer previews are ephemeral, rate-limited, and never journaled. 
 direct-text soft lock names element ID, actor ID, lease ID, and expiry. Lock expiry or
 disconnect makes uncommitted peer text invalid; it is not queued for merge.
 
+The desktop inspector requests, renews, and releases the lease, displays owned or
+peer-held state, and disables direct text controls while another participant owns the
+element. The lock is advisory outside the authenticated command session; it is not a
+filesystem lock.
+
 V1 has no automatic host election, offline edit queue, disconnected merge, or
 simultaneous direct editing of one text element. On host loss, peers become read-only
 after bounded reconnect and may explicitly save independent copies with new IDs.
+Only a coherent shared filesystem such as SMB/NAS can enforce the writer sidecar
+across machines. OneDrive, Google Drive, Dropbox, and comparable local replicas carry
+snapshots but cannot arbitrate independently started hosts.
 
 ## Presentation and export contracts
 

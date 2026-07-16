@@ -66,8 +66,13 @@ and affected third-party components.
   unrestricted CSS, active remote URLs, or executable embedded objects.
 - Rich text, TSV, images, SVG-like vector data, and IPC payloads are normalized into
   typed structures before a transaction commits.
+- PNG, JPEG, and WebP headers are parsed under bounded byte, edge, and pixel-area
+  limits before Chromium decodes pixels. Decoded dimensions must match the validated
+  header.
 - Imported asset bytes are content-addressed and exposed to renderers only through
   opaque session-scoped URLs.
+- Human image import registers the bytes and inserts or replaces the image in one
+  durable transaction, so rejection or undo cannot leave a referenced partial asset.
 - Every persistent mutation is typed, revision-checked, attributable, transactional,
   journaled, and undoable.
 
@@ -82,6 +87,10 @@ and affected third-party components.
   URL fetch, shell, raw HTML, internal state replacement, or secret-retrieval surface.
 - Destructive commit, undo, import, and export use desktop-issued approvals bound to
   action, document, revision, expiry, and single use.
+- V1 caps typed command proposals at 100 commands and MCP frames/results at 2 MiB. A
+  desktop proposal expires after one minute; at most 64 proposals, 32 unconsumed
+  approvals, and 64 consumed approval receipts are retained. Approvals expire after
+  two minutes and consumed receipts after 30 seconds.
 - V1 pauses MCP mutations while LAN collaboration is active so the collaboration host
   remains the only command-ordering authority.
 
@@ -104,6 +113,11 @@ or a bypass of the typed MCP boundary is in scope and should be reported.
   `.hdeck`; guests keep detached recovery state.
 - Same-text edits use a soft lock. Disconnected edits are not queued or merged, and
   writer takeover is never automatic.
+- The soft-lock owner and reservation state are exposed in the text inspector; a peer
+  remains read-only for that element until the lease expires or is released.
+- The one-writer sidecar coordinates machines only when they observe one coherent
+  filesystem namespace, such as SMB/NAS. Separate consumer cloud-sync replicas are
+  snapshot transport, not a distributed lock, and require one designated LAN host.
 
 ### Diagnostics and releases
 

@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-15
+- Last reviewed: 2026-07-16
 
 ## Context
 
@@ -22,7 +23,9 @@ transactions, and broadcasts them in one total order.
 Peers keep read-only canonical snapshots plus ephemeral interaction drafts. Independent
 objects may be edited concurrently by submitting revision-aware commands. Direct text
 editing acquires an expiring soft lock for one element; conflicting participants see
-the owner and remain read-only for that element.
+the owner and remain read-only for that element. The desktop text inspector requests,
+renews, releases, and visibly reports that lease; it disables text controls while a
+peer owns the element.
 
 Discovery advertises only an ephemeral service identity, protocol major version,
 expiry, and nonce-derived document proof. It advertises no deck title, filename, path,

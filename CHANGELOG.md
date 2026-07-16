@@ -7,7 +7,7 @@ and releases use semantic versions.
 
 No user-facing change is queued after the V1 release candidate.
 
-## [1.0.0] - 2026-07-15
+## [1.0.0] - 2026-07-16
 
 ### Added
 
@@ -26,16 +26,22 @@ No user-facing change is queued after the V1 release candidate.
   export through the desktop print surface.
 - Authenticated private-LAN collaboration with WSS, certificate fingerprint,
   document-scoped credentials, optional discovery, host-ordered transactions,
-  reconnect handling, soft text locks, detached guest recovery, and one shared-file
-  writer.
+  reconnect handling, expiring soft text locks with an owner/read-only editor state,
+  detached guest recovery, and one shared-file writer.
 - Local stdio MCP launcher and authenticated desktop RPC with bounded typed tools,
   revision-aware proposal and commit, agent attribution, grouped undo, one-time
-  approvals, asset import, export, and redacted collaboration status.
+  approvals, bounded pending-state quotas, asset import, export, and redacted
+  collaboration status.
 - Per-user Windows x64 NSIS packaging, application icon, `.hdeck` file association,
   second-instance file-open handling, hardened Electron fuses, and a console MCP
   launcher.
+- Windows Electron accessibility and display-scaling smoke coverage for semantic
+  controls, keyboard focus, reduced motion, compact layout, and 100% through 200%
+  scaling. Manual Narrator or NVDA validation remains a release-record item.
 - Source-visible proprietary notice, separate V1 binary terms, direct-dependency
-  notices, Electron/FFmpeg license review, and bundled-asset provenance ledger.
+  notices, an engineering Electron/FFmpeg license review, and bundled-asset
+  provenance ledger. The review does not replace qualified legal approval for
+  commercial distribution.
 
 ### Security
 
@@ -45,6 +51,9 @@ No user-facing change is queued after the V1 release candidate.
   destroyed half-created hidden windows after failed archive open or renderer load.
 - Added bounded recovery-blob garbage collection and proactive TTL/cap enforcement for pending
   runtime agent proposals.
+- Bounded local MCP proposals to 100 commands, 2 MiB frames/results, 64 pending
+  proposals and a one-minute desktop expiry; bounded desktop approvals to 32 pending,
+  two minutes, one use, and 64 short-lived consumed receipts.
 - Kept renderer processes sandboxed and context-isolated with no Node.js integration,
   generic IPC, navigation, popup, permission, or active remote-content capability.
 - Added bounded validation for documents, commands, `.hdeck` ZIP structures,
@@ -64,6 +73,9 @@ No user-facing change is queued after the V1 release candidate.
 - MCP mutations are paused during a live LAN session; read tools remain available.
 - Collaboration has no internet relay, automatic writer election, disconnected edit
   merge, or simultaneous editing of one text element.
+- Writer leases are enforceable across machines only on a coherent shared filesystem;
+  consumer cloud-sync replicas transport snapshots and still require one designated
+  LAN host.
 - Exported HTML is output only. Third-party presentation-file interchange,
   transitions, animations, notes, comments, cloud accounts, and an embedded chatbot
   are not included.
