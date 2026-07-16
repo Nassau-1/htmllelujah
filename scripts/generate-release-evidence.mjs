@@ -8,6 +8,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
+import { artifactFreshness, sourceProvenance } from './release-source-state.mjs';
+
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
 const DEFAULT_ARTIFACT_DIR = path.join(REPO_ROOT, 'apps', 'desktop', 'out');
@@ -232,95 +234,140 @@ function groupDeliverables(inventory) {
   return { blockmaps, deliverables, installers, unpacked };
 }
 
-const SOURCE_EXCLUDED_DIRECTORIES = new Set([
-  '.git',
-  '.smoke',
-  'artifacts',
-  'node_modules',
-  'out',
-  'coverage',
+const TEXT_ARTIFACT_EXTENSIONS = new Set([
+  '.blockmap',
+  '.cfg',
+  '.cmd',
+  '.config',
+  '.html',
+  '.ini',
+  '.json',
+  '.log',
+  '.md',
+  '.ps1',
+  '.txt',
+  '.xml',
+  '.yaml',
+  '.yml',
 ]);
+const MAX_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024;
+const FORBIDDEN_METADATA_PATTERNS = [
+  /(?:^|\/)builder-(?:debug|effective-config)\.(?:json|ya?ml)$/iu,
+  /(?:^|\/)electron-builder(?:[-_.][^/]*)?\.(?:json|log|ya?ml)$/iu,
+  /(?:^|\/)\.env(?:\.[^/]*)?$/iu,
+  /(?:^|\/)[^/]+\.(?:map|pdb)$/iu,
+];
+const PRIVATE_PATH_PATTERNS = [
+  {
+    kind: 'Windows user-profile path',
+    pattern: /[a-z]:[\\/]users[\\/][^\\/\r\n"'<>]+(?:[\\/]|$)/iu,
+  },
+  {
+    kind: 'macOS user-profile path',
+    pattern: /\/users\/[^/\s"'<>]+(?:\/|$)/iu,
+  },
+  {
+    kind: 'Unix home path',
+    pattern: /\/home\/[^/\s"'<>]+(?:\/|$)/iu,
+  },
+];
 
-async function latestSourceInput() {
-  const roots = [
-    path.join(REPO_ROOT, 'apps', 'desktop', 'src'),
-    path.join(REPO_ROOT, 'apps', 'desktop', 'assets'),
-    path.join(REPO_ROOT, 'apps', 'desktop', 'dist'),
-    path.join(REPO_ROOT, 'apps', 'desktop', 'dist-electron'),
-    path.join(REPO_ROOT, 'packages'),
-  ];
-  const standalone = [
-    path.join(REPO_ROOT, 'package.json'),
-    path.join(REPO_ROOT, 'pnpm-lock.yaml'),
-    path.join(REPO_ROOT, 'pnpm-workspace.yaml'),
-    path.join(REPO_ROOT, 'apps', 'desktop', 'package.json'),
-    path.join(REPO_ROOT, 'apps', 'desktop', 'scripts', 'apply-fuses.mjs'),
-    path.join(REPO_ROOT, 'apps', 'desktop', 'vite.config.ts'),
-  ];
-  let newest = { mtimeMs: 0, path: null };
-
-  async function consider(filePath) {
-    const fileStat = await stat(filePath);
-    if (fileStat.mtimeMs > newest.mtimeMs) {
-      newest = { mtimeMs: fileStat.mtimeMs, path: repositoryRelative(filePath) };
-    }
+async function validateCandidatePolicy({ artifactDir, grouped, inventory, version }) {
+  const expectedInstaller = `HTMLlelujah-${version}-x64-unsigned-Setup.exe`;
+  const expectedBlockmap = `${expectedInstaller}.blockmap`;
+  const forbiddenMetadataFiles = inventory
+    .filter((entry) => FORBIDDEN_METADATA_PATTERNS.some((pattern) => pattern.test(entry.path)))
+    .map((entry) => entry.path);
+  const unexpectedRootFiles = inventory
+    .filter(
+      (entry) =>
+        !entry.path.startsWith('win-unpacked/') &&
+        entry.path !== expectedInstaller &&
+        entry.path !== expectedBlockmap,
+    )
+    .map((entry) => entry.path);
+  const candidateErrors = [];
+  if (grouped.installers.length > 1) {
+    candidateErrors.push(`expected at most one installer, found ${grouped.installers.length}`);
   }
-
-  async function visit(directory) {
-    if (!(await exists(directory))) return;
-    const entries = await readdir(directory, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isDirectory() && SOURCE_EXCLUDED_DIRECTORIES.has(entry.name)) continue;
-      const fullPath = path.join(directory, entry.name);
-      if (entry.isDirectory()) await visit(fullPath);
-      else if (entry.isFile()) await consider(fullPath);
-    }
-  }
-
-  for (const root of roots) await visit(root);
-  for (const filePath of standalone) if (await exists(filePath)) await consider(filePath);
-  return newest;
-}
-
-async function artifactFreshness(artifactDir, inventory, installers) {
-  const latestSource = await latestSourceInput();
-  const preferredReferences =
-    installers.length > 0
-      ? installers
-      : inventory.filter((entry) =>
-          /(?:^|\/)win-unpacked\/resources\/app\.asar$/i.test(entry.path),
-        );
-  const artifactReferences =
-    preferredReferences.length > 0
-      ? preferredReferences
-      : inventory.filter((entry) => /(?:^|\/)win-unpacked\/[^/]+\.exe$/i.test(entry.path));
-  if (artifactReferences.length === 0) {
-    throw new Error(
-      'No installer, packaged app.asar, or unpacked executable freshness reference found.',
+  if (grouped.installers.length === 1 && grouped.installers[0].path !== expectedInstaller) {
+    candidateErrors.push(
+      `installer filename must be ${expectedInstaller}, found ${grouped.installers[0].path}`,
     );
   }
-  let latestArtifact = { mtimeMs: 0, path: null };
-  for (const entry of artifactReferences) {
+  if (forbiddenMetadataFiles.length > 0) {
+    candidateErrors.push(`forbidden build metadata: ${forbiddenMetadataFiles.join(', ')}`);
+  }
+  if (unexpectedRootFiles.length > 0) {
+    candidateErrors.push(`unexpected artifact-root files: ${unexpectedRootFiles.join(', ')}`);
+  }
+
+  const requiredUnpackedFiles = [
+    'win-unpacked/HTMLlelujah.exe',
+    'win-unpacked/HTMLlelujah-MCP.cmd',
+    'win-unpacked/EULA.txt',
+    'win-unpacked/LICENSE.txt',
+    'win-unpacked/LICENSE.electron.txt',
+    'win-unpacked/LICENSES.chromium.html',
+    'win-unpacked/THIRD_PARTY_NOTICES.md',
+    'win-unpacked/resources/app.asar',
+  ];
+  const inventoryPaths = new Set(inventory.map((entry) => entry.path));
+  const missingRequiredUnpackedFiles =
+    grouped.unpacked.length === 0
+      ? []
+      : requiredUnpackedFiles.filter((entry) => !inventoryPaths.has(entry));
+  if (missingRequiredUnpackedFiles.length > 0) {
+    candidateErrors.push(
+      `missing required unpacked files: ${missingRequiredUnpackedFiles.join(', ')}`,
+    );
+  }
+
+  const privatePathFindings = [];
+  let scannedTextFileCount = 0;
+  let scannedTextBytes = 0;
+  for (const entry of inventory) {
+    if (!TEXT_ARTIFACT_EXTENSIONS.has(path.extname(entry.path).toLowerCase())) continue;
+    if (entry.size > MAX_TEXT_ARTIFACT_BYTES) {
+      candidateErrors.push(
+        `text artifact exceeds the ${MAX_TEXT_ARTIFACT_BYTES}-byte hygiene scan limit: ${entry.path}`,
+      );
+      continue;
+    }
     const filePath = path.join(artifactDir, ...entry.path.split('/'));
-    const fileStat = await stat(filePath);
-    if (fileStat.mtimeMs > latestArtifact.mtimeMs) {
-      latestArtifact = { mtimeMs: fileStat.mtimeMs, path: entry.path };
+    const content = await readFile(filePath, 'utf8');
+    scannedTextFileCount += 1;
+    scannedTextBytes += entry.size;
+    for (const { kind, pattern } of PRIVATE_PATH_PATTERNS) {
+      if (pattern.test(content)) privatePathFindings.push({ path: entry.path, kind });
     }
   }
-  const stale = latestSource.mtimeMs > latestArtifact.mtimeMs + 1_000;
+  if (privatePathFindings.length > 0) {
+    candidateErrors.push(
+      `private local paths found in loose text artifacts: ${privatePathFindings
+        .map((entry) => `${entry.path} (${entry.kind})`)
+        .join(', ')}`,
+    );
+  }
+  if (candidateErrors.length > 0) {
+    throw new Error(`Release candidate policy failed: ${candidateErrors.join('; ')}`);
+  }
+
   return {
-    stale,
-    latestArtifact: {
-      path: latestArtifact.path,
-      modifiedAt: new Date(latestArtifact.mtimeMs).toISOString(),
+    passed: true,
+    expectedInstaller,
+    allowedArtifactRootFiles: [expectedInstaller, expectedBlockmap],
+    forbiddenMetadataFiles,
+    unexpectedRootFiles,
+    missingRequiredUnpackedFiles,
+    looseTextHygiene: {
+      scannedFileCount: scannedTextFileCount,
+      scannedBytes: scannedTextBytes,
+      maxFileBytes: MAX_TEXT_ARTIFACT_BYTES,
+      privatePathFindings,
+      scope:
+        'Loose text-like release files; binary and compressed payloads require separate exact-artifact scanning.',
     },
-    latestSourceInput: {
-      path: latestSource.path,
-      modifiedAt: new Date(latestSource.mtimeMs).toISOString(),
-    },
-    reason: stale
-      ? 'At least one release input is newer than the newest packaged artifact file.'
-      : 'No tracked release input inspected by this tool is newer than the packaged artifact.',
   };
 }
 
@@ -338,28 +385,6 @@ function componentProperty(name, value) {
 
 function componentHashes(entry) {
   return entry ? [hashObject('SHA-256', entry.sha256)] : undefined;
-}
-
-function runGit(arguments_) {
-  const result = spawnSync('git', arguments_, {
-    cwd: REPO_ROOT,
-    encoding: 'utf8',
-    timeout: 15_000,
-    windowsHide: true,
-  });
-  return result.status === 0 ? result.stdout.trim() : null;
-}
-
-function sourceProvenance() {
-  const status = runGit(['status', '--porcelain=v1', '--untracked-files=normal']);
-  const dirtyEntries = status ? status.split(/\r?\n/).filter(Boolean) : [];
-  return {
-    commit: runGit(['rev-parse', '--verify', 'HEAD']),
-    branch: runGit(['branch', '--show-current']),
-    exactTag: runGit(['describe', '--tags', '--exact-match', 'HEAD']),
-    dirty: status === null ? null : dirtyEntries.length > 0,
-    dirtyEntryCount: status === null ? null : dirtyEntries.length,
-  };
 }
 
 function inventoryEntry(inventory, relativePath) {
@@ -666,9 +691,20 @@ async function main() {
   if (grouped.unpacked.length === 0 && grouped.installers.length === 0) {
     throw new Error('No win-unpacked directory or Windows installer was detected.');
   }
-  const freshness = await artifactFreshness(options.artifactDir, files, grouped.installers);
+  const candidatePolicy = await validateCandidatePolicy({
+    artifactDir: options.artifactDir,
+    grouped,
+    inventory: files,
+    version,
+  });
+  const freshness = await artifactFreshness({
+    artifactDir: options.artifactDir,
+    installers: grouped.installers,
+    inventory: files,
+    repositoryRoot: REPO_ROOT,
+  });
   const generatedAt = new Date().toISOString();
-  const source = sourceProvenance();
+  const source = sourceProvenance(REPO_ROOT);
   const codeSigning = signingEvidence(options.artifactDir, files, grouped.installers);
   const inventory = {
     schemaVersion: 1,
@@ -707,6 +743,7 @@ async function main() {
   }
 
   const installerPresent = grouped.installers.length > 0;
+  const unpackedApplicationPresent = grouped.unpacked.length > 0;
   const manifest = {
     schemaVersion: 1,
     release: {
@@ -730,16 +767,26 @@ async function main() {
     quality: {
       integrityEvidenceGenerated: true,
       installerPresent,
+      unpackedApplicationPresent,
       stale: freshness.stale,
       cleanSource: source.dirty === false,
-      releaseReady: installerPresent && !freshness.stale && source.dirty === false,
+      releaseReady:
+        installerPresent &&
+        unpackedApplicationPresent &&
+        candidatePolicy.passed &&
+        !freshness.stale &&
+        source.dirty === false,
       freshness,
+      candidatePolicy,
       limitations: [
         'This manifest is not a cryptographic signature or code-signing proof.',
         'The build SBOM supplements dependency SBOMs; it does not replace legal review of packaged notices.',
         ...(installerPresent
           ? []
           : ['No Windows installer was present; only the unpacked application was inventoried.']),
+        ...(unpackedApplicationPresent
+          ? []
+          : ['No unpacked application was present; installed payload inspection was unavailable.']),
         ...(source.dirty === false
           ? []
           : ['The source worktree was dirty or its state could not be established.']),

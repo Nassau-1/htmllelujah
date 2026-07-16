@@ -19,8 +19,9 @@
     "package:win": "pnpm --filter @htmllelujah/desktop package",
     "sbom:generate": "pnpm sbom --sbom-format cyclonedx --prod --sbom-type application > artifacts/sbom.cdx.json",
     "test": "pnpm -r --if-present test",
+    "test:release-evidence": "node scripts/test-release-evidence.mjs",
     "typecheck": "pnpm -r --if-present typecheck",
-    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build && pnpm licenses:check"
+    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:release-evidence && pnpm build && pnpm licenses:check"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
