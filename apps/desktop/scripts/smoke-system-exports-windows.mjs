@@ -8,6 +8,15 @@ import { createNeutralDemoDeck } from '@htmllelujah/document-core';
 import { createHdeckArchive, parseHdeckArchive } from '@htmllelujah/hdeck';
 import electronPath from 'electron';
 
+import {
+  CdpSession,
+  fetchJsonWithTimeout,
+  runtimeWindowFingerprint,
+  sameRuntimeWindows,
+  sleep,
+  waitFor,
+} from './system-export-harness.mjs';
+
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
 const runtimeInspectionPath = path.join(import.meta.dirname, 'inspect-electron-runtime.ps1');
@@ -73,24 +82,9 @@ const evidencePath = path.join(
   `system-exports-v1${stressEvidenceSuffix}${pageEvidenceSuffix}.json`,
 );
 const dialogAutomationPath = path.join(import.meta.dirname, 'automate-save-dialog.ps1');
-const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-
-const waitFor = async (operation, timeoutMs, label) => {
-  const deadline = Date.now() + timeoutMs;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const result = await operation();
-      if (result !== undefined && result !== false) return result;
-    } catch (error) {
-      lastError = error;
-    }
-    await sleep(100);
-  }
-  throw new Error(
-    `${label} timed out.${lastError instanceof Error ? ` ${lastError.message}` : ''}`,
-  );
-};
+const runtimeStabilitySamples = 2;
+const cdpCommandTimeoutMs = 5_000;
+const fetchAttemptTimeoutMs = 2_000;
 
 const exists = async (filePath) => {
   try {
@@ -180,19 +174,88 @@ const inspectRuntime = async (rootProcessId) => {
     { label: 'Electron runtime inspection', timeoutMs: 20_000 },
   );
   const sample = JSON.parse(stdout.trim());
+  const validProcessIds =
+    Array.isArray(sample?.processIds) &&
+    sample.processIds.every((processId) => Number.isInteger(processId) && processId > 0) &&
+    new Set(sample.processIds).size === sample.processIds.length;
+  const validWindows =
+    validProcessIds &&
+    Array.isArray(sample?.topLevelWindows) &&
+    sample.topLevelWindows.every(
+      (window) =>
+        window !== null &&
+        typeof window === 'object' &&
+        typeof window.handle === 'string' &&
+        /^[0-9a-f]{16}$/u.test(window.handle) &&
+        Number.isInteger(window.processId) &&
+        sample.processIds.includes(window.processId) &&
+        typeof window.visible === 'boolean',
+    ) &&
+    new Set(sample?.topLevelWindows?.map((window) => window.handle)).size ===
+      sample?.topLevelWindows?.length;
   if (
-    sample?.schemaVersion !== 1 ||
+    sample?.schemaVersion !== 2 ||
     !Number.isInteger(sample.processCount) ||
     !Number.isInteger(sample.topLevelWindowCount) ||
     !Number.isInteger(sample.visibleWindowCount) ||
     typeof sample.processTreeComplete !== 'boolean' ||
     typeof sample.workingSetAvailable !== 'boolean' ||
     (sample.workingSetBytes !== null &&
-      (!Number.isFinite(sample.workingSetBytes) || sample.workingSetBytes < 0))
+      (!Number.isFinite(sample.workingSetBytes) || sample.workingSetBytes < 0)) ||
+    !validProcessIds ||
+    !validWindows ||
+    sample.processCount !== sample.processIds.length ||
+    sample.topLevelWindowCount !== sample.topLevelWindows.length ||
+    sample.visibleWindowCount !== sample.topLevelWindows.filter((window) => window.visible).length
   ) {
     throw new Error('Electron runtime inspection returned an invalid result.');
   }
   return sample;
+};
+
+const waitForStableRuntime = async (rootProcessId, label) => {
+  let previousFingerprint;
+  let stableSamples = 0;
+  return waitFor(
+    async () => {
+      const sample = await inspectRuntime(rootProcessId);
+      if (
+        !sample.processTreeComplete ||
+        sample.processCount < 1 ||
+        sample.topLevelWindowCount < 1
+      ) {
+        previousFingerprint = undefined;
+        stableSamples = 0;
+        return undefined;
+      }
+      const fingerprint = runtimeWindowFingerprint(sample);
+      if (fingerprint === previousFingerprint) stableSamples += 1;
+      else {
+        previousFingerprint = fingerprint;
+        stableSamples = 1;
+      }
+      return stableSamples >= runtimeStabilitySamples ? sample : undefined;
+    },
+    20_000,
+    label,
+  );
+};
+
+const waitForBaselineWindows = async (rootProcessId, baseline, label) => {
+  let stableMatches = 0;
+  return waitFor(
+    async () => {
+      const sample = await inspectRuntime(rootProcessId);
+      if (!sample.processTreeComplete || !sameRuntimeWindows(baseline, sample)) {
+        stableMatches = 0;
+        return undefined;
+      }
+      stableMatches += 1;
+      return stableMatches >= runtimeStabilitySamples ? sample : undefined;
+    },
+    20_000,
+    label,
+  );
 };
 
 const percentile = (values, percentage) => {
@@ -286,71 +349,6 @@ const waitForRuntimeExit = async (rootProcessId, label) =>
     label,
   );
 
-class CdpSession {
-  #nextId = 1;
-  #pending = new Map();
-  #socket;
-
-  static async connect(url) {
-    const socket = new WebSocket(url);
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error('CDP WebSocket connection timed out.')),
-        5_000,
-      );
-      socket.addEventListener(
-        'open',
-        () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        { once: true },
-      );
-      socket.addEventListener(
-        'error',
-        () => {
-          clearTimeout(timer);
-          reject(new Error('CDP WebSocket connection failed.'));
-        },
-        { once: true },
-      );
-    });
-    return new CdpSession(socket);
-  }
-
-  constructor(socket) {
-    this.#socket = socket;
-    socket.addEventListener('message', (event) => {
-      const message = JSON.parse(String(event.data));
-      if (message.id === undefined) return;
-      const pending = this.#pending.get(message.id);
-      if (pending === undefined) return;
-      this.#pending.delete(message.id);
-      if (message.error !== undefined) {
-        pending.reject(new Error(`CDP ${pending.method} failed: ${message.error.message}`));
-      } else pending.resolve(message.result ?? {});
-    });
-    socket.addEventListener('close', () => {
-      for (const pending of this.#pending.values()) {
-        pending.reject(new Error(`CDP closed while waiting for ${pending.method}.`));
-      }
-      this.#pending.clear();
-    });
-  }
-
-  send(method, params = {}) {
-    const id = this.#nextId++;
-    return new Promise((resolve, reject) => {
-      this.#pending.set(id, { method, resolve, reject });
-      this.#socket.send(JSON.stringify({ id, method, params }));
-    });
-  }
-
-  close() {
-    this.#socket.close();
-  }
-}
-
 const launchEditor = async ({ deckPath, userData }) => {
   const executable = process.env.HTMLLELUJAH_EXECUTABLE;
   const launchCommand = executable === undefined ? electronPath : path.resolve(executable);
@@ -390,10 +388,13 @@ const launchEditor = async ({ deckPath, userData }) => {
       'Electron remote debugging endpoint',
     );
     const target = await waitFor(
-      async () => {
-        const response = await fetch(`http://127.0.0.1:${debuggingPort}/json/list`);
-        if (!response.ok) return undefined;
-        const targets = await response.json();
+      async (remainingMs) => {
+        const targets = await fetchJsonWithTimeout(
+          `http://127.0.0.1:${debuggingPort}/json/list`,
+          Math.min(fetchAttemptTimeoutMs, remainingMs),
+          'Electron target discovery request',
+        );
+        if (!Array.isArray(targets)) return undefined;
         return targets.find(
           (candidate) =>
             candidate.type === 'page' &&
@@ -404,7 +405,10 @@ const launchEditor = async ({ deckPath, userData }) => {
       20_000,
       'HTMLlelujah renderer target',
     );
-    cdp = await CdpSession.connect(target.webSocketDebuggerUrl);
+    cdp = await CdpSession.connect(target.webSocketDebuggerUrl, {
+      timeoutMs: cdpCommandTimeoutMs,
+      commandTimeoutMs: cdpCommandTimeoutMs,
+    });
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable');
     await cdp.send('Page.bringToFront');
@@ -679,12 +683,8 @@ try {
     successText: 'Saved locally.',
   });
 
-  const runtimeBaseline = await waitFor(
-    async () => {
-      const sample = await inspectRuntime(activeApplicationPid);
-      return sample.processCount >= 1 && sample.topLevelWindowCount >= 1 ? sample : undefined;
-    },
-    20_000,
+  const runtimeBaseline = await waitForStableRuntime(
+    activeApplicationPid,
     'Observable editor runtime before exports',
   );
   if (!runtimeBaseline.processTreeComplete) {
@@ -738,14 +738,9 @@ try {
               mediaBoxPt: [result.widthPt, result.heightPt],
             };
           })();
-    const runtimeSample = await waitFor(
-      async () => {
-        const sample = await inspectRuntime(activeApplicationPid);
-        return sample.topLevelWindowCount === runtimeBaseline.topLevelWindowCount
-          ? sample
-          : undefined;
-      },
-      20_000,
+    const runtimeSample = await waitForBaselineWindows(
+      activeApplicationPid,
+      runtimeBaseline,
       `Closed native dialog after export ${ordinal}`,
     );
     if (!runtimeSample.processTreeComplete) {
@@ -755,6 +750,12 @@ try {
     }
     if (runtimeSample.topLevelWindowCount !== runtimeBaseline.topLevelWindowCount) {
       throw new Error(`A native or renderer window remained after export ${ordinal}.`);
+    }
+    if (
+      runtimeSample.visibleWindowCount !== runtimeBaseline.visibleWindowCount ||
+      !sameRuntimeWindows(runtimeBaseline, runtimeSample)
+    ) {
+      throw new Error(`The editor window identity changed after export ${ordinal}.`);
     }
     if (runtimeSample.processCount < 1) {
       throw new Error(`The editor process tree disappeared after export ${ordinal}.`);
@@ -818,12 +819,8 @@ try {
   ) {
     throw new Error('The Save As result did not reopen completely in the real editor.');
   }
-  const reopenRuntime = await waitFor(
-    async () => {
-      const sample = await inspectRuntime(activeApplicationPid);
-      return sample.processCount >= 1 && sample.topLevelWindowCount >= 1 ? sample : undefined;
-    },
-    20_000,
+  const reopenRuntime = await waitForStableRuntime(
+    activeApplicationPid,
     'Observable reopened editor runtime',
   );
   if (
@@ -888,6 +885,7 @@ try {
       hdeckParsedAndValidated: true,
       savedHdeckReopenedInRealEditor: true,
       nativeDialogsClosedAfterEveryExport: true,
+      exactWindowHandlesAndVisibilityRestoredAfterEveryExport: true,
       processCountStable: runtimeGrowth.processCountStable,
       processTreesAndWindowsClosedAfterEditorsExit:
         firstRuntimeCleanup.processCount === 0 &&

@@ -15,6 +15,13 @@ public static class HtmllelujahWindowInspection
 {
     private delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
 
+    public sealed class WindowRecord
+    {
+        public long Handle { get; set; }
+        public int ProcessId { get; set; }
+        public bool Visible { get; set; }
+    }
+
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
 
@@ -24,22 +31,28 @@ public static class HtmllelujahWindowInspection
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
-    public static int CountTopLevelWindows(int[] processIds, bool visibleOnly)
+    public static WindowRecord[] ListTopLevelWindows(int[] processIds)
     {
         var accepted = new HashSet<uint>();
         foreach (var processId in processIds) {
             if (processId > 0) accepted.Add((uint)processId);
         }
 
-        var count = 0;
+        var records = new List<WindowRecord>();
         EnumWindows((window, parameter) => {
-            if (visibleOnly && !IsWindowVisible(window)) return true;
             uint processId;
             GetWindowThreadProcessId(window, out processId);
-            if (accepted.Contains(processId)) count++;
+            if (accepted.Contains(processId)) {
+                records.Add(new WindowRecord {
+                    Handle = window.ToInt64(),
+                    ProcessId = (int)processId,
+                    Visible = IsWindowVisible(window)
+                });
+            }
             return true;
         }, IntPtr.Zero);
-        return count;
+        records.Sort((left, right) => left.Handle.CompareTo(right.Handle));
+        return records.ToArray();
     }
 }
 '@
@@ -85,20 +98,28 @@ foreach ($processId in $accepted) {
   }
 }
 
+$sortedLiveProcessIds = @($liveProcessIds.ToArray() | Sort-Object)
+$windowRecords = @(
+  [HtmllelujahWindowInspection]::ListTopLevelWindows($sortedLiveProcessIds) |
+    ForEach-Object {
+      [ordered]@{
+        handle = ([long]$_.Handle).ToString('x16', [System.Globalization.CultureInfo]::InvariantCulture)
+        processId = [int]$_.ProcessId
+        visible = [bool]$_.Visible
+      }
+    }
+)
+
 $result = [ordered]@{
-  schemaVersion = 1
-  processCount = $liveProcessIds.Count
-  topLevelWindowCount = [HtmllelujahWindowInspection]::CountTopLevelWindows(
-    $liveProcessIds.ToArray(),
-    $false
-  )
-  visibleWindowCount = [HtmllelujahWindowInspection]::CountTopLevelWindows(
-    $liveProcessIds.ToArray(),
-    $true
-  )
+  schemaVersion = 2
+  processCount = $sortedLiveProcessIds.Count
+  processIds = $sortedLiveProcessIds
+  topLevelWindowCount = $windowRecords.Count
+  visibleWindowCount = @($windowRecords | Where-Object { $_.visible }).Count
+  topLevelWindows = $windowRecords
   processTreeComplete = $processTreeComplete
-  workingSetAvailable = $workingSetAvailable -and $liveProcessIds.Count -gt 0
-  workingSetBytes = if ($workingSetAvailable -and $liveProcessIds.Count -gt 0) {
+  workingSetAvailable = $workingSetAvailable -and $sortedLiveProcessIds.Count -gt 0
+  workingSetBytes = if ($workingSetAvailable -and $sortedLiveProcessIds.Count -gt 0) {
     $workingSetBytes
   } else {
     $null
