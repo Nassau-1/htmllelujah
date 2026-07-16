@@ -214,38 +214,152 @@ function Find-Window {
 function Find-FileNameEditor {
   param([System.Windows.Automation.AutomationElement]$Window)
 
-  $byId = $Window.FindFirst(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    [System.Windows.Automation.PropertyCondition]::new(
-      [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
-      '1001'
+  $searchRoots = [System.Collections.Generic.List[System.Windows.Automation.AutomationElement]]::new()
+  foreach ($automationId in @('FileNameControlHost', '1148', '1001')) {
+    $root = $Window.FindFirst(
+      [System.Windows.Automation.TreeScope]::Descendants,
+      [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+        $automationId
+      )
     )
-  )
-  if ($null -ne $byId) {
-    return $byId
+    if ($null -ne $root) {
+      [void]$searchRoots.Add($root)
+    }
   }
 
-  $host = $Window.FindFirst(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    [System.Windows.Automation.PropertyCondition]::new(
-      [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
-      'FileNameControlHost'
-    )
-  )
-  if ($null -ne $host) {
-    $editor = $host.FindFirst(
+  $candidateByRuntimeId = @{}
+  $observedControls = [System.Collections.Generic.List[string]]::new()
+  foreach ($root in $searchRoots) {
+    try {
+      $rootCurrent = $root.Current
+      [void]$observedControls.Add(
+        "root:$($rootCurrent.AutomationId)/$($rootCurrent.ControlType.ProgrammaticName)/$($rootCurrent.ClassName)/offscreen=$($rootCurrent.IsOffscreen)"
+      )
+      if ($root.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit) {
+        $runtimeId = ($root.GetRuntimeId() -join '.')
+        $candidateByRuntimeId[$runtimeId] = $root
+      }
+    }
+    catch {
+      # A common-dialog element can disappear while its controls are being materialized.
+    }
+
+    try {
+      $descendants = $root.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.PropertyCondition]::new(
+          [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+          [System.Windows.Automation.ControlType]::Edit
+        )
+      )
+      foreach ($candidate in $descendants) {
+        $candidateCurrent = $candidate.Current
+        [void]$observedControls.Add(
+          "edit:$($candidateCurrent.AutomationId)/$($candidateCurrent.ClassName)/offscreen=$($candidateCurrent.IsOffscreen)/enabled=$($candidateCurrent.IsEnabled)"
+        )
+        $runtimeId = ($candidate.GetRuntimeId() -join '.')
+        $candidateByRuntimeId[$runtimeId] = $candidate
+      }
+    }
+    catch {
+      # Retry at the call site while the dialog remains inside its bounded initialization window.
+    }
+  }
+
+  try {
+    $windowEdits = $Window.FindAll(
       [System.Windows.Automation.TreeScope]::Descendants,
       [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Edit
       )
     )
-    if ($null -ne $editor) {
-      return $editor
+    foreach ($candidate in $windowEdits) {
+      $current = $candidate.Current
+      $hasKnownId = $current.AutomationId -in @('1148', '1001')
+      $hasFileName = $current.Name -match '(?i)(file\s*name|nom du fichier|dateiname|nombre de archivo|nome file|bestandsnaam)'
+      $hasEditClass = $current.ClassName -match '(?i)(^|\.)edit$'
+      if (($hasKnownId -and $hasEditClass) -or $hasFileName) {
+        $runtimeId = ($candidate.GetRuntimeId() -join '.')
+        $candidateByRuntimeId[$runtimeId] = $candidate
+        [void]$observedControls.Add(
+          "identified-edit:$($current.AutomationId)/$($current.ClassName)/$($current.Name)/offscreen=$($current.IsOffscreen)"
+        )
+      }
+    }
+  }
+  catch {
+    [void]$observedControls.Add('identified-edit-enumeration-failed')
+  }
+
+  $eligible = [System.Collections.Generic.List[object]]::new()
+  foreach ($candidate in $candidateByRuntimeId.Values) {
+    try {
+      $current = $candidate.Current
+      $bounds = $current.BoundingRectangle
+      if (
+        -not $current.IsEnabled -or
+        $current.IsOffscreen -or
+        $bounds.Width -le 0 -or
+        $bounds.Height -le 0
+      ) {
+        continue
+      }
+
+      $classMatches = $current.ClassName -match '(?i)(edit|combo)'
+      $nameMatches = $current.Name -match '(?i)(file\s*name|nom du fichier|dateiname|nombre de archivo|nome file|bestandsnaam)'
+      if (-not $classMatches -and -not $nameMatches) {
+        continue
+      }
+
+      $patternObject = $null
+      if (
+        -not $candidate.TryGetCurrentPattern(
+          [System.Windows.Automation.ValuePattern]::Pattern,
+          [ref]$patternObject
+        )
+      ) {
+        continue
+      }
+      $valuePattern = [System.Windows.Automation.ValuePattern]$patternObject
+      if ($valuePattern.Current.IsReadOnly) {
+        continue
+      }
+
+      [void]$eligible.Add([pscustomobject]@{
+          Editor = $candidate
+          ValuePattern = $valuePattern
+          Description = "$($current.AutomationId)/$($current.ClassName)/$($current.Name)"
+        })
+    }
+    catch {
+      # Ignore stale or incomplete candidates and retry within the bounded lookup window.
     }
   }
 
-  return $null
+  if ($eligible.Count -eq 1) {
+    return [pscustomobject]@{
+      Status = 'Found'
+      Editor = $eligible[0].Editor
+      ValuePattern = $eligible[0].ValuePattern
+      Details = $eligible[0].Description
+    }
+  }
+  if ($eligible.Count -gt 1) {
+    return [pscustomobject]@{
+      Status = 'Ambiguous'
+      Editor = $null
+      ValuePattern = $null
+      Details = (($eligible | ForEach-Object { $_.Description }) -join ' | ')
+    }
+  }
+  return [pscustomobject]@{
+    Status = 'Missing'
+    Editor = $null
+    ValuePattern = $null
+    Details = "No visible, writable Edit under the native file-name hosts. Observed: $($observedControls -join ' | ')"
+  }
 }
 
 function Find-DefaultButton {
@@ -305,15 +419,22 @@ if ($null -eq $dialog) {
   throw 'The expected Windows save dialog did not appear before the timeout.'
 }
 
-$editor = Find-FileNameEditor -Window $dialog
-if ($null -eq $editor) {
-  throw 'The Windows save dialog file-name editor was not found.'
+$editorResult = $null
+$editorDeadline = [DateTime]::UtcNow.AddSeconds(5)
+while ([DateTime]::UtcNow -lt $editorDeadline) {
+  $editorResult = Find-FileNameEditor -Window $dialog
+  if ($editorResult.Status -eq 'Found') {
+    break
+  }
+  Start-Sleep -Milliseconds 100
 }
-
-$valuePattern = $editor.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-if ($null -eq $valuePattern -or $valuePattern.Current.IsReadOnly) {
-  throw 'The Windows save dialog file-name editor is not writable.'
+if ($null -eq $editorResult -or $editorResult.Status -ne 'Found') {
+  $status = if ($null -eq $editorResult) { 'Missing' } else { $editorResult.Status }
+  $details = if ($null -eq $editorResult) { 'No lookup result.' } else { $editorResult.Details }
+  throw "The Windows save dialog file-name editor lookup failed closed ($status): $details"
 }
+$editor = $editorResult.Editor
+$valuePattern = $editorResult.ValuePattern
 $editor.SetFocus()
 $nativeEdit = [HtmllelujahUnicodeInput]::ReplaceNativeEdit(
   $editor.Current.NativeWindowHandle,

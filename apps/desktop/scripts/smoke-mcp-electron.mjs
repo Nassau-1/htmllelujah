@@ -5,6 +5,8 @@ import path from 'node:path';
 
 import electronPath from 'electron';
 
+import { createMcpResponseRouter } from './mcp-json-line-router.mjs';
+
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const packagedExecutable = process.env.HTMLLELUJAH_EXECUTABLE;
 const packagedLauncher = process.env.HTMLLELUJAH_MCP_LAUNCHER;
@@ -18,6 +20,7 @@ const waitFor = async (operation, timeoutMs, label) => {
       const result = await operation();
       if (result !== undefined && result !== false) return result;
     } catch (error) {
+      if (error instanceof Error && error.code === 'MCP_STDIO_FAILURE') throw error;
       lastError = error;
     }
     await sleep(50);
@@ -27,21 +30,63 @@ const waitFor = async (operation, timeoutMs, label) => {
   );
 };
 
-const terminate = async (child) => {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+const hasExited = (child) => child.exitCode !== null || child.signalCode !== null;
+
+const waitForExit = (child, timeoutMs) => {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(hasExited(child)), timeoutMs);
+    child.once('exit', onExit);
+  });
+};
+
+const terminate = async (child, label) => {
+  if (hasExited(child) || child.pid === undefined) return;
   if (process.platform === 'win32' && child.pid !== undefined) {
     const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
       windowsHide: true,
       stdio: 'ignore',
     });
-    await Promise.race([new Promise((resolve) => killer.once('exit', resolve)), sleep(5_000)]);
-    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 5_000);
+      const finish = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      killer.once('error', finish);
+      killer.once('exit', finish);
+    });
+    if (await waitForExit(child, 2_000)) return;
   }
-  child.kill();
-  await Promise.race([
-    new Promise((resolve) => child.once('exit', resolve)),
-    sleep(3_000).then(() => child.kill('SIGKILL')),
-  ]);
+
+  try {
+    child.kill();
+  } catch {
+    // Continue to the forceful, bounded termination attempt.
+  }
+  if (await waitForExit(child, 2_000)) return;
+
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // The verified exit check below remains authoritative.
+  }
+  if (await waitForExit(child, 3_000)) return;
+
+  child.stdin?.destroy();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  child.unref();
+  throw new Error(`${label} did not exit within the termination deadline.`);
 };
 
 const userData = await mkdtemp(path.join(tmpdir(), 'htmllelujah-electron-smoke-'));
@@ -57,14 +102,24 @@ const application = spawn(
 );
 let applicationError = '';
 let mcpError = '';
+let applicationSpawnError;
+application.once('error', (error) => {
+  applicationSpawnError = error;
+});
 application.stderr.on('data', (chunk) => {
   applicationError += chunk.toString('utf8');
 });
 
 let mcp;
+let mcpRouter;
+let mcpExitExpected = false;
 try {
   await waitFor(
     async () => {
+      if (applicationSpawnError !== undefined) throw applicationSpawnError;
+      if (hasExited(application)) {
+        throw new Error(`Desktop process exited before MCP startup (${application.exitCode}).`);
+      }
       await access(descriptorPath);
       return true;
     },
@@ -89,54 +144,56 @@ try {
       HTMLLELUJAH_USER_DATA_DIR: userData,
     },
   });
-  let buffered = '';
-  const responses = new Map();
-  const waiters = new Map();
+  mcpRouter = createMcpResponseRouter();
   mcp.stderr.on('data', (chunk) => {
     mcpError += chunk.toString('utf8');
   });
   mcp.stdout.on('data', (chunk) => {
-    buffered += chunk.toString('utf8');
-    for (;;) {
-      const newline = buffered.indexOf('\n');
-      if (newline < 0) break;
-      const line = buffered.slice(0, newline).trim();
-      buffered = buffered.slice(newline + 1);
-      if (line === '') continue;
-      let message;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        throw new Error('MCP stdout contained non-JSON data.');
-      }
-      if (message.id === undefined) continue;
-      const waiter = waiters.get(message.id);
-      if (waiter === undefined) responses.set(message.id, message);
-      else {
-        waiters.delete(message.id);
-        waiter(message);
-      }
+    mcpRouter.push(chunk);
+  });
+  mcp.stdout.once('end', () => {
+    mcpRouter.finish();
+  });
+  mcp.stdin.on('error', (error) => {
+    mcpRouter.fail(new Error('MCP stdin failed.', { cause: error }));
+  });
+  mcp.once('error', (error) => {
+    mcpRouter.fail(new Error('MCP process failed to spawn or communicate.', { cause: error }));
+  });
+  mcp.once('exit', (code, signal) => {
+    if (!mcpExitExpected) {
+      mcpRouter.fail(
+        new Error(`MCP process exited unexpectedly (${String(code ?? signal ?? 'unknown')}).`),
+      );
     }
   });
 
-  const send = async (message, timeoutMs = 10_000) => {
-    mcp.stdin.write(`${JSON.stringify(message)}\n`);
-    if (message.id === undefined) return undefined;
-    const ready = responses.get(message.id);
-    if (ready !== undefined) {
-      responses.delete(message.id);
-      return ready;
-    }
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        waiters.delete(message.id);
-        reject(new Error(`MCP response ${message.id} timed out.`));
-      }, timeoutMs);
-      waiters.set(message.id, (value) => {
+  const writeMcpLine = (line, timeoutMs = 5_000) =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
-        resolve(value);
-      });
+        if (error === undefined || error === null) resolve();
+        else {
+          const failure = mcpRouter.fail(error);
+          reject(failure);
+        }
+      };
+      const timer = setTimeout(() => finish(new Error('MCP stdin write timed out.')), timeoutMs);
+      try {
+        mcp.stdin.write(line, (error) => finish(error));
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error('MCP stdin write failed.'));
+      }
     });
+
+  const send = async (message, timeoutMs = 10_000) => {
+    if (mcpRouter.failure !== undefined) throw mcpRouter.failure;
+    await writeMcpLine(`${JSON.stringify(message)}\n`);
+    if (message.id === undefined) return undefined;
+    return mcpRouter.waitForResponse(message.id, timeoutMs);
   };
 
   const initialize = await send({
@@ -202,9 +259,17 @@ try {
   if (outline.name !== 'MCP smoke verified' || outline.revision !== committed.revision) {
     throw new Error('Desktop and MCP revisions did not converge.');
   }
+  if (mcpRouter.failure !== undefined) throw mcpRouter.failure;
 
+  mcpExitExpected = true;
   mcp.stdin.end();
-  await waitFor(() => mcp.exitCode !== null, 5_000, 'MCP stdio shutdown');
+  await waitFor(
+    () => mcp.exitCode !== null && mcp.stdout.readableEnded && mcp.stderr.readableEnded,
+    5_000,
+    'MCP stdio shutdown',
+  );
+  mcpRouter.finish();
+  if (mcpRouter.failure !== undefined) throw mcpRouter.failure;
   if (mcp.exitCode !== 0) throw new Error(`MCP process exited with ${mcp.exitCode}.`);
   process.stdout.write(
     `Electron MCP smoke passed (${packagedLauncher === undefined ? 'source' : 'packaged launcher'}): opened app, listed tools, committed edit, converged.\n`,
@@ -219,19 +284,25 @@ try {
   }
   throw error;
 } finally {
-  if (mcp !== undefined) await terminate(mcp);
-  await terminate(application);
-  await waitFor(
-    async () => {
-      try {
-        await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
-        return true;
-      } catch (error) {
-        if (error?.code === 'EBUSY' || error?.code === 'EPERM') return false;
-        throw error;
-      }
-    },
-    10_000,
-    'Electron smoke cleanup',
-  );
+  try {
+    if (mcp !== undefined) await terminate(mcp, 'MCP process');
+  } finally {
+    try {
+      await terminate(application, 'Desktop process');
+    } finally {
+      await waitFor(
+        async () => {
+          try {
+            await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+            return true;
+          } catch (error) {
+            if (error?.code === 'EBUSY' || error?.code === 'EPERM') return false;
+            throw error;
+          }
+        },
+        10_000,
+        'Electron smoke cleanup',
+      );
+    }
+  }
 }

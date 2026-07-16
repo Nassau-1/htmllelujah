@@ -17,11 +17,12 @@
     "licenses:check": "node scripts/check-licenses.mjs",
     "make:win": "pnpm --filter @htmllelujah/desktop make",
     "package:win": "pnpm --filter @htmllelujah/desktop package",
-    "sbom:generate": "pnpm sbom --sbom-format cyclonedx --prod --sbom-type application > artifacts/sbom.cdx.json",
+    "sbom:generate": "node scripts/generate-sbom.mjs",
     "test": "pnpm -r --if-present test",
     "test:release-evidence": "node scripts/test-release-evidence.mjs",
+    "test:sbom-generate": "node --test scripts/generate-sbom.test.mjs",
     "typecheck": "pnpm -r --if-present typecheck",
-    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:release-evidence && pnpm build && pnpm licenses:check"
+    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:release-evidence && pnpm test:sbom-generate && pnpm build && pnpm licenses:check"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

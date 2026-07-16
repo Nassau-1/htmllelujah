@@ -5,6 +5,8 @@ import path from 'node:path';
 
 import electronPath from 'electron';
 
+import { assessInteractiveReadiness, assertInteractiveReadiness } from './ui-smoke-performance.mjs';
+
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
 const evidenceDirectory = path.join(repositoryRoot, 'artifacts', 'evidence');
@@ -30,21 +32,63 @@ const waitFor = async (operation, timeoutMs, label) => {
   );
 };
 
-const terminate = async (child) => {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+const hasExited = (child) => child.exitCode !== null || child.signalCode !== null;
+
+const waitForExit = (child, timeoutMs) => {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(hasExited(child)), timeoutMs);
+    child.once('exit', onExit);
+  });
+};
+
+const terminate = async (child, label = 'Electron process') => {
+  if (hasExited(child) || child.pid === undefined) return;
   if (process.platform === 'win32' && child.pid !== undefined) {
     const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
       windowsHide: true,
       stdio: 'ignore',
     });
-    await Promise.race([new Promise((resolve) => killer.once('exit', resolve)), sleep(5_000)]);
-    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 5_000);
+      const finish = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      killer.once('error', finish);
+      killer.once('exit', finish);
+    });
+    if (await waitForExit(child, 2_000)) return;
   }
-  child.kill();
-  await Promise.race([
-    new Promise((resolve) => child.once('exit', resolve)),
-    sleep(3_000).then(() => child.kill('SIGKILL')),
-  ]);
+
+  try {
+    child.kill();
+  } catch {
+    // Continue to the forceful, bounded termination attempt.
+  }
+  if (await waitForExit(child, 2_000)) return;
+
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // The verified exit check below remains authoritative.
+  }
+  if (await waitForExit(child, 3_000)) return;
+
+  child.stdin?.destroy();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  child.unref();
+  throw new Error(`${label} did not exit within the termination deadline.`);
 };
 
 const automateFileDialog = (rootProcessId, windowTitle, targetPath) =>
@@ -154,6 +198,118 @@ class CdpSession {
   }
 }
 
+const waitForDebuggingPort = (child, userData, getStderr, getSpawnError, label) =>
+  waitFor(
+    async () => {
+      const spawnError = getSpawnError();
+      if (spawnError !== undefined) throw spawnError;
+      if (hasExited(child)) {
+        throw new Error(`${label} exited before its debugging endpoint was ready.`);
+      }
+      try {
+        const value = await readFile(path.join(userData, 'DevToolsActivePort'), 'utf8');
+        const port = Number.parseInt(value.split(/\r?\n/u)[0] ?? '', 10);
+        if (Number.isInteger(port) && port > 0) return port;
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      const match = getStderr().match(/DevTools listening on ws:\/\/[^:]+:(\d+)\//u);
+      return match === null ? undefined : Number.parseInt(match[1], 10);
+    },
+    15_000,
+    `${label} remote debugging endpoint`,
+  );
+
+const waitForRendererTarget = (debuggingPort, label) =>
+  waitFor(
+    async () => {
+      const response = await fetch(`http://127.0.0.1:${debuggingPort}/json/list`);
+      if (!response.ok) return undefined;
+      const targets = await response.json();
+      return targets.find(
+        (candidate) =>
+          candidate.type === 'page' &&
+          typeof candidate.url === 'string' &&
+          candidate.url.startsWith('htmllelujah-app://app/'),
+      );
+    },
+    15_000,
+    `${label} renderer target`,
+  );
+
+const evaluateCdp = async (session, expression, userGesture = false) => {
+  const response = await session.send('Runtime.evaluate', {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+    userGesture,
+  });
+  if (response.exceptionDetails !== undefined) {
+    const detail =
+      response.exceptionDetails.exception?.description ?? response.exceptionDetails.text;
+    throw new Error(`Renderer evaluation failed: ${detail}`);
+  }
+  return response.result?.value;
+};
+
+const warmUpApplication = async ({ launchCommand, launchArguments, userData }) => {
+  const debuggingPortPath = path.join(userData, 'DevToolsActivePort');
+  await rm(debuggingPortPath, { force: true });
+
+  const startedAt = performance.now();
+  const warmup = spawn(launchCommand, launchArguments, {
+    cwd: desktopRoot,
+    windowsHide: true,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let warmupError = '';
+  let warmupSpawnError;
+  warmup.once('error', (error) => {
+    warmupSpawnError = error;
+  });
+  warmup.stderr.on('data', (chunk) => {
+    warmupError += chunk.toString('utf8');
+  });
+
+  let warmupCdp;
+  try {
+    const debuggingPort = await waitForDebuggingPort(
+      warmup,
+      userData,
+      () => warmupError,
+      () => warmupSpawnError,
+      'Electron warm-up',
+    );
+    const target = await waitForRendererTarget(debuggingPort, 'Electron warm-up');
+    warmupCdp = await CdpSession.connect(target.webSocketDebuggerUrl);
+    await warmupCdp.send('Runtime.enable');
+    await waitFor(
+      async () =>
+        (await evaluateCdp(
+          warmupCdp,
+          `document.readyState === 'complete' && document.querySelector('.app-shell') !== null`,
+        )) || undefined,
+      15_000,
+      'Electron warm-up application shell',
+    );
+    await evaluateCdp(warmupCdp, `document.fonts.ready.then(() => true)`);
+    return {
+      completed: true,
+      interactiveReadyMs: Number((performance.now() - startedAt).toFixed(3)),
+      profileReusedForMeasuredLaunch: true,
+    };
+  } catch (error) {
+    if (warmupError !== '') {
+      process.stderr.write(`[warm-up desktop stderr]\n${warmupError.slice(0, 4_000)}\n`);
+    }
+    throw error;
+  } finally {
+    warmupCdp?.close();
+    await terminate(warmup, 'Electron warm-up process');
+    await rm(debuggingPortPath, { force: true });
+  }
+};
+
 const userData = await mkdtemp(path.join(tmpdir(), 'htmllelujah-ui-smoke-'));
 const imageFixturePath = path.join(userData, 'native-image-import.png');
 await writeFile(
@@ -167,21 +323,37 @@ const executable = process.env.HTMLLELUJAH_EXECUTABLE;
 const openPath = process.env.HTMLLELUJAH_OPEN_PATH;
 const expectedDeckName = process.env.HTMLLELUJAH_EXPECTED_DECK_NAME;
 const launchCommand = executable === undefined ? electronPath : path.resolve(executable);
-const launchArguments = [
+const createLaunchArguments = (includeOpenPath) => [
   ...(executable === undefined ? ['.'] : []),
-  ...(openPath === undefined ? [] : [path.resolve(openPath)]),
+  ...(includeOpenPath && openPath !== undefined ? [path.resolve(openPath)] : []),
   `--user-data-dir=${userData}`,
   '--remote-debugging-address=127.0.0.1',
   '--remote-debugging-port=0',
   '--force-device-scale-factor=1',
 ];
+let warmupEvidence;
+try {
+  warmupEvidence = await warmUpApplication({
+    launchCommand,
+    launchArguments: createLaunchArguments(false),
+    userData,
+  });
+} catch (error) {
+  await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+  throw error;
+}
+
 const launchStartedAt = performance.now();
-const application = spawn(launchCommand, launchArguments, {
+const application = spawn(launchCommand, createLaunchArguments(true), {
   cwd: desktopRoot,
   windowsHide: true,
   stdio: ['ignore', 'ignore', 'pipe'],
 });
 let applicationError = '';
+let applicationSpawnError;
+application.once('error', (error) => {
+  applicationSpawnError = error;
+});
 application.stderr.on('data', (chunk) => {
   applicationError += chunk.toString('utf8');
 });
@@ -189,57 +361,22 @@ application.stderr.on('data', (chunk) => {
 let cdp;
 let evaluateRenderer;
 try {
-  const debuggingPort = await waitFor(
-    async () => {
-      try {
-        const value = await readFile(path.join(userData, 'DevToolsActivePort'), 'utf8');
-        const port = Number.parseInt(value.split(/\r?\n/u)[0] ?? '', 10);
-        if (Number.isInteger(port) && port > 0) return port;
-      } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-      }
-      const match = applicationError.match(/DevTools listening on ws:\/\/[^:]+:(\d+)\//u);
-      return match === null ? undefined : Number.parseInt(match[1], 10);
-    },
-    15_000,
-    'Electron remote debugging endpoint',
+  const debuggingPort = await waitForDebuggingPort(
+    application,
+    userData,
+    () => applicationError,
+    () => applicationSpawnError,
+    'Electron measured launch',
   );
 
-  const target = await waitFor(
-    async () => {
-      const response = await fetch(`http://127.0.0.1:${debuggingPort}/json/list`);
-      if (!response.ok) return undefined;
-      const targets = await response.json();
-      return targets.find(
-        (candidate) =>
-          candidate.type === 'page' &&
-          typeof candidate.url === 'string' &&
-          candidate.url.startsWith('htmllelujah-app://app/'),
-      );
-    },
-    15_000,
-    'HTMLlelujah renderer target',
-  );
+  const target = await waitForRendererTarget(debuggingPort, 'HTMLlelujah measured launch');
 
   cdp = await CdpSession.connect(target.webSocketDebuggerUrl);
   await cdp.send('Page.enable');
   await cdp.send('Runtime.enable');
   await cdp.send('Page.bringToFront');
 
-  const evaluate = async (expression) => {
-    const response = await cdp.send('Runtime.evaluate', {
-      expression,
-      awaitPromise: true,
-      returnByValue: true,
-      userGesture: true,
-    });
-    if (response.exceptionDetails !== undefined) {
-      const detail =
-        response.exceptionDetails.exception?.description ?? response.exceptionDetails.text;
-      throw new Error(`Renderer evaluation failed: ${detail}`);
-    }
-    return response.result?.value;
-  };
+  const evaluate = (expression) => evaluateCdp(cdp, expression, true);
   evaluateRenderer = evaluate;
 
   const waitForRenderer = (expression, label, timeoutMs = 10_000) =>
@@ -294,6 +431,29 @@ try {
   );
   await evaluate(`document.fonts.ready.then(() => true)`);
   const interactiveReadyMs = Number((performance.now() - launchStartedAt).toFixed(3));
+  const performanceReport = {
+    ...assessInteractiveReadiness(interactiveReadyMs),
+    measurement: 'second-launch-same-profile',
+    warmup: warmupEvidence,
+  };
+  try {
+    assertInteractiveReadiness(performanceReport);
+  } catch (error) {
+    const failureReport = {
+      passed: false,
+      testedAt: new Date().toISOString(),
+      launchMode: executable === undefined ? 'source-build' : 'packaged-executable',
+      failedPhase: 'interactive-readiness',
+      performance: performanceReport,
+      failure: {
+        code: error instanceof Error && 'code' in error ? error.code : 'UNKNOWN',
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+    await mkdir(evidenceDirectory, { recursive: true });
+    await writeFile(reportPath, `${JSON.stringify(failureReport, null, 2)}\n`, 'utf8');
+    throw error;
+  }
 
   const initial = await evaluate(`(() => ({
     title: document.title,
@@ -658,16 +818,13 @@ try {
     passed: true,
     testedAt: new Date().toISOString(),
     launchMode: executable === undefined ? 'source-build' : 'packaged-executable',
-    performance: {
-      interactiveReadyMs,
-      warmStartBudgetMs: 3_000,
-      withinWarmStartBudget: interactiveReadyMs < 3_000,
-    },
+    performance: performanceReport,
     rendererTitle: initial.title,
     initial,
     final: finalState,
     checks: [
       'real Electron renderer opened through the secure app protocol',
+      'one unmeasured warm-up and one measured launch reused the same user-data profile',
       'essential editor surfaces rendered',
       'shape insertion, undo, and redo converged',
       'native image chooser imported one decoded image with atomic undo and redo',
