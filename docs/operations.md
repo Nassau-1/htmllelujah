@@ -54,9 +54,12 @@ and command tests; a visual change needs renderer and opened-app evidence; a des
 capability needs validated IPC and packaged Electron coverage; a release change needs
 inspection of the exact artifact.
 
-The current release record template is
-[`releases/v1.0.0.md`](releases/v1.0.0.md). `PENDING` fields in that record are release
-blockers or explicit residual limitations; do not replace them with inferred results.
+The candidate audit checklist is
+[`releases/v1.0.0.md`](releases/v1.0.0.md). Its `PENDING` fields are release blockers
+or explicit residual limitations; do not replace them with inferred results. The
+separate tracked public notes are
+[`releases/v1.0.0-public.md`](releases/v1.0.0-public.md); they must contain no audit
+placeholder and must match their exact blob in the candidate commit.
 
 ## Source verification
 
@@ -99,12 +102,41 @@ packaging. If the pnpm store was intentionally not primed, use
 
 Electron Builder writes only into the detached staging worktree. The exact installer,
 blockmap, and complete `win-unpacked/` inventory are attested before a transaction
-promotes `apps/desktop/out/` and `artifacts/release-evidence/`. A failed build or
-attestation never promotes a partial candidate. The candidate manifest lives at
+promotes `apps/desktop/out/` and `artifacts/release-evidence/`. Before the first
+rename, the transaction writes and flushes an immutable journal under the repository
+parent. A single inter-process lock covers that exact parent. The lock owner includes
+host, PID, and the operating system's exact process-start identity, so a live process
+cannot be confused with a recycled PID. The journal records the complete source and
+prior-destination identities for both directories. A failed build or attestation never
+promotes a partial candidate.
+The candidate manifest lives at
 `artifacts/release-evidence/release-candidate-v1.json`, outside the artifact root, so
 the artifact root contains only publishable payload. Do not publish an artifact merely
 because packaging completed; run the installed-application lifecycle smoke against
 the promoted candidate.
+
+Promotion is crash-recoverable; two independent directory renames are not presented
+as one filesystem primitive. Every journal publication, backup, candidate move,
+rollback, commit, and cleanup-tombstone rename is followed by a metadata flush of both
+parent directories. On Windows this uses a writable directory handle because a
+read-only handle cannot flush directory metadata. Until the journal-hash-bound commit
+marker is durable, restart recovery rolls every destination back to the prior
+generation. After that marker, recovery keeps the new pair only when both recorded
+directory identities and the release-evidence verifier still pass. The verifier runs
+after both new directories are in place and again before transaction cleanup. Cleanup
+first atomically renames the transaction to a tombstone, so recursive deletion can
+never erase the commit marker first. A missing/corrupt control file, unexpected file,
+duplicate generation, reparse point, or identity mismatch leaves the transaction
+intact and blocks the next build and final publication. Never delete a
+`.htmllelujah-release-promotion-*` directory to bypass that failure; preserve it and
+investigate the recorded paths and hashes.
+
+Recovery of a previously committed transaction uses the verifier's internal-identity
+mode rather than `--require-ready`: `HEAD` may legitimately have advanced after the
+crash, but that must not make a self-consistent prior artifact/evidence pair
+unrecoverable. This mode only permits cleanup of the committed transaction. It cannot
+authorize publication; the finalizer still requires current `HEAD`, the annotated
+local tag, and the peeled remote tag to equal the candidate manifest commit.
 
 The packaged Electron fuses keep cookie encryption, embedded ASAR integrity,
 ASAR-only loading, disabled `NODE_OPTIONS`, disabled CLI inspection, and restricted
@@ -362,9 +394,63 @@ installer after it is built; source and lockfile scans alone are insufficient.
    checksums, and unsigned labelling when applicable.
 6. Update `CHANGELOG.md`, `TODO.md`, release notes, and the release evidence with only
    observed results.
-7. Tag the exact verified commit and publish only the artifacts produced from it.
-8. Re-download the published installer and checksum, verify them, install once more,
-   and retain the prior verified installer for rollback.
+7. Tag and push exactly `release-candidate-v1.json.source.commit`, then generate the
+   final publication record as described below. Publish only its listed assets plus
+   that record under the verified remote tag.
+8. Re-download the published installer, checksum, and final record; verify them,
+   install once more, and retain the prior verified installer for rollback.
+
+### Final tag and publication record
+
+Perform this only after every candidate-specific smoke and review is complete. The
+tag must already exist on the remote before the final record can be generated:
+
+```powershell
+$candidate = Get-Content .\artifacts\release-evidence\release-candidate-v1.json -Raw |
+  ConvertFrom-Json
+git tag -a v1.0.0 $candidate.source.commit -m "HTMLlelujah 1.0.0"
+git push origin refs/tags/v1.0.0
+node scripts/finalize-windows-release.mjs --tag v1.0.0 --remote origin
+# Or create and verify the exact draft:
+node scripts/finalize-windows-release.mjs --tag v1.0.0 --remote origin --publish-draft
+# Or verify the draft, publish it as Latest, and verify the public downloads:
+node scripts/finalize-windows-release.mjs --tag v1.0.0 --remote origin --publish
+```
+
+The finalizer fails closed unless the worktree is clean, no promotion journal is
+pending, the remote is exactly `github.com/Nassau-1/htmllelujah`, and `HEAD`, the
+peeled annotated local tag, and the already-pushed peeled remote tag all equal
+`candidateManifest.source.commit`. The direct local and remote annotated tag object
+IDs must also be identical. The promoted candidate then passes the complete
+release-evidence verifier again. The default notes file is the tracked
+`docs/releases/v1.0.0-public.md`; ignored, untracked, modified, linked, or placeholder
+notes are refused. The finalizer writes
+`artifacts/release-assets/HTMLlelujah-<version>-<commit>-release-record.json` and its
+SHA-256 to stdout. `artifacts/` is ignored, so the record is a release asset, not a
+tracked-source edit. It references the immutable candidate/evidence hashes but is not
+included in its own hash set; this avoids a generated-commit or self-hash loop. Record
+creation is write-once and mode-independent: a draft-to-public rerun reuses only the
+byte-identical record and never clobbers it.
+
+Electron Builder always remains on `--publish never`, and release child processes do
+not inherit token environment variables or `GH_HOST`. Before `--publish-draft` or
+`--publish`, authenticate the GitHub CLI credential store explicitly:
+
+```powershell
+gh auth status --hostname github.com
+```
+
+Publication is pinned to the qualified `github.com/Nassau-1/htmllelujah` repository.
+It refuses an ambiguous API error, uploads only the allowlisted paths plus the final
+record, verifies title/body/state/API URLs/digests, and re-downloads every asset into
+an isolated directory for size and SHA-256 comparison. An exact partial draft may be
+resumed by uploading only missing allowlisted assets; extras or mismatches fail
+closed. An exact existing draft can be promoted, and an exact existing public release
+can be audited after an interrupted client. Public audit failure never automatically
+returns a visible release to draft. Initial publication sets V1 as Latest; a later
+rerun fails closed if another release has become Latest rather than silently
+reordering releases. Source/tag/repository identities are rechecked before and after
+each remote mutation and download phase.
 
 ## Incident containment
 

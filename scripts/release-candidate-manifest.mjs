@@ -28,7 +28,7 @@ export const candidateManifestErrors = ({ manifest, inventory, version, source =
   }
   if (
     manifest?.source?.dirty !== false ||
-    !/^[0-9a-f]{40,64}$/u.test(manifest?.source?.commit ?? '') ||
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(manifest?.source?.commit ?? '') ||
     !/^[0-9a-f]{64}$/u.test(manifest?.source?.treeSha256 ?? '') ||
     !/^[0-9a-f]{64}$/u.test(manifest?.lockfile?.sha256 ?? '')
   ) {
@@ -139,4 +139,100 @@ export const assertCandidateManifest = (options) => {
   if (errors.length > 0) {
     throw new Error(`Release candidate manifest failed validation: ${errors.join('; ')}`);
   }
+};
+
+export const releasePublicationBindingErrors = ({
+  manifest,
+  tag,
+  currentCommit,
+  localTagCommit,
+  localTagObjectType,
+  localTagObjectId,
+  remoteTagCommit,
+  remoteTagObjectId,
+}) => {
+  const errors = [];
+  const candidateCommit = manifest?.source?.commit;
+  const expectedTag = typeof manifest?.version === 'string' ? `v${manifest.version}` : null;
+  if (
+    manifest?.schemaVersion !== 2 ||
+    manifest?.source?.dirty !== false ||
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(candidateCommit ?? '')
+  ) {
+    errors.push('candidate manifest lacks an exact clean source commit');
+  }
+  if (tag !== expectedTag) {
+    errors.push(`release tag must be exactly ${expectedTag ?? 'the candidate version tag'}`);
+  }
+  if (localTagObjectType !== 'tag') {
+    errors.push('local release ref must be an annotated tag object');
+  }
+  if (
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(localTagObjectId ?? '') ||
+    localTagObjectId !== remoteTagObjectId
+  ) {
+    errors.push('local and remote annotated tag object IDs differ');
+  }
+  for (const [label, commit] of [
+    ['current source', currentCommit],
+    ['local tag', localTagCommit],
+    ['remote tag', remoteTagCommit],
+  ]) {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(commit ?? '') || commit !== candidateCommit) {
+      errors.push(`${label} commit does not equal candidateManifest.source.commit`);
+    }
+  }
+  return errors;
+};
+
+export const assertReleasePublicationBinding = (options) => {
+  const errors = releasePublicationBindingErrors(options);
+  if (errors.length > 0) {
+    throw new Error(`Release publication binding failed: ${errors.join('; ')}`);
+  }
+};
+
+export const remoteTagIdentityFromLsRemote = ({ output, tag, requireAnnotated = true }) => {
+  const directRef = `refs/tags/${tag}`;
+  const peeledRef = `${directRef}^{}`;
+  const refs = new Map();
+  for (const line of String(output).trim().split(/\r?\n/u)) {
+    if (!line) continue;
+    const match = /^((?:[0-9a-f]{40}|[0-9a-f]{64}))\s+(.+)$/u.exec(line);
+    if (!match) throw new Error('Remote tag query returned malformed output.');
+    if (match[2] !== directRef && match[2] !== peeledRef) {
+      throw new Error('Remote tag query returned an unexpected ref.');
+    }
+    if (refs.has(match[2])) throw new Error('Remote tag query returned a duplicate ref.');
+    refs.set(match[2], match[1]);
+  }
+  if (!refs.has(directRef) && !refs.has(peeledRef)) {
+    throw new Error(`Remote tag ${tag} does not exist.`);
+  }
+  if (requireAnnotated && (!refs.has(directRef) || !refs.has(peeledRef))) {
+    throw new Error(`Remote tag ${tag} is not an annotated tag with a peeled commit.`);
+  }
+  return {
+    objectId: refs.get(directRef) ?? null,
+    commit: refs.get(peeledRef) ?? refs.get(directRef),
+  };
+};
+
+export const remoteTagCommitFromLsRemote = (options) =>
+  remoteTagIdentityFromLsRemote(options).commit;
+
+export const canonicalGithubRepositoryUrl = (repository) => `https://github.com/${repository}`;
+
+export const assertGithubRepositoryRemote = ({ remoteUrl, repository }) => {
+  const canonical = canonicalGithubRepositoryUrl(repository);
+  const accepted = new Set([
+    canonical,
+    `${canonical}.git`,
+    `git@github.com:${repository}.git`,
+    `ssh://git@github.com/${repository}.git`,
+  ]);
+  if (!accepted.has(String(remoteUrl).replace(/\/$/u, ''))) {
+    throw new Error(`Git remote does not identify the required public repository ${canonical}.`);
+  }
+  return canonical;
 };

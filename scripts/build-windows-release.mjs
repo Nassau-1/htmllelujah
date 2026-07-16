@@ -2,7 +2,7 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -13,12 +13,17 @@ import {
 } from '../apps/desktop/scripts/build-provenance-support.mjs';
 import {
   attestWorkspacePackageOutputs,
+  acquireReleaseLock,
+  assertNoPendingReleasePromotions,
   assertWorkspacePackageOutputsStable,
   buildCommandPlan,
   clearWorkspacePackageOutputs,
   createReleaseEnvironment,
   discoverWorkspacePackages,
   promoteDirectoriesAtomically,
+  recoverPendingReleasePromotions,
+  releaseReleaseLock,
+  RELEASE_PROMOTION_PREFIX,
 } from './windows-release-pipeline-support.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -28,7 +33,7 @@ const releaseEnvironment = createReleaseEnvironment(process.env);
 
 const usage = () => `Usage: node scripts/build-windows-release.mjs [options]
 
-Builds from a clean detached worktree, attests the exact candidate, then atomically promotes it.
+Builds from a clean detached worktree, attests the exact candidate, then promotes it with durable crash recovery.
 
 Options:
   --dry-run          print the detached-worktree command plan without executing it
@@ -102,6 +107,14 @@ const paths = {
   evidenceStaging: path.join(worktreeRoot, 'artifacts', 'release-evidence'),
 };
 paths.candidateManifest = path.join(paths.evidenceStaging, 'release-candidate-v1.json');
+const promotionParent = path.dirname(repositoryRoot);
+const finalArtifactRoot = path.join(repositoryRoot, 'apps', 'desktop', 'out');
+const finalEvidenceRoot = path.join(repositoryRoot, 'artifacts', 'release-evidence');
+const finalDestinations = [finalArtifactRoot, finalEvidenceRoot];
+const finalSourceLayouts = [
+  { destination: finalArtifactRoot, relativeSource: 'apps/desktop/out' },
+  { destination: finalEvidenceRoot, relativeSource: 'artifacts/release-evidence' },
+];
 const plan = buildCommandPlan({
   packageNames: packageBlueprint.map((entry) => entry.name),
   paths,
@@ -139,96 +152,170 @@ if (configuredSigningKeys.length > 0) {
 }
 
 assertSafeWorktree(worktreeRoot);
-const originalSource = await captureSourceSnapshot(repositoryRoot, { requireClean: true });
-let worktreeAdded = false;
-let promoted = false;
-try {
+const validateCandidatePair = async ({ requireReady }) => {
   await runProcess(
-    'git',
-    ['worktree', 'add', '--detach', worktreeRoot, originalSource.commit],
+    process.execPath,
+    [
+      'scripts/verify-release-evidence.mjs',
+      '--artifact-dir',
+      finalArtifactRoot,
+      '--evidence-dir',
+      finalEvidenceRoot,
+      ...(requireReady ? ['--require-ready'] : []),
+    ],
     repositoryRoot,
   );
-  worktreeAdded = true;
-  const worktreeSource = await captureSourceSnapshot(worktreeRoot, { requireClean: true });
-  if (
-    worktreeSource.commit !== originalSource.commit ||
-    JSON.stringify(worktreeSource.tree) !== JSON.stringify(originalSource.tree)
-  ) {
-    throw new Error('Detached release worktree does not match the exact requested commit.');
-  }
+};
+const validatePromotedCandidate = () => validateCandidatePair({ requireReady: true });
 
-  const packages = await discoverWorkspacePackages(worktreeRoot);
-  const packageBuildTimes = new Map();
-  let outputsCleared = false;
-  let workspaceAttested = false;
-  let workspaceBuildRecord = null;
-  for (const step of plan) {
-    if (step.name.startsWith('build-workspace-package:')) {
-      if (!outputsCleared) {
-        await clearWorkspacePackageOutputs(worktreeRoot, packages);
-        outputsCleared = true;
-      }
-      packageBuildTimes.set(step.name.slice('build-workspace-package:'.length), Date.now());
-    } else if (step.name === 'build-desktop-vite' && !workspaceAttested) {
-      workspaceBuildRecord = await attestWorkspacePackageOutputs(packages, packageBuildTimes);
-      await atomicWriteJson(paths.workspaceBuild, workspaceBuildRecord);
-      workspaceAttested = true;
-    }
-    await runProcess(step.command, step.args, worktreeRoot);
-  }
-  if (!workspaceAttested) throw new Error('Workspace package rebuilds were not attested.');
-  await assertWorkspacePackageOutputsStable(packages, packageBuildTimes, workspaceBuildRecord);
-
-  await assertSourceSnapshot(worktreeRoot, worktreeSource, { requireClean: true });
-  await assertSourceSnapshot(repositoryRoot, originalSource, { requireClean: true });
-  const transactionRoot = path.join(
-    path.dirname(repositoryRoot),
-    `.htmllelujah-release-promotion-${buildId}`,
-  );
-  await promoteDirectoriesAtomically({
-    promotions: [
-      {
-        source: paths.artifactStaging,
-        destination: path.join(repositoryRoot, 'apps', 'desktop', 'out'),
-      },
-      {
-        source: paths.evidenceStaging,
-        destination: path.join(repositoryRoot, 'artifacts', 'release-evidence'),
-      },
-    ],
-    transactionRoot,
+const releaseLock = await acquireReleaseLock({
+  transactionParent: promotionParent,
+  purpose: 'build-windows-release',
+});
+try {
+  const recoveredPromotions = await recoverPendingReleasePromotions({
+    transactionParent: promotionParent,
+    releaseLock,
+    allowedDestinations: finalDestinations,
+    allowedSourceParent: promotionParent,
+    allowedSourceLayouts: finalSourceLayouts,
+    // A committed journal can belong to an earlier HEAD after a restart. Recovery
+    // checks the artifact/evidence pair internally so it can clean that transaction;
+    // it does not authorize publication. The finalizer separately requires HEAD and
+    // both local/remote tags to equal candidateManifest.source.commit.
+    validateCommitted: () => validateCandidatePair({ requireReady: false }),
   });
-  promoted = true;
-  try {
-    await rm(transactionRoot, { recursive: true, force: true });
-  } catch (error) {
-    process.stderr.write(`Release promotion cleanup warning: ${error.message}\n`);
+  if (recoveredPromotions.length > 0) {
+    process.stdout.write(
+      `Recovered ${recoveredPromotions.length} interrupted release promotion transaction(s).\n`,
+    );
+    const recoveredWorktrees = new Set();
+    for (const { journal } of recoveredPromotions) {
+      for (const record of journal.records) {
+        const relative = path.relative(promotionParent, record.source);
+        const firstSegment = relative.split(path.sep)[0];
+        if (firstSegment.startsWith('.htmllelujah-release-worktree-')) {
+          recoveredWorktrees.add(path.join(promotionParent, firstSegment));
+        }
+      }
+    }
+    for (const recoveredWorktree of recoveredWorktrees) {
+      try {
+        assertSafeWorktree(recoveredWorktree);
+        await runProcess(
+          'git',
+          ['worktree', 'remove', '--force', recoveredWorktree],
+          repositoryRoot,
+        );
+      } catch (error) {
+        process.stderr.write(`Recovered worktree cleanup warning: ${error.message}\n`);
+      }
+    }
+    await runProcess('git', ['worktree', 'prune'], repositoryRoot);
   }
-  process.stdout.write('\nRelease candidate and evidence promoted atomically.\n');
-} finally {
-  if (worktreeAdded) {
+  await assertNoPendingReleasePromotions({ transactionParent: promotionParent, releaseLock });
+  const originalSource = await captureSourceSnapshot(repositoryRoot, { requireClean: true });
+  let worktreeAdded = false;
+  let promoted = false;
+  const transactionRoot = path.join(promotionParent, `${RELEASE_PROMOTION_PREFIX}${buildId}`);
+  try {
+    await runProcess(
+      'git',
+      ['worktree', 'add', '--detach', worktreeRoot, originalSource.commit],
+      repositoryRoot,
+    );
+    worktreeAdded = true;
+    const worktreeSource = await captureSourceSnapshot(worktreeRoot, { requireClean: true });
+    if (
+      worktreeSource.commit !== originalSource.commit ||
+      JSON.stringify(worktreeSource.tree) !== JSON.stringify(originalSource.tree)
+    ) {
+      throw new Error('Detached release worktree does not match the exact requested commit.');
+    }
+
+    const packages = await discoverWorkspacePackages(worktreeRoot);
+    const packageBuildTimes = new Map();
+    let outputsCleared = false;
+    let workspaceAttested = false;
+    let workspaceBuildRecord = null;
+    for (const step of plan) {
+      if (step.name.startsWith('build-workspace-package:')) {
+        if (!outputsCleared) {
+          await clearWorkspacePackageOutputs(worktreeRoot, packages);
+          outputsCleared = true;
+        }
+        packageBuildTimes.set(step.name.slice('build-workspace-package:'.length), Date.now());
+      } else if (step.name === 'build-desktop-vite' && !workspaceAttested) {
+        workspaceBuildRecord = await attestWorkspacePackageOutputs(packages, packageBuildTimes);
+        await atomicWriteJson(paths.workspaceBuild, workspaceBuildRecord);
+        workspaceAttested = true;
+      }
+      await runProcess(step.command, step.args, worktreeRoot);
+    }
+    if (!workspaceAttested) throw new Error('Workspace package rebuilds were not attested.');
+    await assertWorkspacePackageOutputsStable(packages, packageBuildTimes, workspaceBuildRecord);
+
+    await assertSourceSnapshot(worktreeRoot, worktreeSource, { requireClean: true });
+    await assertSourceSnapshot(repositoryRoot, originalSource, { requireClean: true });
+    await promoteDirectoriesAtomically({
+      promotions: [
+        {
+          source: paths.artifactStaging,
+          destination: finalArtifactRoot,
+        },
+        {
+          source: paths.evidenceStaging,
+          destination: finalEvidenceRoot,
+        },
+      ],
+      transactionRoot,
+      releaseLock,
+      validatePromoted: validatePromotedCandidate,
+    });
+    promoted = true;
+    await assertNoPendingReleasePromotions({ transactionParent: promotionParent, releaseLock });
+    process.stdout.write(
+      '\nRelease candidate and evidence promoted with durable crash recovery and post-promotion verification.\n',
+    );
+  } finally {
+    let transactionPending = false;
     try {
-      await runProcess('git', ['worktree', 'remove', '--force', worktreeRoot], repositoryRoot);
+      await access(transactionRoot);
+      transactionPending = true;
     } catch (error) {
-      process.stderr.write(`Release worktree cleanup warning: ${error.message}\n`);
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') {
+        transactionPending = true;
+        process.stderr.write(`Release transaction state check warning: ${error.message}\n`);
+      }
+    }
+    if (worktreeAdded && transactionPending) {
+      process.stderr.write(`Release worktree preserved for pending recovery: ${worktreeRoot}\n`);
+    } else if (worktreeAdded) {
+      try {
+        await runProcess('git', ['worktree', 'remove', '--force', worktreeRoot], repositoryRoot);
+      } catch (error) {
+        process.stderr.write(`Release worktree cleanup warning: ${error.message}\n`);
+        try {
+          assertSafeWorktree(worktreeRoot);
+          await rm(worktreeRoot, { recursive: true, force: true });
+        } catch (fallbackError) {
+          process.stderr.write(`Release staging cleanup warning: ${fallbackError.message}\n`);
+        }
+      }
+      try {
+        await runProcess('git', ['worktree', 'prune'], repositoryRoot);
+      } catch (error) {
+        process.stderr.write(`Git worktree prune warning: ${error.message}\n`);
+      }
+    } else if (!promoted) {
       try {
         assertSafeWorktree(worktreeRoot);
         await rm(worktreeRoot, { recursive: true, force: true });
-      } catch (fallbackError) {
-        process.stderr.write(`Release staging cleanup warning: ${fallbackError.message}\n`);
+      } catch (error) {
+        process.stderr.write(`Release staging cleanup warning: ${error.message}\n`);
       }
     }
-    try {
-      await runProcess('git', ['worktree', 'prune'], repositoryRoot);
-    } catch (error) {
-      process.stderr.write(`Git worktree prune warning: ${error.message}\n`);
-    }
-  } else if (!promoted) {
-    try {
-      assertSafeWorktree(worktreeRoot);
-      await rm(worktreeRoot, { recursive: true, force: true });
-    } catch (error) {
-      process.stderr.write(`Release staging cleanup warning: ${error.message}\n`);
-    }
   }
+} finally {
+  await releaseReleaseLock({ releaseLock });
 }
