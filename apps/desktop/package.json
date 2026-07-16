@@ -111,6 +111,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "deleteAppDataOnUninstall": false,
+      "include": "scripts/installer-association.nsh",
       "license": "../../EULA.txt",
       "menuCategory": false
     }
