@@ -13,6 +13,7 @@ import {
   parseDeck,
   parseTsv,
   resolveSlide,
+  resolveSlideFromValidatedDocument,
   undoTransaction,
   validateDeck,
   type DeckDocument,
@@ -110,6 +111,16 @@ describe('schema V2 and migration', () => {
 });
 
 describe('projection and placeholders', () => {
+  it('keeps the trusted-document resolver exactly in parity with the validating boundary', () => {
+    const source = createNeutralDemoDeck();
+
+    for (const slide of source.slides) {
+      expect(resolveSlideFromValidatedDocument(source, slide.id)).toEqual(
+        resolveSlide(source, slide.id),
+      );
+    }
+  });
+
   it('resolves theme, master, layout, inherited frames, and inherited text style', () => {
     const source = createDefaultDeck({
       idFactory: idFactory(),

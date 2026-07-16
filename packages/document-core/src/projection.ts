@@ -158,13 +158,19 @@ const fixedElements = (
         : {}),
     }));
 
-/** Resolves the deterministic render/editor projection: theme → master → layout → bindings → local. */
-export const resolveSlide = (
-  input: DeckDocumentInput,
+/**
+ * Resolves a current-schema document that was already validated at a trusted boundary.
+ *
+ * This deliberately skips parsing. Callers that accept files, IPC payloads, or any other
+ * untrusted input must use {@link resolveSlide} instead. Runtime snapshots have already
+ * passed document validation, so presentation navigation can use this variant without
+ * revalidating the entire deck for every slide change.
+ */
+export const resolveSlideFromValidatedDocument = (
+  document: DeckDocument,
   slideId: string,
   options: ResolveSlideOptions = {},
 ): ResolvedSlide => {
-  const document = parseDeck(input);
   const slide = document.slides.find((candidate) => candidate.id === slideId);
   if (slide === undefined) throw new SlideResolutionError(`Slide ${slideId} does not exist.`);
   const layout = document.layouts.find((candidate) => candidate.id === slide.layoutId);
@@ -212,3 +218,10 @@ export const resolveSlide = (
     ],
   };
 };
+
+/** Resolves the deterministic render/editor projection: theme → master → layout → bindings → local. */
+export const resolveSlide = (
+  input: DeckDocumentInput,
+  slideId: string,
+  options: ResolveSlideOptions = {},
+): ResolvedSlide => resolveSlideFromValidatedDocument(parseDeck(input), slideId, options);

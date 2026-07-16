@@ -54,6 +54,7 @@ import {
 import {
   createDuplicateSlide,
   resolveSlide,
+  resolveSlideFromValidatedDocument,
   STANDARD_PAGE_SIZES,
   type DeckDocument,
   type DocumentCommand,
@@ -371,7 +372,7 @@ function PresentationMode() {
       <LoadingScreen message="This presentation has no visible slides. Press Escape to close." />
     );
   if (active === undefined) return <LoadingScreen message="Preparing presentation…" />;
-  const projection = resolveSlide(session.snapshot.document, active.id);
+  const projection = resolveSlideFromValidatedDocument(session.snapshot.document, active.id);
   const rawWidth = projection.page.widthPt * (4 / 3);
   const rawHeight = projection.page.heightPt * (4 / 3);
   const presentationScale = Math.min(viewport.width / rawWidth, viewport.height / rawHeight);
