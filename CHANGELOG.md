@@ -7,7 +7,7 @@ and releases use semantic versions.
 
 No user-facing change is queued after the V1 release candidate.
 
-## [1.0.0] - 2026-07-16
+## [1.0.0] - 2026-07-17
 
 ### Added
 
@@ -73,6 +73,9 @@ No user-facing change is queued after the V1 release candidate.
   the exact clean source tree, lockfile, complete artifact inventory, Windows
   platform/architecture/build, Node runtime, pnpm version, local and remote annotated
   tag objects, and re-downloaded asset hashes.
+- Made clean-source provenance hash canonical Git blob contents so safe LF/CRLF
+  checkout policies cannot split one commit identity, while refusing replacement
+  refs, grafts, hidden index flags, and content-transforming checkout attributes.
 
 ### Known V1 boundaries
 

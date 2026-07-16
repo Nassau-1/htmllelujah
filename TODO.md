@@ -1,6 +1,6 @@
 # Roadmap and TODO
 
-Status: **V1 release candidate**, last reviewed 2026-07-16.
+Status: **V1 release candidate**, last reviewed 2026-07-17.
 
 The usable V1 implementation is present. Publication remains gated by observed
 release evidence for the exact Windows installer; unchecked items below must not be

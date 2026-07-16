@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-16
-- Last reviewed: 2026-07-16
+- Last reviewed: 2026-07-17
 
 ## Context
 
@@ -20,7 +20,9 @@ Use three explicit phases against one immutable candidate:
 
 1. `pnpm make:win` builds in a clean detached worktree, attests the complete Windows
    x64 artifact and source provenance, then promotes the artifact and integrity
-   evidence as one recoverable generation.
+   evidence as one recoverable generation. Clean-source identity is computed from
+   canonical Git blob bytes, while checkout transformations other than text/EOL and
+   Git mechanisms that can hide or replace content are refused.
 2. `pnpm validate:candidate` runs only after promotion under a new acquisition of the
    same release lock. It requires the current clean source tree, lockfile, candidate
    manifest, and complete artifact inventory to match. It executes the packaged and

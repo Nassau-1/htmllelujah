@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   access,
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -16,7 +17,12 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { assertSourceSnapshotIdentity } from './release-source-state.mjs';
+import {
+  assertNoGitObjectSubstitution,
+  assertSourceSnapshotIdentity,
+  captureSourceSnapshot,
+  trackedSourceIdentity,
+} from './release-source-state.mjs';
 import {
   assertCandidateManifest,
   assertReleasePublicationBinding,
@@ -152,8 +158,15 @@ test('release children cannot inherit publication credentials or renderer overri
     NODE_OPTIONS: '--inspect',
     ELECTRON_RUN_AS_NODE: '1',
     VITE_DEV_SERVER_URL: 'https://renderer.invalid/',
+    GIT_NO_REPLACE_OBJECTS: '0',
+    GIT_REPLACE_REF_BASE: 'refs/unsafe-replacements/',
+    GIT_INDEX_FILE: 'unsafe-index',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'filter.release.clean',
+    GIT_CONFIG_VALUE_0: 'unsafe-filter',
     github_token: 'case-insensitive-secret',
     electron_run_as_node: '1',
+    git_replace_ref_base: 'refs/case-insensitive-unsafe/',
   });
   assert.equal(environment.PATH, 'fixture-path');
   assert.equal(environment.CI, 'true');
@@ -165,8 +178,13 @@ test('release children cannot inherit publication credentials or renderer overri
     assert.equal(key.toUpperCase() === 'ELECTRON_RUN_AS_NODE', false);
     assert.equal(key.toUpperCase() === 'VITE_DEV_SERVER_URL', false);
     assert.equal(key.toUpperCase() === 'GITHUB_TOKEN', false);
+    if (key.toUpperCase().startsWith('GIT_')) {
+      assert.ok(['GIT_NO_REPLACE_OBJECTS', 'GIT_TERMINAL_PROMPT'].includes(key.toUpperCase()));
+    }
   }
   assert.equal(environment.CSC_IDENTITY_AUTO_DISCOVERY, 'false');
+  assert.equal(environment.GIT_NO_REPLACE_OBJECTS, '1');
+  assert.equal(environment.GIT_TERMINAL_PROMPT, '0');
 });
 
 test('Windows Corepack resolves to a JavaScript entry instead of a cmd shim', () => {
@@ -282,6 +300,214 @@ test('pre-build source snapshot rejects tracked mutation after capture', () => {
     tree: { ...expected.tree, sha256: 'c'.repeat(64) },
   };
   assert.throws(() => assertSourceSnapshotIdentity(mutated, expected), /snapshot changed/iu);
+});
+
+test('clean source identity uses canonical Git blobs across checkout EOL policies', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'htmllelujah-source-identity-'));
+  const runGit = (cwd, args, env = process.env) => {
+    const result = spawnSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      env,
+      shell: false,
+      timeout: 30_000,
+      windowsHide: true,
+    });
+    if (result.status !== 0 || result.error || result.signal) {
+      throw new Error(`git ${args.join(' ')} failed: ${result.stderr || result.error?.message}.`);
+    }
+    return String(result.stdout ?? '').trim();
+  };
+  try {
+    const source = path.join(root, 'source');
+    const lfCheckout = path.join(root, 'checkout-lf');
+    const crlfCheckout = path.join(root, 'checkout-crlf');
+    await mkdir(source);
+    runGit(source, ['init', '--quiet']);
+    runGit(source, ['config', 'user.name', 'Release Test']);
+    runGit(source, ['config', 'user.email', 'release-test@example.invalid']);
+    runGit(source, ['config', 'core.autocrlf', 'false']);
+    await writeFile(path.join(source, '.gitattributes'), '*.txt text\n');
+    await writeFile(path.join(source, 'deck.txt'), 'first line\nsecond line\n');
+    runGit(source, ['add', '.gitattributes', 'deck.txt']);
+    runGit(source, ['commit', '--quiet', '-m', 'canonical text fixture']);
+    const commit = runGit(source, ['rev-parse', 'HEAD']);
+
+    for (const [checkout, autocrlf, eol] of [
+      [lfCheckout, 'false', 'lf'],
+      [crlfCheckout, 'true', 'crlf'],
+    ]) {
+      runGit(root, ['clone', '--quiet', '--no-checkout', source, checkout]);
+      runGit(checkout, ['config', 'core.autocrlf', autocrlf]);
+      runGit(checkout, ['config', 'core.eol', eol]);
+      runGit(checkout, ['checkout', '--quiet', '--force', commit]);
+      assert.equal(runGit(checkout, ['status', '--porcelain=v1']), '');
+    }
+
+    const lfBytes = await readFile(path.join(lfCheckout, 'deck.txt'));
+    const crlfBytes = await readFile(path.join(crlfCheckout, 'deck.txt'));
+    assert.equal(lfBytes.includes(Buffer.from('\r\n')), false);
+    assert.equal(crlfBytes.includes(Buffer.from('\r\n')), true);
+    assert.notDeepEqual(lfBytes, crlfBytes);
+
+    const lfSnapshot = await captureSourceSnapshot(lfCheckout, { requireClean: true });
+    const crlfSnapshot = await captureSourceSnapshot(crlfCheckout, { requireClean: true });
+    assert.equal(lfSnapshot.commit, commit);
+    assert.equal(crlfSnapshot.commit, commit);
+    assert.deepEqual(lfSnapshot.tree, crlfSnapshot.tree);
+
+    await writeFile(path.join(lfCheckout, 'deck.txt'), 'tracked mutation\n');
+    const dirtySnapshot = await captureSourceSnapshot(lfCheckout);
+    assert.equal(dirtySnapshot.dirty, true);
+    assert.notEqual(dirtySnapshot.tree.sha256, lfSnapshot.tree.sha256);
+    await assert.rejects(
+      captureSourceSnapshot(lfCheckout, { requireClean: true }),
+      /requires a clean index and worktree/iu,
+    );
+
+    runGit(lfCheckout, ['checkout', '--quiet', '--force', commit]);
+    runGit(lfCheckout, ['update-index', '--assume-unchanged', 'deck.txt']);
+    await writeFile(path.join(lfCheckout, 'deck.txt'), 'mutation hidden by assume-unchanged\n');
+    assert.equal(runGit(lfCheckout, ['status', '--porcelain=v1']), '');
+    await assert.rejects(
+      captureSourceSnapshot(lfCheckout, { requireClean: true }),
+      /unsafe index flag/iu,
+    );
+
+    runGit(lfCheckout, ['update-index', '--no-assume-unchanged', 'deck.txt']);
+    runGit(lfCheckout, ['checkout', '--quiet', '--force', commit]);
+    runGit(lfCheckout, ['update-index', '--skip-worktree', 'deck.txt']);
+    await writeFile(path.join(lfCheckout, 'deck.txt'), 'mutation hidden by skip-worktree\n');
+    assert.equal(runGit(lfCheckout, ['status', '--porcelain=v1']), '');
+    await assert.rejects(
+      captureSourceSnapshot(lfCheckout, { requireClean: true }),
+      /unsafe index flag/iu,
+    );
+
+    runGit(lfCheckout, ['update-index', '--no-skip-worktree', 'deck.txt']);
+    runGit(lfCheckout, ['checkout', '--quiet', '--force', commit]);
+    const fsmonitorHook = path.join(lfCheckout, '.git', 'fsmonitor-test.sh');
+    await writeFile(fsmonitorHook, "#!/bin/sh\nprintf 'release-test-token\\n'\n");
+    await chmod(fsmonitorHook, 0o755);
+    runGit(lfCheckout, ['config', 'core.fsmonitor', '.git/fsmonitor-test.sh']);
+    runGit(lfCheckout, ['update-index', '--fsmonitor']);
+    runGit(lfCheckout, ['update-index', '--fsmonitor-valid', 'deck.txt']);
+    assert.match(runGit(lfCheckout, ['ls-files', '--stage', '-v', '-f', 'deck.txt']), /^h /u);
+    await writeFile(path.join(lfCheckout, 'deck.txt'), 'mutation hidden by fsmonitor\n');
+    assert.equal(runGit(lfCheckout, ['status', '--porcelain=v1']), '');
+    await assert.rejects(
+      captureSourceSnapshot(lfCheckout, { requireClean: true }),
+      /unsafe index flag/iu,
+    );
+
+    const infoAttributes = path.join(crlfCheckout, '.git', 'info', 'attributes');
+    await writeFile(infoAttributes, 'deck.txt filter=release-unsafe\n');
+    await assert.rejects(
+      captureSourceSnapshot(crlfCheckout, { requireClean: true }),
+      /forbidden Git filter transformation/iu,
+    );
+    await rm(infoAttributes);
+
+    const configuredAttributes = path.join(crlfCheckout, '.git', 'release-attributes');
+    await writeFile(configuredAttributes, 'deck.txt ident\n');
+    runGit(crlfCheckout, ['config', 'core.attributesFile', configuredAttributes]);
+    await assert.rejects(
+      captureSourceSnapshot(crlfCheckout, { requireClean: true }),
+      /forbidden Git ident transformation/iu,
+    );
+    runGit(crlfCheckout, ['config', '--unset', 'core.attributesFile']);
+    await rm(configuredAttributes);
+
+    runGit(crlfCheckout, ['config', 'user.name', 'Release Test']);
+    runGit(crlfCheckout, ['config', 'user.email', 'release-test@example.invalid']);
+    await writeFile(path.join(crlfCheckout, 'deck.txt'), 'replacement tree\n');
+    runGit(crlfCheckout, ['add', 'deck.txt']);
+    runGit(crlfCheckout, ['commit', '--quiet', '-m', 'replacement fixture']);
+    const replacementCommit = runGit(crlfCheckout, ['rev-parse', 'HEAD']);
+    runGit(crlfCheckout, ['checkout', '--quiet', '--force', commit]);
+    runGit(crlfCheckout, ['replace', commit, replacementCommit]);
+    assert.match(runGit(crlfCheckout, ['show', 'HEAD:deck.txt']), /replacement tree/iu);
+    await assert.rejects(
+      captureSourceSnapshot(crlfCheckout, { requireClean: true }),
+      /replacement refs are forbidden/iu,
+    );
+    runGit(crlfCheckout, ['replace', '-d', commit]);
+
+    const customReplacementBase = 'refs/custom-replacements';
+    const customReplacementRef = `${customReplacementBase}${commit}`;
+    runGit(crlfCheckout, ['update-ref', customReplacementRef, replacementCommit]);
+    const customReplacementEnvironment = {
+      ...process.env,
+      GIT_REPLACE_REF_BASE: customReplacementBase,
+    };
+    assert.match(
+      runGit(crlfCheckout, ['show', 'HEAD:deck.txt'], customReplacementEnvironment),
+      /replacement tree/iu,
+    );
+    assert.throws(
+      () =>
+        assertNoGitObjectSubstitution(crlfCheckout, {
+          environment: customReplacementEnvironment,
+        }),
+      /replacement refs are forbidden/iu,
+    );
+    runGit(crlfCheckout, ['update-ref', '-d', customReplacementRef]);
+
+    const customSlashReplacementBase = 'refs/custom-replacements/';
+    const customSlashReplacementRef = `${customSlashReplacementBase}${commit}`;
+    runGit(crlfCheckout, ['update-ref', customSlashReplacementRef, replacementCommit]);
+    const customSlashReplacementEnvironment = {
+      ...process.env,
+      GIT_REPLACE_REF_BASE: customSlashReplacementBase,
+    };
+    assert.match(
+      runGit(crlfCheckout, ['show', 'HEAD:deck.txt'], customSlashReplacementEnvironment),
+      /replacement tree/iu,
+    );
+    assert.throws(
+      () =>
+        assertNoGitObjectSubstitution(crlfCheckout, {
+          environment: customSlashReplacementEnvironment,
+        }),
+      /replacement refs are forbidden/iu,
+    );
+    runGit(crlfCheckout, ['update-ref', '-d', customSlashReplacementRef]);
+
+    const graftsPathOutput = runGit(crlfCheckout, [
+      'rev-parse',
+      '--path-format=absolute',
+      '--git-path',
+      'info/grafts',
+    ]);
+    const graftsPath = path.resolve(graftsPathOutput);
+    await mkdir(path.dirname(graftsPath), { recursive: true });
+    await writeFile(graftsPath, `${commit} ${replacementCommit}\n`);
+    await assert.rejects(
+      captureSourceSnapshot(crlfCheckout, { requireClean: true }),
+      /info\/grafts is forbidden/iu,
+    );
+    await rm(graftsPath);
+
+    const missingBlob = runGit(crlfCheckout, ['rev-parse', `${commit}:deck.txt`]);
+    const objectsPathOutput = runGit(crlfCheckout, [
+      'rev-parse',
+      '--path-format=absolute',
+      '--git-path',
+      'objects',
+    ]);
+    const missingBlobPath = path.join(
+      path.resolve(objectsPathOutput),
+      missingBlob.slice(0, 2),
+      missingBlob.slice(2),
+    );
+    await rm(missingBlobPath);
+    await assert.rejects(
+      trackedSourceIdentity(crlfCheckout, { sourceState: { dirty: false } }),
+      /malformed or unexpected batch header/iu,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('failed step never invokes promotion', async () => {

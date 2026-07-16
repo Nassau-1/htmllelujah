@@ -69,9 +69,14 @@ export const createReleaseEnvironment = (source = process.env) => {
   const environment = { ...source };
   const keysToRemove = new Set(RELEASE_ENVIRONMENT_KEYS_TO_REMOVE);
   for (const key of Object.keys(environment)) {
-    if (keysToRemove.has(key.toUpperCase())) delete environment[key];
+    const normalizedKey = key.toUpperCase();
+    if (keysToRemove.has(normalizedKey) || normalizedKey.startsWith('GIT_')) {
+      delete environment[key];
+    }
   }
   environment.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
+  environment.GIT_NO_REPLACE_OBJECTS = '1';
+  environment.GIT_TERMINAL_PROMPT = '0';
   return environment;
 };
 

@@ -100,6 +100,14 @@ provenance before the build, and revalidates source and package-output hashes af
 packaging. If the pnpm store was intentionally not primed, use
 `node scripts/build-windows-release.mjs --online-install` explicitly.
 
+For a clean worktree, the source identity hashes canonical Git blob bytes rather than
+checkout-specific line endings, so an allowed LF/CRLF materialization does not change
+the identity of one commit. A dirty development build still hashes the tracked files
+it actually sees. Release capture fails closed on replacement refs, grafts,
+`assume-unchanged`, `skip-worktree`, fsmonitor-valid entries, symlinks, gitlinks, or
+effective `filter`, `ident`, and `working-tree-encoding` attributes; only ordinary
+text/EOL checkout conversion is permitted.
+
 Electron Builder writes only into the detached staging worktree. The exact installer,
 blockmap, and complete `win-unpacked/` inventory are attested before a transaction
 promotes `apps/desktop/out/` and `artifacts/release-evidence/`. Before the first
