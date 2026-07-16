@@ -1,10 +1,14 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 
-import { canonicalSerialize, type DocumentCommand } from '@htmllelujah/document-core';
+import {
+  canonicalSerialize,
+  type DocumentCommand,
+  type ImageElement,
+} from '@htmllelujah/document-core';
 import {
   DocumentSessionManager,
   type DocumentSessionSnapshot,
@@ -17,6 +21,13 @@ const DEFAULT_COMMAND_DELAY_MS = 200;
 const DEFAULT_SAVE_INTERVAL_SECONDS = 60;
 const DEFAULT_REJOIN_INTERVAL_SECONDS = 300;
 const CONVERGENCE_TIMEOUT_MS = 10_000;
+const TEXT_LEASE_INTERVAL_MS = 5 * 60_000;
+const EMBEDDED_PNG = Uint8Array.from(
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  ),
+);
 
 type ActorName = 'host' | 'guest-1' | 'guest-2';
 
@@ -178,7 +189,7 @@ const waitForConvergence = async (participants: readonly MutableParticipant[]): 
 const commandFor = (snapshot: DocumentSessionSnapshot, sequence: number): DocumentCommand => {
   const firstSlide = snapshot.document.slides[0];
   if (firstSlide === undefined) throw new SoakInvariantError('MISSING_SLIDE');
-  const commandKind = Math.floor(sequence / 3) % 3;
+  const commandKind = Math.floor(sequence / 3) % 4;
   if (commandKind === 0) return { type: 'deck.rename', name: `LAN soak deck ${sequence}` };
   if (commandKind === 1) {
     return {
@@ -187,10 +198,28 @@ const commandFor = (snapshot: DocumentSessionSnapshot, sequence: number): Docume
       name: `LAN soak slide ${sequence}`,
     };
   }
+  if (commandKind === 2) {
+    return {
+      type: 'slide.set-hidden',
+      slideId: firstSlide.id,
+      hidden: !firstSlide.hidden,
+    };
+  }
+  const image = firstSlide.elements.find((element) => element.type === 'image');
+  if (image === undefined) throw new SoakInvariantError('SOAK_IMAGE_MISSING');
   return {
-    type: 'slide.set-hidden',
+    type: 'element.transform',
     slideId: firstSlide.id,
-    hidden: !firstSlide.hidden,
+    transforms: [
+      {
+        elementId: image.id,
+        frame: {
+          ...image.frame,
+          xPt: sequence % 2 === 0 ? 536 : 548,
+          yPt: sequence % 2 === 0 ? 382 : 394,
+        },
+      },
+    ],
   };
 };
 
@@ -266,6 +295,13 @@ const main = async (): Promise<void> => {
   let guestSaveAttempts = 0;
   let guestSaveRejections = 0;
   let rejoinCycles = 0;
+  let assetInsertions = 0;
+  let objectEdits = 0;
+  let textLeaseContentions = 0;
+  let textLeaseEdits = 0;
+  let textLeaseTransfers = 0;
+  let hostTerminationChecks = 0;
+  let postHostLossEditRejections = 0;
   let minHostPeerCount = 2;
   let maxHostPeerCount = 0;
   const commandsByActor: Record<ActorName, number> = {
@@ -339,8 +375,204 @@ const main = async (): Promise<void> => {
     rejoinCycles += 1;
   };
 
+  const exerciseTextLease = async (sequence: number): Promise<void> => {
+    const ownerIndex = sequence % participants.length;
+    const owner = participants[ownerIndex];
+    if (owner === undefined) throw new SoakInvariantError('TEXT_LEASE_OWNER_MISSING');
+    const contenders = participants.filter((participant) => participant !== owner);
+    const snapshot = owner.runtime.getSnapshot(owner.sessionId);
+    const slide = snapshot.document.slides[0];
+    const text = slide?.elements.find((element) => element.type === 'text');
+    if (slide === undefined || text === undefined) {
+      throw new SoakInvariantError('TEXT_LEASE_TARGET_MISSING');
+    }
+    const target = { slideId: slide.id, elementId: text.id } as const;
+    const owned = await owner.coordinator.beginTextLease({
+      sessionId: owner.sessionId,
+      ...target,
+    });
+    if (owned.status !== 'owned') throw new SoakInvariantError('TEXT_LEASE_NOT_OWNED');
+    const held = await Promise.all(
+      contenders.map((contender) =>
+        contender.coordinator.beginTextLease({
+          sessionId: contender.sessionId,
+          ...target,
+        }),
+      ),
+    );
+    if (held.some((lease) => lease.status !== 'held')) {
+      throw new SoakInvariantError('TEXT_LEASE_CONTENTION_FAILED');
+    }
+    textLeaseContentions += held.length;
+
+    const before = owner.runtime.getSnapshot(owner.sessionId);
+    const result = await owner.coordinator.execute({
+      sessionId: owner.sessionId,
+      expectedRevision: before.revision,
+      label: 'LAN soak leased text edit',
+      commands: [
+        {
+          type: 'text.replace-content',
+          slideId: slide.id,
+          textId: text.id,
+          content: {
+            blocks: [
+              {
+                id: randomUUID(),
+                type: 'paragraph',
+                alignment: 'left',
+                runs: [
+                  {
+                    text: `Three-participant text lease ${sequence}`,
+                    marks: {
+                      bold: sequence % 2 === 0,
+                      italic: false,
+                      underline: false,
+                      strikethrough: false,
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    });
+    if (result === undefined) throw new SoakInvariantError('TEXT_LEASE_EDIT_SKIPPED');
+    await waitForConvergence(participants);
+    convergenceChecks += 1;
+    textLeaseEdits += 1;
+    commandsByActor[owner.actor] += 1;
+    commandsByType['text.replace-content'] = (commandsByType['text.replace-content'] ?? 0) + 1;
+
+    const released = await owner.coordinator.endTextLease({
+      sessionId: owner.sessionId,
+      ...target,
+    });
+    if (released.status !== 'available') {
+      throw new SoakInvariantError('TEXT_LEASE_RELEASE_FAILED');
+    }
+    const nextOwner = contenders[0];
+    if (nextOwner === undefined) throw new SoakInvariantError('TEXT_LEASE_SUCCESSOR_MISSING');
+    const transferred = await nextOwner.coordinator.beginTextLease({
+      sessionId: nextOwner.sessionId,
+      ...target,
+    });
+    if (transferred.status !== 'owned') {
+      throw new SoakInvariantError('TEXT_LEASE_TRANSFER_FAILED');
+    }
+    textLeaseTransfers += 1;
+    await nextOwner.coordinator.endTextLease({ sessionId: nextOwner.sessionId, ...target });
+  };
+
+  const insertExistingAsset = async (participant: MutableParticipant): Promise<void> => {
+    const snapshot = participant.runtime.getSnapshot(participant.sessionId);
+    const slide = snapshot.document.slides[0];
+    const asset = snapshot.document.assets[0];
+    if (slide === undefined || asset === undefined || asset.kind !== 'image') {
+      throw new SoakInvariantError('SOAK_ASSET_MISSING');
+    }
+    const image: ImageElement = {
+      id: randomUUID(),
+      type: 'image',
+      name: 'Collaborative embedded image',
+      frame: { xPt: 700, yPt: 390, widthPt: 72, heightPt: 72, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      assetId: asset.id,
+      altText: 'Embedded one-pixel collaboration fixture',
+      fit: 'contain',
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+    };
+    const result = await participant.coordinator.execute({
+      sessionId: participant.sessionId,
+      expectedRevision: snapshot.revision,
+      label: 'LAN soak embedded asset insertion',
+      commands: [{ type: 'element.insert', slideId: slide.id, element: image }],
+    });
+    if (result === undefined) throw new SoakInvariantError('ASSET_INSERTION_SKIPPED');
+    await waitForConvergence(participants);
+    convergenceChecks += 1;
+    assetInsertions += 1;
+    commandsByActor[participant.actor] += 1;
+    commandsByType['element.insert'] = (commandsByType['element.insert'] ?? 0) + 1;
+  };
+
+  const verifyHostLoss = async (): Promise<void> => {
+    const host = hostParticipant();
+    const finalSnapshot = host.runtime.getSnapshot(host.sessionId);
+    if (updatePeerRange() !== 2) throw new SoakInvariantError('PRE_TERMINATION_PEER_MISMATCH');
+    await host.coordinator.shutdownAll();
+    hostTerminationChecks += 1;
+    await delay(1_500);
+    for (const guest of participants.filter((participant) => participant.actor !== 'host')) {
+      const before = guest.runtime.getSnapshot(guest.sessionId);
+      try {
+        await guest.coordinator.execute({
+          sessionId: guest.sessionId,
+          expectedRevision: before.revision,
+          label: 'Must fail after host loss',
+          commands: [{ type: 'deck.rename', name: 'Forbidden detached edit' }],
+        });
+      } catch {
+        const after = guest.runtime.getSnapshot(guest.sessionId);
+        if (after.revision !== before.revision || documentHash(after) !== documentHash(before)) {
+          throw new SoakInvariantError('POST_HOST_LOSS_GUEST_MUTATED');
+        }
+        postHostLossEditRejections += 1;
+        continue;
+      }
+      throw new SoakInvariantError('POST_HOST_LOSS_EDIT_ALLOWED');
+    }
+    const persisted = await verifierRuntime.openMainOnly({ targetPath });
+    try {
+      if (
+        persisted.revision !== finalSnapshot.revision ||
+        documentHash(persisted) !== documentHash(finalSnapshot)
+      ) {
+        throw new SoakInvariantError('POST_HOST_LOSS_FILE_DIVERGENCE');
+      }
+    } finally {
+      await verifierRuntime.close(persisted.sessionId, { discardUnsaved: true });
+    }
+  };
+
   try {
-    const hostSource = await hostRuntime.createMainOnly();
+    let hostSource = await hostRuntime.createMainOnly();
+    const sourceSlide = hostSource.document.slides[0];
+    if (sourceSlide === undefined) throw new SoakInvariantError('MISSING_SLIDE');
+    const sourceAssetId = randomUUID();
+    const sourceImage: ImageElement = {
+      id: randomUUID(),
+      type: 'image',
+      name: 'Embedded collaboration fixture',
+      frame: { xPt: 536, yPt: 382, widthPt: 96, heightPt: 96, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      assetId: sourceAssetId,
+      altText: 'Embedded one-pixel collaboration fixture',
+      fit: 'contain',
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+    };
+    hostSource = await hostRuntime.storeAssetAndExecute(hostSource.sessionId, {
+      expectedRevision: hostSource.revision,
+      id: sourceAssetId,
+      bytes: EMBEDDED_PNG,
+      mediaType: 'image/png',
+      fileName: 'embedded-fixture.png',
+      widthPx: 1,
+      heightPx: 1,
+      commands: [{ type: 'element.insert', slideId: sourceSlide.id, element: sourceImage }],
+      metadata: {
+        transactionId: randomUUID(),
+        actorId: 'release-soak-setup',
+        origin: 'system',
+        label: 'Create embedded collaboration fixture',
+        timestamp: new Date().toISOString(),
+      },
+    });
     await hostRuntime.saveAsMainOnly(hostSource.sessionId, {
       targetPath,
       expectedFingerprint: null,
@@ -414,11 +646,14 @@ const main = async (): Promise<void> => {
     await waitForConvergence(participants);
     convergenceChecks += 1;
     await verifyPersistence();
+    await insertExistingAsset(participants[1]!);
+    await exerciseTextLease(0);
 
     steadyStateStartedAt = Date.now();
     const deadline = steadyStateStartedAt + options.durationMs;
     let nextSaveAt = steadyStateStartedAt + options.saveIntervalMs;
     let nextRejoinAt = steadyStateStartedAt + options.rejoinIntervalMs;
+    let nextTextLeaseAt = steadyStateStartedAt + TEXT_LEASE_INTERVAL_MS;
     let nextProgressAt = steadyStateStartedAt + 60_000;
     let rejoinGuestIndex = 1;
 
@@ -443,6 +678,7 @@ const main = async (): Promise<void> => {
       convergenceChecks += 1;
       commandsByActor[actor.actor] += 1;
       commandsByType[command.type] = (commandsByType[command.type] ?? 0) + 1;
+      if (command.type === 'element.transform') objectEdits += 1;
       updatePeerRange();
 
       const now = Date.now();
@@ -458,6 +694,10 @@ const main = async (): Promise<void> => {
         await rejoinGuest(guest);
         rejoinGuestIndex = rejoinGuestIndex === 1 ? 2 : 1;
         nextRejoinAt = Date.now() + options.rejoinIntervalMs;
+      }
+      if (now >= nextTextLeaseAt) {
+        await exerciseTextLease(textLeaseEdits);
+        nextTextLeaseAt = Date.now() + TEXT_LEASE_INTERVAL_MS;
       }
       if (now >= nextProgressAt) {
         console.log(
@@ -488,6 +728,19 @@ const main = async (): Promise<void> => {
         throw new SoakInvariantError('GUEST_SAVE_REJECTION_COUNT_MISMATCH');
       }
       if (updatePeerRange() !== 2) throw new SoakInvariantError('FINAL_PEER_COUNT_MISMATCH');
+      if (
+        objectEdits === 0 ||
+        assetInsertions === 0 ||
+        textLeaseContentions === 0 ||
+        textLeaseEdits === 0 ||
+        textLeaseTransfers === 0
+      ) {
+        throw new SoakInvariantError('REQUIRED_SCENARIO_MISSING');
+      }
+      await verifyHostLoss();
+      if (postHostLossEditRejections !== 2) {
+        throw new SoakInvariantError('HOST_LOSS_REJECTION_COUNT_MISMATCH');
+      }
       status = 'passed';
     }
   } catch (error) {
@@ -547,10 +800,16 @@ const main = async (): Promise<void> => {
       architecture: process.arch,
     },
     operations: {
-      commands: commandCount,
+      commands: commandCount + textLeaseEdits + assetInsertions,
+      steadyStateCommands: commandCount,
       commandsByActor,
       commandsByType,
       convergenceChecks,
+      objectEdits,
+      assetInsertions,
+      textLeaseContentions,
+      textLeaseEdits,
+      textLeaseTransfers,
     },
     commandRoundTripMs: summarizeLatency(commandRoundTripMs),
     persistence: {
@@ -561,6 +820,8 @@ const main = async (): Promise<void> => {
     },
     reconnect: {
       cycles: rejoinCycles,
+      hostTerminationChecks,
+      postHostLossEditRejections,
     },
     peers: {
       expectedGuestCount: 2,
@@ -568,9 +829,16 @@ const main = async (): Promise<void> => {
       maximumObserved: maxHostPeerCount,
     },
     invariants: {
-      revisionAndHashCheckedAfterEveryCommand: convergenceChecks >= commandCount,
+      revisionAndHashCheckedAfterEveryCommand:
+        convergenceChecks >= commandCount + textLeaseEdits + assetInsertions,
       onlyHostSavedSharedFile: guestSaveAttempts === guestSaveRejections,
       persistedSnapshotsMatchedHost: persistedSnapshotVerifications === hostSaves,
+      objectEditingExercised: objectEdits > 0,
+      embeddedAssetInsertionExercised: assetInsertions > 0,
+      textLeaseContentionAndTransferExercised:
+        textLeaseContentions > 0 && textLeaseEdits > 0 && textLeaseTransfers > 0,
+      hostLossRejectedAllGuestEdits:
+        hostTerminationChecks === 1 && postHostLossEditRejections === 2,
       cleanupComplete: cleanupFailures === 0,
     },
     ...(failure === undefined ? {} : { failure }),

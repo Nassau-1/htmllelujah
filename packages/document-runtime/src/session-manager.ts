@@ -160,6 +160,10 @@ const markCommandAssetHashes = (commands: readonly unknown[], hashes: Set<string
 
 const deepFreeze = <T>(value: T): T => {
   if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
+  // ECMAScript engines reject Object.freeze on non-empty typed arrays. Asset bytes are
+  // already copied by structuredClone, so leaving the defensive view mutable cannot mutate
+  // session-owned storage; the containing response is still frozen below.
+  if (ArrayBuffer.isView(value)) return value;
   Object.freeze(value);
   for (const child of Object.values(value)) deepFreeze(child);
   return value;

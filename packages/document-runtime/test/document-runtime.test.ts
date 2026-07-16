@@ -310,6 +310,13 @@ describe('save, reopen, assets, and conflicts', () => {
       expectedRevision: session.revision,
       metadata: metadata(1),
     });
+    const exposed = manager.getAssetBytesMainOnly(
+      session.sessionId,
+      'ffffffff-ffff-4fff-8fff-000000000001',
+    );
+    expect(Array.from(exposed.bytes)).toEqual(Array.from(bytes));
+    exposed.bytes[0] = 0;
+    expect(manager.getAssetBytesMainOnly(session.sessionId, exposed.id).bytes[0]).toBe(bytes[0]);
     await manager.saveAsMainOnly(session.sessionId, {
       targetPath: target,
       expectedFingerprint: null,
