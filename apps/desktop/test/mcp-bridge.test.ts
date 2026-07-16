@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm as remove } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -8,16 +8,22 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DesktopMcpBridge } from '../src/main/mcp-bridge.js';
 
+const rm = (target: string, options: { readonly recursive: true; readonly force: true }) =>
+  remove(target, { ...options, maxRetries: 5, retryDelay: 100 });
+
 describe('DesktopMcpBridge', () => {
   const cleanup: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
-    await Promise.allSettled(
-      cleanup
-        .splice(0)
-        .reverse()
-        .map((operation) => operation()),
-    );
+    const errors: unknown[] = [];
+    for (const operation of cleanup.splice(0).reverse()) {
+      try {
+        await operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) throw new AggregateError(errors, 'MCP bridge test cleanup failed.');
   });
 
   it('exposes visible decks, commits attributable proposals, and enforces one-time approvals', async () => {

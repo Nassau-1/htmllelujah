@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm as remove, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -11,6 +11,9 @@ import { createHdeckArchive, parseHdeckArchive } from '@htmllelujah/hdeck';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { DesktopCollaborationCoordinator } from '../src/main/collaboration-service.js';
+
+const rm = (target: string, options: { readonly recursive: true; readonly force: true }) =>
+  remove(target, { ...options, maxRetries: 5, retryDelay: 100 });
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 5_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
@@ -32,12 +35,15 @@ describe('DesktopCollaborationCoordinator', () => {
   const cleanup: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
-    await Promise.allSettled(
-      cleanup
-        .splice(0)
-        .reverse()
-        .map((operation) => operation()),
-    );
+    const errors: unknown[] = [];
+    for (const operation of cleanup.splice(0).reverse()) {
+      try {
+        await operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) throw new AggregateError(errors, 'Collaboration test cleanup failed.');
   });
 
   it('keeps a host and guest converged while only the host writes the shared file', async () => {
