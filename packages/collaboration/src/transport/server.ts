@@ -514,6 +514,12 @@ export class CollaborationTransportServer {
       this.closeProtocolPeer(state, 'Text frames only');
       return;
     }
+    // Charge the raw frame before JSON parsing or HMAC work so malformed and
+    // chunked traffic share the same bounded per-peer CPU budget.
+    if (!this.consumeRateToken(state)) {
+      this.closeProtocolPeer(state, 'Rate limit');
+      return;
+    }
     let raw: unknown;
     try {
       raw = JSON.parse(data.toString());
@@ -523,17 +529,7 @@ export class CollaborationTransportServer {
     }
 
     if (!state.authenticated) {
-      if (!this.consumeRateToken(state)) {
-        this.closeProtocolPeer(state, 'Rate limit');
-        return;
-      }
       this.authenticate(state, raw);
-      return;
-    }
-    // Charge every authenticated wire frame, not only completed logical
-    // messages, so chunking cannot bypass the per-peer CPU budget.
-    if (!this.consumeRateToken(state)) {
-      this.closeProtocolPeer(state, 'Rate limit');
       return;
     }
     let logical: string | undefined;
