@@ -10,6 +10,7 @@ import electronPath from 'electron';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
+const runtimeInspectionPath = path.join(import.meta.dirname, 'inspect-electron-runtime.ps1');
 const pagePresets = {
   widescreen: { widthPt: 960, heightPt: 540 },
   standard: { widthPt: 720, heightPt: 540 },
@@ -19,13 +20,57 @@ const requestedPagePreset = process.env.HTMLLELUJAH_EXPORT_PAGE_PRESET ?? 'wides
 if (!(requestedPagePreset in pagePresets)) {
   throw new Error('HTMLLELUJAH_EXPORT_PAGE_PRESET must be widescreen, standard, or a4-landscape.');
 }
+
+const parseExportRun = (arguments_) => {
+  let stress = false;
+  let requestedCount;
+  let countProvided = false;
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    if (argument === '--stress') {
+      stress = true;
+      continue;
+    }
+    if (argument === '--stress-count') {
+      if (countProvided) throw new Error('--stress-count can only be provided once.');
+      if (arguments_[index + 1] === undefined) {
+        throw new Error('--stress-count requires an integer value.');
+      }
+      requestedCount = arguments_[index + 1];
+      countProvided = true;
+      index += 1;
+      stress = true;
+      continue;
+    }
+    if (argument.startsWith('--stress-count=')) {
+      if (countProvided) throw new Error('--stress-count can only be provided once.');
+      requestedCount = argument.slice('--stress-count='.length);
+      countProvided = true;
+      stress = true;
+      continue;
+    }
+    throw new Error(`Unknown system export smoke argument: ${argument}`);
+  }
+  if (!stress) return { mode: 'short', exportCount: 2 };
+  const exportCount = requestedCount === undefined ? 50 : Number(requestedCount);
+  if (!Number.isInteger(exportCount) || exportCount < 2 || exportCount > 50) {
+    throw new Error('--stress-count must be an integer from 2 through 50.');
+  }
+  return { mode: 'stress', exportCount };
+};
+
+const exportRun = parseExportRun(process.argv.slice(2));
+const stressEvidenceSuffix =
+  exportRun.mode === 'stress'
+    ? `-stress${exportRun.exportCount === 50 ? '' : `-${exportRun.exportCount}`}`
+    : '';
+const pageEvidenceSuffix =
+  process.env.HTMLLELUJAH_EXPORT_PAGE_PRESET === undefined ? '' : `-${requestedPagePreset}`;
 const evidencePath = path.join(
   repositoryRoot,
   'artifacts',
   'evidence',
-  process.env.HTMLLELUJAH_EXPORT_PAGE_PRESET === undefined
-    ? 'system-exports-v1.json'
-    : `system-exports-v1-${requestedPagePreset}.json`,
+  `system-exports-v1${stressEvidenceSuffix}${pageEvidenceSuffix}.json`,
 );
 const dialogAutomationPath = path.join(import.meta.dirname, 'automate-save-dialog.ps1');
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -118,6 +163,128 @@ const run = (command, arguments_, options = {}) =>
         );
     });
   });
+
+const inspectRuntime = async (rootProcessId) => {
+  const { stdout } = await run(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      runtimeInspectionPath,
+      '-RootProcessId',
+      String(rootProcessId),
+    ],
+    { label: 'Electron runtime inspection', timeoutMs: 20_000 },
+  );
+  const sample = JSON.parse(stdout.trim());
+  if (
+    sample?.schemaVersion !== 1 ||
+    !Number.isInteger(sample.processCount) ||
+    !Number.isInteger(sample.topLevelWindowCount) ||
+    !Number.isInteger(sample.visibleWindowCount) ||
+    typeof sample.processTreeComplete !== 'boolean' ||
+    typeof sample.workingSetAvailable !== 'boolean' ||
+    (sample.workingSetBytes !== null &&
+      (!Number.isFinite(sample.workingSetBytes) || sample.workingSetBytes < 0))
+  ) {
+    throw new Error('Electron runtime inspection returned an invalid result.');
+  }
+  return sample;
+};
+
+const percentile = (values, percentage) => {
+  if (values.length === 0) throw new Error('Cannot compute a percentile without samples.');
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.max(0, Math.ceil((percentage / 100) * sorted.length) - 1)];
+};
+
+const summarizeDurations = (values) => ({
+  p50Ms: Math.round(percentile(values, 50) * 10) / 10,
+  p95Ms: Math.round(percentile(values, 95) * 10) / 10,
+  maxMs: Math.round(Math.max(...values) * 10) / 10,
+});
+
+const summarizeRuntimeGrowth = (baseline, samples) => {
+  const windowSize = Math.min(5, Math.max(2, Math.floor(samples.length / 4)));
+  const earlySamples = samples.slice(0, windowSize);
+  const lateSamples = samples.slice(-windowSize);
+  const stabilizedProcessPeak = Math.max(
+    baseline.processCount,
+    ...earlySamples.map((sample) => sample.processCount),
+  );
+  const allowedProcessCount = stabilizedProcessPeak + 1;
+  const laterProcessPeak = Math.max(
+    ...samples.slice(windowSize).map((sample) => sample.processCount),
+    0,
+  );
+  const finalProcessCount = samples.at(-1)?.processCount ?? baseline.processCount;
+  const processCountStable =
+    laterProcessPeak <= allowedProcessCount && finalProcessCount <= allowedProcessCount;
+
+  const memorySamples = samples.filter(
+    (sample) => sample.workingSetAvailable && sample.workingSetBytes !== null,
+  );
+  const memoryAvailable =
+    baseline.workingSetAvailable &&
+    baseline.workingSetBytes !== null &&
+    memorySamples.length === samples.length;
+  if (!memoryAvailable) {
+    return {
+      processCountStable,
+      stabilizedProcessPeak,
+      laterProcessPeak,
+      finalProcessCount,
+      allowedProcessCount,
+      workingSet: {
+        available: false,
+        limitation: 'Windows process working-set data was not available for every sample.',
+      },
+    };
+  }
+
+  const earlyWorkingSet = percentile(
+    earlySamples.map((sample) => sample.workingSetBytes),
+    50,
+  );
+  const lateWorkingSet = percentile(
+    lateSamples.map((sample) => sample.workingSetBytes),
+    50,
+  );
+  const growthBytes = lateWorkingSet - earlyWorkingSet;
+  const growthBudgetBytes = Math.max(96 * 1024 * 1024, Math.round(earlyWorkingSet * 0.25));
+  return {
+    processCountStable,
+    stabilizedProcessPeak,
+    laterProcessPeak,
+    finalProcessCount,
+    allowedProcessCount,
+    workingSet: {
+      available: true,
+      earlyMedianBytes: earlyWorkingSet,
+      lateMedianBytes: lateWorkingSet,
+      growthBytes,
+      growthBudgetBytes,
+      withinBudget: growthBytes <= growthBudgetBytes,
+    },
+  };
+};
+
+const waitForRuntimeExit = async (rootProcessId, label) =>
+  waitFor(
+    async () => {
+      const sample = await inspectRuntime(rootProcessId);
+      return sample.processCount === 0 &&
+        sample.topLevelWindowCount === 0 &&
+        sample.visibleWindowCount === 0
+        ? sample
+        : undefined;
+    },
+    20_000,
+    label,
+  );
 
 class CdpSession {
   #nextId = 1;
@@ -455,15 +622,32 @@ const safePrefix = path.join(path.resolve(tmpdir()), 'htmllelujah-system-export-
 if (!path.resolve(temporaryRoot).startsWith(safePrefix)) {
   throw new Error('Refusing unsafe system export smoke directory.');
 }
+let temporaryRootRemoved = false;
+const removeTemporaryRoot = async () => {
+  await waitFor(
+    async () => {
+      try {
+        await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        return true;
+      } catch (error) {
+        if (error?.code === 'EBUSY' || error?.code === 'EPERM') return false;
+        throw error;
+      }
+    },
+    15_000,
+    'System export smoke cleanup',
+  );
+  temporaryRootRemoved = true;
+};
 
 const workingDirectory = path.join(temporaryRoot, 'Vérification système 你好');
 const sourcePath = path.join(workingDirectory, 'Présentation source – été.hdeck');
 const savedPath = path.join(workingDirectory, 'Copie enregistrée – 你好.hdeck');
-const htmlPath = path.join(workingDirectory, 'Présentation autonome – 你好.html');
-const pdfPath = path.join(workingDirectory, 'Présentation imprimable – 你好.pdf');
 const firstUserData = path.join(temporaryRoot, 'Profil source');
 const reopenUserData = path.join(temporaryRoot, 'Profil réouverture');
 let editor;
+let activeApplicationPid;
+let executionError;
 
 try {
   await mkdir(workingDirectory, { recursive: true });
@@ -477,6 +661,8 @@ try {
   const sourceBytes = await readFile(sourcePath);
 
   editor = await launchEditor({ deckPath: sourcePath, userData: firstUserData });
+  activeApplicationPid = editor.application.pid;
+  if (activeApplicationPid === undefined) throw new Error('Electron process ID is unavailable.');
   const initial = await editor.evaluate(`(() => ({
     name: document.querySelector('.document-title span')?.textContent?.trim() ?? '',
     slideCount: document.querySelectorAll('.canonical-thumbnail').length,
@@ -492,23 +678,118 @@ try {
     targetPath: savedPath,
     successText: 'Saved locally.',
   });
-  await runSaveOperation({
-    editor,
-    menuPrefix: 'Export standalone HTML',
-    dialogTitle: 'Export standalone HTML',
-    targetPath: htmlPath,
-    successText: 'HTML exported:',
-  });
-  await runSaveOperation({
-    editor,
-    menuPrefix: 'Export PDF',
-    dialogTitle: 'Export PDF',
-    targetPath: pdfPath,
-    successText: 'PDF exported:',
-  });
 
+  const runtimeBaseline = await waitFor(
+    async () => {
+      const sample = await inspectRuntime(activeApplicationPid);
+      return sample.processCount >= 1 && sample.topLevelWindowCount >= 1 ? sample : undefined;
+    },
+    20_000,
+    'Observable editor runtime before exports',
+  );
+  if (!runtimeBaseline.processTreeComplete) {
+    throw new Error('Windows did not permit complete Electron process-tree inspection.');
+  }
+  if (runtimeBaseline.processCount < 1 || runtimeBaseline.topLevelWindowCount < 1) {
+    throw new Error(
+      `The real editor runtime was not observable before exports (processes=${runtimeBaseline.processCount}, windows=${runtimeBaseline.topLevelWindowCount}).`,
+    );
+  }
+
+  const exportRecords = [];
+  const exportTargets = new Set();
+  const runtimeSamples = [];
+  for (let index = 0; index < exportRun.exportCount; index += 1) {
+    const ordinal = index + 1;
+    const format = index % 2 === 0 ? 'html' : 'pdf';
+    const targetPath = path.join(
+      workingDirectory,
+      `Export ${String(ordinal).padStart(2, '0')} – 你好.${format}`,
+    );
+    if (exportTargets.has(targetPath) || (await exists(targetPath))) {
+      throw new Error(`Export ${ordinal} did not receive a unique empty destination.`);
+    }
+    exportTargets.add(targetPath);
+    const startedAt = performance.now();
+    await runSaveOperation({
+      editor,
+      menuPrefix: format === 'html' ? 'Export standalone HTML' : 'Export PDF',
+      dialogTitle: format === 'html' ? 'Export standalone HTML' : 'Export PDF',
+      targetPath,
+      successText: format === 'html' ? 'HTML exported:' : 'PDF exported:',
+    });
+    const durationMs = performance.now() - startedAt;
+    const bytes = await readFile(targetPath);
+    const validation =
+      format === 'html'
+        ? (() => {
+            const result = validateStandaloneHtml(bytes, document.name);
+            return {
+              offline: true,
+              cspHashesValid: Boolean(result.scriptHash && result.styleHash),
+              externalResourceReferences: 0,
+            };
+          })()
+        : (() => {
+            const result = validatePdf(bytes, document.slides.length, document.page);
+            return {
+              signatureAndEofValid: true,
+              pageCount: result.pageCount,
+              mediaBoxPt: [result.widthPt, result.heightPt],
+            };
+          })();
+    const runtimeSample = await waitFor(
+      async () => {
+        const sample = await inspectRuntime(activeApplicationPid);
+        return sample.topLevelWindowCount === runtimeBaseline.topLevelWindowCount
+          ? sample
+          : undefined;
+      },
+      20_000,
+      `Closed native dialog after export ${ordinal}`,
+    );
+    if (!runtimeSample.processTreeComplete) {
+      throw new Error(
+        `Electron process-tree inspection became incomplete after export ${ordinal}.`,
+      );
+    }
+    if (runtimeSample.topLevelWindowCount !== runtimeBaseline.topLevelWindowCount) {
+      throw new Error(`A native or renderer window remained after export ${ordinal}.`);
+    }
+    if (runtimeSample.processCount < 1) {
+      throw new Error(`The editor process tree disappeared after export ${ordinal}.`);
+    }
+    runtimeSamples.push(runtimeSample);
+    exportRecords.push({
+      ordinal,
+      format,
+      durationMs: Math.round(durationMs * 10) / 10,
+      bytes: bytes.length,
+      sha256: sha256(bytes),
+      validation,
+    });
+  }
+
+  const runtimeGrowth = summarizeRuntimeGrowth(runtimeBaseline, runtimeSamples);
+  if (!runtimeGrowth.processCountStable) {
+    throw new Error('The Electron process count grew beyond the stabilized export allowance.');
+  }
+  if (runtimeGrowth.workingSet.available && !runtimeGrowth.workingSet.withinBudget) {
+    throw new Error('The Electron process-tree working set grew beyond the export smoke budget.');
+  }
+  if (!runtimeGrowth.workingSet.available) {
+    process.stdout.write(
+      'Memory-growth limitation: Windows working-set data was unavailable for every sample.\n',
+    );
+  }
+
+  const firstApplicationPid = activeApplicationPid;
   await editor.close();
   editor = undefined;
+  const firstRuntimeCleanup = await waitForRuntimeExit(
+    firstApplicationPid,
+    'Primary editor process and window cleanup',
+  );
 
   const savedBytes = await readFile(savedPath);
   const parsed = parseHdeckArchive(savedBytes);
@@ -522,12 +803,9 @@ try {
     throw new Error('Save As unexpectedly modified the original presentation.');
   }
 
-  const htmlBytes = await readFile(htmlPath);
-  const htmlValidation = validateStandaloneHtml(htmlBytes, document.name);
-  const pdfBytes = await readFile(pdfPath);
-  const pdfValidation = validatePdf(pdfBytes, document.slides.length, document.page);
-
   editor = await launchEditor({ deckPath: savedPath, userData: reopenUserData });
+  activeApplicationPid = editor.application.pid;
+  if (activeApplicationPid === undefined) throw new Error('Electron process ID is unavailable.');
   const reopened = await editor.evaluate(`(() => ({
     name: document.querySelector('.document-title span')?.textContent?.trim() ?? '',
     slideCount: document.querySelectorAll('.canonical-thumbnail').length,
@@ -540,11 +818,35 @@ try {
   ) {
     throw new Error('The Save As result did not reopen completely in the real editor.');
   }
+  const reopenRuntime = await waitFor(
+    async () => {
+      const sample = await inspectRuntime(activeApplicationPid);
+      return sample.processCount >= 1 && sample.topLevelWindowCount >= 1 ? sample : undefined;
+    },
+    20_000,
+    'Observable reopened editor runtime',
+  );
+  if (
+    !reopenRuntime.processTreeComplete ||
+    reopenRuntime.processCount < 1 ||
+    reopenRuntime.topLevelWindowCount < 1
+  ) {
+    throw new Error('The reopened editor runtime was not completely observable.');
+  }
+  const reopenApplicationPid = activeApplicationPid;
   await editor.close();
   editor = undefined;
+  const reopenRuntimeCleanup = await waitForRuntimeExit(
+    reopenApplicationPid,
+    'Reopened editor process and window cleanup',
+  );
+
+  const htmlExports = exportRecords.filter((record) => record.format === 'html');
+  const pdfExports = exportRecords.filter((record) => record.format === 'pdf');
+  await removeTemporaryRoot();
 
   const report = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     passed: true,
     testedAt: new Date().toISOString(),
     platform: `${process.platform}-${process.arch}`,
@@ -556,27 +858,71 @@ try {
       slideCount: document.slides.length,
       page: document.page,
     },
+    run: {
+      mode: exportRun.mode,
+      exportCount: exportRecords.length,
+      htmlExportCount: htmlExports.length,
+      pdfExportCount: pdfExports.length,
+      alternatingFormats: exportRecords.every(
+        (record, index) => record.format === (index % 2 === 0 ? 'html' : 'pdf'),
+      ),
+      uniqueDestinations: exportTargets.size === exportRecords.length,
+    },
     checks: {
       realEditorOpenedSourceDeck: true,
       nativeSaveAsDialogAutomated: true,
-      nativeHtmlExportDialogAutomated: true,
-      nativePdfExportDialogAutomated: true,
+      nativeHtmlExportDialogsAutomated: htmlExports.length,
+      nativePdfExportDialogsAutomated: pdfExports.length,
+      everyHtmlValidatedOfflineWithCspAndNoUrl: htmlExports.every(
+        (record) =>
+          record.validation.offline &&
+          record.validation.cspHashesValid &&
+          record.validation.externalResourceReferences === 0,
+      ),
+      everyPdfValidated: pdfExports.every(
+        (record) =>
+          record.validation.signatureAndEofValid &&
+          record.validation.pageCount === document.slides.length,
+      ),
       sourceDeckUnchanged: true,
       hdeckParsedAndValidated: true,
       savedHdeckReopenedInRealEditor: true,
-      standaloneHtmlOffline: true,
-      standaloneHtmlCspHashesValid: true,
-      pdfSignatureAndEofValid: true,
-      pdfPageCount: pdfValidation.pageCount,
-      pdfMediaBoxPt: [pdfValidation.widthPt, pdfValidation.heightPt],
+      nativeDialogsClosedAfterEveryExport: true,
+      processCountStable: runtimeGrowth.processCountStable,
+      processTreesAndWindowsClosedAfterEditorsExit:
+        firstRuntimeCleanup.processCount === 0 &&
+        firstRuntimeCleanup.topLevelWindowCount === 0 &&
+        firstRuntimeCleanup.visibleWindowCount === 0 &&
+        reopenRuntimeCleanup.processCount === 0 &&
+        reopenRuntimeCleanup.topLevelWindowCount === 0 &&
+        reopenRuntimeCleanup.visibleWindowCount === 0,
+      temporaryWorkspaceRemoved: temporaryRootRemoved,
     },
     artifacts: {
       hdeck: { bytes: savedBytes.length, sha256: sha256(savedBytes) },
-      html: { bytes: htmlBytes.length, sha256: sha256(htmlBytes) },
-      pdf: { bytes: pdfBytes.length, sha256: sha256(pdfBytes) },
+      exports: exportRecords,
+    },
+    performance: {
+      allExports: summarizeDurations(exportRecords.map((record) => record.durationMs)),
+      htmlExports: summarizeDurations(htmlExports.map((record) => record.durationMs)),
+      pdfExports: summarizeDurations(pdfExports.map((record) => record.durationMs)),
+    },
+    runtime: {
+      measurement: {
+        memoryMetric: 'sum of Windows WorkingSet64 across the Electron process tree',
+        limitation:
+          'Working set is an RSS-equivalent signal; a bounded run cannot prove that no slower leak exists.',
+      },
+      baseline: runtimeBaseline,
+      samples: runtimeSamples.map((sample, index) => ({ ordinal: index + 1, ...sample })),
+      growth: runtimeGrowth,
+      cleanup: {
+        primaryEditor: firstRuntimeCleanup,
+        reopenedEditor: reopenRuntimeCleanup,
+      },
     },
     security: {
-      cspSha256DirectivesVerified: Boolean(htmlValidation.scriptHash && htmlValidation.styleHash),
+      cspSha256DirectivesVerifiedForEveryHtml: true,
       externalResourceReferences: 0,
       publicReportContainsLocalPaths: false,
     },
@@ -584,26 +930,39 @@ try {
   await mkdir(path.dirname(evidencePath), { recursive: true });
   await writeFile(evidencePath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
   process.stdout.write(
-    'Windows system export smoke passed: Save As, HTML, PDF, parsing, and real reopen verified.\n',
+    `Windows system export smoke passed: ${exportRecords.length} mixed exports, parsing, runtime cleanup, and real reopen verified.\n`,
   );
 } catch (error) {
   if (editor !== undefined && editor.applicationError() !== '') {
     process.stderr.write(`[desktop stderr]\n${editor.applicationError()}\n`);
   }
-  throw error;
+  executionError = error;
 } finally {
-  if (editor !== undefined) await editor.close();
-  await waitFor(
-    async () => {
-      try {
-        await rm(temporaryRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-        return true;
-      } catch (error) {
-        if (error?.code === 'EBUSY' || error?.code === 'EPERM') return false;
-        throw error;
+  const cleanupErrors = [];
+  if (editor !== undefined) {
+    const rootProcessId = editor.application.pid;
+    try {
+      await editor.close();
+      if (rootProcessId !== undefined) {
+        await waitForRuntimeExit(rootProcessId, 'Failed-run editor process and window cleanup');
       }
-    },
-    15_000,
-    'System export smoke cleanup',
-  );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (!temporaryRootRemoved) {
+    try {
+      await removeTemporaryRoot();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length > 0) {
+    executionError = new AggregateError(
+      executionError === undefined ? cleanupErrors : [executionError, ...cleanupErrors],
+      'The system export smoke or its cleanup failed.',
+    );
+  }
 }
+
+if (executionError !== undefined) throw executionError;
