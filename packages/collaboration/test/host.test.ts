@@ -547,6 +547,30 @@ describe('authoritative collaboration host', () => {
       knownRevision: 'rev1-not-the-current-revision',
     });
     expect(divergent.kind).toBe('snapshot');
+
+    const { host: boundedTailHost } = createHost({ maxTailResyncBytes: 1 });
+    const boundedInitialRevision = boundedTailHost.revision;
+    const boundedElement = boundedTailHost.getSnapshot().document.slides[0]!.elements[0]!;
+    boundedTailHost.submit(
+      createRequest(boundedTailHost, {
+        clientId: CLIENT_A,
+        clientRequestId: requestId(54),
+        commands: [
+          transformCommand(boundedElement.id, {
+            ...boundedElement.frame,
+            xPt: boundedElement.frame.xPt + 1,
+          }),
+        ],
+      }),
+    );
+    const bounded = boundedTailHost.getResync({
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      sessionId: boundedTailHost.sessionId,
+      documentId: boundedTailHost.documentId,
+      afterSeq: 0,
+      knownRevision: boundedInitialRevision,
+    });
+    expect(bounded.kind).toBe('snapshot');
   });
 
   it('bounds and expires ephemeral presence', () => {

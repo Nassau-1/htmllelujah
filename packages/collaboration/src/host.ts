@@ -64,6 +64,7 @@ export interface AuthoritativeSessionHostOptions {
   readonly maxCommandsPerBatch?: number;
   readonly maxCommandPayloadBytes?: number;
   readonly maxPresencePayloadBytes?: number;
+  readonly maxTailResyncBytes?: number;
   readonly maxParticipants?: number;
   readonly textLeaseTtlMs?: number;
   readonly presenceTtlMs?: number;
@@ -86,6 +87,7 @@ interface PreparedSubmission {
 }
 
 const DEFAULT_TAIL_LIMIT = 256;
+const DEFAULT_MAX_TAIL_RESYNC_BYTES = 24 * 1024 * 1024;
 const DEFAULT_IDEMPOTENCY_LIMIT = 10_000;
 const DEFAULT_MAX_PARTICIPANTS = 32;
 
@@ -163,6 +165,7 @@ export class AuthoritativeSessionHost {
   private readonly maxCommandsPerBatch: number;
   private readonly maxCommandPayloadBytes: number;
   private readonly maxPresencePayloadBytes: number;
+  private readonly maxTailResyncBytes: number;
   private readonly maxParticipants: number;
   private readonly textLeaseTtlMs: number;
   private readonly presenceTtlMs: number;
@@ -192,6 +195,7 @@ export class AuthoritativeSessionHost {
       options.maxCommandPayloadBytes ?? DEFAULT_MAX_COMMAND_PAYLOAD_BYTES;
     this.maxPresencePayloadBytes =
       options.maxPresencePayloadBytes ?? DEFAULT_MAX_PRESENCE_PAYLOAD_BYTES;
+    this.maxTailResyncBytes = options.maxTailResyncBytes ?? DEFAULT_MAX_TAIL_RESYNC_BYTES;
     this.maxParticipants = options.maxParticipants ?? DEFAULT_MAX_PARTICIPANTS;
     this.textLeaseTtlMs = options.textLeaseTtlMs ?? DEFAULT_TEXT_LEASE_TTL_MS;
     this.presenceTtlMs = options.presenceTtlMs ?? DEFAULT_PRESENCE_TTL_MS;
@@ -203,6 +207,7 @@ export class AuthoritativeSessionHost {
         this.maxCommandsPerBatch,
         this.maxCommandPayloadBytes,
         this.maxPresencePayloadBytes,
+        this.maxTailResyncBytes,
         this.maxParticipants,
         this.textLeaseTtlMs,
         this.presenceTtlMs,
@@ -421,7 +426,7 @@ export class AuthoritativeSessionHost {
       return this.createSnapshotResync();
     }
 
-    return tailResyncResponseSchema.parse({
+    const response = tailResyncResponseSchema.parse({
       protocolVersion: COLLABORATION_PROTOCOL_VERSION,
       kind: 'tail',
       sessionId: this.sessionId,
@@ -431,6 +436,9 @@ export class AuthoritativeSessionHost {
       revision: this.currentRevision,
       transactions,
     });
+    return measureJsonBytes(response) > this.maxTailResyncBytes
+      ? this.createSnapshotResync()
+      : response;
   }
 
   public acquireTextLease(rawRequest: unknown): TextLease {

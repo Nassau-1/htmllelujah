@@ -1,5 +1,7 @@
 import { once } from 'node:events';
 import { createHmac } from 'node:crypto';
+import { connect as connectTcp } from 'node:net';
+import { connect as connectTls } from 'node:tls';
 
 import {
   createNeutralDemoDeck,
@@ -55,6 +57,34 @@ const createLargeEngine = (): AuthoritativeSessionHost => {
   });
 };
 
+const createSupportedContractEngine = (): {
+  readonly engine: AuthoritativeSessionHost;
+  readonly documentBytes: number;
+} => {
+  const deck = createNeutralDemoDeck();
+  const element = deck.slides[0]?.elements[0];
+  if (element?.type !== 'text' || element.content.blocks[0]?.type !== 'paragraph') {
+    throw new Error('Demo deck does not expose the expected text element.');
+  }
+  const original = element.content.blocks[0].runs[0]!;
+  const mutableBlock = element.content.blocks[0] as unknown as {
+    runs: Array<typeof original>;
+  };
+  mutableBlock.runs = Array.from({ length: 180 }, (_, index) => ({
+    ...original,
+    text: `${String(index).padStart(4, '0')}:${'y'.repeat(99_980)}`,
+  }));
+  const documentBytes = Buffer.byteLength(JSON.stringify(deck));
+  expect(documentBytes).toBeGreaterThan(16 * 1024 * 1024);
+  expect(documentBytes).toBeLessThan(32 * 1024 * 1024);
+  return {
+    engine: new AuthoritativeSessionHost(new InMemoryDocumentAdapter(deck), {
+      sessionId: SESSION_ID,
+    }),
+    documentBytes,
+  };
+};
+
 const createCommandRequest = (
   engine: AuthoritativeSessionHost,
   clientId: string,
@@ -90,6 +120,8 @@ const createClient = (
     readonly secret?: Uint8Array;
     readonly nonceFactory?: () => string;
     readonly clock?: () => number;
+    readonly requestTimeoutMs?: number;
+    readonly maxPayloadBytes?: number;
   } = {},
 ): CollaborationTransportClient =>
   new CollaborationTransportClient({
@@ -99,6 +131,10 @@ const createClient = (
     documentSecret: options.secret ?? SECRET,
     ...(options.nonceFactory === undefined ? {} : { nonceFactory: options.nonceFactory }),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
+    ...(options.requestTimeoutMs === undefined
+      ? {}
+      : { requestTimeoutMs: options.requestTimeoutMs }),
+    ...(options.maxPayloadBytes === undefined ? {} : { maxPayloadBytes: options.maxPayloadBytes }),
   });
 
 const expectRemoteCode = async (operation: Promise<unknown>, code: string): Promise<void> => {
@@ -469,6 +505,43 @@ describe('WSS collaboration transport', () => {
     }
   });
 
+  it('charges every authenticated chunk against the wire-frame rate limit', async () => {
+    const engine = createEngine();
+    const server = new CollaborationTransportServer({
+      engine,
+      documentSecret: SECRET,
+      maxPayloadBytes: 512,
+      maxMessagesPerWindow: 1,
+      rateWindowMs: 60_000,
+    });
+    const invitation = await server.start();
+    const client = createClient(invitation, engine, 'client-chunk-rate', {
+      maxPayloadBytes: 512,
+    });
+    try {
+      await client.connect();
+      await expect(
+        client.updatePresence({
+          protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+          sessionId: engine.sessionId,
+          documentId: engine.documentId,
+          clientId: 'client-chunk-rate',
+          sequence: 1,
+          displayName: 'A'.repeat(64),
+          selectedElementIds: Array.from(
+            { length: 100 },
+            (_, index) =>
+              `95000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+          ),
+        }),
+      ).rejects.toBeInstanceOf(Error);
+      await waitFor(() => server.connectionCount === 0);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it('chunks snapshots larger than one MiB and preserves concurrent resync ordering', async () => {
     const engine = createLargeEngine();
     const server = new CollaborationTransportServer({ engine, documentSecret: SECRET });
@@ -522,6 +595,32 @@ describe('WSS collaboration transport', () => {
       await server.close();
     }
   }, 20_000);
+
+  it('resynchronizes a supported document above the former sixteen MiB boundary', async () => {
+    const { engine, documentBytes } = createSupportedContractEngine();
+    const server = new CollaborationTransportServer({ engine, documentSecret: SECRET });
+    const invitation = await server.start();
+    const client = createClient(invitation, engine, 'client-supported-limit', {
+      requestTimeoutMs: 30_000,
+    });
+    try {
+      await client.connect();
+      const result = await client.getResync({
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        sessionId: engine.sessionId,
+        documentId: engine.documentId,
+        afterSeq: 0,
+        knownRevision: 'force-a-snapshot',
+      });
+      expect(result.kind).toBe('snapshot');
+      if (result.kind === 'snapshot') {
+        expect(Buffer.byteLength(JSON.stringify(result.snapshot.document))).toBe(documentBytes);
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  }, 60_000);
 
   it('refuses an oversized logical result with a typed error and keeps the channel usable', async () => {
     const engine = createLargeEngine();
@@ -678,6 +777,57 @@ describe('WSS collaboration transport', () => {
       await addressServer.close();
     }
   });
+
+  it('bounds raw TCP and partial TLS handshakes before WebSocket upgrade', async () => {
+    const engine = createEngine();
+    const server = new CollaborationTransportServer({
+      engine,
+      documentSecret: SECRET,
+      maxPendingConnections: 2,
+      maxPendingPerAddress: 1,
+      authTimeoutMs: 1_500,
+    });
+    const invitation = await server.start();
+    const sockets: Array<ReturnType<typeof connectTcp>> = [];
+    const client = createClient(invitation, engine, 'post-handshake-quota');
+    try {
+      const first = connectTcp({ host: invitation.host, port: invitation.port });
+      sockets.push(first);
+      const firstClosed = once(first, 'close');
+      await once(first, 'connect');
+      await waitFor(() => server.pendingHandshakeCount === 1);
+
+      const rejected = connectTcp({ host: invitation.host, port: invitation.port });
+      sockets.push(rejected);
+      const rejectedClosed = once(rejected, 'close');
+      await once(rejected, 'connect');
+      await rejectedClosed;
+      expect(server.pendingHandshakeCount).toBe(1);
+
+      await firstClosed;
+      await waitFor(() => server.pendingHandshakeCount === 0);
+
+      const partialTls = connectTls({
+        host: invitation.host,
+        port: invitation.port,
+        rejectUnauthorized: false,
+      });
+      sockets.push(partialTls);
+      const partialClosed = once(partialTls, 'close');
+      await once(partialTls, 'secureConnect');
+      await waitFor(() => server.pendingHandshakeCount === 1);
+      await partialClosed;
+      await waitFor(() => server.pendingHandshakeCount === 0);
+
+      await client.connect();
+      expect(server.authenticatedPeerCount).toBe(1);
+      expect(server.pendingHandshakeCount).toBe(0);
+    } finally {
+      sockets.forEach((socket) => socket.destroy());
+      await client.close();
+      await server.close();
+    }
+  }, 15_000);
 
   it('fails closed on malformed authenticated transport frames', async () => {
     const engine = createEngine();

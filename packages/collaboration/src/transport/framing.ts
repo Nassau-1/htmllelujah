@@ -6,12 +6,15 @@ import { COLLABORATION_PROTOCOL_VERSION } from '../contracts.js';
 import { transportChunkSchema, type TransportChunk } from './protocol.js';
 
 export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
-export const DEFAULT_MAX_LOGICAL_PAYLOAD_BYTES = 16 * 1024 * 1024;
-export const DEFAULT_MAX_REASSEMBLY_BYTES = 32 * 1024 * 1024;
+// A supported .hdeck may contain 32 MiB of document JSON. Reserve one MiB for
+// the resync protocol envelope so every valid V1 document can cross the wire.
+export const DEFAULT_MAX_LOGICAL_PAYLOAD_BYTES = 33 * 1024 * 1024;
+export const DEFAULT_MAX_REASSEMBLY_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_MAX_CONCURRENT_TRANSFERS = 4;
 export const DEFAULT_CHUNK_TIMEOUT_MS = 10_000;
 export const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
-export const DEFAULT_MAX_QUEUED_BYTES = 32 * 1024 * 1024;
+// Base64url framing expands a full logical payload by roughly one third.
+export const DEFAULT_MAX_QUEUED_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_SEND_TIMEOUT_MS = 5_000;
 export const MAX_CHUNKS_PER_TRANSFER = 65_536;
 const MAX_COMPLETED_TRANSFER_IDS = 4_096;

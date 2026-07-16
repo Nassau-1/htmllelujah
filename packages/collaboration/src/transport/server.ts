@@ -1,5 +1,5 @@
 import { createServer, type Server as HttpsServer } from 'node:https';
-import type { AddressInfo } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 
 import WebSocket, { WebSocketServer } from 'ws';
 
@@ -89,6 +89,14 @@ interface ConnectionState {
   queuedRequestBytes: number;
 }
 
+interface PreUpgradeConnectionState {
+  readonly socket: Socket;
+  readonly remoteAddress: string;
+  readonly key: string;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  upgraded: boolean;
+}
+
 const DEFAULT_MAX_PEERS = 8;
 const DEFAULT_MAX_PENDING_CONNECTIONS = 16;
 const DEFAULT_MAX_PENDING_PER_ADDRESS = 8;
@@ -128,6 +136,7 @@ export class CollaborationTransportServer {
   private readonly idFactory: () => string;
   private readonly nonceFactory: () => string;
   private readonly connections = new Map<WebSocket, ConnectionState>();
+  private readonly preUpgradeConnections = new Map<string, PreUpgradeConnectionState>();
   private readonly replayNonces = new Map<string, number>();
   private httpsServer: HttpsServer | undefined;
   private webSocketServer: WebSocketServer | undefined;
@@ -205,6 +214,10 @@ export class CollaborationTransportServer {
     return this.connections.size;
   }
 
+  public get pendingHandshakeCount(): number {
+    return [...this.preUpgradeConnections.values()].filter((state) => !state.upgraded).length;
+  }
+
   public start(): Promise<ManualInvitation> {
     if (this.invitation !== undefined) return Promise.resolve(this.invitation);
     if (this.closed) {
@@ -239,6 +252,11 @@ export class CollaborationTransportServer {
       perMessageDeflate: false,
     });
     webSocketServer.on('connection', (socket, request) => {
+      if (!this.markConnectionUpgraded(request.socket as Socket)) {
+        socket.close(1013, 'Pending limit');
+        socket.terminate();
+        return;
+      }
       this.acceptConnection(
         socket,
         request.url ?? '',
@@ -247,6 +265,7 @@ export class CollaborationTransportServer {
       );
     });
     webSocketServer.on('error', () => undefined);
+    server.on('connection', (socket) => this.acceptPreUpgradeConnection(socket as Socket));
     server.on('clientError', (_error, socket) => socket.destroy());
 
     await new Promise<void>((resolve, reject) => {
@@ -312,6 +331,11 @@ export class CollaborationTransportServer {
       state.socket.terminate();
     });
     this.connections.clear();
+    this.preUpgradeConnections.forEach((state) => {
+      if (state.timer !== undefined) clearTimeout(state.timer);
+      state.socket.destroy();
+    });
+    this.preUpgradeConnections.clear();
     connectedClientIds.forEach((clientId) => {
       this.engine.removePresence(clientId);
       this.engine.releaseTextLeasesForClient(clientId);
@@ -426,6 +450,60 @@ export class CollaborationTransportServer {
     void sender.sendRaw(json(challenge)).catch(() => this.removeConnection(state));
   }
 
+  private acceptPreUpgradeConnection(socket: Socket): void {
+    const remoteAddress = socket.remoteAddress ?? 'unknown';
+    const key = this.connectionKey(socket);
+    const pending = [...this.preUpgradeConnections.values()].filter((state) => !state.upgraded);
+    if (
+      pending.length >= this.maxPendingConnections ||
+      pending.filter((state) => state.remoteAddress === remoteAddress).length >=
+        this.maxPendingPerAddress ||
+      this.preUpgradeConnections.has(key)
+    ) {
+      socket.destroy();
+      return;
+    }
+    const state: PreUpgradeConnectionState = {
+      socket,
+      remoteAddress,
+      key,
+      timer: undefined,
+      upgraded: false,
+    };
+    state.timer = setTimeout(() => {
+      if (!state.upgraded) socket.destroy();
+    }, this.authTimeoutMs);
+    state.timer.unref?.();
+    this.preUpgradeConnections.set(key, state);
+    const remove = (): void => {
+      if (state.timer !== undefined) clearTimeout(state.timer);
+      state.timer = undefined;
+      if (this.preUpgradeConnections.get(key) === state) {
+        this.preUpgradeConnections.delete(key);
+      }
+    };
+    socket.once('close', remove);
+    socket.once('error', remove);
+  }
+
+  private markConnectionUpgraded(socket: Socket): boolean {
+    const state = this.preUpgradeConnections.get(this.connectionKey(socket));
+    if (state === undefined || state.upgraded) return false;
+    state.upgraded = true;
+    if (state.timer !== undefined) clearTimeout(state.timer);
+    state.timer = undefined;
+    return true;
+  }
+
+  private connectionKey(socket: Socket): string {
+    return [
+      socket.remoteAddress ?? 'unknown',
+      socket.remotePort ?? -1,
+      socket.localAddress ?? 'unknown',
+      socket.localPort ?? -1,
+    ].join('\0');
+  }
+
   private receive(state: ConnectionState, data: WebSocket.RawData, isBinary: boolean): void {
     if (this.connections.get(state.socket) !== state) {
       state.socket.terminate();
@@ -452,6 +530,12 @@ export class CollaborationTransportServer {
       this.authenticate(state, raw);
       return;
     }
+    // Charge every authenticated wire frame, not only completed logical
+    // messages, so chunking cannot bypass the per-peer CPU budget.
+    if (!this.consumeRateToken(state)) {
+      this.closeProtocolPeer(state, 'Rate limit');
+      return;
+    }
     let logical: string | undefined;
     try {
       logical = state.reassembler.accept(raw);
@@ -460,10 +544,6 @@ export class CollaborationTransportServer {
       return;
     }
     if (logical === undefined) return;
-    if (!this.consumeRateToken(state)) {
-      this.closeProtocolPeer(state, 'Rate limit');
-      return;
-    }
     const logicalByteLength = Buffer.byteLength(logical);
     if (
       state.queuedRequests >= this.maxQueuedRequestsPerConnection ||
