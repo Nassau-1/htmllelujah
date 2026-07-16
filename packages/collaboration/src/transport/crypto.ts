@@ -114,5 +114,11 @@ export const constantTimeEqual = (left: string, right: string): boolean => {
   } catch {
     return false;
   }
+  // Node accepts non-canonical base64url encodings whose unused trailing bits
+  // decode to the same bytes. Reject those aliases so pinned fingerprints and
+  // signed protocol values have exactly one wire representation.
+  if (leftBytes.toString('base64url') !== left || rightBytes.toString('base64url') !== right) {
+    return false;
+  }
   return leftBytes.byteLength === rightBytes.byteLength && timingSafeEqual(leftBytes, rightBytes);
 };
