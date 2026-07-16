@@ -18,7 +18,9 @@ import path from 'node:path';
 
 import {
   INSTALLER_SMOKE_TEMP_PREFIXES,
+  NSIS_INSTALLED_TREE_ALLOWLIST,
   assertCleanSourceState,
+  assertInstalledTreeMatchesCandidate,
   assertOwnedTemporaryPath,
   assertReleaseCandidateManifest,
   assertSourceStateUnchanged,
@@ -483,6 +485,108 @@ const snapshotTree = async (root) => {
   return { rootExists: true, entries };
 };
 
+const installedReparsePoints = (root) =>
+  normalizeJsonArray(
+    powershellJson(
+      [
+        '$rootPath = [IO.Path]::GetFullPath($env:HTMLLELUJAH_INSTALLED_TREE_ROOT)',
+        '$rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop',
+        "$prefix = $rootPath.TrimEnd('\\') + '\\'",
+        '$pending = [System.Collections.Generic.Queue[string]]::new()',
+        '$found = [System.Collections.Generic.List[string]]::new()',
+        'if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {',
+        "  $found.Add('.')",
+        '} else {',
+        '  $pending.Enqueue($rootPath)',
+        '}',
+        'while ($pending.Count -gt 0) {',
+        '  $directory = $pending.Dequeue()',
+        '  foreach ($item in Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) {',
+        '    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {',
+        '      if (-not $item.FullName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw "Installed-tree traversal escaped its root." }',
+        "      $found.Add($item.FullName.Substring($prefix.Length).Replace('\\', '/'))",
+        '      continue',
+        '    }',
+        '    if ($item.PSIsContainer) { $pending.Enqueue($item.FullName) }',
+        '  }',
+        '}',
+        'ConvertTo-Json -InputObject @($found | Sort-Object) -Compress',
+      ].join('\n'),
+      { HTMLLELUJAH_INSTALLED_TREE_ROOT: root },
+    ),
+  );
+
+const assertNoInstalledReparsePoints = (root) => {
+  const reparsePoints = installedReparsePoints(root);
+  if (reparsePoints.length > 0) {
+    throw new Error(
+      `Installed tree contains symlinks or reparse points: ${reparsePoints.slice(0, 5).join(', ')}.`,
+    );
+  }
+};
+
+const snapshotInstalledTree = async (root) => {
+  const rootMetadata = await lstat(root);
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+    throw new Error('The installed application root is not a regular directory.');
+  }
+
+  const entries = [];
+  const pending = [{ absolute: root, relative: '' }];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const children = await readdir(current.absolute, { withFileTypes: true });
+    children.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of children) {
+      const absolute = path.join(current.absolute, entry.name);
+      const relative = path.join(current.relative, entry.name).split(path.sep).join('/');
+      const metadataBefore = await lstat(absolute);
+      if (entry.isSymbolicLink() || metadataBefore.isSymbolicLink()) {
+        entries.push({ path: relative, kind: 'reparse', reparsePoint: true });
+      } else if (metadataBefore.isDirectory()) {
+        entries.push({ path: relative, kind: 'directory', reparsePoint: false });
+        pending.push({ absolute, relative });
+      } else if (metadataBefore.isFile()) {
+        const fileSha256 = await sha256(absolute);
+        const metadataAfter = await lstat(absolute);
+        if (
+          !metadataAfter.isFile() ||
+          metadataAfter.isSymbolicLink() ||
+          metadataAfter.size !== metadataBefore.size ||
+          metadataAfter.mtimeMs !== metadataBefore.mtimeMs
+        ) {
+          throw new Error(`Installed file changed while it was inventoried: ${relative}.`);
+        }
+        entries.push({
+          path: relative,
+          kind: 'file',
+          reparsePoint: false,
+          size: metadataAfter.size,
+          sha256: fileSha256,
+        });
+      } else {
+        entries.push({ path: relative, kind: 'other', reparsePoint: false });
+      }
+      if (entries.length > 50_000) {
+        throw new Error('The installed application tree exceeds its entry-count budget.');
+      }
+    }
+  }
+  entries.sort((left, right) => left.path.localeCompare(right.path));
+  return entries;
+};
+
+const inspectInstalledTree = async (root, candidateManifest, expectedGeneratedFiles) => {
+  assertNoInstalledReparsePoints(root);
+  const entries = await snapshotInstalledTree(root);
+  assertNoInstalledReparsePoints(root);
+  return assertInstalledTreeMatchesCandidate({
+    manifest: candidateManifest,
+    entries,
+    expectedGeneratedFiles,
+  });
+};
+
 const sameTreeSnapshot = (before, after) => JSON.stringify(before) === JSON.stringify(after);
 
 const removeIfEmpty = async (directory) => {
@@ -727,6 +831,7 @@ let applicationDataBefore;
 let registryBefore;
 let capturedRegistryIdentities = [];
 let shortcutsBefore;
+const installedTreeInventory = {};
 
 const stage = async (name, operation) => {
   const started = performance.now();
@@ -793,6 +898,9 @@ try {
   installed = true;
   await waitFor(() => exists(installedExecutable), 30_000, 'Installed application');
   await assertInstalledFiles(installDirectory);
+  installedTreeInventory.install = await stage('installedTreeAfterInstall', () =>
+    inspectInstalledTree(installDirectory, candidateManifest),
+  );
   const installedRegistryState = registryState(installDirectory);
   assertInstalledWindowsState(installedRegistryState, registryBefore, installedExecutable);
   capturedRegistryIdentities = captureCreatedProductRegistryIdentities(
@@ -872,6 +980,13 @@ try {
   );
   await waitFor(() => exists(noticePath), 30_000, 'Repaired installed notice');
   await assertInstalledFiles(installDirectory);
+  installedTreeInventory.repair = await stage('installedTreeAfterRepair', () =>
+    inspectInstalledTree(
+      installDirectory,
+      candidateManifest,
+      installedTreeInventory.install.generatedFiles,
+    ),
+  );
   if ((await sha256(installedExecutable)) !== installedExecutableHash) {
     throw new Error('The repair rerun did not restore the exact final executable.');
   }
@@ -891,6 +1006,13 @@ try {
     throw new Error('The upgrade-like reinstall retained an obsolete product payload.');
   }
   await assertInstalledFiles(installDirectory);
+  installedTreeInventory.upgradeLike = await stage('installedTreeAfterUpgradeLike', () =>
+    inspectInstalledTree(
+      installDirectory,
+      candidateManifest,
+      installedTreeInventory.install.generatedFiles,
+    ),
+  );
   if ((await sha256(installedExecutable)) !== installedExecutableHash) {
     throw new Error('The upgrade-like reinstall did not publish the exact final executable.');
   }
@@ -1099,6 +1221,14 @@ const report = {
     companionAppAsarSha256: companionAsarBefore.sha256,
     installedPayloadMatchedCompanion: true,
   },
+  installedTreeInventory: {
+    candidateFileCount: installedTreeInventory.install.fileCount,
+    candidateDirectoryCount: installedTreeInventory.install.directoryCount,
+    candidateTotalSize: installedTreeInventory.install.totalSize,
+    candidateAggregateSha256: installedTreeInventory.install.aggregateSha256,
+    allowedGeneratedFiles: NSIS_INSTALLED_TREE_ALLOWLIST.map((entry) => entry.path),
+    phases: installedTreeInventory,
+  },
   stageDurationsMs,
   checks: {
     nonElevatedCurrentUserToken: true,
@@ -1120,6 +1250,12 @@ const report = {
     installedMcpLauncherRoundTrip: true,
     repairRerunRestoredMissingPayload: true,
     upgradeLikeReinstallRemovedObsoletePayload: true,
+    completeInstalledTreeMatchedCandidateAfterInstall: true,
+    completeInstalledTreeMatchedCandidateAfterRepair: true,
+    completeInstalledTreeMatchedCandidateAfterUpgradeLikeReinstall: true,
+    installedFileSizesAndSha256Verified: true,
+    noInstalledSymlinksOrReparsePoints: true,
+    onlyExactGeneratedUninstallerAllowlisted: true,
     maintenancePreservedUserDeck: true,
     uninstallPreservedUserDeck: true,
     sourceDeckUnchangedWithoutSave: true,

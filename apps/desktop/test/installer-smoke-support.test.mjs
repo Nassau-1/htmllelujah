@@ -1,10 +1,14 @@
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import {
+  NSIS_INSTALLED_TREE_ALLOWLIST,
+  assertCandidateWinUnpackedInventory,
   assertCleanSourceState,
+  assertInstalledTreeMatchesCandidate,
   assertOwnedTemporaryPath,
   assertReleaseCandidateManifest,
   assertSourceStateUnchanged,
@@ -20,6 +24,47 @@ import {
   selectOwnedProcessRecords,
   sameAssociationState,
 } from '../scripts/installer-smoke-support.mjs';
+
+const inventoryAggregate = (entries) => {
+  const digest = createHash('sha256');
+  for (const entry of entries) {
+    digest.update(entry.path);
+    digest.update('\0');
+    digest.update(String(entry.size));
+    digest.update('\0');
+    digest.update(entry.sha256);
+    digest.update('\n');
+  }
+  return digest.digest('hex');
+};
+
+const candidateManifestWithFiles = (files) => ({
+  artifact: {
+    winUnpacked: {
+      fileCount: files.length,
+      totalSize: files.reduce((sum, entry) => sum + entry.size, 0),
+      aggregateSha256: inventoryAggregate(files),
+      files,
+    },
+  },
+});
+
+const payloadFiles = [
+  { path: 'HTMLlelujah.exe', size: 100, sha256: 'a'.repeat(64) },
+  { path: 'resources/app.asar', size: 200, sha256: 'b'.repeat(64) },
+];
+
+const installedTree = [
+  { path: 'HTMLlelujah.exe', kind: 'file', size: 100, sha256: 'a'.repeat(64) },
+  { path: 'resources', kind: 'directory' },
+  { path: 'resources/app.asar', kind: 'file', size: 200, sha256: 'b'.repeat(64) },
+  {
+    path: 'Uninstall HTMLlelujah.exe',
+    kind: 'file',
+    size: 2_048,
+    sha256: 'c'.repeat(64),
+  },
+];
 
 describe('Windows installer lifecycle smoke support', () => {
   it('requires an explicit final-artifact gate and exactly one installer', () => {
@@ -185,7 +230,11 @@ describe('Windows installer lifecycle smoke support', () => {
         blockmap: expected.blockmap,
         winUnpacked: {
           fileCount: 2,
-          aggregateSha256: 'f'.repeat(64),
+          totalSize: 200,
+          aggregateSha256: inventoryAggregate([
+            { path: 'HTMLlelujah.exe', ...identity },
+            { path: 'resources/app.asar', ...identity },
+          ]),
           files: [
             { path: 'HTMLlelujah.exe', ...identity },
             { path: 'resources/app.asar', ...identity },
@@ -212,6 +261,156 @@ describe('Windows installer lifecycle smoke support', () => {
         expected,
       ),
     ).toThrow(/not bound/u);
+  });
+
+  it('matches the complete installed file and directory tree to the candidate inventory', () => {
+    const manifest = candidateManifestWithFiles(payloadFiles);
+    expect(assertCandidateWinUnpackedInventory(manifest)).toMatchObject({
+      fileCount: 2,
+      directoryCount: 1,
+      totalSize: 300,
+      aggregateSha256: inventoryAggregate(payloadFiles),
+    });
+
+    const result = assertInstalledTreeMatchesCandidate({ manifest, entries: installedTree });
+    expect(result).toMatchObject({
+      exactTreeMatch: true,
+      fileCount: 2,
+      directoryCount: 1,
+      totalSize: 300,
+      aggregateSha256: inventoryAggregate(payloadFiles),
+      generatedFiles: [
+        {
+          path: 'Uninstall HTMLlelujah.exe',
+          size: 2_048,
+          sha256: 'c'.repeat(64),
+        },
+      ],
+    });
+    expect(NSIS_INSTALLED_TREE_ALLOWLIST.map((entry) => entry.path)).toEqual([
+      'Uninstall HTMLlelujah.exe',
+    ]);
+  });
+
+  it('fails closed on missing, surplus, case-mismatched, or byte-mismatched installed files', () => {
+    const manifest = candidateManifestWithFiles(payloadFiles);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: installedTree.filter((entry) => entry.path !== 'resources/app.asar'),
+      }),
+    ).toThrow(/missing files/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: [
+          ...installedTree,
+          { path: 'unexpected.log', kind: 'file', size: 1, sha256: 'd'.repeat(64) },
+        ],
+      }),
+    ).toThrow(/surplus files/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: installedTree.map((entry) =>
+          entry.path === 'resources/app.asar' ? { ...entry, path: 'Resources/app.asar' } : entry,
+        ),
+      }),
+    ).toThrow(/differs from the candidate/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: installedTree.map((entry) =>
+          entry.path === 'HTMLlelujah.exe' ? { ...entry, sha256: 'd'.repeat(64) } : entry,
+        ),
+      }),
+    ).toThrow(/size or SHA-256/u);
+  });
+
+  it('rejects unsafe or case-colliding candidate and installed paths', () => {
+    expect(() =>
+      assertCandidateWinUnpackedInventory(
+        candidateManifestWithFiles([
+          { path: 'Resources/a.bin', size: 1, sha256: 'a'.repeat(64) },
+          { path: 'resources/b.bin', size: 1, sha256: 'b'.repeat(64) },
+        ]),
+      ),
+    ).toThrow(/case-colliding/u);
+    expect(() =>
+      assertCandidateWinUnpackedInventory(
+        candidateManifestWithFiles([{ path: '../escape.bin', size: 1, sha256: 'a'.repeat(64) }]),
+      ),
+    ).toThrow(/unsafe|not representable/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest: candidateManifestWithFiles(payloadFiles),
+        entries: [...installedTree, { path: 'RESOURCES', kind: 'directory' }],
+      }),
+    ).toThrow(/case-colliding/u);
+  });
+
+  it('rejects symlinks, reparse points, non-regular entries, and surplus directories', () => {
+    const manifest = candidateManifestWithFiles(payloadFiles);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: installedTree.map((entry) =>
+          entry.path === 'resources/app.asar'
+            ? { path: entry.path, kind: 'reparse', reparsePoint: true }
+            : entry,
+        ),
+      }),
+    ).toThrow(/symlink or reparse/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: [...installedTree, { path: 'pipe', kind: 'other' }],
+      }),
+    ).toThrow(/non-regular/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: [...installedTree, { path: 'empty', kind: 'directory' }],
+      }),
+    ).toThrow(/surplus directories/u);
+  });
+
+  it('allows only the exact generated uninstaller and pins it across maintenance phases', () => {
+    const manifest = candidateManifestWithFiles(payloadFiles);
+    const installed = assertInstalledTreeMatchesCandidate({ manifest, entries: installedTree });
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: installedTree.filter((entry) => entry.path !== 'Uninstall HTMLlelujah.exe'),
+      }),
+    ).toThrow(/generated installed file is missing/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: installedTree.map((entry) =>
+          entry.path === 'Uninstall HTMLlelujah.exe' ? { ...entry, size: 1 } : entry,
+        ),
+      }),
+    ).toThrow(/invalid size/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: installedTree.map((entry) =>
+          entry.path === 'Uninstall HTMLlelujah.exe' ? { ...entry, sha256: 'd'.repeat(64) } : entry,
+        ),
+        expectedGeneratedFiles: installed.generatedFiles,
+      }),
+    ).toThrow(/changed across maintenance phases/u);
+    expect(() =>
+      assertInstalledTreeMatchesCandidate({
+        manifest,
+        entries: installedTree,
+        generatedAllowlist: [
+          ...NSIS_INSTALLED_TREE_ALLOWLIST,
+          { path: 'installer.log', minSize: 1, maxSize: 1_024 },
+        ],
+      }),
+    ).toThrow(/exactly one/u);
   });
 
   it('fails closed when source or release-harness identity changes', () => {
@@ -301,6 +500,15 @@ describe('Windows installer lifecycle smoke support', () => {
     expect(source).not.toContain("path.join(desktopRoot, 'out', 'release-candidate-v1.json')");
     expect(source).toContain('readPackagedBuildProvenance(companionAsarPath, desktopRoot)');
     expect(source).toContain('readPackagedBuildProvenance(installedAsarPath, desktopRoot)');
+    expect(source).toContain("stage('installedTreeAfterInstall'");
+    expect(source).toContain("stage('installedTreeAfterRepair'");
+    expect(source).toContain("stage('installedTreeAfterUpgradeLike'");
+    expect(source).toContain('[IO.FileAttributes]::ReparsePoint');
+    expect(source).toContain('completeInstalledTreeMatchedCandidateAfterInstall: true');
+    expect(source).toContain('completeInstalledTreeMatchedCandidateAfterRepair: true');
+    expect(source).toContain(
+      'completeInstalledTreeMatchedCandidateAfterUpgradeLikeReinstall: true',
+    );
   });
 
   it('contains distinct real repair, upgrade-like, recovery, and uninstall gates', async () => {

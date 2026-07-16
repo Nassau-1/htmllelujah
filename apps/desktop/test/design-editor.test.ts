@@ -5,6 +5,7 @@ import {
   createDesignCanvasContext,
   duplicateThemeWithFreshIds,
   rebaseEntityReplacement,
+  retainExistingCanvasSelection,
   replaceElementFrames,
   themeForSlide,
   updateThemeFontFamily,
@@ -156,5 +157,27 @@ describe('canonical theme, master, and layout editor helpers', () => {
     expect(result[0]?.frame).toEqual(frame);
     expect(result[0]).not.toBe(element);
     expect(element).toEqual(before);
+  });
+
+  it('retains live selections across slide, layout, and master revisions', () => {
+    const source = createNeutralDemoDeck();
+    const masterElement = {
+      ...structuredClone(source.layouts[0]!.elements[0]!),
+      id: '00000000-0000-4000-8000-000000000098',
+    };
+    const document = {
+      ...source,
+      masters: source.masters.map((master, index) =>
+        index === 0 ? { ...master, elements: [masterElement] } : master,
+      ),
+    };
+    const selected = [
+      document.slides[0]!.elements[0]!.id,
+      document.layouts[0]!.elements[0]!.id,
+      document.masters[0]!.elements[0]!.id,
+      '00000000-0000-4000-8000-000000000099',
+    ];
+
+    expect(retainExistingCanvasSelection(document, selected)).toEqual(selected.slice(0, 3));
   });
 });

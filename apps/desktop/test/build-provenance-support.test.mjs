@@ -18,7 +18,23 @@ import {
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..', '..');
 const desktopRoot = path.join(repositoryRoot, 'apps', 'desktop');
 const temporaryRoots = [];
-const gitProbe = spawnSync('git', ['--version'], { encoding: 'utf8', windowsHide: true });
+const gitProcessTimeoutMs = 10_000;
+// gitSourceState intentionally cross-checks each sample with eight Git processes. Git for
+// Windows process startup can make the two-sample integration exceed Vitest's 5 s default.
+const actualGitIntegrationTimeoutMs = 30_000;
+const gitEnvironment = {
+  ...process.env,
+  GCM_INTERACTIVE: 'Never',
+  GIT_CONFIG_COUNT: '0',
+  GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : os.devNull,
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_TERMINAL_PROMPT: '0',
+};
+const gitProbe = spawnSync('git', ['--version'], {
+  encoding: 'utf8',
+  timeout: gitProcessTimeoutMs,
+  windowsHide: true,
+});
 const actualGitAvailable = gitProbe.status === 0;
 
 afterEach(async () => {
@@ -55,10 +71,27 @@ const gitRunner =
     throw new Error(`Unexpected fake Git command: ${args.join(' ')}`);
   };
 
-const runActualGit = (cwd, ...args) => {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
-  if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+const runActualGitProcess = (cwd, args, allowedStatuses = [0]) => {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: null,
+    env: gitEnvironment,
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: gitProcessTimeoutMs,
+    windowsHide: true,
+  });
+  if (result.error || result.signal || !allowedStatuses.includes(result.status)) {
+    const stderr = Buffer.isBuffer(result.stderr)
+      ? result.stderr.toString('utf8').trim()
+      : String(result.stderr ?? '').trim();
+    throw new Error(
+      stderr || result.error?.message || `git ${args.join(' ')} failed (${result.status})`,
+    );
+  }
+  return result;
 };
+
+const runActualGit = (cwd, ...args) => runActualGitProcess(cwd, args);
 
 describe('release build provenance', () => {
   it('interprets an exact clean Git commit fail-closed', () => {
@@ -84,17 +117,40 @@ describe('release build provenance', () => {
     async () => {
       const fixture = await mkdtemp(path.join(os.tmpdir(), 'htmllelujah-real-git-state-'));
       temporaryRoots.push(fixture);
-      runActualGit(fixture, 'init');
-      runActualGit(fixture, 'config', 'user.email', 'release-test@example.invalid');
-      runActualGit(fixture, 'config', 'user.name', 'Release Test');
+      runActualGit(fixture, 'init', '--quiet');
       await writeFile(path.join(fixture, 'tracked.txt'), 'before\n');
       runActualGit(fixture, 'add', 'tracked.txt');
-      runActualGit(fixture, 'commit', '-m', 'fixture');
-      expect(gitSourceState(fixture).dirty).toBe(false);
+      runActualGit(
+        fixture,
+        '-c',
+        'user.email=release-test@example.invalid',
+        '-c',
+        'user.name=Release Test',
+        '-c',
+        'commit.gpgSign=false',
+        'commit',
+        '--quiet',
+        '--no-gpg-sign',
+        '--no-verify',
+        '-m',
+        'fixture',
+      );
+      expect(gitSourceState(fixture, runActualGitProcess)).toMatchObject({
+        dirty: false,
+        staged: false,
+        unstaged: false,
+        untracked: false,
+      });
       await writeFile(path.join(fixture, 'tracked.txt'), 'after\n');
       runActualGit(fixture, 'add', 'tracked.txt');
-      expect(gitSourceState(fixture)).toMatchObject({ dirty: true, staged: true });
+      expect(gitSourceState(fixture, runActualGitProcess)).toMatchObject({
+        dirty: true,
+        staged: true,
+        unstaged: false,
+        untracked: false,
+      });
     },
+    actualGitIntegrationTimeoutMs,
   );
 
   it('accepts only clean embedded provenance for the exact source tree and lockfile', () => {

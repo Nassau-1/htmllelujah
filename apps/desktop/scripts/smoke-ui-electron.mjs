@@ -420,6 +420,58 @@ try {
     if (!clicked) throw new Error(`${label} was not found.`);
   };
 
+  const dragElement = async (selector, deltaX, deltaY, label) => {
+    const point = await evaluate(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!(element instanceof HTMLElement)) return null;
+      const bounds = element.getBoundingClientRect();
+      return { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+    })()`);
+    if (point === null) throw new Error(`${label} was not found.`);
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: point.x,
+      y: point.y,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: point.x,
+      y: point.y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: point.x + deltaX,
+      y: point.y + deltaY,
+      button: 'left',
+      buttons: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: point.x + deltaX,
+      y: point.y + deltaY,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+  };
+
+  const selectedCanvasFrame = () =>
+    evaluate(`(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const element = selected[0];
+      if (selected.length !== 1 || !(element instanceof HTMLElement)) return null;
+      return {
+        left: element.style.left,
+        top: element.style.top,
+        width: element.style.width,
+        height: element.style.height,
+        transform: element.style.transform,
+      };
+    })()`);
+
   const setInputValue = async (selector, value, label, blur = false) => {
     const updated = await evaluate(`(() => {
       const element = document.querySelector(${JSON.stringify(selector)});
@@ -781,6 +833,61 @@ try {
     return true;
   })()`);
   if (!selectedMasterObject) throw new Error('The inserted master object could not be selected.');
+  const masterFrameBefore = await selectedCanvasFrame();
+  if (masterFrameBefore === null) throw new Error('The selected master object has no hit frame.');
+  await dragElement('.canonical-hitbox.is-selected', 18, 12, 'Master shape drag target');
+  await waitForRenderer(
+    `(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const element = selected[0];
+      return selected.length === 1 && element instanceof HTMLElement &&
+        (element.style.left !== ${JSON.stringify(masterFrameBefore.left)} ||
+          element.style.top !== ${JSON.stringify(masterFrameBefore.top)});
+    })()`,
+    'Master selection and moved frame retained after drag revision',
+  );
+  const masterFrameAfterMove = await selectedCanvasFrame();
+  if (masterFrameAfterMove === null) throw new Error('The dragged master object lost selection.');
+  await dragElement(
+    '.canonical-hitbox.is-selected .canonical-resize-handle.handle-south-east',
+    16,
+    10,
+    'Master shape resize handle',
+  );
+  await waitForRenderer(
+    `(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const element = selected[0];
+      return selected.length === 1 && element instanceof HTMLElement &&
+        (element.style.width !== ${JSON.stringify(masterFrameAfterMove.width)} ||
+          element.style.height !== ${JSON.stringify(masterFrameAfterMove.height)});
+    })()`,
+    'Master selection and resized frame retained after resize revision',
+  );
+  const masterFrameAfterResize = await selectedCanvasFrame();
+  if (masterFrameAfterResize === null) throw new Error('The resized master object lost selection.');
+  const rotatedMasterObject = await evaluate(`(() => {
+    const handle = document.querySelector('.canonical-rotation-handle');
+    if (!(handle instanceof HTMLButtonElement)) return false;
+    handle.focus();
+    handle.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowRight',
+        code: 'ArrowRight',
+        bubbles: true,
+      }),
+    );
+    return true;
+  })()`);
+  if (!rotatedMasterObject) throw new Error('The selected master object could not be rotated.');
+  await waitForRenderer(
+    `(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const transform = selected[0] instanceof HTMLElement ? selected[0].style.transform : '';
+      return selected.length === 1 && transform !== ${JSON.stringify(masterFrameAfterResize.transform)};
+    })()`,
+    'Master selection retained after transform revision',
+  );
   await waitForRenderer(
     `[...document.querySelectorAll('.toolbar .add-tools button')].length >= 7 && [...document.querySelectorAll('.toolbar .add-tools button')].every((button) => button instanceof HTMLButtonElement && button.disabled)`,
     'Slide-only toolbar disabled on master surface',
@@ -797,6 +904,41 @@ try {
     'Slide-only Edit actions disabled on master surface',
   );
   await clickButtonWithText('Edit', 'Edit menu close on master surface');
+  await click('[aria-label="Undo"]', 'Undo master shape rotation');
+  await waitForRenderer(
+    `(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const transform = selected[0] instanceof HTMLElement ? selected[0].style.transform : '';
+      return selected.length === 1 && transform === ${JSON.stringify(masterFrameAfterResize.transform)};
+    })()`,
+    'Master selection retained after transform undo',
+  );
+  await click('[aria-label="Undo"]', 'Undo master shape resize');
+  await waitForRenderer(
+    `(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const element = selected[0];
+      return selected.length === 1 && element instanceof HTMLElement &&
+        element.style.left === ${JSON.stringify(masterFrameAfterMove.left)} &&
+        element.style.top === ${JSON.stringify(masterFrameAfterMove.top)} &&
+        element.style.width === ${JSON.stringify(masterFrameAfterMove.width)} &&
+        element.style.height === ${JSON.stringify(masterFrameAfterMove.height)};
+    })()`,
+    'Master selection retained after resize undo',
+  );
+  await click('[aria-label="Undo"]', 'Undo master shape drag');
+  await waitForRenderer(
+    `(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const element = selected[0];
+      return selected.length === 1 && element instanceof HTMLElement &&
+        element.style.left === ${JSON.stringify(masterFrameBefore.left)} &&
+        element.style.top === ${JSON.stringify(masterFrameBefore.top)} &&
+        element.style.width === ${JSON.stringify(masterFrameBefore.width)} &&
+        element.style.height === ${JSON.stringify(masterFrameBefore.height)};
+    })()`,
+    'Master selection retained after drag undo',
+  );
   await click('[aria-label="Undo"]', 'Undo master shape insertion');
   await waitForRenderer(
     `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore}`,
@@ -811,6 +953,53 @@ try {
   await waitForRenderer(
     `[...document.querySelectorAll('.toolbar .add-tools button')].every((button) => button instanceof HTMLButtonElement && button.disabled)`,
     'Slide-only toolbar disabled on layout surface',
+  );
+  const selectedLayoutPlaceholder = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].find((candidate) =>
+      candidate.getAttribute('aria-label')?.startsWith('Title placeholder'),
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+    return true;
+  })()`);
+  if (!selectedLayoutPlaceholder) throw new Error('The title layout placeholder was unavailable.');
+  await waitForRenderer(
+    `document.querySelectorAll('.canonical-hitbox.is-selected').length === 1 && document.querySelector('.canonical-resize-handle.handle-south-east') !== null`,
+    'Layout placeholder selection',
+  );
+  const layoutFrameBeforeResize = await selectedCanvasFrame();
+  if (layoutFrameBeforeResize === null) {
+    throw new Error('The selected layout placeholder has no hit frame.');
+  }
+  await dragElement(
+    '.canonical-hitbox.is-selected .canonical-resize-handle.handle-south-east',
+    14,
+    8,
+    'Layout placeholder resize handle',
+  );
+  await waitForRenderer(
+    `(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const element = selected[0];
+      return selected.length === 1 && element instanceof HTMLElement &&
+        (element.style.width !== ${JSON.stringify(layoutFrameBeforeResize.width)} ||
+          element.style.height !== ${JSON.stringify(layoutFrameBeforeResize.height)});
+    })()`,
+    'Layout selection and resized frame retained after revision',
+  );
+  await click('[aria-label="Undo"]', 'Undo layout placeholder resize');
+  await waitForRenderer(
+    `(() => {
+      const selected = document.querySelectorAll('.canonical-hitbox.is-selected');
+      const element = selected[0];
+      return selected.length === 1 && element instanceof HTMLElement &&
+        element.style.left === ${JSON.stringify(layoutFrameBeforeResize.left)} &&
+        element.style.top === ${JSON.stringify(layoutFrameBeforeResize.top)} &&
+        element.style.width === ${JSON.stringify(layoutFrameBeforeResize.width)} &&
+        element.style.height === ${JSON.stringify(layoutFrameBeforeResize.height)};
+    })()`,
+    'Layout selection retained after resize undo',
   );
   const layoutPlaceholderFrames = await evaluate(`(() => {
     const frame = (name) => {
@@ -1007,7 +1196,8 @@ try {
       'LAN collaboration dialog opened and closed',
       'page format changed through the Design inspector and undid cleanly',
       'master and layout scopes disabled slide-only toolbar and menu mutations',
-      'dedicated master-object insertion and undo stayed inside the master',
+      'master object drag, resize, rotate, undo, and selection retention stayed inside the master',
+      'layout placeholder resize, undo, and selection retention stayed inside the layout',
       'new slide instantiated title/body frames from the active layout exactly',
       'Design and Properties inspector tabs switched',
       'stable PNG screenshot captured from the real window',

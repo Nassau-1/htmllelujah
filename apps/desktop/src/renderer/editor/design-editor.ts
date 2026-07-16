@@ -21,6 +21,24 @@ export type DesignCanvasContext = Readonly<{
   label: string;
 }>;
 
+/**
+ * Keeps selections that still exist on any editable top-level canvas. Session
+ * updates arrive for slide, layout, and master commands alike, so filtering only
+ * against slide elements would make a just-transformed template object disappear
+ * from the selection immediately after its revision is accepted.
+ */
+export const retainExistingCanvasSelection = (
+  document: DeckDocument,
+  selectedIds: readonly string[],
+): readonly string[] => {
+  const existing = new Set(
+    [...document.slides, ...document.layouts, ...document.masters].flatMap((container) =>
+      container.elements.map((element) => element.id),
+    ),
+  );
+  return selectedIds.filter((identifier) => existing.has(identifier));
+};
+
 export const duplicateThemeWithFreshIds = (source: Theme, id: () => string): Theme => ({
   ...source,
   id: id(),

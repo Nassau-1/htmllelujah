@@ -23,7 +23,7 @@
     "test:release-evidence": "node scripts/test-release-evidence.mjs",
     "test:release-pipeline": "node --test --test-isolation=none scripts/windows-release-pipeline.test.mjs",
     "test:sbom-generate": "node --test scripts/generate-sbom.test.mjs",
-    "typecheck": "pnpm --workspace-concurrency=1 -r --if-present typecheck",
+    "typecheck": "pnpm build:packages && pnpm --workspace-concurrency=1 -r --if-present typecheck",
     "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:release-evidence && pnpm test:release-pipeline && pnpm test:sbom-generate && pnpm build && pnpm licenses:check"
   },
   "devDependencies": {

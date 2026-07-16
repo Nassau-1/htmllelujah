@@ -128,6 +128,7 @@ import {
   createDesignCanvasContext,
   duplicateThemeWithFreshIds,
   rebaseEntityReplacement,
+  retainExistingCanvasSelection,
   replaceElementFrames,
   themeForSlide,
   themeRoleStyle,
@@ -634,14 +635,7 @@ function EditorApp() {
         ? current
         : (next.snapshot.document.slides[0]?.id ?? ''),
     );
-    setSelectedIds((current) => {
-      const ids = new Set(
-        next.snapshot.document.slides.flatMap((slide) =>
-          slide.elements.map((element) => element.id),
-        ),
-      );
-      return current.filter((id) => ids.has(id));
-    });
+    setSelectedIds((current) => retainExistingCanvasSelection(next.snapshot.document, current));
   }, []);
 
   const notify = useCallback((message: string, kind: Toast['kind'] = 'info'): void => {
