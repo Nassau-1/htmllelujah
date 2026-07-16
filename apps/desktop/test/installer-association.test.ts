@@ -89,7 +89,11 @@ describe('Windows installer association cleanup', () => {
     expect(include).toContain('!insertmacro HTMLLELUJAH_RESTORE_FOREIGN_HDECK_DEFAULT');
     expect(include).toContain('Function .onInstFailed');
     expect(include).toContain('!insertmacro HTMLLELUJAH_ROLL_BACK_FAILED_HDECK_DEFAULT');
-    expect(include).toContain('Function .onUserAbort');
+    expect(include).toContain(
+      '!define MUI_CUSTOMFUNCTION_ABORT HTMLlelujahRestoreHdeckDefaultOnAbort',
+    );
+    expect(include).toContain('Function HTMLlelujahRestoreHdeckDefaultOnAbort');
+    expect(include).not.toMatch(/Function\s+\.onUserAbort\b/);
   });
 
   it('removes an orphan owned association while preserving foreign defaults and Open With entries', () => {

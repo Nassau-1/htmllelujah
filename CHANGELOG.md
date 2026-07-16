@@ -78,6 +78,8 @@ No user-facing change is queued after the V1 release candidate.
   refs, grafts, hidden index flags, and content-transforming checkout attributes.
 - Bounded detached release-worktree names so locked pnpm and NSIS include paths stay
   within the legacy Windows path budget used by the unsigned V1 builder.
+- Chained installer-cancellation association rollback through MUI2's supported abort
+  hook so the assisted NSIS installer compiles without redefining its native callback.
 
 ### Known V1 boundaries
 

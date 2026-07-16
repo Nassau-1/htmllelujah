@@ -40,12 +40,18 @@
 
   # A failed install rolls the default back to its captured state. User cancellation can occur
   # on UI pages before registration or after a completed section, so it only reapplies a captured
-  # foreign default; doing so is harmless in either phase.
+  # foreign default; doing so is harmless in either phase. MUI2 owns .onUserAbort and invokes its
+  # custom abort hook only after its configured abort handling accepts cancellation.
   Function .onInstFailed
     !insertmacro HTMLLELUJAH_ROLL_BACK_FAILED_HDECK_DEFAULT
   FunctionEnd
 
-  Function .onUserAbort
+  !ifdef MUI_CUSTOMFUNCTION_ABORT
+    !error "MUI_CUSTOMFUNCTION_ABORT is already defined"
+  !endif
+  !define MUI_CUSTOMFUNCTION_ABORT HTMLlelujahRestoreHdeckDefaultOnAbort
+
+  Function HTMLlelujahRestoreHdeckDefaultOnAbort
     !insertmacro HTMLLELUJAH_RESTORE_FOREIGN_HDECK_DEFAULT
   FunctionEnd
 !endif
