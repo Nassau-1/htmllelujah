@@ -24,12 +24,13 @@ import {
   recoverPendingReleasePromotions,
   releaseReleaseLock,
   RELEASE_PROMOTION_PREFIX,
+  resolveCorepackInvocation,
 } from './windows-release-pipeline-support.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
-const corepackCommand = process.platform === 'win32' ? 'corepack.cmd' : 'corepack';
 const releaseEnvironment = createReleaseEnvironment(process.env);
+const corepackInvocation = resolveCorepackInvocation({ environment: releaseEnvironment });
 
 const usage = () => `Usage: node scripts/build-windows-release.mjs [options]
 
@@ -56,9 +57,12 @@ const parseArgs = (argv) => {
 
 const runProcess = (command, args, cwd) =>
   new Promise((resolve, reject) => {
-    const executable = command === 'corepack' ? corepackCommand : command;
-    process.stdout.write(`\n[release] ${executable} ${args.join(' ')}\n`);
-    const child = spawn(executable, args, {
+    const invocation =
+      command === 'corepack'
+        ? { command: corepackInvocation.command, args: [...corepackInvocation.argsPrefix, ...args] }
+        : { command, args };
+    process.stdout.write(`\n[release] ${invocation.command} ${invocation.args.join(' ')}\n`);
+    const child = spawn(invocation.command, invocation.args, {
       cwd,
       env: releaseEnvironment,
       shell: false,
@@ -68,7 +72,10 @@ const runProcess = (command, args, cwd) =>
     child.once('error', reject);
     child.once('exit', (code, signal) => {
       if (code === 0 && signal === null) resolve();
-      else reject(new Error(`${executable} exited with ${signal ?? code ?? 'unknown status'}.`));
+      else
+        reject(
+          new Error(`${invocation.command} exited with ${signal ?? code ?? 'unknown status'}.`),
+        );
     });
   });
 

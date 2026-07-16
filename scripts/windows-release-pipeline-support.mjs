@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import {
   access,
   lstat,
@@ -36,6 +37,14 @@ const RELEASE_PUBLISH_CREDENTIAL_KEYS = [
   'SNAPCRAFT_STORE_CREDENTIALS',
 ];
 
+const RELEASE_ENVIRONMENT_KEYS_TO_REMOVE = [
+  ...RELEASE_PUBLISH_CREDENTIAL_KEYS,
+  'CSC_IDENTITY_AUTO_DISCOVERY',
+  'ELECTRON_RUN_AS_NODE',
+  'NODE_OPTIONS',
+  'VITE_DEV_SERVER_URL',
+];
+
 export const RELEASE_PROMOTION_PREFIX = '.htmllelujah-release-promotion-';
 export const RELEASE_PREPARATION_PREFIX = '.htmllelujah-release-preparation-';
 const RELEASE_CLEANUP_PREFIX = '.htmllelujah-release-cleanup-';
@@ -57,15 +66,46 @@ const pathKey = (value, platform = process.platform) => {
 };
 
 export const createReleaseEnvironment = (source = process.env) => {
-  const environment = {
-    ...source,
-    NODE_OPTIONS: '',
-    ELECTRON_RUN_AS_NODE: '',
-    VITE_DEV_SERVER_URL: '',
-    CSC_IDENTITY_AUTO_DISCOVERY: 'false',
-  };
-  for (const key of RELEASE_PUBLISH_CREDENTIAL_KEYS) delete environment[key];
+  const environment = { ...source };
+  const keysToRemove = new Set(RELEASE_ENVIRONMENT_KEYS_TO_REMOVE);
+  for (const key of Object.keys(environment)) {
+    if (keysToRemove.has(key.toUpperCase())) delete environment[key];
+  }
+  environment.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
   return environment;
+};
+
+export const resolveCorepackInvocation = ({
+  executable = process.execPath,
+  environment = process.env,
+  platform = process.platform,
+  pathExists = existsSync,
+} = {}) => {
+  if (platform !== 'win32') {
+    return { command: 'corepack', argsPrefix: [] };
+  }
+
+  const pathValue = environment.Path ?? environment.PATH ?? '';
+  const candidateDirectories = [
+    path.dirname(executable),
+    ...String(pathValue)
+      .split(path.delimiter)
+      .map((entry) => entry.trim())
+      .filter(Boolean),
+  ];
+  const seen = new Set();
+  for (const directory of candidateDirectories) {
+    const normalized = path.resolve(directory).toLocaleLowerCase('en-US');
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    const entry = path.join(directory, 'node_modules', 'corepack', 'dist', 'corepack.js');
+    if (pathExists(entry)) {
+      return { command: executable, argsPrefix: [path.resolve(entry)] };
+    }
+  }
+  throw new Error(
+    'Corepack could not be resolved to a JavaScript entry point; refusing to execute a Windows .cmd shim with shell disabled.',
+  );
 };
 
 const exists = async (value) => {

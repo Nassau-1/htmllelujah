@@ -46,6 +46,7 @@ import {
   recoverReleasePromotion,
   releaseReleaseLock,
   RELEASE_PROMOTION_PREFIX,
+  resolveCorepackInvocation,
   runSequentialPlan,
 } from './windows-release-pipeline-support.mjs';
 
@@ -134,16 +135,61 @@ test('release children cannot inherit publication credentials or renderer overri
     NODE_OPTIONS: '--inspect',
     ELECTRON_RUN_AS_NODE: '1',
     VITE_DEV_SERVER_URL: 'https://renderer.invalid/',
+    github_token: 'case-insensitive-secret',
+    electron_run_as_node: '1',
   });
   assert.equal(environment.PATH, 'fixture-path');
   assert.equal(environment.CI, 'true');
   for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GITLAB_TOKEN', 'AWS_ACCESS_KEY_ID']) {
     assert.equal(environment[key], undefined);
   }
-  assert.equal(environment.NODE_OPTIONS, '');
-  assert.equal(environment.ELECTRON_RUN_AS_NODE, '');
-  assert.equal(environment.VITE_DEV_SERVER_URL, '');
+  for (const key of Object.keys(environment)) {
+    assert.equal(key.toUpperCase() === 'NODE_OPTIONS', false);
+    assert.equal(key.toUpperCase() === 'ELECTRON_RUN_AS_NODE', false);
+    assert.equal(key.toUpperCase() === 'VITE_DEV_SERVER_URL', false);
+    assert.equal(key.toUpperCase() === 'GITHUB_TOKEN', false);
+  }
+  assert.equal(environment.CSC_IDENTITY_AUTO_DISCOVERY, 'false');
 });
+
+test('Windows Corepack resolves to a JavaScript entry instead of a cmd shim', () => {
+  const executable = path.join('C:\\', 'Program Files', 'nodejs', 'node.exe');
+  const corepackEntry = path.join(
+    path.dirname(executable),
+    'node_modules',
+    'corepack',
+    'dist',
+    'corepack.js',
+  );
+  const invocation = resolveCorepackInvocation({
+    executable,
+    environment: { Path: '' },
+    platform: 'win32',
+    pathExists: (entry) => path.resolve(entry) === path.resolve(corepackEntry),
+  });
+  assert.equal(invocation.command, executable);
+  assert.deepEqual(invocation.argsPrefix, [path.resolve(corepackEntry)]);
+  assert.equal(invocation.command.toLowerCase().endsWith('.cmd'), false);
+});
+
+test(
+  'resolved Windows Corepack entry launches without a shell',
+  { skip: process.platform !== 'win32' },
+  () => {
+    const invocation = resolveCorepackInvocation();
+    const result = spawnSync(invocation.command, [...invocation.argsPrefix, '--version'], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      env: createReleaseEnvironment(process.env),
+      shell: false,
+      windowsHide: true,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.signal, null);
+    assert.equal(result.status, 0, String(result.stderr ?? ''));
+    assert.match(String(result.stdout ?? '').trim(), /^\d+\.\d+\.\d+/u);
+  },
+);
 
 test('workspace output attestation rejects stale dist and records fresh build order', async () => {
   await withTemporaryRoot('htmllelujah-workspace-output-', async (root) => {
