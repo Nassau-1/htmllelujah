@@ -425,6 +425,7 @@ export const createFlagElement = (countryCode = 'FR'): IconElement => ({
 export const createConnectorElement = (): ConnectorElement => ({
   ...base('Connector', 180, 200, 260, 100),
   type: 'connector',
+  geometryVersion: 2,
   start: { xPt: 180, yPt: 250, binding: {} },
   end: { xPt: 440, yPt: 250, binding: {} },
   routing: 'straight',

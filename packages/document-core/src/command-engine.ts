@@ -23,6 +23,14 @@ import type {
   TableElement,
   Slide,
 } from './model.js';
+import {
+  canonicalizeConnectorGeometry,
+  canonicalizeElementConnectorGeometry,
+  canonicalizeElementsConnectorGeometry,
+  connectorFallbackBounds,
+  resolveDocumentConnectorGeometries,
+  type ResolvedDocumentConnectorGeometry,
+} from './connector-geometry.js';
 import { createRevisionToken } from './revision.js';
 import { parseTsv, TsvParseError } from './tsv.js';
 import { DocumentValidationError, parseDeck, validateDeck } from './validation.js';
@@ -164,12 +172,111 @@ const requireEditable = (elements: readonly Element[]): void => {
   }
 };
 
-const selectionBounds = (elements: readonly Element[]): Bounds => ({
-  left: Math.min(...elements.map((element) => element.frame.xPt)),
-  top: Math.min(...elements.map((element) => element.frame.yPt)),
-  right: Math.max(...elements.map((element) => element.frame.xPt + element.frame.widthPt)),
-  bottom: Math.max(...elements.map((element) => element.frame.yPt + element.frame.heightPt)),
-});
+const sameFrame = (left: Frame, right: Frame): boolean =>
+  left.xPt === right.xPt &&
+  left.yPt === right.yPt &&
+  left.widthPt === right.widthPt &&
+  left.heightPt === right.heightPt &&
+  left.rotationDeg === right.rotationDeg;
+
+const sameConnectorEndpointGeometry = (
+  left: ConnectorEndpoint,
+  right: ConnectorEndpoint,
+): boolean =>
+  left.xPt === right.xPt &&
+  left.yPt === right.yPt &&
+  left.binding.elementId === right.binding.elementId &&
+  left.binding.anchor === right.binding.anchor;
+
+const structurallyEqual = (left: unknown, right: unknown): boolean => {
+  if (Object.is(left, right)) return true;
+  if (typeof left !== 'object' || left === null || typeof right !== 'object' || right === null) {
+    return false;
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => structurallyEqual(value, right[index]))
+    );
+  }
+  const leftRecord = left as Readonly<Record<string, unknown>>;
+  const rightRecord = right as Readonly<Record<string, unknown>>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key, index) =>
+        key === rightKeys[index] && structurallyEqual(leftRecord[key], rightRecord[key]),
+    )
+  );
+};
+
+/**
+ * Generic replacement is intentionally not a geometry escape hatch. Connector
+ * geometry changes must go through commands that can materialize live anchors,
+ * detach atomically, and preserve exact undo state.
+ */
+const requireSafeElementReplacement = (current: Element, replacement: Element): void => {
+  if (current.type === 'group' || replacement.type === 'group') {
+    if (
+      current.type !== 'group' ||
+      replacement.type !== 'group' ||
+      !structurallyEqual(current.children, replacement.children)
+    ) {
+      throw new DocumentCommandError(
+        'UNSUPPORTED_OPERATION',
+        'Group children must be changed with dedicated element or connector commands targeting the group with containerId.',
+      );
+    }
+    return;
+  }
+  if (current.type !== 'connector' && replacement.type !== 'connector') return;
+  if (current.type !== 'connector' || replacement.type !== 'connector') {
+    throw new DocumentCommandError(
+      'TYPE_MISMATCH',
+      'element.update cannot change an element to or from a connector.',
+    );
+  }
+  if (
+    !sameFrame(current.frame, replacement.frame) ||
+    !sameConnectorEndpointGeometry(current.start, replacement.start) ||
+    !sameConnectorEndpointGeometry(current.end, replacement.end)
+  ) {
+    throw new DocumentCommandError(
+      'UNSUPPORTED_OPERATION',
+      'Connector geometry and bindings must be changed with element.transform or connector.update-endpoint.',
+    );
+  }
+};
+
+const elementGeometryBounds = (
+  element: Element,
+  connectorGeometries?: ReadonlyMap<string, ResolvedDocumentConnectorGeometry>,
+): Bounds =>
+  element.type === 'connector'
+    ? (connectorGeometries?.get(element.id)?.boundsInContainer ?? connectorFallbackBounds(element))
+    : {
+        left: element.frame.xPt,
+        top: element.frame.yPt,
+        right: element.frame.xPt + element.frame.widthPt,
+        bottom: element.frame.yPt + element.frame.heightPt,
+      };
+
+const selectionBounds = (
+  elements: readonly Element[],
+  connectorGeometries?: ReadonlyMap<string, ResolvedDocumentConnectorGeometry>,
+): Bounds => {
+  const bounds = elements.map((element) => elementGeometryBounds(element, connectorGeometries));
+  return {
+    left: Math.min(...bounds.map(({ left }) => left)),
+    top: Math.min(...bounds.map(({ top }) => top)),
+    right: Math.max(...bounds.map(({ right }) => right)),
+    bottom: Math.max(...bounds.map(({ bottom }) => bottom)),
+  };
+};
 
 const containerBounds = (slide: Slide, containerId: string | undefined, page: PageSize): Bounds => {
   if (containerId === undefined) {
@@ -195,16 +302,41 @@ const replaceFrames = (
   elements.map((element) => {
     const frame = frames.get(element.id);
     if (frame === undefined) return element;
-    const transformed =
-      element.type === 'connector'
-        ? {
-            ...element,
-            frame,
-            start: connectorEndpointAfterFrameTransform(element.start, element.frame, frame),
-            end: connectorEndpointAfterFrameTransform(element.end, element.frame, frame),
-          }
-        : { ...element, frame };
+    if (element.type !== 'connector') {
+      return withPlaceholderOverride({ ...element, frame }, 'frame');
+    }
+    const connector = canonicalizeConnectorGeometry(element);
+    const transformed = {
+      ...connector,
+      frame,
+      start: connectorEndpointAfterFrameTransform(connector.start, connector.frame, frame),
+      end: connectorEndpointAfterFrameTransform(connector.end, connector.frame, frame),
+    };
     return withPlaceholderOverride(transformed, 'frame');
+  });
+
+/**
+ * Alignment and distribution are explicit whole-object relocation commands.
+ * A bound endpoint cannot be transformed independently of its target, so
+ * intentional connector relocation commands first freeze the two currently
+ * painted points as fallbacks and atomically release their bindings. Structural
+ * group/ungroup changes use separate coordinate conversions and retain bindings.
+ */
+const materializeConnectorGeometryForRelocation = (
+  elements: readonly Element[],
+  frames: ReadonlyMap<string, Frame>,
+  geometries: ReadonlyMap<string, ResolvedDocumentConnectorGeometry>,
+): readonly Element[] =>
+  elements.map((element) => {
+    if (element.type !== 'connector' || !frames.has(element.id)) return element;
+    const geometry = geometries.get(element.id);
+    if (geometry === undefined) return canonicalizeConnectorGeometry(element);
+    const connector = canonicalizeConnectorGeometry(element);
+    return {
+      ...connector,
+      start: { ...connector.start, ...geometry.startInContainer, binding: {} },
+      end: { ...connector.end, ...geometry.endInContainer, binding: {} },
+    };
   });
 
 const rotatePoint = (
@@ -229,8 +361,8 @@ const rotatePoint = (
  * Connector endpoint coordinates are persisted in their container coordinate space.
  * Re-express the fallback point in the replacement frame so moving, resizing, and
  * rotating a connector never leaves its hit frame detached from the painted line.
- * A binding is deliberately preserved: renderers continue to prefer its live anchor,
- * while the transformed fallback remains ready if that target is later deleted.
+ * This helper preserves the binding supplied by its caller. Intentional connector
+ * transforms materialize and detach effective endpoints before reaching it.
  */
 const connectorEndpointAfterFrameTransform = (
   endpoint: ConnectorEndpoint,
@@ -267,20 +399,30 @@ const collectElementIds = (elements: readonly Element[], output: Set<string>): v
 const releaseDeletedConnectorBindings = (
   elements: readonly Element[],
   deletedIds: ReadonlySet<string>,
+  geometries: ReadonlyMap<string, ResolvedDocumentConnectorGeometry>,
 ): readonly Element[] =>
   elements.map((element) => {
     if (element.type === 'group') {
       return {
         ...element,
-        children: releaseDeletedConnectorBindings(element.children, deletedIds),
+        children: releaseDeletedConnectorBindings(element.children, deletedIds, geometries),
       };
     }
     if (element.type !== 'connector') return element;
-    const release = (endpoint: ConnectorEndpoint): ConnectorEndpoint =>
+    const connector = canonicalizeConnectorGeometry(element);
+    const geometry = geometries.get(connector.id);
+    const release = (
+      endpoint: ConnectorEndpoint,
+      effectivePoint: Readonly<{ xPt: number; yPt: number }> | undefined,
+    ): ConnectorEndpoint =>
       endpoint.binding.elementId !== undefined && deletedIds.has(endpoint.binding.elementId)
-        ? { ...endpoint, binding: {} }
+        ? { ...endpoint, ...(effectivePoint ?? {}), binding: {} }
         : endpoint;
-    return { ...element, start: release(element.start), end: release(element.end) };
+    return {
+      ...connector,
+      start: release(connector.start, geometry?.startInContainer),
+      end: release(connector.end, geometry?.endInContainer),
+    };
   });
 
 const deleteElementsAndReleaseConnectorBindings = (
@@ -290,6 +432,7 @@ const deleteElementsAndReleaseConnectorBindings = (
   elementIds: readonly string[],
 ): DeckDocument =>
   replaceSlide(document, slideId, (slide) => {
+    const connectorGeometries = resolveDocumentConnectorGeometries(slide.elements);
     const deletedIds = new Set<string>();
     const withoutDeleted = updateContainer(slide.elements, containerId, (elements) => {
       const selected = requireElements(elements, elementIds);
@@ -299,7 +442,7 @@ const deleteElementsAndReleaseConnectorBindings = (
     });
     return {
       ...slide,
-      elements: releaseDeletedConnectorBindings(withoutDeleted, deletedIds),
+      elements: releaseDeletedConnectorBindings(withoutDeleted, deletedIds, connectorGeometries),
     };
   });
 
@@ -317,21 +460,40 @@ function withPlaceholderOverride(
   };
 }
 
-const alignedFrame = (frame: Frame, mode: AlignElementsCommand['mode'], target: Bounds): Frame => {
+const alignedElementFrame = (
+  element: Element,
+  mode: AlignElementsCommand['mode'],
+  target: Bounds,
+  connectorGeometries: ReadonlyMap<string, ResolvedDocumentConnectorGeometry>,
+): Frame => {
+  const bounds = elementGeometryBounds(element, connectorGeometries);
+  let deltaX = 0;
+  let deltaY = 0;
   switch (mode) {
     case 'left':
-      return { ...frame, xPt: target.left };
+      deltaX = target.left - bounds.left;
+      break;
     case 'horizontal-center':
-      return { ...frame, xPt: (target.left + target.right - frame.widthPt) / 2 };
+      deltaX = (target.left + target.right - bounds.left - bounds.right) / 2;
+      break;
     case 'right':
-      return { ...frame, xPt: target.right - frame.widthPt };
+      deltaX = target.right - bounds.right;
+      break;
     case 'top':
-      return { ...frame, yPt: target.top };
+      deltaY = target.top - bounds.top;
+      break;
     case 'vertical-middle':
-      return { ...frame, yPt: (target.top + target.bottom - frame.heightPt) / 2 };
+      deltaY = (target.top + target.bottom - bounds.top - bounds.bottom) / 2;
+      break;
     case 'bottom':
-      return { ...frame, yPt: target.bottom - frame.heightPt };
+      deltaY = target.bottom - bounds.bottom;
+      break;
   }
+  return {
+    ...element.frame,
+    xPt: element.frame.xPt + deltaX,
+    yPt: element.frame.yPt + deltaY,
+  };
 };
 
 const alignElements = (document: DeckDocument, command: AlignElementsCommand): DeckDocument => {
@@ -339,17 +501,24 @@ const alignElements = (document: DeckDocument, command: AlignElementsCommand): D
   if (slide === undefined) {
     throw new DocumentCommandError('NOT_FOUND', `Slide ${command.slideId} does not exist.`);
   }
+  const connectorGeometries = resolveDocumentConnectorGeometries(slide.elements);
   return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
     const selected = requireElements(elements, command.elementIds);
     requireEditable(selected);
     const target =
       command.relativeTo === 'selection'
-        ? selectionBounds(selected)
+        ? selectionBounds(selected, connectorGeometries)
         : containerBounds(slide, command.containerId, document.page);
     const frames = new Map(
-      selected.map((element) => [element.id, alignedFrame(element.frame, command.mode, target)]),
+      selected.map((element) => [
+        element.id,
+        alignedElementFrame(element, command.mode, target, connectorGeometries),
+      ]),
     );
-    return replaceFrames(elements, frames);
+    return replaceFrames(
+      materializeConnectorGeometryForRelocation(elements, frames, connectorGeometries),
+      frames,
+    );
   });
 };
 
@@ -357,24 +526,35 @@ const distributedFrames = (
   elements: readonly Element[],
   axis: DistributeElementsCommand['axis'],
   target: Bounds,
+  connectorGeometries: ReadonlyMap<string, ResolvedDocumentConnectorGeometry>,
 ): ReadonlyMap<string, Frame> => {
+  const geometryById = new Map(
+    elements.map((element) => [element.id, elementGeometryBounds(element, connectorGeometries)]),
+  );
   const sorted = [...elements].sort((left, right) =>
-    axis === 'horizontal' ? left.frame.xPt - right.frame.xPt : left.frame.yPt - right.frame.yPt,
+    axis === 'horizontal'
+      ? (geometryById.get(left.id)?.left ?? 0) - (geometryById.get(right.id)?.left ?? 0)
+      : (geometryById.get(left.id)?.top ?? 0) - (geometryById.get(right.id)?.top ?? 0),
   );
-  const totalSize = sorted.reduce(
-    (sum, element) =>
-      sum + (axis === 'horizontal' ? element.frame.widthPt : element.frame.heightPt),
-    0,
-  );
+  const totalSize = sorted.reduce((sum, element) => {
+    const bounds =
+      geometryById.get(element.id) ?? elementGeometryBounds(element, connectorGeometries);
+    return sum + (axis === 'horizontal' ? bounds.right - bounds.left : bounds.bottom - bounds.top);
+  }, 0);
   const span = axis === 'horizontal' ? target.right - target.left : target.bottom - target.top;
   const gap = (span - totalSize) / (sorted.length - 1);
   let cursor = axis === 'horizontal' ? target.left : target.top;
   const frames = new Map<string, Frame>();
   sorted.forEach((element) => {
+    const bounds =
+      geometryById.get(element.id) ?? elementGeometryBounds(element, connectorGeometries);
     const frame =
-      axis === 'horizontal' ? { ...element.frame, xPt: cursor } : { ...element.frame, yPt: cursor };
+      axis === 'horizontal'
+        ? { ...element.frame, xPt: element.frame.xPt + cursor - bounds.left }
+        : { ...element.frame, yPt: element.frame.yPt + cursor - bounds.top };
     frames.set(element.id, frame);
-    cursor += (axis === 'horizontal' ? element.frame.widthPt : element.frame.heightPt) + gap;
+    cursor +=
+      (axis === 'horizontal' ? bounds.right - bounds.left : bounds.bottom - bounds.top) + gap;
   });
   return frames;
 };
@@ -387,23 +567,44 @@ const distributeElements = (
   if (slide === undefined) {
     throw new DocumentCommandError('NOT_FOUND', `Slide ${command.slideId} does not exist.`);
   }
+  const connectorGeometries = resolveDocumentConnectorGeometries(slide.elements);
   return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
     const selected = requireElements(elements, command.elementIds);
     requireEditable(selected);
     const target =
       command.relativeTo === 'selection'
-        ? selectionBounds(selected)
+        ? selectionBounds(selected, connectorGeometries)
         : containerBounds(slide, command.containerId, document.page);
-    return replaceFrames(elements, distributedFrames(selected, command.axis, target));
+    const frames = distributedFrames(selected, command.axis, target, connectorGeometries);
+    return replaceFrames(
+      materializeConnectorGeometryForRelocation(elements, frames, connectorGeometries),
+      frames,
+    );
   });
 };
 
-const groupElements = (document: DeckDocument, command: GroupElementsCommand): DeckDocument =>
-  updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
-    const selected = requireElements(elements, command.elementIds);
-    requireEditable(selected);
-    const bounds = selectionBounds(selected);
+const groupElements = (document: DeckDocument, command: GroupElementsCommand): DeckDocument => {
+  const slide = document.slides.find((candidate) => candidate.id === command.slideId);
+  if (slide === undefined) {
+    throw new DocumentCommandError('NOT_FOUND', `Slide ${command.slideId} does not exist.`);
+  }
+  const connectorGeometries = resolveDocumentConnectorGeometries(slide.elements);
+  return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
+    const selectedInput = requireElements(elements, command.elementIds);
+    requireEditable(selectedInput);
+    const selected = selectedInput.map(canonicalizeElementConnectorGeometry);
+    const rawBounds = selectionBounds(selected, connectorGeometries);
+    const minimumGroupDimensionPt = 1;
+    const missingWidth = Math.max(0, minimumGroupDimensionPt - (rawBounds.right - rawBounds.left));
+    const missingHeight = Math.max(0, minimumGroupDimensionPt - (rawBounds.bottom - rawBounds.top));
+    const bounds = {
+      left: rawBounds.left - missingWidth / 2,
+      top: rawBounds.top - missingHeight / 2,
+      right: rawBounds.right + missingWidth / 2,
+      bottom: rawBounds.bottom + missingHeight / 2,
+    };
     const selectedIds = new Set(command.elementIds);
+    const selectedById = new Map(selected.map((element) => [element.id, element] as const));
     const insertionIndex = Math.min(
       ...elements
         .map((element, index) => (selectedIds.has(element.id) ? index : undefined))
@@ -411,7 +612,8 @@ const groupElements = (document: DeckDocument, command: GroupElementsCommand): D
     );
     const children = elements
       .filter((element) => selectedIds.has(element.id))
-      .map((element): Element => {
+      .map((inputElement): Element => {
+        const element = selectedById.get(inputElement.id) ?? inputElement;
         const frame = {
           ...element.frame,
           xPt: element.frame.xPt - bounds.left,
@@ -453,14 +655,17 @@ const groupElements = (document: DeckDocument, command: GroupElementsCommand): D
     const remaining = elements.filter((element) => !selectedIds.has(element.id));
     return [...remaining.slice(0, insertionIndex), group, ...remaining.slice(insertionIndex)];
   });
+};
 
 const childFrameAfterUngroup = (child: Element, group: GroupElement): Frame => {
-  const scaleX = group.frame.widthPt / group.coordinateSpace.widthPt;
-  const scaleY = group.frame.heightPt / group.coordinateSpace.heightPt;
+  const coordinateWidth = Math.max(0.001, group.coordinateSpace.widthPt);
+  const coordinateHeight = Math.max(0.001, group.coordinateSpace.heightPt);
+  const scaleX = group.frame.widthPt / coordinateWidth;
+  const scaleY = group.frame.heightPt / coordinateHeight;
   const localCenterX = child.frame.xPt + child.frame.widthPt / 2;
   const localCenterY = child.frame.yPt + child.frame.heightPt / 2;
-  const offsetX = (localCenterX - group.coordinateSpace.widthPt / 2) * scaleX;
-  const offsetY = (localCenterY - group.coordinateSpace.heightPt / 2) * scaleY;
+  const offsetX = (localCenterX - coordinateWidth / 2) * scaleX;
+  const offsetY = (localCenterY - coordinateHeight / 2) * scaleY;
   const radians = (group.frame.rotationDeg * Math.PI) / 180;
   const rotatedX = offsetX * Math.cos(radians) - offsetY * Math.sin(radians);
   const rotatedY = offsetX * Math.sin(radians) + offsetY * Math.cos(radians);
@@ -481,8 +686,8 @@ const connectorEndpointAfterUngroup = (
   endpoint: ConnectorEndpoint,
   group: GroupElement,
 ): ConnectorEndpoint => {
-  const scaleX = group.frame.widthPt / group.coordinateSpace.widthPt;
-  const scaleY = group.frame.heightPt / group.coordinateSpace.heightPt;
+  const scaleX = group.frame.widthPt / Math.max(0.001, group.coordinateSpace.widthPt);
+  const scaleY = group.frame.heightPt / Math.max(0.001, group.coordinateSpace.heightPt);
   const unrotated = {
     xPt: group.frame.xPt + endpoint.xPt * scaleX,
     yPt: group.frame.yPt + endpoint.yPt * scaleY,
@@ -507,7 +712,8 @@ const ungroupElements = (document: DeckDocument, command: UngroupElementsCommand
       );
     }
     requireEditable([element]);
-    const children = element.children.map((child): Element => {
+    const children = element.children.map((inputChild): Element => {
+      const child = canonicalizeElementConnectorGeometry(inputChild);
       const frame = childFrameAfterUngroup(child, element);
       const opacity = child.opacity * element.opacity;
       const visible = child.visible && element.visible;
@@ -1506,7 +1712,12 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
         ...document,
         assets: document.assets.filter((asset) => asset.id !== command.assetId),
       };
-    case 'connector.update-endpoint':
+    case 'connector.update-endpoint': {
+      const slide = document.slides.find((candidate) => candidate.id === command.slideId);
+      if (slide === undefined) {
+        throw new DocumentCommandError('NOT_FOUND', `Slide ${command.slideId} does not exist.`);
+      }
+      const geometry = resolveDocumentConnectorGeometries(slide.elements).get(command.connectorId);
       return updateTargetElement(
         document,
         command.slideId,
@@ -1519,9 +1730,23 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
               `Element ${command.connectorId} is not a connector.`,
             );
           }
-          return { ...element, [command.endpoint]: command.value };
+          const connector = canonicalizeConnectorGeometry(element);
+          const previousEndpoint = connector[command.endpoint];
+          const removesBinding =
+            previousEndpoint.binding.elementId !== undefined &&
+            command.value.binding.elementId === undefined;
+          const effectivePoint =
+            command.endpoint === 'start' ? geometry?.startInContainer : geometry?.endInContainer;
+          return {
+            ...connector,
+            [command.endpoint]:
+              removesBinding && effectivePoint !== undefined
+                ? { ...command.value, ...effectivePoint }
+                : command.value,
+          };
         },
       );
+    }
     case 'slide.create': {
       const index = command.index ?? document.slides.length;
       if (index > document.slides.length) {
@@ -1534,7 +1759,10 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
         ...document,
         slides: [
           ...document.slides.slice(0, index),
-          command.slide,
+          {
+            ...command.slide,
+            elements: canonicalizeElementsConnectorGeometry(command.slide.elements),
+          },
           ...document.slides.slice(index),
         ],
       };
@@ -1580,7 +1808,11 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
             `Element insertion index ${index} exceeds ${elements.length}.`,
           );
         }
-        return [...elements.slice(0, index), command.element, ...elements.slice(index)];
+        return [
+          ...elements.slice(0, index),
+          canonicalizeElementConnectorGeometry(command.element),
+          ...elements.slice(index),
+        ];
       });
     case 'element.update':
       if (command.elementId !== command.replacement.id) {
@@ -1592,8 +1824,18 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
       return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
         const selected = requireElements(elements, [command.elementId]);
         requireEditable(selected);
+        const current = selected[0];
+        if (current === undefined) {
+          throw new DocumentCommandError(
+            'NOT_FOUND',
+            `Element ${command.elementId} does not exist.`,
+          );
+        }
+        requireSafeElementReplacement(current, command.replacement);
         return elements.map((element) =>
-          element.id === command.elementId ? command.replacement : element,
+          element.id === command.elementId
+            ? canonicalizeElementConnectorGeometry(command.replacement)
+            : element,
         );
       });
     case 'element.delete':
@@ -1603,16 +1845,25 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
         command.containerId,
         command.elementIds,
       );
-    case 'element.transform':
+    case 'element.transform': {
+      const slide = document.slides.find((candidate) => candidate.id === command.slideId);
+      if (slide === undefined) {
+        throw new DocumentCommandError('NOT_FOUND', `Slide ${command.slideId} does not exist.`);
+      }
+      const connectorGeometries = resolveDocumentConnectorGeometries(slide.elements);
       return updateSlideContainer(document, command.slideId, command.containerId, (elements) => {
         const elementIds = command.transforms.map((transform) => transform.elementId);
         const selected = requireElements(elements, elementIds);
         requireEditable(selected);
+        const frames = new Map(
+          command.transforms.map((transform) => [transform.elementId, transform.frame]),
+        );
         return replaceFrames(
-          elements,
-          new Map(command.transforms.map((transform) => [transform.elementId, transform.frame])),
+          materializeConnectorGeometryForRelocation(elements, frames, connectorGeometries),
+          frames,
         );
       });
+    }
     case 'element.align':
       return alignElements(document, command);
     case 'element.distribute':

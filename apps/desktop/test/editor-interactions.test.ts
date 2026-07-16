@@ -1,4 +1,9 @@
-import { createDefaultDeck, createNeutralDemoDeck, resolveSlide } from '@htmllelujah/document-core';
+import {
+  applyCommand,
+  createDefaultDeck,
+  createNeutralDemoDeck,
+  resolveSlide,
+} from '@htmllelujah/document-core';
 import { readFileSync } from 'node:fs';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -6,7 +11,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   canvasTransformsToCommit,
+  canvasKeyboardRotationFrame,
   CanonicalSlideCanvas,
+  connectorAfterInteractionFrameTransform,
   MINIMUM_ROTATION_TOUCH_TARGET_PX,
   pointAfterInteractionFrameTransform,
   resolveCanvasEditableElements,
@@ -183,12 +190,13 @@ describe('accessible editor interactions', () => {
     const target = {
       ...createShapeElement(),
       name: 'Connector target',
-      frame: { xPt: 400, yPt: 160, widthPt: 100, heightPt: 80, rotationDeg: 0 },
+      frame: { xPt: 400, yPt: 160, widthPt: 100, heightPt: 80, rotationDeg: 90 },
     };
     const connector = {
       ...createConnectorElement(),
+      geometryVersion: undefined,
       name: 'Bound connector',
-      frame: { xPt: 0, yPt: 0, widthPt: 40, heightPt: 40, rotationDeg: 0 },
+      frame: { xPt: 0, yPt: 0, widthPt: 40, heightPt: 40, rotationDeg: 37 },
       start: { xPt: 100, yPt: 200, binding: {} },
       end: { xPt: 999, yPt: 999, binding: { elementId: target.id, anchor: 'left' as const } },
     };
@@ -199,9 +207,9 @@ describe('accessible editor interactions', () => {
     const projectedConnector = editable.find((entry) => entry.localElement.id === connector.id);
     const interactionFrame = {
       xPt: 100,
-      yPt: 194,
-      widthPt: 300,
-      heightPt: 12,
+      yPt: 150,
+      widthPt: 350,
+      heightPt: 50,
       rotationDeg: 0,
     };
 
@@ -218,16 +226,241 @@ describe('accessible editor interactions', () => {
         movedInteractionFrame,
       ),
     ).toEqual({ xPt: 130, yPt: 215 });
+    const movedTransforms = canvasTransformsToCommit(
+      { [connector.id]: movedInteractionFrame },
+      [{ id: connector.id, frame: interactionFrame }],
+      new Map([[connector.id, connector]]),
+    );
+    expect(movedTransforms).toEqual([
+      {
+        elementId: connector.id,
+        frame: { xPt: 30, yPt: 15, widthPt: 40, heightPt: 40, rotationDeg: 37 },
+      },
+    ]);
+    const movedLocalFrame = movedTransforms[0]?.frame;
+    if (movedLocalFrame === undefined) throw new Error('Missing moved connector transform.');
+
+    const preview = connectorAfterInteractionFrameTransform(
+      connector,
+      {
+        startInContainer: { xPt: 100, yPt: 200 },
+        endInContainer: { xPt: 450, yPt: 150 },
+      },
+      connector.frame,
+      movedLocalFrame,
+    );
+    expect(preview.start.xPt).toBeCloseTo(130, 10);
+    expect(preview.start.yPt).toBeCloseTo(215, 10);
+    expect(preview.end.xPt).toBeCloseTo(480, 10);
+    expect(preview.end.yPt).toBeCloseTo(165, 10);
+    expect(preview.start.binding).toEqual({});
+    expect(preview.end.binding).toEqual({});
+    const committed = applyCommand(
+      document,
+      {
+        type: 'element.transform',
+        slideId: localSlide.id,
+        transforms: [
+          {
+            elementId: connector.id,
+            frame: movedLocalFrame,
+          },
+        ],
+      },
+      {
+        metadata: {
+          transactionId: 'aaaaaaaa-aaaa-4aaa-8aaa-000000000001',
+          actorId: 'editor-test',
+          origin: 'user',
+          label: 'Move bound connector',
+          timestamp: '2026-07-16T18:00:00.000Z',
+        },
+      },
+    );
+    const committedConnector = committed.document.slides[0]!.elements.find(
+      (element) => element.id === connector.id,
+    );
+    expect(committedConnector?.type === 'connector' ? committedConnector.start : undefined).toEqual(
+      preview.start,
+    );
+    expect(committedConnector?.type === 'connector' ? committedConnector.end : undefined).toEqual(
+      preview.end,
+    );
+
+    const resizedRotatedInteractionFrame = {
+      xPt: 80,
+      yPt: 120,
+      widthPt: 525,
+      heightPt: 100,
+      rotationDeg: 30,
+    };
+    const combinedFrame = canvasTransformsToCommit(
+      { [connector.id]: resizedRotatedInteractionFrame },
+      [{ id: connector.id, frame: interactionFrame }],
+      new Map([[connector.id, connector]]),
+    )[0]?.frame;
+    if (combinedFrame === undefined) throw new Error('Missing combined connector transform.');
+    const combinedPreview = connectorAfterInteractionFrameTransform(
+      connector,
+      {
+        startInContainer: { xPt: 100, yPt: 200 },
+        endInContainer: { xPt: 450, yPt: 150 },
+      },
+      connector.frame,
+      combinedFrame,
+    );
+    const combinedCommit = applyCommand(
+      document,
+      {
+        type: 'element.transform',
+        slideId: localSlide.id,
+        transforms: [{ elementId: connector.id, frame: combinedFrame }],
+      },
+      {
+        metadata: {
+          transactionId: 'aaaaaaaa-aaaa-4aaa-8aaa-000000000002',
+          actorId: 'editor-test',
+          origin: 'user',
+          label: 'Resize and rotate bound connector',
+          timestamp: '2026-07-16T18:00:01.000Z',
+        },
+      },
+    );
+    const combinedConnector = combinedCommit.document.slides[0]!.elements.find(
+      (element) => element.id === connector.id,
+    );
+    if (combinedConnector?.type !== 'connector') {
+      throw new Error('Missing combined committed connector.');
+    }
+    expect(combinedConnector.start.xPt).toBeCloseTo(combinedPreview.start.xPt, 10);
+    expect(combinedConnector.start.yPt).toBeCloseTo(combinedPreview.start.yPt, 10);
+    expect(combinedConnector.end.xPt).toBeCloseTo(combinedPreview.end.xPt, 10);
+    expect(combinedConnector.end.yPt).toBeCloseTo(combinedPreview.end.yPt, 10);
+    expect(combinedConnector.start.binding).toEqual({});
+    expect(combinedConnector.end.binding).toEqual({});
+  });
+
+  it('maps keyboard rotation from connector hitboxes back to bound and unbound local frames', () => {
+    const bound = {
+      ...createConnectorElement(),
+      frame: { xPt: 0, yPt: 0, widthPt: 40, heightPt: 40, rotationDeg: 7 },
+      start: { xPt: 100, yPt: 200, binding: {} },
+      end: {
+        xPt: 999,
+        yPt: 999,
+        binding: { elementId: createShapeElement().id, anchor: 'left' as const },
+      },
+    };
+    const unbound = createConnectorElement();
+    const fixtures = [
+      {
+        connector: bound,
+        interaction: { xPt: 100, yPt: 194, widthPt: 300, heightPt: 12, rotationDeg: 0 },
+      },
+      {
+        connector: unbound,
+        interaction: { xPt: 180, yPt: 244, widthPt: 260, heightPt: 12, rotationDeg: 0 },
+      },
+    ];
+
+    for (const { connector, interaction } of fixtures) {
+      const arrowFrame = canvasKeyboardRotationFrame(connector, interaction, 'ArrowRight', false);
+      expect(arrowFrame?.rotationDeg).toBe(1);
+      const arrowCommit =
+        arrowFrame === null
+          ? undefined
+          : canvasTransformsToCommit(
+              { [connector.id]: arrowFrame },
+              [{ id: connector.id, frame: interaction }],
+              new Map([[connector.id, connector]]),
+            )[0]?.frame;
+      expect(arrowCommit?.rotationDeg).toBe(connector.frame.rotationDeg + 1);
+
+      const rotatedInteraction = { ...interaction, rotationDeg: 15 };
+      const transforms = canvasTransformsToCommit(
+        { [connector.id]: rotatedInteraction },
+        [{ id: connector.id, frame: interaction }],
+        new Map([[connector.id, connector]]),
+      );
+      const committed = transforms[0]?.frame;
+      expect(committed).toBeDefined();
+      if (committed === undefined) throw new Error('Missing keyboard connector transform.');
+      const expectedCenter = pointAfterInteractionFrameTransform(
+        {
+          xPt: connector.frame.xPt + connector.frame.widthPt / 2,
+          yPt: connector.frame.yPt + connector.frame.heightPt / 2,
+        },
+        interaction,
+        rotatedInteraction,
+      );
+      expect(committed.widthPt).toBe(connector.frame.widthPt);
+      expect(committed.heightPt).toBe(connector.frame.heightPt);
+      expect(committed.rotationDeg).toBe(connector.frame.rotationDeg + 15);
+      expect(committed.xPt + committed.widthPt / 2).toBeCloseTo(expectedCenter.xPt, 10);
+      expect(committed.yPt + committed.heightPt / 2).toBeCloseTo(expectedCenter.yPt, 10);
+      expect(committed).not.toEqual(rotatedInteraction);
+    }
+
+    const homeFrame = canvasKeyboardRotationFrame(bound, fixtures[0]!.interaction, 'Home', false);
+    expect(homeFrame?.rotationDeg).toBe(-7);
+    const homeCommit =
+      homeFrame === null
+        ? undefined
+        : canvasTransformsToCommit(
+            { [bound.id]: homeFrame },
+            [{ id: bound.id, frame: fixtures[0]!.interaction }],
+            new Map([[bound.id, bound]]),
+          )[0]?.frame;
+    expect(homeCommit?.rotationDeg).toBe(0);
+    expect(
+      canvasKeyboardRotationFrame(unbound, fixtures[1]!.interaction, 'Home', false),
+    ).toBeNull();
+    expect(
+      canvasKeyboardRotationFrame(bound, fixtures[0]!.interaction, 'ArrowRight', true)?.rotationDeg,
+    ).toBe(8);
+  });
+
+  it('uses final pre-marker path bounds without double rotation after reopen', () => {
+    const deck = createDefaultDeck();
+    const slide = deck.slides[0]!;
+    const connector = {
+      ...createConnectorElement(),
+      name: 'Legacy rotated connector',
+      frame: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 50, rotationDeg: 90 },
+      start: { xPt: 85, yPt: -5, binding: {} },
+      end: { xPt: 35, yPt: 95, binding: {} },
+    };
+    const localSlide = { ...slide, elements: [...slide.elements, connector] };
+    const document = { ...deck, slides: [localSlide] };
+    const resolved = resolveSlide(document, localSlide.id);
+    const editable = resolveCanvasEditableElements(resolved, 'slide', localSlide.elements);
+    const projectedConnector = editable.find((entry) => entry.localElement.id === connector.id);
+    const interactionFrame = {
+      xPt: 35,
+      yPt: -5,
+      widthPt: 50,
+      heightPt: 100,
+      rotationDeg: 0,
+    };
+
+    expect(projectedConnector?.effectiveElement.frame).toEqual(interactionFrame);
+    expect(projectedConnector?.localElement).toBe(connector);
     expect(
       canvasTransformsToCommit(
-        { [connector.id]: movedInteractionFrame },
+        {
+          [connector.id]: {
+            ...interactionFrame,
+            xPt: interactionFrame.xPt + 20,
+            yPt: interactionFrame.yPt + 10,
+          },
+        },
         [{ id: connector.id, frame: interactionFrame }],
         new Map([[connector.id, connector]]),
       ),
     ).toEqual([
       {
         elementId: connector.id,
-        frame: { xPt: 30, yPt: 15, widthPt: 40, heightPt: 40, rotationDeg: 0 },
+        frame: { xPt: 30, yPt: 30, widthPt: 100, heightPt: 50, rotationDeg: 90 },
       },
     ]);
   });

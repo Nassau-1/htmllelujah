@@ -212,6 +212,8 @@ export interface ShapeElement extends BaseElement {
 
 export interface ConnectorElement extends BaseElement {
   readonly type: 'connector';
+  /** See document-core: missing is the compatible pre-marker final-point representation. */
+  readonly geometryVersion?: 2 | undefined;
   readonly start: {
     readonly xPt: number;
     readonly yPt: number;

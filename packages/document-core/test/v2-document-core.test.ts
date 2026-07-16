@@ -12,6 +12,7 @@ import {
   migrateDeckV1ToV2,
   parseDeck,
   parseTsv,
+  resolveDocumentConnectorGeometries,
   resolveSlide,
   resolveSlideFromValidatedDocument,
   undoTransaction,
@@ -107,6 +108,50 @@ describe('schema V2 and migration', () => {
     expect(validateDeck(deck)).toMatchObject({ success: true });
     expect(deck.metadata).toMatchObject({ locale: 'fr-FR', creator: 'Test' });
     expect(new Set(deck.themes[0]?.textStyles.map((style) => style.role)).size).toBe(6);
+  });
+
+  it('reopens pre-marker V2 rotation without rotating final endpoints a second time', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const legacyConnector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000390',
+      type: 'connector',
+      name: 'Legacy rotated connector',
+      frame: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 50, rotationDeg: 90 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 85, yPt: -5, binding: {} },
+      end: { xPt: 35, yPt: 95, binding: {} },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const legacyDocument = {
+      ...source,
+      slides: source.slides.map((candidate) =>
+        candidate.id === slide.id
+          ? { ...candidate, elements: [...candidate.elements, legacyConnector] }
+          : candidate,
+      ),
+    };
+
+    const opened = parseDeck(JSON.parse(JSON.stringify(legacyDocument)));
+    const reopened = parseDeck(JSON.parse(JSON.stringify(opened)));
+    const migrated = opened.slides[2]!.elements.find(
+      (element) => element.id === legacyConnector.id,
+    );
+
+    expect(migrated?.type).toBe('connector');
+    if (migrated?.type !== 'connector') throw new Error('Missing migrated connector.');
+    expect(migrated.geometryVersion).toBe(2);
+    expect(migrated.start.xPt).toBeCloseTo(85, 10);
+    expect(migrated.start.yPt).toBeCloseTo(-5, 10);
+    expect(migrated.end.xPt).toBeCloseTo(35, 10);
+    expect(migrated.end.yPt).toBeCloseTo(95, 10);
+    expect(reopened).toEqual(opened);
+    expect('geometryVersion' in legacyConnector).toBe(false);
   });
 });
 
@@ -973,10 +1018,110 @@ describe('element, text, table, asset, and connector commands', () => {
     );
   });
 
+  it('frees a nested bound endpoint at its current painted anchor after the target moves', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const target: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000402',
+      type: 'shape',
+      name: 'Nested moving endpoint target',
+      frame: { xPt: 10, yPt: 10, widthPt: 40, heightPt: 20, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const connector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000403',
+      type: 'connector',
+      geometryVersion: 2,
+      name: 'Nested bound connector',
+      frame: { xPt: 0, yPt: 0, widthPt: 100, heightPt: 50, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 0, yPt: 0, binding: {} },
+      end: { xPt: 99, yPt: 88, binding: { elementId: target.id, anchor: 'right' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const filler: Element = {
+      ...target,
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000404',
+      name: 'Nested endpoint filler',
+      frame: { xPt: 70, yPt: 10, widthPt: 10, heightPt: 10, rotationDeg: 0 },
+    };
+    const group: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000405',
+      type: 'group',
+      name: 'Nested endpoint group',
+      frame: { xPt: 100, yPt: 50, widthPt: 200, heightPt: 100, rotationDeg: 30 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      coordinateSpace: { widthPt: 100, heightPt: 50 },
+      children: [target, connector, filler],
+    };
+    const inserted = applyCommand(
+      source,
+      { type: 'element.insert', slideId: slide.id, element: group },
+      metadata(),
+    );
+    const movedTarget = applyCommand(
+      inserted.document,
+      {
+        type: 'element.transform',
+        slideId: slide.id,
+        containerId: group.id,
+        transforms: [
+          {
+            elementId: target.id,
+            frame: { xPt: 20, yPt: 10, widthPt: 40, heightPt: 20, rotationDeg: 90 },
+          },
+        ],
+      },
+      metadata('2'),
+    );
+    const effectiveBeforeFree = resolveDocumentConnectorGeometries(
+      movedTarget.document.slides[2]!.elements,
+    ).get(connector.id)!;
+    expect(effectiveBeforeFree.endInContainer).toEqual({ xPt: 40, yPt: 40 });
+
+    const freed = applyCommand(
+      movedTarget.document,
+      {
+        type: 'connector.update-endpoint',
+        slideId: slide.id,
+        containerId: group.id,
+        connectorId: connector.id,
+        endpoint: 'end',
+        value: { xPt: 99, yPt: 88, binding: {} },
+      },
+      metadata('3'),
+    );
+    const freedGroup = freed.document.slides[2]!.elements.find(
+      (element) => element.id === group.id,
+    );
+    const result =
+      freedGroup?.type === 'group'
+        ? freedGroup.children.find((element) => element.id === connector.id)
+        : undefined;
+    expect(result?.type === 'connector' ? result.end : undefined).toEqual({
+      xPt: 40,
+      yPt: 40,
+      binding: {},
+    });
+    expect(undoTransaction(freed.document, freed)).toEqual(movedTarget.document);
+  });
+
   it('moves, resizes, and rotates connector fallback endpoints with their frame', () => {
     const source = createNeutralDemoDeck();
     const slide = source.slides[2]!;
-    const target = slide.elements[0]!;
     const connector: Element = {
       id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000410',
       type: 'connector',
@@ -986,7 +1131,7 @@ describe('element, text, table, asset, and connector commands', () => {
       visible: true,
       locked: false,
       start: { xPt: 10, yPt: 20, binding: {} },
-      end: { xPt: 110, yPt: 70, binding: { elementId: target.id, anchor: 'right' } },
+      end: { xPt: 110, yPt: 70, binding: {} },
       routing: 'straight',
       stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
       startCap: 'none',
@@ -1022,7 +1167,7 @@ describe('element, text, table, asset, and connector commands', () => {
     );
     expect(requireConnector(moved.document)).toMatchObject({
       start: { xPt: 30, yPt: 40, binding: {} },
-      end: { xPt: 130, yPt: 90, binding: { elementId: target.id, anchor: 'right' } },
+      end: { xPt: 130, yPt: 90, binding: {} },
     });
 
     const resized = transform(
@@ -1032,7 +1177,7 @@ describe('element, text, table, asset, and connector commands', () => {
     );
     expect(requireConnector(resized.document)).toMatchObject({
       start: { xPt: 30, yPt: 40, binding: {} },
-      end: { xPt: 230, yPt: 140, binding: { elementId: target.id, anchor: 'right' } },
+      end: { xPt: 230, yPt: 140, binding: {} },
     });
 
     const rotated = transform(
@@ -1045,8 +1190,480 @@ describe('element, text, table, asset, and connector commands', () => {
     expect(result.start.yPt).toBeCloseTo(-10, 10);
     expect(result.end.xPt).toBeCloseTo(80, 10);
     expect(result.end.yPt).toBeCloseTo(190, 10);
-    expect(result.end.binding).toEqual({ elementId: target.id, anchor: 'right' });
+    expect(result.end.binding).toEqual({});
     expect(undoTransaction(rotated.document, rotated)).toEqual(resized.document);
+  });
+
+  it('rejects connector geometry and binding changes through generic replacement atomically', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const target = slide.elements[0]!;
+    const connector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000417',
+      type: 'connector',
+      name: 'Guarded connector',
+      frame: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 50, rotationDeg: 17 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 10, yPt: 20, binding: {} },
+      end: { xPt: 110, yPt: 70, binding: { elementId: target.id, anchor: 'left' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const inserted = applyCommand(
+      source,
+      { type: 'element.insert', slideId: slide.id, element: connector },
+      metadata(),
+    );
+    const current = inserted.document.slides[2]!.elements.find(
+      (element) => element.id === connector.id,
+    );
+    if (current?.type !== 'connector') throw new Error('Missing guarded connector.');
+
+    const replacements: readonly Element[] = [
+      { ...current, frame: { ...current.frame, xPt: current.frame.xPt + 10 } },
+      { ...current, start: { ...current.start, xPt: current.start.xPt + 10 } },
+      { ...current, end: { ...current.end, binding: {} } },
+    ];
+    for (const replacement of replacements) {
+      expect(() =>
+        applyCommand(
+          inserted.document,
+          {
+            type: 'element.update',
+            slideId: slide.id,
+            elementId: connector.id,
+            replacement,
+          },
+          metadata('2'),
+        ),
+      ).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_OPERATION' }));
+    }
+
+    const before = structuredClone(inserted.document);
+    expect(() =>
+      applyTransaction(
+        inserted.document,
+        [
+          { type: 'deck.rename', name: 'Must not leak from failed transaction' },
+          {
+            type: 'element.update',
+            slideId: slide.id,
+            elementId: connector.id,
+            replacement: replacements[0]!,
+          },
+        ],
+        metadata('3'),
+      ),
+    ).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_OPERATION' }));
+    expect(inserted.document).toEqual(before);
+
+    const restyled = applyCommand(
+      inserted.document,
+      {
+        type: 'element.update',
+        slideId: slide.id,
+        elementId: connector.id,
+        replacement: {
+          ...current,
+          stroke: { ...current.stroke, color: '#ff0000' },
+        },
+      },
+      metadata('4'),
+    );
+    expect(
+      restyled.document.slides[2]!.elements.find((element) => element.id === connector.id),
+    ).toMatchObject({ stroke: { color: '#ff0000' } });
+  });
+
+  it('keeps group replacement properties editable without exposing its child structure', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const target: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000511',
+      type: 'shape',
+      name: 'Protected nested target',
+      frame: { xPt: 10, yPt: 10, widthPt: 30, heightPt: 20, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const filler: Element = {
+      ...target,
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000512',
+      name: 'Protected nested filler',
+      frame: { xPt: 50, yPt: 10, widthPt: 20, heightPt: 20, rotationDeg: 0 },
+    };
+    const connector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000513',
+      type: 'connector',
+      name: 'Protected nested connector',
+      frame: { xPt: 0, yPt: 0, widthPt: 90, heightPt: 50, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 0, yPt: 25, binding: {} },
+      end: { xPt: 25, yPt: 20, binding: { elementId: target.id, anchor: 'center' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const group: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000514',
+      type: 'group',
+      name: 'Protected group',
+      frame: { xPt: 100, yPt: 100, widthPt: 100, heightPt: 60, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      coordinateSpace: { widthPt: 100, heightPt: 60 },
+      children: [target, filler, connector],
+    };
+    const inserted = applyCommand(
+      source,
+      { type: 'element.insert', slideId: slide.id, element: group },
+      metadata(),
+    );
+    const current = inserted.document.slides[2]!.elements.find(
+      (element) => element.id === group.id,
+    );
+    if (current?.type !== 'group') throw new Error('Missing protected group.');
+    const currentConnector = current.children.find((element) => element.id === connector.id);
+    if (currentConnector?.type !== 'connector') {
+      throw new Error('Missing protected nested connector.');
+    }
+
+    const endpointMutation: Element = {
+      ...current,
+      children: current.children.map((element) =>
+        element.id === currentConnector.id
+          ? { ...currentConnector, end: { ...currentConnector.end, xPt: 999 } }
+          : element,
+      ),
+    };
+    const before = structuredClone(inserted.document);
+    expect(() =>
+      applyTransaction(
+        inserted.document,
+        [
+          { type: 'deck.rename', name: 'Must remain atomic' },
+          {
+            type: 'element.update',
+            slideId: slide.id,
+            elementId: current.id,
+            replacement: endpointMutation,
+          },
+        ],
+        metadata('2'),
+      ),
+    ).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_OPERATION' }));
+    expect(inserted.document).toEqual(before);
+
+    expect(() =>
+      applyCommand(
+        inserted.document,
+        {
+          type: 'element.update',
+          slideId: slide.id,
+          elementId: current.id,
+          replacement: {
+            ...current,
+            children: current.children.filter((element) => element.id !== target.id),
+          },
+        },
+        metadata('3'),
+      ),
+    ).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_OPERATION' }));
+
+    const propertiesOnly = applyCommand(
+      inserted.document,
+      {
+        type: 'element.update',
+        slideId: slide.id,
+        elementId: current.id,
+        replacement: {
+          ...current,
+          name: 'Restyled protected group',
+          frame: { ...current.frame, xPt: 140, rotationDeg: 20 },
+          opacity: 0.75,
+          children: current.children,
+        },
+      },
+      metadata('4'),
+    );
+    const result = propertiesOnly.document.slides[2]!.elements.find(
+      (element) => element.id === current.id,
+    );
+    expect(result).toMatchObject({
+      name: 'Restyled protected group',
+      frame: { xPt: 140, rotationDeg: 20 },
+      opacity: 0.75,
+    });
+    expect(result?.type === 'group' ? result.children : undefined).toEqual(current.children);
+  });
+
+  it('atomically materializes and detaches a moved connector while a moved target keeps binding live', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const target: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000418',
+      type: 'shape',
+      name: 'Movable binding target',
+      frame: { xPt: 300, yPt: 100, widthPt: 100, heightPt: 100, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const connector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000419',
+      type: 'connector',
+      geometryVersion: 2,
+      name: 'Bound movable connector',
+      frame: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 50, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 10, yPt: 20, binding: {} },
+      end: { xPt: 110, yPt: 70, binding: { elementId: target.id, anchor: 'right' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const inserted = applyTransaction(
+      source,
+      [
+        { type: 'element.insert', slideId: slide.id, element: target },
+        { type: 'element.insert', slideId: slide.id, element: connector },
+      ],
+      metadata(),
+    );
+    const initialGeometry = resolveDocumentConnectorGeometries(
+      inserted.document.slides[2]!.elements,
+    ).get(connector.id)!;
+    expect(initialGeometry.endInContainer).toEqual({ xPt: 400, yPt: 150 });
+
+    const movedConnector = applyCommand(
+      inserted.document,
+      {
+        type: 'element.transform',
+        slideId: slide.id,
+        transforms: [
+          {
+            elementId: connector.id,
+            frame: { ...connector.frame, xPt: 30, yPt: 40 },
+          },
+        ],
+      },
+      metadata('2'),
+    );
+    const detached = movedConnector.document.slides[2]!.elements.find(
+      (element) => element.id === connector.id,
+    );
+    if (detached?.type !== 'connector') throw new Error('Missing detached connector.');
+    expect(detached.start).toEqual({ xPt: 30, yPt: 40, binding: {} });
+    expect(detached.end).toEqual({ xPt: 420, yPt: 170, binding: {} });
+    expect(undoTransaction(movedConnector.document, movedConnector)).toEqual(inserted.document);
+
+    const movedTarget = applyCommand(
+      inserted.document,
+      {
+        type: 'element.transform',
+        slideId: slide.id,
+        transforms: [
+          {
+            elementId: target.id,
+            frame: { ...target.frame, xPt: target.frame.xPt + 50, rotationDeg: 90 },
+          },
+        ],
+      },
+      metadata('3'),
+    );
+    const stillBound = movedTarget.document.slides[2]!.elements.find(
+      (element) => element.id === connector.id,
+    );
+    expect(stillBound?.type === 'connector' ? stillBound.end.binding : undefined).toEqual({
+      elementId: target.id,
+      anchor: 'right',
+    });
+    const followed = resolveDocumentConnectorGeometries(
+      movedTarget.document.slides[2]!.elements,
+    ).get(connector.id)!;
+    expect(followed.endInContainer).toEqual({ xPt: 400, yPt: 200 });
+    expect(undoTransaction(movedTarget.document, movedTarget)).toEqual(inserted.document);
+  });
+
+  it('aligns connector fallback geometry rather than its padded editing frame', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const bindingTarget: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000416',
+      type: 'shape',
+      name: 'Moved binding target',
+      frame: { xPt: 200, yPt: 100, widthPt: 50, heightPt: 50, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const connector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000411',
+      type: 'connector',
+      geometryVersion: 2,
+      name: 'Alignment connector',
+      frame: { xPt: 250, yPt: 60, widthPt: 240, heightPt: 100, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 300, yPt: 110, binding: {} },
+      end: {
+        xPt: 400,
+        yPt: 110,
+        binding: { elementId: bindingTarget.id, anchor: 'right' },
+      },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const shape: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000412',
+      type: 'shape',
+      name: 'Alignment shape',
+      frame: { xPt: 800, yPt: 200, widthPt: 50, heightPt: 30, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const inserted = applyTransaction(
+      source,
+      [
+        { type: 'element.insert', slideId: slide.id, element: bindingTarget },
+        { type: 'element.insert', slideId: slide.id, element: connector },
+        { type: 'element.insert', slideId: slide.id, element: shape },
+      ],
+      metadata(),
+    );
+    const aligned = applyCommand(
+      inserted.document,
+      {
+        type: 'element.align',
+        slideId: slide.id,
+        elementIds: [connector.id, shape.id],
+        mode: 'right',
+        relativeTo: 'selection',
+      },
+      metadata('2'),
+    );
+    const result = aligned.document.slides[2]!.elements.find(
+      (element) => element.id === connector.id,
+    );
+
+    if (result?.type !== 'connector') throw new Error('Missing aligned connector.');
+    expect(result.frame.xPt).toBe(800);
+    expect(result.start).toMatchObject({ xPt: 850, yPt: 110, binding: {} });
+    expect(result.end).toMatchObject({ xPt: 800, yPt: 125, binding: {} });
+    expect(undoTransaction(aligned.document, aligned)).toEqual(inserted.document);
+  });
+
+  it('distributes effective connector widths with equal visual gaps and atomic detachment', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const bindingTarget: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000417',
+      type: 'shape',
+      name: 'Moved distribution target',
+      frame: { xPt: 500, yPt: 100, widthPt: 50, heightPt: 50, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const connector = (id: string, startX: number, width: number, binding = false): Element => ({
+      id,
+      type: 'connector',
+      geometryVersion: 2,
+      name: `Distributed connector ${id.slice(-1)}`,
+      frame: { xPt: startX - 40, yPt: 80, widthPt: width + 80, heightPt: 100, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: startX, yPt: 130, binding: {} },
+      end: {
+        xPt: startX + width,
+        yPt: 130,
+        binding: binding ? { elementId: bindingTarget.id, anchor: 'left' } : {},
+      },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    });
+    const connectors = [
+      connector('bbbbbbbb-bbbb-4bbb-8bbb-000000000413', 100, 20),
+      connector('bbbbbbbb-bbbb-4bbb-8bbb-000000000414', 330, 40, true),
+      connector('bbbbbbbb-bbbb-4bbb-8bbb-000000000415', 800, 60),
+    ];
+    const inserted = applyTransaction(
+      source,
+      [
+        { type: 'element.insert' as const, slideId: slide.id, element: bindingTarget },
+        ...connectors.map((element) => ({
+          type: 'element.insert' as const,
+          slideId: slide.id,
+          element,
+        })),
+      ],
+      metadata(),
+    );
+    const distributed = applyCommand(
+      inserted.document,
+      {
+        type: 'element.distribute',
+        slideId: slide.id,
+        elementIds: connectors.map(({ id }) => id),
+        axis: 'horizontal',
+        relativeTo: 'selection',
+      },
+      metadata('2'),
+    );
+    const results = connectors.map(({ id }) => {
+      const element = distributed.document.slides[2]!.elements.find(
+        (candidate) => candidate.id === id,
+      );
+      if (element?.type !== 'connector') throw new Error(`Missing distributed connector ${id}.`);
+      return element;
+    });
+    const firstGap = results[1]!.start.xPt - results[0]!.end.xPt;
+    const secondGap = results[2]!.start.xPt - results[1]!.end.xPt;
+
+    expect(firstGap).toBeCloseTo(secondGap, 10);
+    expect(results[0]!.start.xPt).toBe(100);
+    expect(results[2]!.end.xPt).toBe(860);
+    expect(results[1]!.end.binding).toEqual({});
+    expect(undoTransaction(distributed.document, distributed)).toEqual(inserted.document);
   });
 
   it('preserves connector geometry while grouping, transforming, and ungrouping', () => {
@@ -1100,7 +1717,22 @@ describe('element, text, table, asset, and connector commands', () => {
       },
       metadata('2'),
     );
+    const beforeGroupingGeometry = resolveDocumentConnectorGeometries(
+      inserted.document.slides[2]!.elements,
+    ).get(connector.id);
+    const afterGroupingGeometry = resolveDocumentConnectorGeometries(
+      grouped.document.slides[2]!.elements,
+    ).get(connector.id);
     const group = grouped.document.slides[2]!.elements.find((element) => element.id === groupId);
+    expect(group?.frame).toEqual({
+      xPt: 10,
+      yPt: 20,
+      widthPt: 50,
+      heightPt: 20,
+      rotationDeg: 0,
+    });
+    expect(afterGroupingGeometry?.startInDocument).toEqual(beforeGroupingGeometry?.startInDocument);
+    expect(afterGroupingGeometry?.endInDocument).toEqual(beforeGroupingGeometry?.endInDocument);
     const groupedConnector =
       group?.type === 'group'
         ? group.children.find((element) => element.id === connector.id)
@@ -1135,17 +1767,93 @@ describe('element, text, table, asset, and connector commands', () => {
       { type: 'element.ungroup', slideId: slide.id, groupId },
       metadata('4'),
     );
+    const beforeUngroupGeometry = resolveDocumentConnectorGeometries(
+      transformed.document.slides[2]!.elements,
+    ).get(connector.id);
+    const afterUngroupGeometry = resolveDocumentConnectorGeometries(
+      ungrouped.document.slides[2]!.elements,
+    ).get(connector.id);
     const result = ungrouped.document.slides[2]!.elements.find(
       (element) => element.id === connector.id,
     );
     if (result?.type !== 'connector') throw new Error('Missing ungrouped connector.');
-    expect(result.start.xPt).toBeCloseTo(180, 10);
-    expect(result.start.yPt).toBeCloseTo(-10, 10);
-    expect(result.end.xPt).toBeCloseTo(80, 10);
-    expect(result.end.yPt).toBeCloseTo(190, 10);
+    expect(afterUngroupGeometry?.startInDocument).toEqual(beforeUngroupGeometry?.startInDocument);
+    expect(afterUngroupGeometry?.endInDocument).toEqual(beforeUngroupGeometry?.endInDocument);
     expect(result.end.binding).toEqual({ elementId: filler.id, anchor: 'center' });
     expect(validateDeck(ungrouped.document)).toMatchObject({ success: true });
     expect(undoTransaction(ungrouped.document, ungrouped)).toEqual(transformed.document);
+  });
+
+  it('groups and ungroups a rotated legacy connector without a second rotation', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[2]!;
+    const target: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000423',
+      type: 'shape',
+      name: 'Legacy binding target',
+      frame: { xPt: 50, yPt: 30, widthPt: 10, heightPt: 10, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const legacyConnector: Element = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000424',
+      type: 'connector',
+      name: 'Legacy grouped connector',
+      frame: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 50, rotationDeg: 90 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 85, yPt: -5, binding: {} },
+      end: { xPt: 35, yPt: 95, binding: { elementId: target.id, anchor: 'center' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const inserted = applyTransaction(
+      source,
+      [
+        { type: 'element.insert', slideId: slide.id, element: legacyConnector },
+        { type: 'element.insert', slideId: slide.id, element: target },
+      ],
+      metadata(),
+    );
+    const groupId = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000425';
+    const grouped = applyCommand(
+      inserted.document,
+      {
+        type: 'element.group',
+        slideId: slide.id,
+        elementIds: [legacyConnector.id, target.id],
+        groupId,
+        name: 'Legacy geometry group',
+      },
+      metadata('2'),
+    );
+    const ungrouped = applyCommand(
+      grouped.document,
+      { type: 'element.ungroup', slideId: slide.id, groupId },
+      metadata('3'),
+    );
+    const before = inserted.document.slides[2]!.elements.find(
+      (element) => element.id === legacyConnector.id,
+    );
+    const after = ungrouped.document.slides[2]!.elements.find(
+      (element) => element.id === legacyConnector.id,
+    );
+
+    expect(after).toEqual(before);
+    expect(after?.type === 'connector' ? after.geometryVersion : undefined).toBe(2);
+    expect(after?.type === 'connector' ? after.end.binding : undefined).toEqual({
+      elementId: target.id,
+      anchor: 'center',
+    });
+    expect(undoTransaction(ungrouped.document, ungrouped)).toEqual(grouped.document);
   });
 
   it('releases connector bindings recursively when a target or its group is deleted', () => {
@@ -1242,10 +1950,10 @@ describe('element, text, table, asset, and connector commands', () => {
     );
     expect(
       changedNestedConnector?.type === 'connector' ? changedNestedConnector.start : null,
-    ).toEqual({ xPt: 7, yPt: 8, binding: {} });
+    ).toEqual({ xPt: 10, yPt: 25, binding: {} });
     expect(changedRootConnector?.type === 'connector' ? changedRootConnector.end : null).toEqual({
-      xPt: 203,
-      yPt: 104,
+      xPt: 130,
+      yPt: 125,
       binding: {},
     });
     expect(validateDeck(targetDeleted.document)).toMatchObject({ success: true });
@@ -1260,8 +1968,8 @@ describe('element, text, table, asset, and connector commands', () => {
       (element) => element.id === rootConnector.id,
     );
     expect(survivingConnector?.type === 'connector' ? survivingConnector.end : null).toEqual({
-      xPt: 203,
-      yPt: 104,
+      xPt: 130,
+      yPt: 125,
       binding: {},
     });
     expect(validateDeck(groupDeleted.document)).toMatchObject({ success: true });

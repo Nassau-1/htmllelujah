@@ -19,7 +19,11 @@ import {
   type ResizeHandle,
   type SmartGuide,
 } from '@htmllelujah/geometry';
-import { resolveConnectorGeometries, SlideSurface } from '@htmllelujah/renderer';
+import {
+  resolveConnectorGeometries,
+  SlideSurface,
+  type ResolvedConnectorGeometry,
+} from '@htmllelujah/renderer';
 import {
   useEffect,
   useMemo,
@@ -267,6 +271,36 @@ export const pointAfterInteractionFrameTransform = (
   );
 };
 
+/** Preview the same materialize-detach-transform operation committed by document-core. */
+export const connectorAfterInteractionFrameTransform = (
+  connector: Extract<Element, { readonly type: 'connector' }>,
+  geometry: Pick<ResolvedConnectorGeometry, 'startInContainer' | 'endInContainer'>,
+  previousLocalFrame: Frame,
+  nextLocalFrame: Frame,
+): Extract<Element, { readonly type: 'connector' }> => ({
+  ...connector,
+  geometryVersion: 2,
+  frame: nextLocalFrame,
+  start: {
+    ...connector.start,
+    ...pointAfterInteractionFrameTransform(
+      geometry.startInContainer,
+      previousLocalFrame,
+      nextLocalFrame,
+    ),
+    binding: {},
+  },
+  end: {
+    ...connector.end,
+    ...pointAfterInteractionFrameTransform(
+      geometry.endInContainer,
+      previousLocalFrame,
+      nextLocalFrame,
+    ),
+    binding: {},
+  },
+});
+
 const localConnectorFrameAfterInteraction = (
   localFrame: Frame,
   previousInteractionFrame: Frame,
@@ -320,6 +354,28 @@ export const canvasTransformsToCommit = (
             : frame,
       };
     });
+};
+
+/** Converts an absolute local connector rotation shortcut into a hitbox-relative delta. */
+export const canvasKeyboardRotationFrame = (
+  localElement: Element,
+  effectiveFrame: Frame,
+  key: string,
+  shiftKey: boolean,
+): Frame | null => {
+  if (localElement.type !== 'connector') {
+    return rotationFrameForKeyboard(effectiveFrame, key, shiftKey);
+  }
+  const localRotationFrame = rotationFrameForKeyboard(
+    { ...effectiveFrame, rotationDeg: localElement.frame.rotationDeg },
+    key,
+    shiftKey,
+  );
+  if (localRotationFrame === null) return null;
+  return {
+    ...effectiveFrame,
+    rotationDeg: localRotationFrame.rotationDeg - localElement.frame.rotationDeg,
+  };
 };
 
 const frameStyle = (frame: Frame): CSSProperties => ({
@@ -462,6 +518,9 @@ export function CanonicalSlideCanvas({
   );
   const projection = useMemo(() => {
     if (Object.keys(draftFrames).length === 0) return baseProjection;
+    const connectorGeometries = resolveConnectorGeometries(
+      baseProjection.elements.map((entry) => entry.element),
+    );
     const startingFrames = new Map(
       resolveCanvasEditableElements(baseProjection, editableSource, localElements).map((entry) => [
         entry.localElement.id,
@@ -481,22 +540,31 @@ export function CanonicalSlideCanvas({
         if (previousFrame === undefined) {
           return { ...entry, element: { ...entry.element, frame: nextFrame } };
         }
-        const transformEndpoint = (endpoint: typeof entry.element.start) => ({
-          ...endpoint,
-          ...pointAfterInteractionFrameTransform(endpoint, previousFrame, nextFrame),
-        });
+        const geometry = connectorGeometries.get(entry.element.id);
+        if (geometry === undefined) {
+          return { ...entry, element: { ...entry.element, frame: nextFrame } };
+        }
+        const localElement = localById.get(entry.element.id);
+        if (localElement?.type !== 'connector') {
+          return { ...entry, element: { ...entry.element, frame: nextFrame } };
+        }
+        const nextLocalFrame = localConnectorFrameAfterInteraction(
+          localElement.frame,
+          previousFrame,
+          nextFrame,
+        );
         return {
           ...entry,
-          element: {
-            ...entry.element,
-            frame: nextFrame,
-            start: transformEndpoint(entry.element.start),
-            end: transformEndpoint(entry.element.end),
-          },
+          element: connectorAfterInteractionFrameTransform(
+            entry.element,
+            geometry,
+            localElement.frame,
+            nextLocalFrame,
+          ),
         };
       }),
     };
-  }, [baseProjection, draftFrames, editableSource, localElements]);
+  }, [baseProjection, draftFrames, editableSource, localById, localElements]);
   const editableProjection = useMemo(
     () => resolveCanvasEditableElements(projection, editableSource, localElements),
     [editableSource, localElements, projection],
@@ -700,7 +768,8 @@ export function CanonicalSlideCanvas({
     event: ReactKeyboardEvent<HTMLButtonElement>,
     editable: CanvasEditableElementProjection,
   ): void => {
-    const frame = rotationFrameForKeyboard(
+    const frame = canvasKeyboardRotationFrame(
+      editable.localElement,
       editable.effectiveElement.frame,
       event.key,
       event.shiftKey,
@@ -708,7 +777,12 @@ export function CanonicalSlideCanvas({
     if (frame === null) return;
     event.preventDefault();
     event.stopPropagation();
-    onTransform([{ elementId: editable.localElement.id, frame }]);
+    const transforms = canvasTransformsToCommit(
+      { [editable.localElement.id]: frame },
+      [{ id: editable.localElement.id, frame: editable.effectiveElement.frame }],
+      localById,
+    );
+    if (transforms.length > 0) onTransform(transforms);
   };
 
   const wrapperStyle = {

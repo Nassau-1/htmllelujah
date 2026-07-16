@@ -3,13 +3,14 @@ import { describe, expect, it } from 'vitest';
 
 import {
   createDefaultDeck,
+  resolveDocumentConnectorGeometries,
   resolveSlide,
   type DeckDocument,
   type Element,
   type PlaceholderElement,
   type TextElement,
 } from '../../document-core/src/index.js';
-import { EditorOverlay, SlideSurface } from '../src/index.js';
+import { EditorOverlay, SlideSurface, resolveConnectorGeometries } from '../src/index.js';
 
 const createCanonicalDeck = (): DeckDocument => {
   let nextId = 0;
@@ -45,6 +46,61 @@ const replaceElement = (elements: readonly Element[], replacement: Element): rea
   elements.map((element) => (element.id === replacement.id ? replacement : element));
 
 describe('document-core V2 compatibility', () => {
+  it('keeps bound legacy connector geometry in parity across core and renderer group transforms', () => {
+    const target: Element = {
+      id: '10000000-0000-4000-8000-000000000001',
+      name: 'Nested rotated target',
+      type: 'shape',
+      frame: { xPt: 20, yPt: 10, widthPt: 40, heightPt: 20, rotationDeg: 90 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      shape: 'rectangle',
+      fill: '#ffffff',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const connector: Element = {
+      id: '10000000-0000-4000-8000-000000000002',
+      name: 'Nested legacy connector',
+      type: 'connector',
+      frame: { xPt: 0, yPt: 0, widthPt: 100, heightPt: 50, rotationDeg: 90 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 0, yPt: 0, binding: {} },
+      end: { xPt: 100, yPt: 50, binding: { elementId: target.id, anchor: 'right' } },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const group: Element = {
+      id: '10000000-0000-4000-8000-000000000003',
+      name: 'Scaled rotated group',
+      type: 'group',
+      frame: { xPt: 100, yPt: 50, widthPt: 300, heightPt: 100, rotationDeg: 30 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      coordinateSpace: { widthPt: 100, heightPt: 50 },
+      children: [target, connector],
+    };
+    const core = resolveDocumentConnectorGeometries([group]).get(connector.id)!;
+    const renderer = resolveConnectorGeometries([group]).get(connector.id)!;
+
+    expect(renderer.startInContainer).toEqual(core.startInContainer);
+    expect(renderer.endInContainer).toEqual(core.endInContainer);
+    expect(renderer.startInSlide).toEqual(core.startInDocument);
+    expect(renderer.endInSlide).toEqual(core.endInDocument);
+    expect(renderer.boundsInSlide).toEqual({
+      xPt: core.boundsInDocument.left,
+      yPt: core.boundsInDocument.top,
+      widthPt: core.boundsInDocument.right - core.boundsInDocument.left,
+      heightPt: core.boundsInDocument.bottom - core.boundsInDocument.top,
+    });
+  });
+
   it('renders the actual canonical projection with inherited placeholder frame, style and visibility', () => {
     const source = createCanonicalDeck();
     const { slideTitle, titlePlaceholder } = titleParts(source);

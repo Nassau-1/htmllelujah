@@ -242,6 +242,16 @@ export interface ConnectorEndpoint {
 
 export interface ConnectorElement extends BaseElement {
   readonly type: 'connector';
+  /**
+   * Geometry v2 stores both fallback endpoints as final coordinates in the
+   * connector's immediate container.  The frame remains the affine editing
+   * basis, but its rotation is already baked into those endpoint coordinates.
+   *
+   * Missing is the pre-marker V2 representation used by existing files. Its
+   * endpoints already have final coordinates too; parsing only stamps the
+   * marker and never re-applies frame.rotationDeg.
+   */
+  readonly geometryVersion?: 2 | undefined;
   readonly start: ConnectorEndpoint;
   readonly end: ConnectorEndpoint;
   readonly routing: 'straight' | 'elbow';

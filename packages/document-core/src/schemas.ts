@@ -281,6 +281,7 @@ const connectorElementSchema = z
   .object({
     ...baseElementShape,
     type: z.literal('connector'),
+    geometryVersion: z.literal(2).optional(),
     start: connectorEndpointSchema,
     end: connectorEndpointSchema,
     routing: z.enum(['straight', 'elbow']),

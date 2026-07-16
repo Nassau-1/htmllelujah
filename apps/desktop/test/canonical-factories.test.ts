@@ -242,6 +242,7 @@ describe('template object duplication', () => {
       ...createConnectorElement(),
       start: { xPt: 180, yPt: 250, binding: { elementId: shape.id, anchor: 'center' } },
     };
+    expect(connector.geometryVersion).toBe(2);
     const copies = duplicateTemplateElements([shape, connector]);
     const shapeCopy = copies[0];
     const connectorCopy = copies[1];

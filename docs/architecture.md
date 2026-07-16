@@ -86,6 +86,13 @@ editor zoom levels and presentation viewport sizes. Style resolution is determin
 theme -> master -> layout -> slide -> local element override
 ```
 
+Connector endpoints use final coordinates in their immediate container; the shared
+renderer never applies the connector frame rotation a second time. Live bindings are
+resolved through nested group transforms, while intentional connector relocation
+materializes and releases the affected bindings atomically. The full invariant and
+rejected alternatives are recorded in
+[`ADR-009`](decisions/ADR-009-canonical-connector-geometry.md).
+
 Rich text is represented as typed blocks, spans, and marks. Tables persist native
 rows, columns, cells, and style data. Images reference embedded content-addressed
 assets. The model never stores arbitrary HTML, JavaScript, active remote URLs,

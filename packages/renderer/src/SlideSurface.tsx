@@ -90,9 +90,14 @@ const applyTransform = (transform: AffineTransform, point: Point): Point => ({
   yPt: transform.b * point.xPt + transform.d * point.yPt + transform.f,
 });
 
+const normalizeGeometryCoordinate = (value: number): number => {
+  const rounded = Math.round(finiteOr(value, 0) * 1e10) / 1e10;
+  return Math.abs(rounded) < 1e-10 ? 0 : rounded;
+};
+
 const normalizeGeometryPoint = (point: Point): Point => ({
-  xPt: Math.abs(finiteOr(point.xPt, 0)) < 1e-10 ? 0 : finiteOr(point.xPt, 0),
-  yPt: Math.abs(finiteOr(point.yPt, 0)) < 1e-10 ? 0 : finiteOr(point.yPt, 0),
+  xPt: normalizeGeometryCoordinate(point.xPt),
+  yPt: normalizeGeometryCoordinate(point.yPt),
 });
 
 const frameTransform = (frame: RenderElement['frame']): AffineTransform => {

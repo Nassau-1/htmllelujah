@@ -147,6 +147,45 @@ describe('SlideSurface', () => {
     expect(resolveConnectorGeometry(fixtureSlide.elements, 'missing-connector')).toBeUndefined();
   });
 
+  it('renders pre-marker final endpoints without applying frame rotation a second time', () => {
+    const legacy: RenderElement = {
+      id: 'legacy-rotated-connector',
+      name: 'Legacy rotated connector',
+      type: 'connector',
+      frame: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 50, rotationDeg: 90 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 85, yPt: -5, binding: {} },
+      end: { xPt: 35, yPt: 95, binding: {} },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const canonical: RenderElement = {
+      ...legacy,
+      geometryVersion: 2,
+      start: { xPt: 85, yPt: -5, binding: {} },
+      end: { xPt: 35, yPt: 95, binding: {} },
+    };
+    const renderConnector = (element: RenderElement): string =>
+      renderToStaticMarkup(
+        <SlideSurface slide={{ ...fixtureSlide, elements: [element] }} mode="presentation" />,
+      );
+    const legacyHtml = renderConnector(legacy);
+    const canonicalHtml = renderConnector(canonical);
+
+    expect(legacyHtml).toContain('d="M 85 -5 L 35 95"');
+    expect(legacyHtml).not.toContain('<path d="M 85 -5 L 35 95" transform=');
+    expect(canonicalHtml).toBe(legacyHtml);
+    expect(resolveConnectorGeometry([legacy], legacy.id)).toMatchObject({
+      startInSlide: { xPt: 85, yPt: -5 },
+      endInSlide: { xPt: 35, yPt: 95 },
+      boundsInSlide: { xPt: 35, yPt: -5, widthPt: 50, heightPt: 100 },
+    });
+  });
+
   it('resolves a bound endpoint from the effective rotated target frame', () => {
     const target: RenderElement = {
       id: 'rotated-target',
@@ -165,6 +204,7 @@ describe('SlideSurface', () => {
       id: 'bound-connector',
       name: 'Bound connector',
       type: 'connector',
+      geometryVersion: 2,
       frame: { xPt: 300, yPt: 300, widthPt: 20, heightPt: 20, rotationDeg: 90 },
       opacity: 1,
       visible: true,
@@ -275,6 +315,59 @@ describe('SlideSurface', () => {
       endInSlide: { xPt: 220, yPt: 60 },
       boundsInSlide: { xPt: 220, yPt: 0, widthPt: 30, heightPt: 60 },
     });
+  });
+
+  it('keeps grouped connector overflow visible instead of clipping paths at group bounds', () => {
+    const connector: RenderElement = {
+      id: 'overflow-connector',
+      name: 'Overflow connector',
+      type: 'connector',
+      geometryVersion: 2,
+      frame: { xPt: -20, yPt: 40, widthPt: 140, heightPt: 20, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: -20, yPt: 50, binding: {} },
+      end: { xPt: 120, yPt: 50, binding: {} },
+      routing: 'straight',
+      stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const group: RenderElement = {
+      id: 'overflow-group',
+      name: 'Overflow group',
+      type: 'group',
+      frame: { xPt: 100, yPt: 100, widthPt: 100, heightPt: 100, rotationDeg: 30 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      coordinateSpace: { widthPt: 100, heightPt: 100 },
+      children: [
+        connector,
+        {
+          id: 'overflow-filler',
+          name: 'Overflow filler',
+          type: 'shape',
+          frame: { xPt: 45, yPt: 45, widthPt: 10, heightPt: 10, rotationDeg: 0 },
+          opacity: 1,
+          visible: true,
+          locked: false,
+          shape: 'rectangle',
+          fill: '#ffffff',
+          stroke: { color: '#000000', widthPt: 1, dash: 'solid' },
+          cornerRadiusPt: 0,
+        },
+      ],
+    };
+    const html = renderToStaticMarkup(
+      <SlideSurface slide={{ ...fixtureSlide, elements: [group] }} mode="presentation" />,
+    );
+
+    expect(RENDERER_CSS).toContain('.hl-group { overflow: visible; }');
+    expect(html).toContain('d="M -20 50 L 120 50"');
+    expect(html.match(/rotate\(30deg\)/g) ?? []).toHaveLength(1);
+    expect(html).not.toContain('<path d="M -20 50 L 120 50" transform=');
   });
 
   it('accepts only opaque local raster asset sources and never emits a remote URL', () => {

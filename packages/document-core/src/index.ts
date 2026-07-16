@@ -1,6 +1,7 @@
 export * from './adapter.js';
 export * from './command-engine.js';
 export * from './commands.js';
+export * from './connector-geometry.js';
 export * from './clone.js';
 export * from './defaults.js';
 export * from './demo.js';

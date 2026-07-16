@@ -1,5 +1,6 @@
 import { ZodError } from 'zod';
 
+import { canonicalizeDeckConnectorGeometry } from './connector-geometry.js';
 import { DOCUMENT_LIMITS } from './limits.js';
 import { migrateParsedDeckToCurrent } from './migrations/index.js';
 import type {
@@ -488,6 +489,8 @@ export const validateDeck = (input: unknown): ValidationResult => {
     }
     document = migrateParsedDeckToCurrent(parsedV1.data).document;
   }
+
+  document = canonicalizeDeckConnectorGeometry(document);
 
   const issues = structuralIssues(document);
   if (issues.length > 0) return { success: false, issues };
