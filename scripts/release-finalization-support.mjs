@@ -1,5 +1,41 @@
 import path from 'node:path';
 
+import {
+  FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+  FUNCTIONAL_VALIDATION_FILE_NAME,
+} from './windows-candidate-validation-support.mjs';
+
+const SHA256 = /^[0-9a-f]{64}$/u;
+
+const exactFunctionalValidationAsset = ({ assets, name, role, size, sha256 }) => {
+  if (!Array.isArray(assets)) {
+    throw new Error('Final release assets are required for functional validation binding.');
+  }
+  const matches = assets.filter((asset) => asset?.name === name);
+  if (matches.length !== 1) {
+    throw new Error(`Final release assets must contain exactly one ${name}.`);
+  }
+  const [asset] = matches;
+  if (
+    asset.role !== role ||
+    typeof asset.path !== 'string' ||
+    asset.path.length === 0 ||
+    asset.path.includes('\0') ||
+    asset.path.includes('\\') ||
+    /^[a-z]:/iu.test(asset.path) ||
+    path.posix.isAbsolute(asset.path) ||
+    path.win32.isAbsolute(asset.path) ||
+    path.posix.normalize(asset.path) !== asset.path ||
+    asset.path.split('/').some((part) => part === '' || part === '.' || part === '..') ||
+    path.posix.basename(asset.path) !== name ||
+    asset.size !== size ||
+    asset.sha256 !== sha256
+  ) {
+    throw new Error(`Final release asset ${name} does not match its functional validation record.`);
+  }
+  return asset;
+};
+
 export const assertTrackedReleaseNotes = ({ repositoryRoot, notesFile, runGit }) => {
   const relative = path.relative(path.resolve(repositoryRoot), path.resolve(notesFile));
   if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
@@ -28,6 +64,7 @@ export const buildFinalReleaseRecord = ({
   assets,
   candidateManifestSha256,
   evidenceManifestSha256,
+  functionalValidation,
 }) => {
   if (
     typeof binding?.canonicalRepositoryUrl !== 'string' ||
@@ -45,8 +82,46 @@ export const buildFinalReleaseRecord = ({
   ) {
     throw new Error('Release evidence lacks its deterministic generation timestamp.');
   }
+  const functionalManifest = functionalValidation?.manifest;
+  if (
+    functionalManifest?.releaseReady !== true ||
+    functionalManifest?.candidate?.manifestSha256 !== candidateManifestSha256 ||
+    functionalManifest?.candidate?.artifactAggregateSha256 !==
+      candidateManifest?.artifact?.aggregateSha256 ||
+    functionalManifest?.source?.commit !== candidateManifest?.source?.commit ||
+    functionalManifest?.source?.treeSha256 !== candidateManifest?.source?.treeSha256 ||
+    functionalManifest?.source?.fileCount !== candidateManifest?.source?.fileCount ||
+    functionalManifest?.source?.bytes !== candidateManifest?.source?.bytes ||
+    functionalManifest?.source?.lockfileSha256 !== candidateManifest?.lockfile?.sha256 ||
+    functionalManifest?.bundle?.fileName !== FUNCTIONAL_VALIDATION_BUNDLE_NAME ||
+    functionalManifest?.bundle?.sha256 !== functionalValidation?.bundleSha256 ||
+    functionalManifest?.bundle?.size !== functionalValidation?.bundleSize ||
+    !SHA256.test(functionalValidation?.manifestSha256 ?? '') ||
+    !SHA256.test(functionalValidation?.bundleSha256 ?? '') ||
+    !SHA256.test(functionalManifest?.evidence?.aggregateSha256 ?? '') ||
+    !Number.isSafeInteger(functionalValidation?.manifestSize) ||
+    functionalValidation.manifestSize < 1 ||
+    !Number.isSafeInteger(functionalValidation?.bundleSize) ||
+    functionalValidation.bundleSize < 1
+  ) {
+    throw new Error('Final release record lacks an exact release-ready functional validation.');
+  }
+  const functionalManifestAsset = exactFunctionalValidationAsset({
+    assets,
+    name: FUNCTIONAL_VALIDATION_FILE_NAME,
+    role: 'functional-validation',
+    size: functionalValidation.manifestSize,
+    sha256: functionalValidation.manifestSha256,
+  });
+  const functionalBundleAsset = exactFunctionalValidationAsset({
+    assets,
+    name: FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+    role: 'functional-validation-evidence',
+    size: functionalValidation.bundleSize,
+    sha256: functionalValidation.bundleSha256,
+  });
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     productName: 'HTMLlelujah',
     version,
     generatedAt,
@@ -69,6 +144,34 @@ export const buildFinalReleaseRecord = ({
       manifestSha256: candidateManifestSha256,
       artifactAggregateSha256: candidateManifest.artifact.aggregateSha256,
       evidenceManifestSha256,
+    },
+    functionalValidation: {
+      releaseReady: true,
+      generatedAt: functionalManifest.generatedAt,
+      manifest: {
+        path: functionalManifestAsset.path,
+        name: functionalManifestAsset.name,
+        size: functionalManifestAsset.size,
+        sha256: functionalManifestAsset.sha256,
+      },
+      evidence: {
+        fileCount: functionalManifest.evidence.fileCount,
+        totalSize: functionalManifest.evidence.totalSize,
+        aggregateSha256: functionalManifest.evidence.aggregateSha256,
+      },
+      bundle: {
+        path: functionalBundleAsset.path,
+        name: functionalBundleAsset.name,
+        size: functionalBundleAsset.size,
+        sha256: functionalBundleAsset.sha256,
+      },
+      binding: {
+        candidateManifestSha256,
+        artifactAggregateSha256: candidateManifest.artifact.aggregateSha256,
+        sourceCommit: candidateManifest.source.commit,
+        sourceTreeSha256: candidateManifest.source.treeSha256,
+        lockfileSha256: candidateManifest.lockfile.sha256,
+      },
     },
     publication: {
       allowed: true,

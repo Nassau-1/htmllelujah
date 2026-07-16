@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
+import { release as operatingSystemRelease, version as operatingSystemVersion } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +16,7 @@ import {
   assertReleasePublicationBinding,
   remoteTagIdentityFromLsRemote,
 } from './release-candidate-manifest.mjs';
-import { gitSourceState } from './release-source-state.mjs';
+import { captureSourceSnapshot, gitSourceState } from './release-source-state.mjs';
 import {
   assertTrackedReleaseNotes,
   buildFinalReleaseRecord,
@@ -29,6 +30,11 @@ import {
   createReleaseEnvironment,
   releaseReleaseLock,
 } from './windows-release-pipeline-support.mjs';
+import {
+  FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+  FUNCTIONAL_VALIDATION_FILE_NAME,
+  verifyFunctionalValidationPair,
+} from './windows-candidate-validation-support.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
@@ -38,7 +44,7 @@ const EXPECTED_GITHUB_REPOSITORY = 'Nassau-1/htmllelujah';
 
 const usage = () => `Usage: node scripts/finalize-windows-release.mjs [options]
 
-Verifies the promoted candidate, local and remote tag, then writes an ignored public asset record.
+Verifies the promoted candidate, functional evidence pair, and local/remote tag, then writes an ignored public asset record.
 
 Options:
   --tag <tag>          exact version tag (default: v<desktop version>)
@@ -140,23 +146,73 @@ const run = (command, args, options = {}) => {
 
 const readJson = async (filePath) => JSON.parse(await readFile(filePath, 'utf8'));
 
+const sameRegularFile = (before, after) =>
+  before.isFile() &&
+  after.isFile() &&
+  !before.isSymbolicLink() &&
+  !after.isSymbolicLink() &&
+  before.nlink === 1 &&
+  after.nlink === 1 &&
+  before.size === after.size &&
+  before.mtimeMs === after.mtimeMs &&
+  (before.ino === 0 || after.ino === 0 || before.ino === after.ino) &&
+  (before.dev === 0 || after.dev === 0 || before.dev === after.dev);
+
+const readRegularFileStable = async (filePath, label) => {
+  const before = await lstat(filePath);
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size < 1) {
+    throw new Error(`${label} must be a non-empty regular non-link file with one link.`);
+  }
+  let handle;
+  let opened;
+  let bytes;
+  try {
+    handle = await open(filePath, 'r');
+    opened = await handle.stat();
+    if (!sameRegularFile(before, opened)) throw new Error(`${label} changed before it was read.`);
+    bytes = await handle.readFile();
+    const afterRead = await handle.stat();
+    if (!sameRegularFile(opened, afterRead)) {
+      throw new Error(`${label} changed while it was read.`);
+    }
+  } finally {
+    await handle?.close();
+  }
+  const after = await lstat(filePath);
+  if (!sameRegularFile(opened, after) || bytes.length !== after.size) {
+    throw new Error(`${label} changed while its path identity was confirmed.`);
+  }
+  return bytes;
+};
+
 const assetEntry = async ({ role, filePath }) => {
   const linkMetadata = await lstat(filePath);
   const metadata = await stat(filePath);
-  if (linkMetadata.isSymbolicLink() || !metadata.isFile() || metadata.size < 1) {
+  if (
+    linkMetadata.isSymbolicLink() ||
+    !metadata.isFile() ||
+    linkMetadata.nlink !== 1 ||
+    metadata.nlink !== 1 ||
+    metadata.size < 1
+  ) {
     throw new Error(`Final release asset is missing or empty: ${filePath}.`);
   }
   const relativePath = path.relative(repositoryRoot, filePath);
   if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
     throw new Error('Final release asset escaped the repository workspace.');
   }
-  return {
+  const identity = {
     role,
     path: relativePath.split(path.sep).join('/'),
     name: path.basename(filePath),
     size: metadata.size,
     sha256: await sha256(filePath),
   };
+  const confirmation = await lstat(filePath);
+  if (!sameRegularFile(linkMetadata, confirmation) || confirmation.size !== identity.size) {
+    throw new Error(`Final release asset changed while it was hashed: ${filePath}.`);
+  }
+  return identity;
 };
 
 const syncDirectoryMetadata = async (directory) => {
@@ -264,10 +320,17 @@ try {
   const desktopPackage = await readJson(
     path.join(repositoryRoot, 'apps', 'desktop', 'package.json'),
   );
+  const rootPackage = await readJson(path.join(repositoryRoot, 'package.json'));
   const candidatePath = path.join(options.evidenceDir, 'release-candidate-v1.json');
   const evidenceManifestPath = path.join(options.evidenceDir, 'release-manifest.json');
   const contentInventoryPath = path.join(options.evidenceDir, 'content-inventory.json');
-  const candidateManifest = await readJson(candidatePath);
+  const functionalManifestPath = path.join(options.evidenceDir, FUNCTIONAL_VALIDATION_FILE_NAME);
+  const functionalBundlePath = path.join(options.evidenceDir, FUNCTIONAL_VALIDATION_BUNDLE_NAME);
+  const candidateManifestBytes = await readRegularFileStable(
+    candidatePath,
+    'Release candidate manifest',
+  );
+  const candidateManifest = JSON.parse(candidateManifestBytes.toString('utf8'));
   const evidenceManifest = await readJson(evidenceManifestPath);
   const contentInventory = await readJson(contentInventoryPath);
   if (
@@ -357,6 +420,87 @@ try {
 
   const initialBinding = readPublicationBinding();
 
+  const verifyExactFunctionalState = async () => {
+    await assertCandidateRootsPlain();
+    const sourceBefore = await captureSourceSnapshot(repositoryRoot, { requireClean: true });
+    const currentCandidateBytes = await readRegularFileStable(
+      candidatePath,
+      'Release candidate manifest',
+    );
+    if (!currentCandidateBytes.equals(candidateManifestBytes)) {
+      throw new Error('Release candidate manifest changed during finalization.');
+    }
+    const currentCandidate = JSON.parse(currentCandidateBytes.toString('utf8'));
+    const artifactInventoryBefore = await buildDirectoryInventory(options.artifactDir);
+    assertCandidateManifest({
+      manifest: currentCandidate,
+      inventory: artifactInventoryBefore.files,
+      version: desktopPackage.version,
+      source: sourceBefore,
+    });
+    const lockfileBytes = await readRegularFileStable(
+      path.join(repositoryRoot, 'pnpm-lock.yaml'),
+      'Release lockfile',
+    );
+    const lockfileSha256 = createHash('sha256').update(lockfileBytes).digest('hex');
+    const functionalManifestBytes = await readRegularFileStable(
+      functionalManifestPath,
+      'Functional validation manifest',
+    );
+    const functionalBundleBytes = await readRegularFileStable(
+      functionalBundlePath,
+      'Functional validation evidence bundle',
+    );
+    const functional = verifyFunctionalValidationPair({
+      manifestBytes: functionalManifestBytes,
+      bundleBytes: functionalBundleBytes,
+      candidateManifest: currentCandidate,
+      candidateManifestBytes: currentCandidateBytes,
+      artifactInventory: artifactInventoryBefore,
+      source: sourceBefore,
+      lockfileSha256,
+      packageManager: rootPackage.packageManager,
+      platform: process.platform,
+      architecture: process.arch,
+      osRelease: operatingSystemRelease(),
+      osVersion: operatingSystemVersion(),
+      nodeVersion: process.version,
+    });
+
+    const [candidateConfirmation, lockfileConfirmation, manifestConfirmation, bundleConfirmation] =
+      await Promise.all([
+        readRegularFileStable(candidatePath, 'Release candidate manifest'),
+        readRegularFileStable(path.join(repositoryRoot, 'pnpm-lock.yaml'), 'Release lockfile'),
+        readRegularFileStable(functionalManifestPath, 'Functional validation manifest'),
+        readRegularFileStable(functionalBundlePath, 'Functional validation evidence bundle'),
+      ]);
+    const artifactInventoryAfter = await buildDirectoryInventory(options.artifactDir);
+    const sourceAfter = await captureSourceSnapshot(repositoryRoot, { requireClean: true });
+    await assertCandidateRootsPlain();
+    if (
+      !candidateConfirmation.equals(currentCandidateBytes) ||
+      !lockfileConfirmation.equals(lockfileBytes) ||
+      !manifestConfirmation.equals(functionalManifestBytes) ||
+      !bundleConfirmation.equals(functionalBundleBytes) ||
+      JSON.stringify(artifactInventoryAfter) !== JSON.stringify(artifactInventoryBefore) ||
+      JSON.stringify(sourceAfter) !== JSON.stringify(sourceBefore)
+    ) {
+      throw new Error('Functional release state changed while it was verified.');
+    }
+    const { evidenceFiles, ...functionalIdentity } = functional;
+    return {
+      source: sourceBefore,
+      candidateManifest: currentCandidate,
+      candidateManifestSha256: createHash('sha256').update(currentCandidateBytes).digest('hex'),
+      lockfileSha256,
+      artifactInventory: artifactInventoryBefore,
+      functionalValidation: {
+        ...functionalIdentity,
+        evidenceFileCount: evidenceFiles.length,
+      },
+    };
+  };
+
   run(
     process.execPath,
     [
@@ -370,17 +514,10 @@ try {
     { timeoutMs: 600_000 },
   );
 
-  await assertCandidateRootsPlain();
-  const artifactInventory = await buildDirectoryInventory(options.artifactDir);
-  await assertCandidateRootsPlain();
-  assertCandidateManifest({
-    manifest: candidateManifest,
-    inventory: artifactInventory.files,
-    version: desktopPackage.version,
-    source: initialBinding.currentSource,
-  });
-  const evidenceCandidate = await readJson(candidatePath);
-  if (JSON.stringify(evidenceCandidate) !== JSON.stringify(candidateManifest)) {
+  const initialFunctionalState = await verifyExactFunctionalState();
+  if (
+    JSON.stringify(initialFunctionalState.candidateManifest) !== JSON.stringify(candidateManifest)
+  ) {
     throw new Error('Evidence candidate manifest changed during final release recording.');
   }
   if (
@@ -410,6 +547,8 @@ try {
       ['content-inventory', 'content-inventory.json'],
       ['candidate-manifest', 'release-candidate-v1.json'],
       ['release-evidence', 'release-manifest.json'],
+      ['functional-validation', FUNCTIONAL_VALIDATION_FILE_NAME],
+      ['functional-validation-evidence', FUNCTIONAL_VALIDATION_BUNDLE_NAME],
     ]) {
       result.push(await assetEntry({ role, filePath: path.join(options.evidenceDir, name) }));
     }
@@ -434,15 +573,11 @@ try {
     { timeoutMs: 600_000 },
   );
   const finalBinding = readPublicationBinding();
-  await assertCandidateRootsPlain();
-  const finalArtifactInventory = await buildDirectoryInventory(options.artifactDir);
-  await assertCandidateRootsPlain();
-  const finalCandidateManifest = await readJson(candidatePath);
+  const finalFunctionalState = await verifyExactFunctionalState();
   const finalEvidenceManifest = await readJson(evidenceManifestPath);
   const finalAssets = await collectPublicationAssets();
   if (
-    JSON.stringify(finalArtifactInventory) !== JSON.stringify(artifactInventory) ||
-    JSON.stringify(finalCandidateManifest) !== JSON.stringify(candidateManifest) ||
+    JSON.stringify(finalFunctionalState) !== JSON.stringify(initialFunctionalState) ||
     JSON.stringify(finalEvidenceManifest) !== JSON.stringify(evidenceManifest) ||
     JSON.stringify(finalAssets) !== JSON.stringify(assets) ||
     JSON.stringify(finalBinding) !== JSON.stringify(initialBinding)
@@ -465,21 +600,20 @@ try {
     title,
     notes,
     assets,
-    candidateManifestSha256: await sha256(candidatePath),
-    evidenceManifestSha256: await sha256(evidenceManifestPath),
+    candidateManifestSha256: finalFunctionalState.candidateManifestSha256,
+    evidenceManifestSha256: assets.find((asset) => asset.role === 'release-evidence').sha256,
+    functionalValidation: finalFunctionalState.functionalValidation,
   });
   const recordDisposition = await atomicCreateOrVerifyJson(outputPath, record);
   const confirmation = await readJson(outputPath);
   const postWriteAssets = await collectPublicationAssets();
-  await assertCandidateRootsPlain();
-  const postWriteInventory = await buildDirectoryInventory(options.artifactDir);
-  await assertCandidateRootsPlain();
+  const postWriteFunctionalState = await verifyExactFunctionalState();
   const postWriteBinding = readPublicationBinding();
   await assertNoPendingReleasePromotions({ transactionParent: promotionParent, releaseLock });
   if (
     JSON.stringify(confirmation) !== JSON.stringify(record) ||
     JSON.stringify(postWriteAssets) !== JSON.stringify(assets) ||
-    JSON.stringify(postWriteInventory) !== JSON.stringify(artifactInventory) ||
+    JSON.stringify(postWriteFunctionalState) !== JSON.stringify(finalFunctionalState) ||
     JSON.stringify(postWriteBinding) !== JSON.stringify(finalBinding)
   ) {
     throw new Error('Final release record failed its post-write verification.');
@@ -501,12 +635,16 @@ try {
 
   const revalidateBinding = async (stage) => {
     const currentBinding = readPublicationBinding();
+    const currentFunctionalState = await verifyExactFunctionalState();
     const currentAssets = await collectPublicationAssets();
     const currentRecord = await assetEntry({ role: 'final-release-record', filePath: outputPath });
     const currentNotes = await assetEntry({ role: 'release-notes', filePath: options.notesFile });
+    const confirmedBinding = readPublicationBinding();
     await assertNoPendingReleasePromotions({ transactionParent: promotionParent, releaseLock });
     if (
       JSON.stringify(currentBinding) !== JSON.stringify(finalBinding) ||
+      JSON.stringify(confirmedBinding) !== JSON.stringify(finalBinding) ||
+      JSON.stringify(currentFunctionalState) !== JSON.stringify(finalFunctionalState) ||
       JSON.stringify(currentAssets) !== JSON.stringify(assets) ||
       currentRecord.sha256 !== recordAsset.sha256 ||
       currentRecord.size !== recordAsset.size ||

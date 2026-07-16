@@ -115,6 +115,29 @@ the artifact root contains only publishable payload. Do not publish an artifact 
 because packaging completed; run the installed-application lifecycle smoke against
 the promoted candidate.
 
+Run the complete candidate-bound matrix as a separate process after promotion:
+
+```powershell
+pnpm validate:candidate
+```
+
+The command acquires the shared release lock and refuses a dirty source tree, a
+different tracked tree or lockfile, a changed artifact inventory, a non-Windows x64
+host, or a LAN soak shorter than 30 minutes. It runs the exact unpacked and installed
+application for UI, export, MCP, accessibility, text-lock, single-instance, and
+installer gates. Source-scoped capacity benchmarks and the three-participant WSS
+loopback soak are labelled explicitly rather than represented as packaged or
+multi-machine coverage. Every loose report and screenshot is freshness-checked,
+privacy-screened, moved into a deterministic ZIP, and removed after collection. The
+durable commit marker is
+`artifacts/release-evidence/v1-functional-validation.json`; it is written only after
+cleanup and binds
+`artifacts/release-evidence/v1-functional-validation-evidence.zip` to the exact
+candidate, source tree, lockfile, Windows platform, x64 architecture and build, Node
+runtime, and pnpm version. A failed rerun removes any prior functional success. Do not
+run this command as a child of `make:win`, because the build intentionally owns the
+same cross-process lock until promotion is complete.
+
 Promotion is crash-recoverable; two independent directory renames are not presented
 as one filesystem primitive. Every journal publication, backup, candidate move,
 rollback, commit, and cleanup-tombstone rename is followed by a metadata flush of both
@@ -386,8 +409,9 @@ installer after it is built; source and lockfile scans alone are insufficient.
 1. Start from a clean, current commit and install with the committed lockfile.
 2. Run `pnpm verify` and all feature-specific unit, integration, adversarial,
    recovery, MCP, LAN, accessibility, visual, PDF, soak, and performance gates.
-3. Build the unpacked directory and NSIS installer; run the opened-app and installer
-   checks above.
+3. Build the unpacked directory and NSIS installer. Run `pnpm validate:candidate` to
+   execute and record the opened-app, export, MCP, accessibility, performance, LAN,
+   and installer checks against that exact promoted candidate.
 4. Review packaged contents, notices, asset provenance, runtime licenses, SBOM, and
    vulnerability results.
 5. Verify version, application identity, `.hdeck` association, signature state,
@@ -422,7 +446,14 @@ pending, the remote is exactly `github.com/Nassau-1/htmllelujah`, and `HEAD`, th
 peeled annotated local tag, and the already-pushed peeled remote tag all equal
 `candidateManifest.source.commit`. The direct local and remote annotated tag object
 IDs must also be identical. The promoted candidate then passes the complete
-release-evidence verifier again. The default notes file is the tracked
+release-evidence verifier again. The finalizer also requires the canonical functional
+JSON and ZIP above, reconstructs every bundled proof, independently recalculates the
+Windows platform/architecture/build, Node runtime, pnpm version, source tree,
+lockfile, and full artifact inventory, and enforces the 30-minute LAN minimum. It
+repeats that exact state check before and after record creation and around every remote
+publication or download phase. Both functional files are mandatory public assets and
+are re-downloaded by SHA-256. The
+default notes file is the tracked
 `docs/releases/v1.0.0-public.md`; ignored, untracked, modified, linked, or placeholder
 notes are refused. The finalizer writes
 `artifacts/release-assets/HTMLlelujah-<version>-<commit>-release-record.json` and its

@@ -85,22 +85,23 @@ export const resolveCorepackInvocation = ({
     return { command: 'corepack', argsPrefix: [] };
   }
 
+  const platformPath = path.win32;
   const pathValue = environment.Path ?? environment.PATH ?? '';
   const candidateDirectories = [
-    path.dirname(executable),
+    platformPath.dirname(executable),
     ...String(pathValue)
-      .split(path.delimiter)
+      .split(platformPath.delimiter)
       .map((entry) => entry.trim())
       .filter(Boolean),
   ];
   const seen = new Set();
   for (const directory of candidateDirectories) {
-    const normalized = path.resolve(directory).toLocaleLowerCase('en-US');
+    const normalized = platformPath.resolve(directory).toLocaleLowerCase('en-US');
     if (seen.has(normalized)) continue;
     seen.add(normalized);
-    const entry = path.join(directory, 'node_modules', 'corepack', 'dist', 'corepack.js');
+    const entry = platformPath.join(directory, 'node_modules', 'corepack', 'dist', 'corepack.js');
     if (pathExists(entry)) {
-      return { command: executable, argsPrefix: [path.resolve(entry)] };
+      return { command: executable, argsPrefix: [platformPath.resolve(entry)] };
     }
   }
   throw new Error(

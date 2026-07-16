@@ -1005,6 +1005,8 @@ export const runWindowsCandidateValidation = async (options, injected = {}) => {
       (entry) => entry.gateId === 'installer-lifecycle' && entry.role === 'report',
     );
     const publicEnvironment = buildPublicValidationEnvironment({
+      platform: dependencies.platform,
+      architecture: dependencies.architecture,
       osRelease: dependencies.operatingSystemRelease(),
       osVersion: dependencies.operatingSystemVersion(),
       nodeVersion: process.version,

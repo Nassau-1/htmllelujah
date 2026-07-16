@@ -178,7 +178,14 @@ pnpm build
 pnpm licenses:check
 pnpm package:win
 pnpm make:win
+pnpm validate:candidate
 ```
+
+`validate:candidate` is the Windows x64 release gate for the exact promoted binary.
+It opens the packaged and installed application, exercises exports and MCP, records
+performance and a 30-minute loopback collaboration soak, and writes a candidate-bound
+functional manifest plus public evidence bundle. It is intentionally separate from
+`make:win`; the release finalizer requires both outputs before it can publish.
 
 The release process and artifact checks are documented in
 [`docs/operations.md`](docs/operations.md). Material changes follow the specification

@@ -26,6 +26,10 @@ import {
   assertTrackedReleaseNotes,
   buildFinalReleaseRecord,
 } from './release-finalization-support.mjs';
+import {
+  FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+  FUNCTIONAL_VALIDATION_FILE_NAME,
+} from './windows-candidate-validation-support.mjs';
 import { runGithubReleasePublication } from './github-release-publication-runner.mjs';
 import {
   assertExactGithubRelease,
@@ -124,6 +128,19 @@ test('command plan rebuilds every package sequentially before desktop and packag
   assert.equal(plan.at(-1).name, 'verify-release-evidence');
 });
 
+test('finalizer CLI loads the mandatory functional evidence contract', () => {
+  const result = spawnSync(process.execPath, ['scripts/finalize-windows-release.mjs', '--help'], {
+    cwd: repositoryRoot,
+    encoding: 'utf8',
+    env: createReleaseEnvironment(process.env),
+    shell: false,
+    timeout: 30_000,
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, String(result.stderr ?? ''));
+  assert.match(String(result.stdout ?? ''), /functional evidence pair/iu);
+});
+
 test('release children cannot inherit publication credentials or renderer overrides', () => {
   const environment = createReleaseEnvironment({
     PATH: 'fixture-path',
@@ -153,9 +170,9 @@ test('release children cannot inherit publication credentials or renderer overri
 });
 
 test('Windows Corepack resolves to a JavaScript entry instead of a cmd shim', () => {
-  const executable = path.join('C:\\', 'Program Files', 'nodejs', 'node.exe');
-  const corepackEntry = path.join(
-    path.dirname(executable),
+  const executable = path.win32.join('C:\\', 'Program Files', 'nodejs', 'node.exe');
+  const corepackEntry = path.win32.join(
+    path.win32.dirname(executable),
     'node_modules',
     'corepack',
     'dist',
@@ -165,25 +182,31 @@ test('Windows Corepack resolves to a JavaScript entry instead of a cmd shim', ()
     executable,
     environment: { Path: '' },
     platform: 'win32',
-    pathExists: (entry) => path.resolve(entry) === path.resolve(corepackEntry),
+    pathExists: (entry) => path.win32.resolve(entry) === path.win32.resolve(corepackEntry),
   });
   assert.equal(invocation.command, executable);
-  assert.deepEqual(invocation.argsPrefix, [path.resolve(corepackEntry)]);
+  assert.deepEqual(invocation.argsPrefix, [path.win32.resolve(corepackEntry)]);
   assert.equal(invocation.command.toLowerCase().endsWith('.cmd'), false);
 });
 
 test('Windows Corepack resolver supports a userland PATH installation', () => {
-  const executable = path.join('C:\\', 'Node', 'node.exe');
-  const userlandBin = path.join('C:\\', 'Users', 'fixture', 'AppData', 'Roaming', 'npm');
-  const userlandEntry = path.join(userlandBin, 'node_modules', 'corepack', 'dist', 'corepack.js');
+  const executable = path.win32.join('C:\\', 'Node', 'node.exe');
+  const userlandBin = path.win32.join('C:\\', 'Users', 'fixture', 'AppData', 'Roaming', 'npm');
+  const userlandEntry = path.win32.join(
+    userlandBin,
+    'node_modules',
+    'corepack',
+    'dist',
+    'corepack.js',
+  );
   const invocation = resolveCorepackInvocation({
     executable,
     environment: { Path: userlandBin },
     platform: 'win32',
-    pathExists: (entry) => path.resolve(entry) === path.resolve(userlandEntry),
+    pathExists: (entry) => path.win32.resolve(entry) === path.win32.resolve(userlandEntry),
   });
   assert.equal(invocation.command, executable);
-  assert.deepEqual(invocation.argsPrefix, [path.resolve(userlandEntry)]);
+  assert.deepEqual(invocation.argsPrefix, [path.win32.resolve(userlandEntry)]);
 });
 
 test(
@@ -1672,18 +1695,114 @@ test('publication rerun audits command-side create and publish success after an 
   });
 });
 
-test('exported publication runner executes a fake gh child, verifies filesystem downloads, latest, and resume', async () => {
+test('exported record and publication wiring carries the functional pair through fake gh create and resume', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'htmllelujah-publication-runner-'));
   try {
     const artifactsRoot = path.join(root, 'artifacts');
     const notesFile = path.join(root, 'release-notes.md');
     const installerPath = path.join(root, 'HTMLlelujah-1.0.0.exe');
+    const functionalManifestPath = path.join(root, FUNCTIONAL_VALIDATION_FILE_NAME);
+    const functionalBundlePath = path.join(root, FUNCTIONAL_VALIDATION_BUNDLE_NAME);
     const recordPath = path.join(root, 'HTMLlelujah-1.0.0-release-record.json');
     const statePath = path.join(root, 'fake-gh-state.json');
     const installerContent = Buffer.from('installer-content');
-    const recordContent = Buffer.from('{"verified":true}\n');
+    const functionalManifestContent = Buffer.from('{"releaseReady":true}\n');
+    const functionalBundleContent = Buffer.from('functional-evidence-bundle');
+    const candidateManifestSha256 = '5'.repeat(64);
+    const candidateManifest = {
+      buildId: 'build-publication-wiring',
+      source: {
+        commit: '1'.repeat(40),
+        treeSha256: '7'.repeat(64),
+        fileCount: 100,
+        bytes: 10_000,
+      },
+      lockfile: { sha256: '8'.repeat(64) },
+      artifact: { aggregateSha256: '2'.repeat(64) },
+    };
+    const publicationSourceAssets = [
+      {
+        role: 'windows-installer',
+        path: 'dist/release/HTMLlelujah-1.0.0.exe',
+        name: path.basename(installerPath),
+        size: installerContent.length,
+        sha256: createHash('sha256').update(installerContent).digest('hex'),
+        filePath: installerPath,
+      },
+      {
+        role: 'functional-validation',
+        path: `dist/release-evidence/${FUNCTIONAL_VALIDATION_FILE_NAME}`,
+        name: FUNCTIONAL_VALIDATION_FILE_NAME,
+        size: functionalManifestContent.length,
+        sha256: createHash('sha256').update(functionalManifestContent).digest('hex'),
+        filePath: functionalManifestPath,
+      },
+      {
+        role: 'functional-validation-evidence',
+        path: `dist/release-evidence/${FUNCTIONAL_VALIDATION_BUNDLE_NAME}`,
+        name: FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+        size: functionalBundleContent.length,
+        sha256: createHash('sha256').update(functionalBundleContent).digest('hex'),
+        filePath: functionalBundlePath,
+      },
+    ];
+    const functionalManifestAsset = publicationSourceAssets[1];
+    const functionalBundleAsset = publicationSourceAssets[2];
+    const record = buildFinalReleaseRecord({
+      version: '1.0.0',
+      candidateManifest,
+      evidenceManifest: { release: { generatedAt: '2026-07-16T12:00:00.000Z' } },
+      tag: publicationTag,
+      remote: 'origin',
+      binding: {
+        remoteUrl: 'git@github.com:Nassau-1/htmllelujah.git',
+        canonicalRepositoryUrl: 'https://github.com/Nassau-1/htmllelujah',
+        localTagCommit: candidateManifest.source.commit,
+        localTagObjectType: 'tag',
+        localTagObjectId: '3'.repeat(40),
+        remoteTagCommit: candidateManifest.source.commit,
+        remoteTagObjectId: '3'.repeat(40),
+      },
+      repository: publicationRepository,
+      title: publicationTitle,
+      notes: { path: 'docs/releases/v1.0.0-public.md', size: 99, sha256: '4'.repeat(64) },
+      assets: publicationSourceAssets.map(({ filePath: _filePath, ...asset }) => asset),
+      candidateManifestSha256,
+      evidenceManifestSha256: '6'.repeat(64),
+      functionalValidation: {
+        manifestSha256: functionalManifestAsset.sha256,
+        manifestSize: functionalManifestAsset.size,
+        bundleSha256: functionalBundleAsset.sha256,
+        bundleSize: functionalBundleAsset.size,
+        manifest: {
+          generatedAt: '2026-07-16T12:30:00.000Z',
+          releaseReady: true,
+          candidate: {
+            manifestSha256: candidateManifestSha256,
+            artifactAggregateSha256: candidateManifest.artifact.aggregateSha256,
+          },
+          source: {
+            ...candidateManifest.source,
+            lockfileSha256: candidateManifest.lockfile.sha256,
+          },
+          evidence: {
+            fileCount: 23,
+            totalSize: 50_000,
+            aggregateSha256: 'b'.repeat(64),
+          },
+          bundle: {
+            fileName: FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+            size: functionalBundleAsset.size,
+            sha256: functionalBundleAsset.sha256,
+          },
+        },
+      },
+    });
+    const recordContent = Buffer.from(`${JSON.stringify(record, null, 2)}\n`);
     await writeFile(notesFile, publicationNotes);
     await writeFile(installerPath, installerContent);
+    await writeFile(functionalManifestPath, functionalManifestContent);
+    await writeFile(functionalBundlePath, functionalBundleContent);
     await writeFile(recordPath, recordContent);
     await writeFile(
       statePath,
@@ -1697,13 +1816,7 @@ test('exported publication runner executes a fake gh child, verifies filesystem 
       })}\n`,
     );
     const assets = [
-      {
-        role: 'windows-installer',
-        name: path.basename(installerPath),
-        size: installerContent.length,
-        sha256: createHash('sha256').update(installerContent).digest('hex'),
-        filePath: installerPath,
-      },
+      ...publicationSourceAssets,
       {
         role: 'final-release-record',
         name: path.basename(recordPath),
@@ -1752,6 +1865,8 @@ test('exported publication runner executes a fake gh child, verifies filesystem 
       (call) => call.args[0] === 'release' && call.args[1] === 'create',
     );
     assert.ok(createCall.args.includes(installerPath));
+    assert.ok(createCall.args.includes(functionalManifestPath));
+    assert.ok(createCall.args.includes(functionalBundlePath));
     assert.ok(createCall.args.includes(recordPath));
     assert.ok(
       state.calls.some(
@@ -1828,6 +1943,8 @@ test('exported publication runner executes a fake gh child, verifies filesystem 
     );
     assert.ok(uploadCall);
     assert.equal(uploadCall.args.includes(installerPath), false);
+    assert.equal(uploadCall.args.includes(functionalManifestPath), true);
+    assert.equal(uploadCall.args.includes(functionalBundlePath), true);
     assert.equal(uploadCall.args.includes(recordPath), true);
 
     state.corruptDownloads = true;
@@ -1845,11 +1962,33 @@ test('public release notes and final JSON record are deterministic and contain e
     () => assertPublishableReleaseNotes('# Release\n\nPENDING verification.'),
     /placeholder/iu,
   );
-  const record = buildFinalReleaseRecord({
+  const functionalValidationAssets = [
+    {
+      role: 'functional-validation',
+      path: `dist/release-evidence/${FUNCTIONAL_VALIDATION_FILE_NAME}`,
+      name: FUNCTIONAL_VALIDATION_FILE_NAME,
+      size: 1_001,
+      sha256: '9'.repeat(64),
+    },
+    {
+      role: 'functional-validation-evidence',
+      path: `dist/release-evidence/${FUNCTIONAL_VALIDATION_BUNDLE_NAME}`,
+      name: FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+      size: 2_002,
+      sha256: 'a'.repeat(64),
+    },
+  ];
+  const recordInput = {
     version: '1.0.0',
     candidateManifest: {
       buildId: 'build-1',
-      source: { commit: '1'.repeat(40) },
+      source: {
+        commit: '1'.repeat(40),
+        treeSha256: '7'.repeat(64),
+        fileCount: 100,
+        bytes: 10_000,
+      },
+      lockfile: { sha256: '8'.repeat(64) },
       artifact: { aggregateSha256: '2'.repeat(64) },
     },
     evidenceManifest: { release: { generatedAt: '2026-07-16T12:00:00.000Z' } },
@@ -1867,10 +2006,45 @@ test('public release notes and final JSON record are deterministic and contain e
     repository: publicationRepository,
     title: publicationTitle,
     notes: { path: 'docs/releases/v1.0.0-public.md', size: 99, sha256: '4'.repeat(64) },
-    assets: publicationAssets.map(({ filePath: _filePath, ...asset }) => asset),
+    assets: [
+      ...publicationAssets.map(({ filePath: _filePath, ...asset }) => asset),
+      ...functionalValidationAssets,
+    ],
     candidateManifestSha256: '5'.repeat(64),
     evidenceManifestSha256: '6'.repeat(64),
-  });
+    functionalValidation: {
+      manifestSha256: '9'.repeat(64),
+      manifestSize: 1_001,
+      bundleSha256: 'a'.repeat(64),
+      bundleSize: 2_002,
+      manifest: {
+        generatedAt: '2026-07-16T12:30:00.000Z',
+        releaseReady: true,
+        candidate: {
+          manifestSha256: '5'.repeat(64),
+          artifactAggregateSha256: '2'.repeat(64),
+        },
+        source: {
+          commit: '1'.repeat(40),
+          treeSha256: '7'.repeat(64),
+          fileCount: 100,
+          bytes: 10_000,
+          lockfileSha256: '8'.repeat(64),
+        },
+        evidence: {
+          fileCount: 23,
+          totalSize: 50_000,
+          aggregateSha256: 'b'.repeat(64),
+        },
+        bundle: {
+          fileName: 'v1-functional-validation-evidence.zip',
+          size: 2_002,
+          sha256: 'a'.repeat(64),
+        },
+      },
+    },
+  };
+  const record = buildFinalReleaseRecord(recordInput);
   const serialized = JSON.parse(`${JSON.stringify(record)}\n`);
   assert.equal(serialized.source.repositoryUrl, 'https://github.com/Nassau-1/htmllelujah');
   assert.equal(serialized.source.remoteUrl, 'git@github.com:Nassau-1/htmllelujah.git');
@@ -1878,6 +2052,91 @@ test('public release notes and final JSON record are deterministic and contain e
   assert.equal(serialized.publication.title, publicationTitle);
   assert.equal(serialized.publication.requestedMode, undefined);
   assert.equal(serialized.generatedAt, '2026-07-16T12:00:00.000Z');
+  assert.equal(serialized.schemaVersion, 2);
+  assert.equal(serialized.functionalValidation.releaseReady, true);
+  assert.deepEqual(serialized.functionalValidation.manifest, {
+    path: functionalValidationAssets[0].path,
+    name: functionalValidationAssets[0].name,
+    size: functionalValidationAssets[0].size,
+    sha256: functionalValidationAssets[0].sha256,
+  });
+  assert.deepEqual(serialized.functionalValidation.bundle, {
+    path: functionalValidationAssets[1].path,
+    name: functionalValidationAssets[1].name,
+    size: functionalValidationAssets[1].size,
+    sha256: functionalValidationAssets[1].sha256,
+  });
+  assert.throws(
+    () =>
+      buildFinalReleaseRecord({
+        ...recordInput,
+        functionalValidation: {
+          ...recordInput.functionalValidation,
+          manifest: { ...recordInput.functionalValidation.manifest, releaseReady: false },
+        },
+      }),
+    /functional validation/iu,
+  );
+  const assetMutations = [
+    (assets) => assets.filter((asset) => asset.name !== FUNCTIONAL_VALIDATION_FILE_NAME),
+    (assets) => assets.filter((asset) => asset.name !== FUNCTIONAL_VALIDATION_BUNDLE_NAME),
+    (assets) => [
+      ...assets,
+      structuredClone(assets.find((asset) => asset.name === FUNCTIONAL_VALIDATION_FILE_NAME)),
+    ],
+    (assets) => [
+      ...assets,
+      structuredClone(assets.find((asset) => asset.name === FUNCTIONAL_VALIDATION_BUNDLE_NAME)),
+    ],
+    (assets) =>
+      assets.map((asset) =>
+        asset.name === FUNCTIONAL_VALIDATION_FILE_NAME ? { ...asset, size: asset.size + 1 } : asset,
+      ),
+    (assets) =>
+      assets.map((asset) =>
+        asset.name === FUNCTIONAL_VALIDATION_BUNDLE_NAME
+          ? { ...asset, sha256: 'f'.repeat(64) }
+          : asset,
+      ),
+    (assets) =>
+      assets.map((asset) =>
+        asset.name === FUNCTIONAL_VALIDATION_FILE_NAME
+          ? { ...asset, path: `../${asset.name}` }
+          : asset,
+      ),
+    (assets) =>
+      assets.map((asset) =>
+        asset.name === FUNCTIONAL_VALIDATION_FILE_NAME
+          ? { ...asset, path: `C:/${asset.name}` }
+          : asset,
+      ),
+    (assets) =>
+      assets.map((asset) =>
+        asset.name === FUNCTIONAL_VALIDATION_FILE_NAME
+          ? { ...asset, path: `C:relative/${asset.name}` }
+          : asset,
+      ),
+    (assets) =>
+      assets.map((asset) =>
+        asset.name === FUNCTIONAL_VALIDATION_FILE_NAME
+          ? { ...asset, path: `evidence/\0/${asset.name}` }
+          : asset,
+      ),
+    (assets) =>
+      assets.map((asset) =>
+        asset.name === FUNCTIONAL_VALIDATION_BUNDLE_NAME ? { ...asset, role: 'wrong-role' } : asset,
+      ),
+  ];
+  for (const mutateAssets of assetMutations) {
+    assert.throws(
+      () =>
+        buildFinalReleaseRecord({
+          ...recordInput,
+          assets: mutateAssets(structuredClone(recordInput.assets)),
+        }),
+      /functional validation|exactly one/iu,
+    );
+  }
 });
 
 test('release notes must be tracked and byte-identical to the candidate HEAD blob', async () => {

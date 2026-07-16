@@ -285,6 +285,8 @@ export const EXTERNAL_VALIDATION_LIMITATIONS = Object.freeze([
 ]);
 
 export const buildPublicValidationEnvironment = ({
+  platform,
+  architecture,
   osRelease,
   osVersion,
   nodeVersion,
@@ -292,6 +294,8 @@ export const buildPublicValidationEnvironment = ({
   installerReport,
 }) => {
   if (
+    platform !== 'win32' ||
+    architecture !== 'x64' ||
     typeof osRelease !== 'string' ||
     osRelease.length === 0 ||
     typeof osVersion !== 'string' ||
@@ -307,7 +311,13 @@ export const buildPublicValidationEnvironment = ({
   if (!/^\d+$/u.test(build ?? '')) throw new Error('Windows build number is unavailable.');
   return {
     os: { platform: 'Windows', release: osRelease, version: osVersion, build },
-    runtime: { node: nodeVersion, packageManager, packageManagerLocked: true },
+    runtime: {
+      platform,
+      architecture,
+      node: nodeVersion,
+      packageManager,
+      packageManagerLocked: true,
+    },
     token: {
       elevated: false,
       system: false,
@@ -387,15 +397,17 @@ export const publicEvidenceJsonErrors = (bytes) => {
     errors.push('JSON evidence size is outside public bundle bounds');
     return errors;
   }
-  const text = Buffer.from(bytes).toString('utf8');
   let value;
   try {
-    value = JSON.parse(text);
-  } catch {
-    errors.push('JSON evidence is not valid JSON');
+    value = jsonObjectFromBytes(bytes, {
+      label: 'JSON evidence',
+      canonical: true,
+    });
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : 'JSON evidence is invalid');
     return errors;
   }
-  if (!isRecord(value)) errors.push('JSON evidence root must be an object');
+  const text = Buffer.from(bytes).toString('utf8');
   const inspectedStrings = [text, ...collectStringValues(value)];
   for (const pattern of PRIVATE_TEXT_PATTERNS) {
     if (inspectedStrings.some((item) => pattern.test(item))) {
@@ -406,6 +418,149 @@ export const publicEvidenceJsonErrors = (bytes) => {
     errors.push('JSON evidence contains forbidden environment identity keys');
   }
   return [...new Set(errors)];
+};
+
+const assertNoDuplicateJsonKeys = (text, label) => {
+  let offset = 0;
+  const skipWhitespace = () => {
+    while (/\s/u.test(text[offset] ?? '')) offset += 1;
+  };
+  const scanString = () => {
+    const start = offset;
+    offset += 1;
+    while (offset < text.length) {
+      if (text[offset] === '"') {
+        offset += 1;
+        return JSON.parse(text.slice(start, offset));
+      }
+      if (text[offset] === '\\') {
+        offset += text[offset + 1] === 'u' ? 6 : 2;
+      } else {
+        offset += 1;
+      }
+    }
+    throw new Error(`${label} contains an unterminated JSON string.`);
+  };
+  const scanValue = () => {
+    skipWhitespace();
+    if (text[offset] === '{') {
+      offset += 1;
+      skipWhitespace();
+      const keys = new Set();
+      if (text[offset] === '}') {
+        offset += 1;
+        return;
+      }
+      while (offset < text.length) {
+        if (text[offset] !== '"') throw new Error(`${label} contains invalid JSON object syntax.`);
+        const key = scanString();
+        if (keys.has(key)) throw new Error(`${label} contains duplicate JSON key ${key}.`);
+        keys.add(key);
+        skipWhitespace();
+        if (text[offset] !== ':') throw new Error(`${label} contains invalid JSON object syntax.`);
+        offset += 1;
+        scanValue();
+        skipWhitespace();
+        if (text[offset] === '}') {
+          offset += 1;
+          return;
+        }
+        if (text[offset] !== ',') throw new Error(`${label} contains invalid JSON object syntax.`);
+        offset += 1;
+        skipWhitespace();
+      }
+      throw new Error(`${label} contains an unterminated JSON object.`);
+    }
+    if (text[offset] === '[') {
+      offset += 1;
+      skipWhitespace();
+      if (text[offset] === ']') {
+        offset += 1;
+        return;
+      }
+      while (offset < text.length) {
+        scanValue();
+        skipWhitespace();
+        if (text[offset] === ']') {
+          offset += 1;
+          return;
+        }
+        if (text[offset] !== ',') throw new Error(`${label} contains invalid JSON array syntax.`);
+        offset += 1;
+      }
+      throw new Error(`${label} contains an unterminated JSON array.`);
+    }
+    if (text[offset] === '"') {
+      scanString();
+      return;
+    }
+    const start = offset;
+    while (offset < text.length && !/[\s,\]}]/u.test(text[offset])) offset += 1;
+    if (offset === start) throw new Error(`${label} contains an invalid JSON value.`);
+  };
+
+  try {
+    scanValue();
+    skipWhitespace();
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith(label)) throw error;
+    throw new Error(`${label} contains invalid JSON syntax.`, { cause: error });
+  }
+  if (offset !== text.length) throw new Error(`${label} contains trailing JSON data.`);
+};
+
+const exactBytes = (bytes, label) => {
+  if (!Buffer.isBuffer(bytes) && !(bytes instanceof Uint8Array)) {
+    throw new Error(`${label} bytes are unavailable.`);
+  }
+  return Buffer.from(bytes);
+};
+
+const jsonObjectFromBytes = (bytes, { label, canonical }) => {
+  const data = exactBytes(bytes, label);
+  if (data.length === 0) throw new Error(`${label} bytes are empty.`);
+  const text = data.toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(data)) throw new Error(`${label} is not valid UTF-8.`);
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${label} is not valid JSON or contains trailing JSON data.`, { cause: error });
+  }
+  assertNoDuplicateJsonKeys(text, label);
+  if (!isRecord(value)) throw new Error(`${label} JSON root must be an object.`);
+  if (canonical) {
+    const expected = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    if (!data.equals(expected)) {
+      throw new Error(`${label} bytes are not canonical two-space JSON with one final newline.`);
+    }
+  }
+  return value;
+};
+
+const stableJsonText = (value, seen = new Set()) => {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new Error('Candidate manifest object is cyclic.');
+    seen.add(value);
+    const result = `[${value.map((item) => stableJsonText(item, seen)).join(',')}]`;
+    seen.delete(value);
+    return result;
+  }
+  if (isRecord(value)) {
+    if (seen.has(value)) throw new Error('Candidate manifest object is cyclic.');
+    seen.add(value);
+    const result = `{${Object.keys(value)
+      .sort((left, right) => left.localeCompare(right, 'en'))
+      .map((key) => `${JSON.stringify(key)}:${stableJsonText(value[key], seen)}`)
+      .join(',')}}`;
+    seen.delete(value);
+    return result;
+  }
+  throw new Error('Candidate manifest object contains a non-JSON value.');
 };
 
 export const publicPngErrors = (bytes) => {
@@ -592,11 +747,21 @@ export const readPublicEvidenceZipEntries = (bytes) => {
     ) {
       throw new Error('ZIP local entry flags, method, sizes, or bounds are invalid.');
     }
-    const entryPath = data.subarray(nameStart, nameStart + nameLength).toString('utf8');
+    const nameBytes = data.subarray(nameStart, nameStart + nameLength);
+    const entryPath = nameBytes.toString('utf8');
+    if (!Buffer.from(entryPath, 'utf8').equals(nameBytes)) {
+      throw new Error('ZIP local entry name is not valid UTF-8.');
+    }
     if (!safeEvidencePath(entryPath)) throw new Error('ZIP contains an unsafe path.');
     const content = data.subarray(contentStart, contentEnd);
     if (crc32(content) !== checksum) throw new Error('ZIP entry CRC does not match its bytes.');
-    entries.push({ path: entryPath, bytes: content, checksum, localOffset: offset });
+    entries.push({
+      path: entryPath,
+      nameBytes: Buffer.from(nameBytes),
+      bytes: content,
+      checksum,
+      localOffset: offset,
+    });
     offset = contentEnd;
   }
   if (offset !== centralOffset || entries.length !== entryCount) {
@@ -623,7 +788,11 @@ export const readPublicEvidenceZipEntries = (bytes) => {
     const localOffset = data.readUInt32LE(centralCursor + 42);
     const nameStart = centralCursor + 46;
     const next = nameStart + nameLength + extraLength + entryCommentLength;
-    const entryPath = data.subarray(nameStart, nameStart + nameLength).toString('utf8');
+    const nameBytes = data.subarray(nameStart, nameStart + nameLength);
+    const entryPath = nameBytes.toString('utf8');
+    if (!Buffer.from(entryPath, 'utf8').equals(nameBytes)) {
+      throw new Error('ZIP central entry name is not valid UTF-8.');
+    }
     if (
       next > endOffset ||
       flags !== 0x0800 ||
@@ -635,7 +804,7 @@ export const readPublicEvidenceZipEntries = (bytes) => {
       entryCommentLength !== 0 ||
       entryDisk !== 0 ||
       localOffset !== local.localOffset ||
-      entryPath !== local.path
+      !nameBytes.equals(local.nameBytes)
     ) {
       throw new Error('ZIP central entry differs from its local entry.');
     }
@@ -696,7 +865,10 @@ const reportForGate = (gate, evidenceFiles) => {
   );
   if (!report) return null;
   try {
-    return JSON.parse(Buffer.from(report.bytes).toString('utf8'));
+    return jsonObjectFromBytes(report.bytes, {
+      label: `${gate.id} report`,
+      canonical: true,
+    });
   } catch {
     return null;
   }
@@ -1046,8 +1218,14 @@ export const gateReportErrors = ({
     let ui;
     let mcp;
     try {
-      ui = JSON.parse(Buffer.from(installedUi?.bytes ?? []).toString('utf8'));
-      mcp = JSON.parse(Buffer.from(installedMcp?.bytes ?? []).toString('utf8'));
+      ui = jsonObjectFromBytes(installedUi?.bytes, {
+        label: 'Installed UI report',
+        canonical: true,
+      });
+      mcp = jsonObjectFromBytes(installedMcp?.bytes, {
+        label: 'Installed MCP report',
+        canonical: true,
+      });
     } catch {
       fail('installed child evidence is invalid JSON');
     }
@@ -1386,6 +1564,113 @@ export const assertFunctionalValidationBundle = (options) => {
   const evidenceFiles = reconstructEvidenceFilesFromBundle(options);
   assertFunctionalValidationManifest({ ...options, evidenceFiles });
   return evidenceFiles;
+};
+
+export const verifyFunctionalValidationPair = ({
+  manifestBytes,
+  bundleBytes,
+  candidateManifest,
+  candidateManifestBytes,
+  artifactInventory,
+  source,
+  lockfileSha256,
+  packageManager,
+  platform,
+  architecture,
+  osRelease,
+  osVersion,
+  nodeVersion,
+}) => {
+  const manifestData = exactBytes(manifestBytes, 'Functional validation manifest');
+  const safetyErrors = publicEvidenceJsonErrors(manifestData);
+  if (safetyErrors.length > 0) {
+    throw new Error(
+      `Functional validation manifest is not public-safe: ${safetyErrors.join('; ')}`,
+    );
+  }
+  const manifest = jsonObjectFromBytes(manifestData, {
+    label: 'Functional validation manifest',
+    canonical: true,
+  });
+  const candidateData = exactBytes(candidateManifestBytes, 'Release candidate manifest');
+  const candidateFromBytes = jsonObjectFromBytes(candidateData, {
+    label: 'Release candidate manifest',
+    canonical: false,
+  });
+  if (stableJsonText(candidateFromBytes) !== stableJsonText(candidateManifest)) {
+    throw new Error('Parsed release candidate manifest differs from its exact bytes.');
+  }
+
+  const bundleData = exactBytes(bundleBytes, 'Functional validation evidence bundle');
+  const reconstructedEvidence = reconstructEvidenceFilesFromBundle({
+    manifest,
+    bundleBytes: bundleData,
+  });
+  const canonicalBundle = createPublicEvidenceZip(
+    reconstructedEvidence.map(({ path, bytes }) => ({ path, bytes })),
+    manifest.generatedAt,
+  );
+  if (!bundleData.equals(canonicalBundle)) {
+    throw new Error(
+      'Functional validation evidence bundle is not the exact canonical ZIP for its entries and generatedAt timestamp.',
+    );
+  }
+  const installerReports = reconstructedEvidence.filter(
+    (entry) => entry.gateId === 'installer-lifecycle' && entry.role === 'report',
+  );
+  if (installerReports.length !== 1) {
+    throw new Error(
+      'Functional validation bundle must contain exactly one installer-lifecycle report.',
+    );
+  }
+  const installerReport = jsonObjectFromBytes(installerReports[0].bytes, {
+    label: 'Installer lifecycle report',
+    canonical: true,
+  });
+  const expectedEnvironment = buildPublicValidationEnvironment({
+    platform,
+    architecture,
+    osRelease,
+    osVersion,
+    nodeVersion,
+    packageManager,
+    installerReport,
+  });
+  const verifiedEvidence = assertFunctionalValidationBundle({
+    manifest,
+    candidateManifest,
+    candidateManifestSha256: sha256Bytes(candidateData),
+    artifactInventory,
+    source,
+    lockfileSha256,
+    bundleBytes: bundleData,
+    expectedEnvironment,
+    minimumLanDurationMs: DEFAULT_LAN_DURATION_MS,
+  });
+  const manifestIdentity = {
+    path: FUNCTIONAL_VALIDATION_FILE_NAME,
+    size: manifestData.length,
+    sha256: sha256Bytes(manifestData),
+  };
+  const bundleIdentity = {
+    path: FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+    size: bundleData.length,
+    sha256: sha256Bytes(bundleData),
+  };
+  return {
+    manifest,
+    evidenceFiles: verifiedEvidence,
+    manifestSha256: manifestIdentity.sha256,
+    manifestSize: manifestIdentity.size,
+    bundleSha256: bundleIdentity.sha256,
+    bundleSize: bundleIdentity.size,
+    evidenceAggregateSha256: manifest.evidence.aggregateSha256,
+    aggregateSha256: aggregateEvidenceInventory(
+      [manifestIdentity, bundleIdentity].sort((left, right) =>
+        left.path.localeCompare(right.path, 'en'),
+      ),
+    ),
+  };
 };
 
 export const buildFunctionalValidationManifest = ({

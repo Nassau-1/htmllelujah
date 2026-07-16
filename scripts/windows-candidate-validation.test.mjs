@@ -24,6 +24,7 @@ import {
   readPublicEvidenceZipEntries,
   reconstructEvidenceFilesFromBundle,
   sha256Bytes,
+  verifyFunctionalValidationPair,
 } from './windows-candidate-validation-support.mjs';
 import {
   buildCandidateValidationPlan,
@@ -245,6 +246,7 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
         checks: allTrue,
       };
     case 'lan-loopback-soak':
+      const reconnectCycles = Math.floor(Math.max(0, lanDurationMs - 1) / (5 * 60_000));
       return {
         schemaVersion: 1,
         status: 'passed',
@@ -255,10 +257,10 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
         topology: { hosts: 1, guests: 2 },
         peers: {
           expectedGuestCount: 2,
-          minimumObservedDuringExercise: 2,
+          minimumObservedDuringExercise: reconnectCycles > 0 ? 1 : 2,
           maximumObserved: 2,
         },
-        reconnect: { cycles: 0 },
+        reconnect: { cycles: reconnectCycles },
         operations: { commands: 20 },
         continuity: {
           maximumLoopHiatusMs: 1_000,
@@ -378,7 +380,7 @@ const createCandidateFixture = async () => {
   return { repositoryRoot, artifactDir, evidenceRoot, candidate, candidatePath, inventory, source };
 };
 
-const injectedDependencies = (fixture, runCommand) => {
+const injectedDependencies = (fixture, runCommand, { lanElapsedMs = 100 } = {}) => {
   let clock = Date.now();
   let monotonicClock = 0;
   return {
@@ -405,10 +407,102 @@ const injectedDependencies = (fixture, runCommand) => {
     runCommand: async (command) => {
       await runCommand(command);
       if (command.gate.id === 'lan-loopback-soak') {
-        clock += 100;
-        monotonicClock += 100;
+        clock += lanElapsedMs;
+        monotonicClock += lanElapsedMs;
       }
     },
+  };
+};
+
+const createFinalizationPairFixture = async () => {
+  const fixture = await createCandidateFixture();
+  const candidateManifestBytes = await readFile(fixture.candidatePath);
+  const target = {
+    installer: fixture.candidate.artifact.installer,
+    blockmap: fixture.candidate.artifact.blockmap,
+    executable: fixture.candidate.artifact.files.find(
+      (entry) => entry.path === 'win-unpacked/HTMLlelujah.exe',
+    ),
+    launcher: fixture.candidate.artifact.files.find(
+      (entry) => entry.path === 'win-unpacked/HTMLlelujah-MCP.cmd',
+    ),
+    appAsar: fixture.candidate.artifact.files.find(
+      (entry) => entry.path === 'win-unpacked/resources/app.asar',
+    ),
+    candidateManifestSha256: sha256Bytes(candidateManifestBytes),
+  };
+  const runCommand = async ({ gate }) => {
+    for (const descriptor of gate.outputs) {
+      await mkdir(path.dirname(descriptor.sourcePath), { recursive: true });
+      const bytes = descriptor.role.includes('screenshot')
+        ? PNG
+        : jsonBytes(
+            reportForOutput({
+              gate,
+              descriptor,
+              target,
+              lanDurationMs: DEFAULT_LAN_DURATION_MS,
+            }),
+          );
+      await writeFile(descriptor.sourcePath, bytes);
+    }
+  };
+  const result = await runWindowsCandidateValidation(
+    {
+      repositoryRoot: fixture.repositoryRoot,
+      releaseLock: { fixture: true },
+      lanMinutes: DEFAULT_LAN_DURATION_MS / 60_000,
+    },
+    injectedDependencies(fixture, runCommand, { lanElapsedMs: DEFAULT_LAN_DURATION_MS }),
+  );
+  const manifestBytes = await readFile(result.manifestPath);
+  const bundleBytes = await readFile(result.bundlePath);
+  return {
+    fixture,
+    manifestBytes,
+    bundleBytes,
+    options: {
+      manifestBytes,
+      bundleBytes,
+      candidateManifest: fixture.candidate,
+      candidateManifestBytes,
+      artifactInventory: fixture.inventory,
+      source: fixture.source,
+      lockfileSha256: LOCK_SHA,
+      packageManager: 'pnpm@11.13.0',
+      platform: 'win32',
+      architecture: 'x64',
+      osRelease: '10.0.26200',
+      osVersion: 'Windows 11 Enterprise',
+      nodeVersion: process.version,
+    },
+  };
+};
+
+const rebuildPairWithReportBytes = (pair, { gateId, role = 'report' }, transform) => {
+  const manifest = JSON.parse(pair.manifestBytes.toString('utf8'));
+  const entries = readPublicEvidenceZipEntries(pair.bundleBytes).map((entry) => ({
+    ...entry,
+    bytes: Buffer.from(entry.bytes),
+  }));
+  const reportMetadata = manifest.evidence.files.find(
+    (entry) => entry.gateId === gateId && entry.role === role,
+  );
+  assert.ok(reportMetadata);
+  const reportEntry = entries.find((entry) => entry.path === reportMetadata.path);
+  assert.ok(reportEntry);
+  reportEntry.bytes = Buffer.from(transform(reportEntry.bytes));
+  reportMetadata.size = reportEntry.bytes.length;
+  reportMetadata.sha256 = sha256Bytes(reportEntry.bytes);
+  manifest.evidence.totalSize = manifest.evidence.files.reduce((sum, entry) => sum + entry.size, 0);
+  manifest.evidence.aggregateSha256 = aggregateEvidenceInventory(manifest.evidence.files);
+  const bundleBytes = createPublicEvidenceZip(entries, manifest.generatedAt);
+  manifest.bundle.size = bundleBytes.length;
+  manifest.bundle.sha256 = sha256Bytes(bundleBytes);
+  return {
+    ...pair.options,
+    manifestBytes: jsonBytes(manifest),
+    bundleBytes,
   };
 };
 
@@ -417,6 +511,201 @@ test('CLI parser is strict and keeps the 30-minute production default', () => {
   assert.deepEqual(parseCandidateValidationArgs(['--lan-minutes', '45']), { lanMinutes: 45 });
   assert.throws(() => parseCandidateValidationArgs(['--unknown']), /Unknown/u);
   assert.throws(() => parseCandidateValidationArgs(['--lan-minutes', '0']), /positive/u);
+});
+
+test('pure finalization verifier binds canonical public bytes and rejects all pair tampering', async (t) => {
+  const pair = await createFinalizationPairFixture();
+  t.after(() => rm(pair.fixture.repositoryRoot, { recursive: true, force: true }));
+
+  const verified = verifyFunctionalValidationPair(pair.options);
+  assert.equal(verified.manifest.releaseReady, true);
+  assert.equal(verified.manifest.environment.runtime.platform, 'win32');
+  assert.equal(verified.manifest.environment.runtime.architecture, 'x64');
+  assert.equal(verified.manifestSha256, sha256Bytes(pair.manifestBytes));
+  assert.equal(verified.manifestSize, pair.manifestBytes.length);
+  assert.equal(verified.bundleSha256, sha256Bytes(pair.bundleBytes));
+  assert.equal(verified.bundleSize, pair.bundleBytes.length);
+  assert.equal(verified.evidenceAggregateSha256, verified.manifest.evidence.aggregateSha256);
+  assert.equal(
+    verified.aggregateSha256,
+    aggregateEvidenceInventory(
+      [
+        {
+          path: FUNCTIONAL_VALIDATION_FILE_NAME,
+          size: pair.manifestBytes.length,
+          sha256: sha256Bytes(pair.manifestBytes),
+        },
+        {
+          path: FUNCTIONAL_VALIDATION_BUNDLE_NAME,
+          size: pair.bundleBytes.length,
+          sha256: sha256Bytes(pair.bundleBytes),
+        },
+      ].sort((left, right) => left.path.localeCompare(right.path, 'en')),
+    ),
+  );
+  assert.equal(
+    verified.evidenceFiles.filter(
+      (entry) => entry.gateId === 'installer-lifecycle' && entry.role === 'report',
+    ).length,
+    1,
+  );
+
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        manifestBytes: Buffer.from(JSON.stringify(verified.manifest), 'utf8'),
+      }),
+    /canonical/u,
+  );
+  const duplicateManifestBytes = Buffer.from(
+    pair.manifestBytes.toString('utf8').replace('{\n', '{\n  "schemaVersion": 1,\n'),
+    'utf8',
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        manifestBytes: duplicateManifestBytes,
+      }),
+    /duplicate JSON key/u,
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        manifestBytes: Buffer.concat([pair.manifestBytes, Buffer.from('{}', 'utf8')]),
+      }),
+    /public-safe|trailing JSON/u,
+  );
+  const privateManifest = structuredClone(verified.manifest);
+  privateManifest.environment.hostname = 'private-workstation';
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        manifestBytes: jsonBytes(privateManifest),
+      }),
+    /public-safe|identity/u,
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        osVersion: 'Windows environment mismatch',
+      }),
+    /environment|validation failed/u,
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        architecture: 'arm64',
+      }),
+    /environment inputs|Windows|x64/u,
+  );
+  const tamperedBundle = Buffer.from(pair.bundleBytes);
+  tamperedBundle[30 + tamperedBundle.readUInt16LE(26)] ^= 1;
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        bundleBytes: tamperedBundle,
+      }),
+    /bundle|ZIP|CRC/u,
+  );
+  const alternateTimestampBundle = Buffer.from(pair.bundleBytes);
+  alternateTimestampBundle.writeUInt16LE(alternateTimestampBundle.readUInt16LE(10) ^ 1, 10);
+  const alternateTimestampManifest = structuredClone(verified.manifest);
+  alternateTimestampManifest.bundle.sha256 = sha256Bytes(alternateTimestampBundle);
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        manifestBytes: jsonBytes(alternateTimestampManifest),
+        bundleBytes: alternateTimestampBundle,
+      }),
+    /exact canonical ZIP|generatedAt/u,
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        candidateManifest: { ...pair.options.candidateManifest, version: '9.9.9' },
+      }),
+    /differs from its exact bytes/u,
+  );
+  const duplicateCandidateBytes = Buffer.from(
+    pair.options.candidateManifestBytes
+      .toString('utf8')
+      .replace('{\n', '{\n  "schemaVersion": 1,\n'),
+    'utf8',
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        candidateManifestBytes: duplicateCandidateBytes,
+      }),
+    /duplicate JSON key/u,
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair({
+        ...pair.options,
+        candidateManifestBytes: Buffer.concat([
+          pair.options.candidateManifestBytes,
+          Buffer.from('{}', 'utf8'),
+        ]),
+      }),
+    /trailing JSON/u,
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair(
+        rebuildPairWithReportBytes(pair, { gateId: 'installer-lifecycle' }, (bytes) =>
+          Buffer.from(bytes.toString('utf8').replace('{\n', '{\n  "schemaVersion": 4,\n'), 'utf8'),
+        ),
+      ),
+    /duplicate JSON key/u,
+  );
+});
+
+test('finalization verifier strictly parses every JSON report in the canonical ZIP', async (t) => {
+  const pair = await createFinalizationPairFixture();
+  t.after(() => rm(pair.fixture.repositoryRoot, { recursive: true, force: true }));
+
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair(
+        rebuildPairWithReportBytes(pair, { gateId: 'ui-packaged' }, (bytes) =>
+          Buffer.from(bytes.toString('utf8').replace('{\n', '{\n  "passed": true,\n'), 'utf8'),
+        ),
+      ),
+    /duplicate JSON key/u,
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair(
+        rebuildPairWithReportBytes(pair, { gateId: 'ui-packaged' }, (bytes) => {
+          const invalid = Buffer.from(bytes);
+          const offset = invalid.indexOf(Buffer.from('packaged-executable', 'utf8'));
+          assert.notEqual(offset, -1);
+          invalid[offset] = 0xff;
+          return invalid;
+        }),
+      ),
+    /UTF-8/u,
+  );
+  assert.throws(
+    () =>
+      verifyFunctionalValidationPair(
+        rebuildPairWithReportBytes(pair, { gateId: 'ui-packaged' }, (bytes) =>
+          Buffer.from(JSON.stringify(JSON.parse(bytes.toString('utf8'))), 'utf8'),
+        ),
+      ),
+    /canonical two-space JSON/u,
+  );
 });
 
 test('command plan exactly covers every required candidate gate', () => {
@@ -530,6 +819,26 @@ test(
 test('public evidence screening rejects private identity and PNG text metadata', () => {
   assert.deepEqual(publicEvidenceJsonErrors(jsonBytes({ passed: true })), []);
   assert.match(
+    publicEvidenceJsonErrors(
+      Buffer.from('{\n  "passed": true,\n  "passed": true\n}\n', 'utf8'),
+    ).join(' '),
+    /duplicate JSON key/u,
+  );
+  assert.match(
+    publicEvidenceJsonErrors(
+      Buffer.concat([
+        Buffer.from('{\n  "passed": "', 'utf8'),
+        Buffer.from([0xff]),
+        Buffer.from('"\n}\n', 'utf8'),
+      ]),
+    ).join(' '),
+    /UTF-8/u,
+  );
+  assert.match(
+    publicEvidenceJsonErrors(Buffer.from('{"passed":true}\n', 'utf8')).join(' '),
+    /canonical two-space JSON/u,
+  );
+  assert.match(
     publicEvidenceJsonErrors(jsonBytes({ path: 'C:\\Users\\Private\\file.hdeck' })).join(' '),
     /private/u,
   );
@@ -573,6 +882,13 @@ test('public ZIP is deterministic, sorted, and rejects traversal', () => {
   corruptCrc.writeUInt32LE(corruptCrc.readUInt32LE(14) ^ 1, 14);
   assert.throws(() => readPublicEvidenceZipEntries(corruptCrc), /CRC/u);
   const centralOffset = first.readUInt32LE(first.length - 22 + 16);
+  const invalidUtf8Name = Buffer.from(first);
+  invalidUtf8Name[30] = 0xff;
+  invalidUtf8Name[centralOffset + 46] = 0xff;
+  assert.throws(() => readPublicEvidenceZipEntries(invalidUtf8Name), /valid UTF-8/u);
+  const divergentNameBytes = Buffer.from(first);
+  divergentNameBytes[centralOffset + 46] = Buffer.from('b', 'utf8')[0];
+  assert.throws(() => readPublicEvidenceZipEntries(divergentNameBytes), /central entry differs/u);
   const corruptCentral = Buffer.from(first);
   corruptCentral[centralOffset] ^= 1;
   assert.throws(() => readPublicEvidenceZipEntries(corruptCentral), /central/u);

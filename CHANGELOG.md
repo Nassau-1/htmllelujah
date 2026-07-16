@@ -38,6 +38,10 @@ No user-facing change is queued after the V1 release candidate.
 - Windows Electron accessibility and display-scaling smoke coverage for semantic
   controls, keyboard focus, reduced motion, compact layout, and 100% through 200%
   scaling. Manual Narrator or NVDA validation remains a release-record item.
+- Candidate-bound Windows validation with opened packaged and installed UI, HTML/PDF
+  exports, packaged MCP, scaling, two-process text locks, installer lifecycle,
+  performance limits, a continuous 30-minute collaboration soak, and a deterministic
+  public evidence bundle.
 - Source-visible proprietary notice, separate V1 binary terms, direct-dependency
   notices, an engineering Electron/FFmpeg license review, and bundled-asset
   provenance ledger. The review does not replace qualified legal approval for
@@ -65,6 +69,10 @@ No user-facing change is queued after the V1 release candidate.
 - Enabled Electron `RunAsNode` only for the packaged MCP console entrypoint while
   disabling `NODE_OPTIONS` and CLI inspection and retaining ASAR integrity and
   ASAR-only loading. The tradeoff is recorded in ADR-008 and the security policy.
+- Made release publication require a canonical functional manifest and ZIP bound to
+  the exact clean source tree, lockfile, complete artifact inventory, Windows
+  platform/architecture/build, Node runtime, pnpm version, local and remote annotated
+  tag objects, and re-downloaded asset hashes.
 
 ### Known V1 boundaries
 
