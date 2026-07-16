@@ -2,7 +2,10 @@ import { mkdtemp, readFile, rm as remove, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { CollaborationTransportServer } from '@htmllelujah/collaboration';
+import {
+  CollaborationTransportClient,
+  CollaborationTransportServer,
+} from '@htmllelujah/collaboration';
 import {
   defaultArchiveDurability,
   DocumentSessionManager,
@@ -305,6 +308,13 @@ describe('DesktopCollaborationCoordinator', () => {
       allowOverwrite: true,
     });
     const guestSource = await guestRuntime.openMainOnly({ targetPath });
+    const createGuestReplica = guestRuntime.createMainOnly.bind(guestRuntime);
+    vi.spyOn(guestRuntime, 'createMainOnly').mockImplementation(async (...args) => {
+      // Exceed the deliberately short presence TTL during local replica creation. join() must
+      // refresh presence before it resolves instead of exposing an authenticated invisible peer.
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      return createGuestReplica(...args);
+    });
 
     const hosted = await host.host({
       sessionId: hostSource.sessionId,
@@ -402,6 +412,70 @@ describe('DesktopCollaborationCoordinator', () => {
     expect((await guest.leave(joined.snapshot.sessionId))?.mode).toBe('guest');
     expect((await host.leave(hosted.snapshot.sessionId))?.mode).toBe('host');
   }, 30_000);
+
+  it('rolls back a detached guest when its initial presence refresh fails', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-join-presence-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    const hostRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'host-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const guestRuntime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'guest-recovery'),
+      autosaveDelayMs: 0,
+    });
+    const host = new DesktopCollaborationCoordinator(hostRuntime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+    });
+    const guest = new DesktopCollaborationCoordinator(guestRuntime);
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(guestRuntime));
+    cleanup.push(() => closeRuntime(hostRuntime));
+    cleanup.push(() => guest.shutdownAll());
+    cleanup.push(() => host.shutdownAll());
+
+    const hostSource = await hostRuntime.createMainOnly();
+    await hostRuntime.saveAsMainOnly(hostSource.sessionId, {
+      targetPath,
+      expectedFingerprint: null,
+    });
+    const guestSource = await guestRuntime.openMainOnly({ targetPath });
+    const hosted = await host.host({
+      sessionId: hostSource.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+    let detachedSessionId: string | undefined;
+    const createGuestReplica = guestRuntime.createMainOnly.bind(guestRuntime);
+    vi.spyOn(guestRuntime, 'createMainOnly').mockImplementation(async (...args) => {
+      const detached = await createGuestReplica(...args);
+      detachedSessionId = detached.sessionId;
+      return detached;
+    });
+    const updatePresence = vi
+      .spyOn(CollaborationTransportClient.prototype, 'updatePresence')
+      .mockRejectedValueOnce(new Error('Injected initial presence failure.'));
+
+    await expect(
+      guest.join({
+        sessionId: guestSource.sessionId,
+        targetPath,
+        endpoint: hosted.status.endpoint!,
+        sessionCode: hosted.status.sessionCode!,
+        expectedFingerprint: hosted.status.hostFingerprint!,
+        displayName: 'Guest',
+      }),
+    ).rejects.toThrow('Injected initial presence failure.');
+    updatePresence.mockRestore();
+    expect(detachedSessionId).toBeDefined();
+    expect(guest.mode(detachedSessionId!)).toBe('offline');
+    expect(guestRuntime.listSessions().map((session) => session.sessionId)).toEqual([
+      guestSource.sessionId,
+    ]);
+    await waitFor(() => host.status(hosted.snapshot.sessionId).connectedPeers === 0);
+  }, 20_000);
 
   it('coordinates text leases across a host and two guests through renew, disconnect, and expiry', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-text-leases-'));

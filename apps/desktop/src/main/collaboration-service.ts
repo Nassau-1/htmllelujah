@@ -950,6 +950,8 @@ export class DesktopCollaborationCoordinator {
         ? {}
         : { joinApprovalTimeoutMs: this.#options.joinApprovalTimeoutMs + 1_000 }),
     });
+    let detached: DocumentSessionSnapshot | undefined;
+    let state: GuestState | undefined;
     try {
       await client.connect();
       const initial = await client.getResync({
@@ -971,10 +973,11 @@ export class DesktopCollaborationCoordinator {
         synchronized = memory.getSnapshot();
         lastSeq = initial.toSeq;
       }
-      const detached = await this.#cloneDetached(input.sessionId, synchronized);
-      const state: GuestState = {
+      const detachedSnapshot = await this.#cloneDetached(input.sessionId, synchronized);
+      detached = detachedSnapshot;
+      const guestState: GuestState = {
         mode: 'guest',
-        sessionId: detached.sessionId,
+        sessionId: detachedSnapshot.sessionId,
         targetPath: input.targetPath,
         clientId,
         displayName: input.displayName,
@@ -992,26 +995,53 @@ export class DesktopCollaborationCoordinator {
         stopTransactionListener: () => undefined,
         stopDisconnectListener: () => undefined,
       };
-      state.stopTransactionListener = client.onTransaction((transaction) => {
+      state = guestState;
+      guestState.stopTransactionListener = client.onTransaction((transaction) => {
         // The queue records a fatal replica failure and disconnects before this rejection is
         // consumed at the event boundary, so a divergence can never remain silent/editable.
-        void this.#queueGuestTransaction(state, transaction).catch(() => undefined);
+        void this.#queueGuestTransaction(guestState, transaction).catch(() => undefined);
       });
-      this.#states.set(detached.sessionId, state);
-      state.stopPresenceHeartbeat = this.#startPresenceHeartbeat(state);
-      state.stopDisconnectListener = client.onDisconnect(() => {
-        if (this.#states.get(state.sessionId) !== state || state.failure !== undefined) return;
-        state.textLeases.clear();
-        void this.#reconnectGuest(state).catch(() => undefined);
+      this.#states.set(detachedSnapshot.sessionId, guestState);
+      guestState.stopDisconnectListener = client.onDisconnect(() => {
+        if (
+          this.#states.get(guestState.sessionId) !== guestState ||
+          guestState.failure !== undefined
+        )
+          return;
+        guestState.textLeases.clear();
+        void this.#reconnectGuest(guestState).catch(() => undefined);
       });
+      guestState.stopPresenceHeartbeat = this.#startPresenceHeartbeat(guestState);
+      // Authentication creates sequence 0 on the host, but cloning a large local replica can
+      // outlive the presence TTL before the heartbeat exists. Refresh once before join resolves
+      // so an authenticated guest is represented when the caller first observes the session.
+      await this.#enqueuePresence(guestState);
       return {
         previousSessionId: input.sessionId,
-        snapshot: detached,
+        snapshot: detachedSnapshot,
         targetPath: input.targetPath,
-        status: this.status(detached.sessionId),
+        status: this.status(detachedSnapshot.sessionId),
       };
     } catch (error) {
+      if (state !== undefined) {
+        state.stopTransactionListener();
+        state.stopDisconnectListener();
+        state.stopPresenceHeartbeat();
+        if (this.#states.get(state.sessionId) === state) this.#states.delete(state.sessionId);
+        await client.close().catch(() => undefined);
+        await state.reconnectPromise?.catch(() => undefined);
+        await state.applyQueue;
+        await state.presenceQueue;
+        await state.textLeaseQueue;
+        await state.safeTransition;
+        state.secret.fill(0);
+      }
       await client.close().catch(() => undefined);
+      if (detached !== undefined) {
+        await this.#runtime
+          .close(detached.sessionId, { discardUnsaved: true })
+          .catch(() => undefined);
+      }
       throw error;
     } finally {
       decoded.secret.fill(0);
