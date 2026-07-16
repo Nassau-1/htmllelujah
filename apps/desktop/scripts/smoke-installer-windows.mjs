@@ -22,19 +22,33 @@ import { createHdeckArchive } from '@htmllelujah/hdeck';
 
 import {
   INSTALLER_SMOKE_TEMP_PREFIXES,
+  assertCleanSourceState,
   assertOwnedTemporaryPath,
+  assertSourceStateUnchanged,
   assertStableArtifact,
+  assertStableHarnessManifest,
+  captureCreatedProductRegistryIdentities,
   expectedUnsignedInstallerName,
   newTemporaryEntries,
   normalizeJsonArray,
   parseInstallerSmokeArguments,
+  remainingCapturedRegistryIdentities,
+  selectOwnedProcessRecords,
   sameAssociationState,
 } from './installer-smoke-support.mjs';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
 const evidencePath = path.join(repositoryRoot, 'artifacts', 'evidence', 'installer-v1.json');
-const supportPath = path.join(import.meta.dirname, 'installer-smoke-support.mjs');
+const harnessPaths = [
+  import.meta.filename,
+  path.join(import.meta.dirname, 'installer-smoke-support.mjs'),
+  path.join(import.meta.dirname, 'smoke-ui-electron.mjs'),
+  path.join(import.meta.dirname, 'ui-smoke-performance.mjs'),
+  path.join(import.meta.dirname, 'automate-save-dialog.ps1'),
+  path.join(import.meta.dirname, 'smoke-mcp-electron.mjs'),
+  path.join(import.meta.dirname, 'mcp-json-line-router.mjs'),
+];
 const productProgId = 'HTMLlelujah presentation';
 const temporaryPrefix = 'htmllelujah-installer-smoke-';
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -87,13 +101,28 @@ const artifactIdentity = async (filePath) => {
   };
 };
 
-const harnessSha256 = async () => {
-  const digest = createHash('sha256');
-  for (const filePath of [import.meta.filename, supportPath]) {
-    digest.update(path.basename(filePath));
-    digest.update(await readFile(filePath));
+const harnessIdentity = async () => {
+  if (harnessPaths.length === 0 || harnessPaths.length > 16) {
+    throw new Error('The release harness file set is invalid.');
   }
-  return digest.digest('hex');
+  const digest = createHash('sha256');
+  const files = [];
+  for (const filePath of harnessPaths) {
+    const metadata = await stat(filePath);
+    if (!metadata.isFile() || metadata.size === 0 || metadata.size > 1_048_576) {
+      throw new Error(`Release harness file is invalid: ${path.basename(filePath)}`);
+    }
+    const relativePath = path.relative(repositoryRoot, filePath).split(path.sep).join('/');
+    const fileSha256 = await sha256(filePath);
+    digest.update(relativePath);
+    digest.update('\0');
+    digest.update(String(metadata.size));
+    digest.update('\0');
+    digest.update(fileSha256);
+    digest.update('\n');
+    files.push({ path: relativePath, size: metadata.size, sha256: fileSha256 });
+  }
+  return { sha256: digest.digest('hex'), files };
 };
 
 const terminateProcessTree = (processId) => {
@@ -188,6 +217,7 @@ const registryState = (installDirectory) => {
       'if ($null -ne $extension) { $extension.Dispose() }',
       "$openWith = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\Classes\\.hdeck\\OpenWithProgids')",
       '$openWithProgIds = if ($null -eq $openWith) { @() } else { @($openWith.GetValueNames() | Sort-Object) }',
+      '$openWithKeyRegistered = $null -ne $openWith',
       'if ($null -ne $openWith) { $openWith.Dispose() }',
       "$productClass = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(('Software\\Classes\\{0}' -f $productProgId))",
       '$productClassRegistered = $null -ne $productClass',
@@ -197,6 +227,8 @@ const registryState = (installDirectory) => {
       'if ($null -ne $commandKey) { $commandKey.Dispose() }',
       '$installRecords = @()',
       '$uninstallRecords = @()',
+      '$installKeyIdentities = @()',
+      '$uninstallKeyIdentities = @()',
       '$hives = @(',
       "  [pscustomobject]@{ Name = 'HKCU'; Hive = [Microsoft.Win32.Registry]::CurrentUser },",
       "  [pscustomobject]@{ Name = 'HKLM'; Hive = [Microsoft.Win32.Registry]::LocalMachine }",
@@ -205,6 +237,7 @@ const registryState = (installDirectory) => {
       "  $software = $item.Hive.OpenSubKey('Software')",
       '  if ($null -ne $software) {',
       '    foreach ($name in $software.GetSubKeyNames()) {',
+      '      $installKeyIdentities += [pscustomobject]@{ hive = $item.Name; key = $name }',
       '      $key = $software.OpenSubKey($name)',
       "      $location = if ($null -eq $key) { $null } else { [string]$key.GetValue('InstallLocation') }",
       '      if (-not [string]::IsNullOrWhiteSpace($location) -and [string]::Equals($location, $target, [StringComparison]::OrdinalIgnoreCase)) {',
@@ -217,6 +250,7 @@ const registryState = (installDirectory) => {
       "  $uninstall = $item.Hive.OpenSubKey('Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall')",
       '  if ($null -ne $uninstall) {',
       '    foreach ($name in $uninstall.GetSubKeyNames()) {',
+      '      $uninstallKeyIdentities += [pscustomobject]@{ hive = $item.Name; key = $name }',
       '      $key = $uninstall.OpenSubKey($name)',
       "      $displayName = if ($null -eq $key) { $null } else { [string]$key.GetValue('DisplayName') }",
       "      $location = if ($null -eq $key) { $null } else { [string]$key.GetValue('InstallLocation') }",
@@ -233,12 +267,15 @@ const registryState = (installDirectory) => {
       '}',
       '[ordered]@{',
       '  extensionKeyRegistered = $extensionKeyRegistered',
+      '  openWithKeyRegistered = $openWithKeyRegistered',
       '  extensionDefault = $extensionDefault',
       '  openWithProgIds = @($openWithProgIds)',
       '  productClassRegistered = $productClassRegistered',
       '  productCommand = $productCommand',
       '  installRecords = @($installRecords)',
       '  uninstallRecords = @($uninstallRecords)',
+      '  installKeyIdentities = @($installKeyIdentities)',
+      '  uninstallKeyIdentities = @($uninstallKeyIdentities)',
       '} | ConvertTo-Json -Compress -Depth 5',
     ].join('\n'),
     { HTMLLELUJAH_INSTALL_TARGET: installDirectory },
@@ -248,6 +285,8 @@ const registryState = (installDirectory) => {
     openWithProgIds: normalizeJsonArray(state.openWithProgIds),
     installRecords: normalizeJsonArray(state.installRecords),
     uninstallRecords: normalizeJsonArray(state.uninstallRecords),
+    installKeyIdentities: normalizeJsonArray(state.installKeyIdentities),
+    uninstallKeyIdentities: normalizeJsonArray(state.uninstallKeyIdentities),
   };
 };
 
@@ -271,23 +310,20 @@ const shortcutState = (installedExecutable) => {
   return normalizeJsonArray(state);
 };
 
-const productProcesses = (installDirectory, installedExecutable) => {
+const productProcesses = (installedExecutable) => {
   const state = powershellJson(
     [
-      '$target = $env:HTMLLELUJAH_EXECUTABLE',
-      '$directory = $env:HTMLLELUJAH_INSTALL_TARGET',
-      '$matches = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {',
-      '  (-not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and [string]::Equals($_.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase)) -or',
-      '  (-not [string]::IsNullOrWhiteSpace($_.CommandLine) -and $_.CommandLine.IndexOf($directory, [StringComparison]::OrdinalIgnoreCase) -ge 0)',
-      '} | ForEach-Object { [pscustomobject]@{ processId = [int]$_.ProcessId } }',
+      '$matches = Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {',
+      '  [pscustomobject]@{',
+      '    processId = [int]$_.ProcessId',
+      '    parentProcessId = [int]$_.ParentProcessId',
+      '    executablePath = if ([string]::IsNullOrWhiteSpace($_.ExecutablePath)) { $null } else { [string]$_.ExecutablePath }',
+      '  }',
+      '}',
       'ConvertTo-Json -InputObject @($matches) -Compress',
     ].join('\n'),
-    {
-      HTMLLELUJAH_EXECUTABLE: installedExecutable,
-      HTMLLELUJAH_INSTALL_TARGET: installDirectory,
-    },
   );
-  return normalizeJsonArray(state);
+  return selectOwnedProcessRecords(normalizeJsonArray(state), installedExecutable);
 };
 
 const namedProductProcesses = () => {
@@ -300,8 +336,8 @@ const namedProductProcesses = () => {
   return normalizeJsonArray(state);
 };
 
-const terminateOwnedProcesses = (installDirectory, installedExecutable) => {
-  for (const entry of productProcesses(installDirectory, installedExecutable)) {
+const terminateOwnedProcesses = (installedExecutable) => {
+  for (const entry of productProcesses(installedExecutable)) {
     if (Number.isSafeInteger(entry.processId)) terminateProcessTree(entry.processId);
   }
 };
@@ -419,13 +455,14 @@ const assertInstalledShortcuts = (shortcuts) => {
   }
 };
 
-const assertNoProductRegistry = (state, baseline) => {
+const assertNoProductRegistry = (state, baseline, capturedRegistryIdentities) => {
   if (
     !sameAssociationState(baseline, state) ||
     state.productClassRegistered ||
     state.openWithProgIds.some((value) => value === productProgId) ||
     state.installRecords.length > 0 ||
-    state.uninstallRecords.length > 0
+    state.uninstallRecords.length > 0 ||
+    remainingCapturedRegistryIdentities(capturedRegistryIdentities, state).length > 0
   ) {
     throw new Error('Product registry state was not restored to its pre-test baseline.');
   }
@@ -495,18 +532,31 @@ const inspectRecoveryCandidate = async (recoveryDirectory, recovery, consume = f
   return candidate.recordCount;
 };
 
-const gitCommit = () => {
-  const result = spawnSync('git', ['rev-parse', 'HEAD'], {
+const gitSourceState = () => {
+  const commitResult = spawnSync('git', ['rev-parse', 'HEAD'], {
     cwd: repositoryRoot,
     windowsHide: true,
     encoding: 'utf8',
     timeout: 10_000,
   });
-  const value = result.status === 0 ? result.stdout.trim() : '';
-  return /^[0-9a-f]{40}$/u.test(value) ? value : null;
+  const statusResult = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
+    cwd: repositoryRoot,
+    windowsHide: true,
+    encoding: 'utf8',
+    timeout: 10_000,
+  });
+  const commit = commitResult.status === 0 ? commitResult.stdout.trim() : '';
+  return {
+    commit: /^[0-9a-f]{40}$/u.test(commit) ? commit : null,
+    dirty: statusResult.status === 0 ? statusResult.stdout.trim() !== '' : null,
+  };
 };
 
 if (process.platform !== 'win32') throw new Error('The installer smoke requires Windows.');
+
+const sourceBefore = gitSourceState();
+assertCleanSourceState(sourceBefore);
+const harnessBefore = await harnessIdentity();
 
 await mkdir(path.dirname(evidencePath), { recursive: true });
 await rm(evidencePath, { force: true });
@@ -525,7 +575,6 @@ if (path.basename(installer) !== expectedUnsignedInstallerName(desktopPackage.ve
 }
 
 const artifactBefore = await artifactIdentity(installer);
-const harnessHash = await harnessSha256();
 const startedAt = new Date();
 const token = tokenProfile();
 if (token.isElevated || token.isSystem) {
@@ -565,6 +614,7 @@ let recoveryDirectoryExisted = false;
 let recoveryBlobsExisted = false;
 let applicationDataBefore;
 let registryBefore;
+let capturedRegistryIdentities = [];
 let shortcutsBefore;
 
 const stage = async (name, operation) => {
@@ -629,7 +679,12 @@ try {
   installed = true;
   await waitFor(() => exists(installedExecutable), 30_000, 'Installed application');
   await assertInstalledFiles(installDirectory);
-  assertInstalledWindowsState(registryState(installDirectory), registryBefore, installedExecutable);
+  const installedRegistryState = registryState(installDirectory);
+  assertInstalledWindowsState(installedRegistryState, registryBefore, installedExecutable);
+  capturedRegistryIdentities = captureCreatedProductRegistryIdentities(
+    registryBefore,
+    installedRegistryState,
+  );
   assertInstalledShortcuts(shortcutState(installedExecutable));
   const installedExecutableHash = await sha256(installedExecutable);
 
@@ -649,7 +704,7 @@ try {
     throw new Error('Opening and editing in memory unexpectedly changed the source deck.');
   }
   await waitFor(
-    () => (productProcesses(installDirectory, installedExecutable).length === 0 ? true : false),
+    () => (productProcesses(installedExecutable).length === 0 ? true : false),
     15_000,
     'Installed editor process cleanup',
   );
@@ -666,7 +721,7 @@ try {
     }),
   );
   await waitFor(
-    () => (productProcesses(installDirectory, installedExecutable).length === 0 ? true : false),
+    () => (productProcesses(installedExecutable).length === 0 ? true : false),
     15_000,
     'Installed MCP process cleanup',
   );
@@ -719,21 +774,27 @@ try {
   installed = false;
   await waitFor(async () => !(await exists(installDirectory)), 60_000, 'Installation removal');
   await waitFor(
-    () => (productProcesses(installDirectory, installedExecutable).length === 0 ? true : false),
+    () => (productProcesses(installedExecutable).length === 0 ? true : false),
     15_000,
     'Uninstalled process cleanup',
   );
   await waitFor(
     () => {
       const state = registryState(installDirectory);
-      return sameAssociationState(registryBefore, state) && state.installRecords.length === 0
+      return sameAssociationState(registryBefore, state) &&
+        state.installRecords.length === 0 &&
+        remainingCapturedRegistryIdentities(capturedRegistryIdentities, state).length === 0
         ? state
         : false;
     },
     30_000,
     'Registry cleanup',
   );
-  assertNoProductRegistry(registryState(installDirectory), registryBefore);
+  assertNoProductRegistry(
+    registryState(installDirectory),
+    registryBefore,
+    capturedRegistryIdentities,
+  );
   await waitFor(
     () => (shortcutState(installedExecutable).every((entry) => !entry.present) ? true : false),
     30_000,
@@ -747,9 +808,9 @@ try {
   lifecycleError = error;
 } finally {
   try {
-    terminateOwnedProcesses(installDirectory, installedExecutable);
+    terminateOwnedProcesses(installedExecutable);
     await waitFor(
-      () => (productProcesses(installDirectory, installedExecutable).length === 0 ? true : false),
+      () => (productProcesses(installedExecutable).length === 0 ? true : false),
       15_000,
       'Owned process cleanup',
     );
@@ -801,14 +862,15 @@ try {
 
 try {
   if (await exists(temporaryRoot)) throw new Error('The owned installer smoke directory remains.');
-  if (
-    productProcesses(installDirectory, installedExecutable).length > 0 ||
-    namedProductProcesses().length > 0
-  ) {
+  if (productProcesses(installedExecutable).length > 0 || namedProductProcesses().length > 0) {
     throw new Error('A product process remains after the installer lifecycle.');
   }
   if (registryBefore !== undefined) {
-    assertNoProductRegistry(registryState(installDirectory), registryBefore);
+    assertNoProductRegistry(
+      registryState(installDirectory),
+      registryBefore,
+      capturedRegistryIdentities,
+    );
   }
   if (shortcutsBefore !== undefined) {
     assertNoShortcuts(shortcutState(installedExecutable));
@@ -828,6 +890,9 @@ try {
       `Installer lifecycle left temporary directories: ${leakedTemporaryEntries.join(', ')}`,
     );
   }
+  const harnessAfter = await harnessIdentity();
+  assertStableHarnessManifest(harnessBefore.files, harnessAfter.files);
+  assertSourceStateUnchanged(sourceBefore, gitSourceState());
   assertStableArtifact(artifactBefore, await artifactIdentity(installer));
 } catch (error) {
   cleanupErrors.push(error);
@@ -843,15 +908,16 @@ if (lifecycleError !== undefined || cleanupErrors.length > 0) {
 
 const completedAt = new Date();
 const report = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   passed: true,
   startedAt: startedAt.toISOString(),
   completedAt: completedAt.toISOString(),
   durationMs: completedAt.getTime() - startedAt.getTime(),
   platform: `${process.platform}-${process.arch}`,
-  sourceCommit: gitCommit(),
+  sourceCommit: sourceBefore.commit,
+  sourceCleanAndStable: true,
   harness: {
-    sha256: harnessHash,
+    ...harnessBefore,
     finalArtifactGate: true,
   },
   installer: {
@@ -865,7 +931,8 @@ const report = {
   },
   stageDurationsMs,
   checks: {
-    nonElevatedStandardUserToken: true,
+    nonElevatedCurrentUserToken: true,
+    dedicatedNonAdministratorAccount: 'not-tested',
     perUserRegistryOnly: true,
     perUserSilentInstall: true,
     unicodeInstallDirectory: true,
@@ -884,16 +951,20 @@ const report = {
     repairRerunRestoredMissingPayload: true,
     upgradeLikeReinstallRemovedObsoletePayload: true,
     maintenancePreservedUserDeck: true,
-    maintenancePreservedDurableRecovery: true,
     uninstallPreservedUserDeck: true,
-    uninstallPreservedAndReplayedDurableRecovery: true,
-    recoveryJournalRecordCount: recoveryRecordCount,
     sourceDeckUnchangedWithoutSave: true,
     noResidualProductProcesses: true,
     noResidualProductRegistry: true,
     noResidualProductShortcuts: true,
     noResidualHarnessOrChildSmokeTemp: true,
     priorApplicationDataTreeRestored: true,
+  },
+  recoveryWorkspace: {
+    validationScope: 'repository-source-runtime-format-and-file-preservation',
+    installedExecutableRecoveryExecution: 'not-tested',
+    formatAndFilePreservationVerified: true,
+    sourceRuntimeReplayAfterUninstallVerified: true,
+    journalRecordCount: recoveryRecordCount,
   },
 };
 const evidenceTemporary = `${evidencePath}.${randomUUID()}.tmp`;

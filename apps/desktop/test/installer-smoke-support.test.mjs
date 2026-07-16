@@ -4,12 +4,18 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  assertCleanSourceState,
   assertOwnedTemporaryPath,
+  assertSourceStateUnchanged,
   assertStableArtifact,
+  assertStableHarnessManifest,
+  captureCreatedProductRegistryIdentities,
   expectedUnsignedInstallerName,
   newTemporaryEntries,
   normalizeJsonArray,
   parseInstallerSmokeArguments,
+  remainingCapturedRegistryIdentities,
+  selectOwnedProcessRecords,
   sameAssociationState,
 } from '../scripts/installer-smoke-support.mjs';
 
@@ -72,6 +78,7 @@ describe('Windows installer lifecycle smoke support', () => {
   it('requires the foreign association baseline to be restored exactly', () => {
     const baseline = {
       extensionKeyRegistered: true,
+      openWithKeyRegistered: true,
       extensionDefault: 'Another.Editor',
       openWithProgIds: ['Another.Editor'],
       productClassRegistered: false,
@@ -85,6 +92,68 @@ describe('Windows installer lifecycle smoke support', () => {
         openWithProgIds: ['Another.Editor', 'HTMLlelujah presentation'],
       }),
     ).toBe(false);
+    expect(sameAssociationState(baseline, { ...baseline, openWithKeyRegistered: false })).toBe(
+      false,
+    );
+  });
+
+  it('selects only the exact product executable and its transitive children', () => {
+    const installedExecutable = 'C:\\Temp\\HTMLlelujah\\HTMLlelujah.exe';
+    const records = [
+      { processId: 10, parentProcessId: 1, executablePath: installedExecutable },
+      { processId: 11, parentProcessId: 10, executablePath: 'C:\\Windows\\System32\\conhost.exe' },
+      { processId: 12, parentProcessId: 11, executablePath: 'C:\\Windows\\System32\\WerFault.exe' },
+      {
+        processId: 20,
+        parentProcessId: 1,
+        executablePath: 'C:\\Windows\\System32\\notepad.exe',
+        commandLine: `notepad.exe ${path.dirname(installedExecutable)}`,
+      },
+      { processId: 21, parentProcessId: 20, executablePath: 'C:\\Windows\\System32\\conhost.exe' },
+    ];
+
+    expect(
+      selectOwnedProcessRecords(records, installedExecutable).map((entry) => entry.processId),
+    ).toEqual([10, 11, 12]);
+  });
+
+  it('fails closed when source or release-harness identity changes', () => {
+    const clean = { commit: 'a'.repeat(40), dirty: false };
+    expect(() => assertCleanSourceState(clean)).not.toThrow();
+    expect(() => assertCleanSourceState({ ...clean, dirty: true })).toThrow(/clean/u);
+    expect(() => assertSourceStateUnchanged(clean, clean)).not.toThrow();
+    expect(() =>
+      assertSourceStateUnchanged(clean, { commit: 'b'.repeat(40), dirty: false }),
+    ).toThrow(/changed/u);
+    expect(() => assertStableHarnessManifest([{ sha256: 'a' }], [{ sha256: 'a' }])).not.toThrow();
+    expect(() => assertStableHarnessManifest([{ sha256: 'a' }], [{ sha256: 'b' }])).toThrow(
+      /changed/u,
+    );
+  });
+
+  it('tracks exact created registry keys after their identifying values disappear', () => {
+    const before = {
+      installKeyIdentities: [{ hive: 'HKCU', key: 'Existing' }],
+      uninstallKeyIdentities: [{ hive: 'HKCU', key: 'ExistingUninstall' }],
+    };
+    const installed = {
+      installRecords: [{ hive: 'HKCU', key: 'HTMLlelujah' }],
+      uninstallRecords: [{ hive: 'HKCU', key: '{PRODUCT-GUID}' }],
+      installKeyIdentities: [...before.installKeyIdentities, { hive: 'HKCU', key: 'HTMLlelujah' }],
+      uninstallKeyIdentities: [
+        ...before.uninstallKeyIdentities,
+        { hive: 'HKCU', key: '{PRODUCT-GUID}' },
+      ],
+    };
+    const captured = captureCreatedProductRegistryIdentities(before, installed);
+    const emptiedButPresent = {
+      installRecords: [],
+      uninstallRecords: [],
+      installKeyIdentities: installed.installKeyIdentities,
+      uninstallKeyIdentities: installed.uninstallKeyIdentities,
+    };
+    expect(remainingCapturedRegistryIdentities(captured, emptiedButPresent)).toHaveLength(2);
+    expect(remainingCapturedRegistryIdentities(captured, before)).toEqual([]);
   });
 
   it('rejects an artifact whose bytes, length, or timestamp changed', () => {
@@ -124,6 +193,10 @@ describe('Windows installer lifecycle smoke support', () => {
     expect(source).toContain(
       'assertStableArtifact(artifactBefore, await artifactIdentity(installer))',
     );
+    expect(source).toContain('assertSourceStateUnchanged(sourceBefore, gitSourceState())');
+    expect(source).toContain(
+      'assertStableHarnessManifest(harnessBefore.files, harnessAfter.files)',
+    );
     expect(source).toContain('await rename(evidenceTemporary, evidencePath)');
   });
 
@@ -141,6 +214,7 @@ describe('Windows installer lifecycle smoke support', () => {
     expect(source).toContain('await manager.listRecoveryCandidatesMainOnly()');
     expect(source).toContain('await manager.recoverMainOnly(recovery.candidateId)');
     expect(source).toContain('await manager.close(recovery.candidateId, { discardUnsaved: true })');
+    expect(source).toContain(`installedExecutableRecoveryExecution: 'not-tested'`);
   });
 
   it('requires a non-elevated HKCU install and checks every owned residue class', async () => {
@@ -152,10 +226,13 @@ describe('Windows installer lifecycle smoke support', () => {
     expect(source).toContain('if (token.isElevated || token.isSystem)');
     expect(source).toContain("entry.hive === 'HKCU'");
     expect(source).toContain("entry.hive === 'HKLM'");
-    expect(source).toContain('assertNoProductRegistry(registryState(installDirectory)');
+    expect(source).toContain('assertNoProductRegistry(');
     expect(source).toContain('assertNoShortcuts(shortcutState(installedExecutable))');
-    expect(source).toContain('productProcesses(installDirectory, installedExecutable).length > 0');
+    expect(source).toContain('productProcesses(installedExecutable).length > 0');
     expect(source).toContain('namedProductProcesses().length > 0');
+    expect(source).not.toContain('CommandLine.IndexOf($directory');
+    expect(source).toContain('captureCreatedProductRegistryIdentities(');
+    expect(source).toContain('remainingCapturedRegistryIdentities(');
     expect(source).toContain('newTemporaryEntries(');
     expect(source).toContain('sameTreeSnapshot(applicationDataBefore, applicationDataAfter)');
   });
