@@ -40,7 +40,12 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_REQUESTS_PER_MINUTE = 120;
 const DEFAULT_DESCRIPTOR_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ROTATION_LEAD_MS = 5 * 60 * 1000;
-const MIN_DESCRIPTOR_LIFETIME_MS = 100;
+// A descriptor must remain discoverable long enough for an in-flight client to
+// finish the bounded authentication handshake. Keeping two authentication
+// windows before expiry also leaves one full window for atomic publication.
+const MIN_ROTATION_LEAD_MS = AUTH_TIMEOUT_MS * 2;
+const MIN_ROTATION_INTERVAL_MS = AUTH_TIMEOUT_MS;
+const MIN_DESCRIPTOR_LIFETIME_MS = MIN_ROTATION_LEAD_MS + MIN_ROTATION_INTERVAL_MS;
 
 export interface LocalRpcEndpointDescriptor {
   readonly protocolVersion: 1;
@@ -55,6 +60,7 @@ export interface LocalRpcEndpointDescriptor {
 export interface LocalRpcServerHandle {
   readonly descriptor: LocalRpcEndpointDescriptor;
   readonly connectionCount: number;
+  rotateCredentials(): Promise<LocalRpcEndpointDescriptor>;
   close(): Promise<void>;
 }
 
@@ -483,8 +489,8 @@ export const startLocalRpcServer = async (input: {
     !Number.isSafeInteger(lifetimeMs) ||
     lifetimeMs < MIN_DESCRIPTOR_LIFETIME_MS ||
     !Number.isSafeInteger(rotationLeadMs) ||
-    rotationLeadMs <= 0 ||
-    rotationLeadMs >= lifetimeMs
+    rotationLeadMs < MIN_ROTATION_LEAD_MS ||
+    lifetimeMs - rotationLeadMs < MIN_ROTATION_INTERVAL_MS
   ) {
     throw new McpSafeError('INVALID_REQUEST', 'Endpoint rotation timing is invalid.');
   }
@@ -533,36 +539,54 @@ export const startLocalRpcServer = async (input: {
   }
   let closed = false;
   let rotationTimer: ReturnType<typeof setTimeout> | undefined;
-  let rotationTask: Promise<void> | undefined;
+  let rotationTask: Promise<LocalRpcEndpointDescriptor> | undefined;
   const rotationDelayMs = lifetimeMs - rotationLeadMs;
+  const beginRotation = (): Promise<LocalRpcEndpointDescriptor> => {
+    if (closed) {
+      return Promise.reject(new McpSafeError('SERVICE_UNAVAILABLE', 'Local RPC server is closed.'));
+    }
+    if (rotationTask !== undefined) return rotationTask;
+    const task = (async () => {
+      const now = Date.now();
+      for (const [candidateId, credential] of credentials) {
+        if (credential.expiresAtMs <= now) credentials.delete(candidateId);
+      }
+      const replacement = createDescriptor();
+      credentials.set(replacement.instanceId, {
+        secret: replacement.secret,
+        expiresAtMs: Date.parse(replacement.expiresAt),
+      });
+      try {
+        await writeDescriptorAtomic(input.descriptorPath, replacement);
+      } catch (error) {
+        credentials.delete(replacement.instanceId);
+        throw error;
+      }
+      descriptor = replacement;
+      return replacement;
+    })();
+    rotationTask = task;
+    void task.then(
+      () => {
+        if (rotationTask === task) rotationTask = undefined;
+      },
+      () => {
+        if (rotationTask === task) rotationTask = undefined;
+      },
+    );
+    return task;
+  };
   const scheduleRotation = (delayMs: number): void => {
     if (closed) return;
+    if (rotationTimer !== undefined) clearTimeout(rotationTimer);
     rotationTimer = setTimeout(() => {
       rotationTimer = undefined;
-      const task = (async () => {
-        const replacement = createDescriptor();
-        credentials.set(replacement.instanceId, {
-          secret: replacement.secret,
-          expiresAtMs: Date.parse(replacement.expiresAt),
-        });
-        try {
-          await writeDescriptorAtomic(input.descriptorPath, replacement);
-        } catch (error) {
-          credentials.delete(replacement.instanceId);
-          throw error;
-        }
-        descriptor = replacement;
-      })();
-      rotationTask = task;
-      void task
+      void beginRotation()
         .then(() => scheduleRotation(rotationDelayMs))
         .catch(() => {
           const remainingMs = Date.parse(descriptor.expiresAt) - Date.now();
           const retryMs = Math.max(50, Math.min(1_000, Math.floor(remainingMs / 2)));
           scheduleRotation(retryMs);
-        })
-        .finally(() => {
-          if (rotationTask === task) rotationTask = undefined;
         });
     }, delayMs);
     rotationTimer.unref?.();
@@ -574,6 +598,24 @@ export const startLocalRpcServer = async (input: {
     },
     get connectionCount() {
       return sockets.size;
+    },
+    async rotateCredentials() {
+      if (rotationTimer !== undefined) {
+        clearTimeout(rotationTimer);
+        rotationTimer = undefined;
+      }
+      try {
+        const replacement = await beginRotation();
+        scheduleRotation(rotationDelayMs);
+        return replacement;
+      } catch (error) {
+        if (!closed) {
+          const remainingMs = Date.parse(descriptor.expiresAt) - Date.now();
+          const retryMs = Math.max(50, Math.min(1_000, Math.floor(remainingMs / 2)));
+          scheduleRotation(retryMs);
+        }
+        throw error;
+      }
     },
     async close() {
       if (closed) return;
@@ -617,6 +659,25 @@ const parseDescriptor = (value: unknown): LocalRpcEndpointDescriptor => {
     throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is stale or invalid.');
   }
   return value as unknown as LocalRpcEndpointDescriptor;
+};
+
+const readDescriptor = async (descriptorPath: string): Promise<LocalRpcEndpointDescriptor> => {
+  let descriptorBytes: Buffer;
+  try {
+    descriptorBytes = await readFile(descriptorPath);
+  } catch {
+    throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is unavailable.');
+  }
+  if (descriptorBytes.byteLength > 16 * 1024) {
+    throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is too large.');
+  }
+  let descriptorValue: unknown;
+  try {
+    descriptorValue = JSON.parse(descriptorBytes.toString('utf8')) as unknown;
+  } catch {
+    throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is invalid.');
+  }
+  return parseDescriptor(descriptorValue);
 };
 
 const connectSocket = async (pipeName: string): Promise<Socket> =>
@@ -670,22 +731,33 @@ export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate 
   }
 
   private async connectInternal(): Promise<void> {
-    let descriptorBytes: Buffer;
+    const descriptor = await readDescriptor(this.descriptorPath);
     try {
-      descriptorBytes = await readFile(this.descriptorPath);
-    } catch {
-      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is unavailable.');
+      await this.connectWithDescriptor(descriptor);
+      return;
+    } catch (error) {
+      if (this.closed) throw error;
+      // Atomic replacement can happen after a client reads the file but before
+      // it finishes authentication. Retry exactly once only when the endpoint
+      // identity actually changed; unchanged or tampered descriptors still
+      // fail closed without a timing-based retry loop.
+      let replacement: LocalRpcEndpointDescriptor;
+      try {
+        replacement = await readDescriptor(this.descriptorPath);
+      } catch {
+        throw error;
+      }
+      if (
+        replacement.instanceId === descriptor.instanceId &&
+        replacement.secret === descriptor.secret
+      ) {
+        throw error;
+      }
+      await this.connectWithDescriptor(replacement);
     }
-    if (descriptorBytes.byteLength > 16 * 1024) {
-      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is too large.');
-    }
-    let descriptorValue: unknown;
-    try {
-      descriptorValue = JSON.parse(descriptorBytes.toString('utf8')) as unknown;
-    } catch {
-      throw new McpSafeError('SERVICE_UNAVAILABLE', 'Endpoint descriptor is invalid.');
-    }
-    const descriptor = parseDescriptor(descriptorValue);
+  }
+
+  private async connectWithDescriptor(descriptor: LocalRpcEndpointDescriptor): Promise<void> {
     if (this.closed) {
       throw new McpSafeError('SERVICE_UNAVAILABLE', 'Local RPC client is closed.');
     }

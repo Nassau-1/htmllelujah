@@ -1,4 +1,6 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -549,15 +551,18 @@ describe('authenticated local RPC', () => {
     });
   });
 
-  it('rotates an expiring descriptor and secret while preserving established clients', async () => {
+  it('rotates credentials behind an explicit barrier while preserving established clients', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const initialTime = Date.parse('2026-07-16T12:00:00.000Z');
+    vi.setSystemTime(initialTime);
     const directory = await createTemporaryDirectory();
     const descriptorPath = path.join(directory, 'endpoint-v1.json');
     const staleDescriptorPath = path.join(directory, 'expired-endpoint-v1.json');
     const server = await startLocalRpcServer({
       service: createService(),
       descriptorPath,
-      lifetimeMs: 300,
-      rotationLeadMs: 150,
+      lifetimeMs: 60_000,
+      rotationLeadMs: 20_000,
     });
     const firstDescriptor = JSON.parse(await readFile(descriptorPath, 'utf8')) as {
       readonly instanceId: string;
@@ -568,24 +573,13 @@ describe('authenticated local RPC', () => {
     };
     await writeFile(staleDescriptorPath, JSON.stringify(firstDescriptor), 'utf8');
     const establishedClient = new LocalRpcClient(descriptorPath);
-    let freshClient: LocalRpcClient | undefined;
+    let overlapClient: LocalRpcClient | undefined;
+    const freshClients: LocalRpcClient[] = [];
     try {
       await expect(establishedClient.appStatus()).resolves.toMatchObject({ running: true });
-      await vi.waitFor(
-        async () => {
-          const current = JSON.parse(await readFile(descriptorPath, 'utf8')) as {
-            readonly instanceId: string;
-          };
-          expect(current.instanceId).not.toBe(firstDescriptor.instanceId);
-        },
-        { timeout: 3_000, interval: 20 },
-      );
-      await vi.waitFor(
-        () => expect(Date.now()).toBeGreaterThan(Date.parse(firstDescriptor.expiresAt)),
-        {
-          timeout: 3_000,
-          interval: 20,
-        },
+      vi.setSystemTime(initialTime + 30_000);
+      const rotations = await Promise.all(
+        Array.from({ length: 8 }, () => server.rotateCredentials()),
       );
 
       const currentDescriptor = JSON.parse(await readFile(descriptorPath, 'utf8')) as {
@@ -602,21 +596,122 @@ describe('authenticated local RPC', () => {
         Date.parse(firstDescriptor.createdAt),
       );
       expect(Date.parse(currentDescriptor.expiresAt)).toBeGreaterThan(Date.now());
+      expect(new Set(rotations.map((candidate) => candidate.instanceId))).toEqual(
+        new Set([currentDescriptor.instanceId]),
+      );
       expect(server.descriptor).toMatchObject({
         instanceId: currentDescriptor.instanceId,
         secret: currentDescriptor.secret,
       });
 
+      overlapClient = new LocalRpcClient(staleDescriptorPath);
+      await expect(overlapClient.appStatus()).resolves.toMatchObject({ running: true });
+
+      vi.setSystemTime(Date.parse(firstDescriptor.expiresAt) + 1);
       await expect(establishedClient.appStatus()).resolves.toMatchObject({ running: true });
-      freshClient = new LocalRpcClient(descriptorPath);
-      await expect(freshClient.appStatus()).resolves.toMatchObject({ running: true });
+      await expect(overlapClient.appStatus()).resolves.toMatchObject({ running: true });
+
+      freshClients.push(...Array.from({ length: 12 }, () => new LocalRpcClient(descriptorPath)));
+      await expect(
+        Promise.all(freshClients.map(async (client) => client.appStatus())),
+      ).resolves.toEqual(
+        Array.from({ length: freshClients.length }, () =>
+          expect.objectContaining({ running: true }),
+        ),
+      );
       await expect(new LocalRpcClient(staleDescriptorPath).appStatus()).rejects.toMatchObject({
         code: 'SERVICE_UNAVAILABLE',
       });
     } finally {
-      await establishedClient.close();
-      await freshClient?.close();
+      await Promise.all([
+        establishedClient.close(),
+        overlapClient?.close(),
+        ...freshClients.map(async (client) => client.close()),
+      ]);
       await server.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects descriptor timing that cannot cover an authentication window', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v1.json');
+    await expect(
+      startLocalRpcServer({
+        service: createService(),
+        descriptorPath,
+        lifetimeMs: 300,
+        rotationLeadMs: 150,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(
+      startLocalRpcServer({
+        service: createService(),
+        descriptorPath,
+        lifetimeMs: 20_000,
+        rotationLeadMs: 9_999,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+  });
+
+  it('retries authentication once when the atomically published endpoint changes', async () => {
+    const directory = await createTemporaryDirectory();
+    const primaryDescriptorPath = path.join(directory, 'primary-endpoint-v1.json');
+    const clientDescriptorPath = path.join(directory, 'client-endpoint-v1.json');
+    const pipeName =
+      process.platform === 'win32'
+        ? `\\\\.\\pipe\\htmllelujah-stalled-${randomUUID()}`
+        : path.join(directory, 'stalled.sock');
+    const sockets = new Set<Socket>();
+    let acceptConnection: (() => void) | undefined;
+    const accepted = new Promise<void>((resolve) => {
+      acceptConnection = resolve;
+    });
+    const stalledServer = createServer((socket) => {
+      sockets.add(socket);
+      socket.once('close', () => sockets.delete(socket));
+      acceptConnection?.();
+    });
+    await new Promise<void>((resolve, reject) => {
+      stalledServer.once('error', reject);
+      stalledServer.listen(pipeName, () => {
+        stalledServer.off('error', reject);
+        resolve();
+      });
+    });
+    const primaryServer = await startLocalRpcServer({
+      service: createService(),
+      descriptorPath: primaryDescriptorPath,
+    });
+    const now = Date.now();
+    await writeFile(
+      clientDescriptorPath,
+      JSON.stringify({
+        protocolVersion: 1,
+        pipeName,
+        secret: 'a'.repeat(64),
+        instanceId: randomUUID(),
+        pid: process.pid,
+        createdAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + 60_000).toISOString(),
+      }),
+      'utf8',
+    );
+    const client = new LocalRpcClient(clientDescriptorPath);
+    try {
+      const status = client.appStatus();
+      await accepted;
+      const replacementPath = path.join(directory, 'replacement-endpoint-v1.json');
+      await writeFile(replacementPath, JSON.stringify(primaryServer.descriptor), 'utf8');
+      await rename(replacementPath, clientDescriptorPath);
+      for (const socket of sockets) socket.destroy();
+      await expect(status).resolves.toMatchObject({ running: true, version: '1.0.0' });
+      expect(primaryServer.connectionCount).toBe(1);
+    } finally {
+      await client.close();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => stalledServer.close(() => resolve()));
+      await primaryServer.close();
     }
   });
 
