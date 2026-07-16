@@ -10,6 +10,7 @@ import {
   type DeckDocument,
 } from '@htmllelujah/document-core';
 import { DocumentSessionManager } from '@htmllelujah/document-runtime';
+import { createPrintHtml, createStandaloneHtml } from '@htmllelujah/exporter';
 import { moveItemsWithSnapping, type GeometryItem } from '@htmllelujah/geometry';
 
 const percentile = (samples: readonly number[], quantile: number): number => {
@@ -88,12 +89,43 @@ const benchmarkGesture = (): { readonly p95Ms: number; readonly samples: number 
   return { p95Ms: rounded(percentile(samples.slice(25), 0.95)), samples: samples.length - 25 };
 };
 
+const benchmarkExports = (): {
+  readonly mixedExports: number;
+  readonly p95Ms: number;
+  readonly totalMs: number;
+  readonly outputBytes: number;
+  readonly heapDeltaBytes: number;
+} => {
+  const deck = createDefaultDeck({ name: 'Repeated export fixture' });
+  const assets = new Map<string, Uint8Array>();
+  const samples: number[] = [];
+  let outputBytes = 0;
+  const heapBefore = process.memoryUsage().heapUsed;
+  const startedAt = performance.now();
+  for (let index = 0; index < 50; index += 1) {
+    const operationStartedAt = performance.now();
+    const output =
+      index % 2 === 0 ? createStandaloneHtml(deck, assets) : createPrintHtml(deck, assets);
+    samples.push(performance.now() - operationStartedAt);
+    outputBytes += Buffer.byteLength(output, 'utf8');
+  }
+  return {
+    mixedExports: samples.length,
+    p95Ms: rounded(percentile(samples.slice(5), 0.95)),
+    totalMs: rounded(performance.now() - startedAt),
+    outputBytes,
+    heapDeltaBytes: process.memoryUsage().heapUsed - heapBefore,
+  };
+};
+
 const benchmarkRuntime = async (
   directory: string,
 ): Promise<{
   readonly commandP95Ms: number;
   readonly commandSamples: number;
   readonly saveMs: number;
+  readonly repeatedSaveP95Ms: number;
+  readonly repeatedSaveSamples: number;
   readonly reopenMs: number;
   readonly reopenedSlides: number;
 }> => {
@@ -137,6 +169,24 @@ const benchmarkRuntime = async (
     });
     const saveMs = performance.now() - saveStartedAt;
 
+    const repeatedSaveMs: number[] = [];
+    for (let index = 0; index < 100; index += 1) {
+      snapshot = await manager.execute(snapshot.sessionId, {
+        expectedRevision: snapshot.revision,
+        commands: [{ type: 'deck.rename', name: `Repeated supported-limit save ${index % 2}` }],
+        metadata: {
+          transactionId: randomUUID(),
+          actorId: 'release-benchmark',
+          origin: 'system',
+          label: 'Measure repeated verified save',
+          timestamp: new Date().toISOString(),
+        },
+      });
+      const repeatedSaveStartedAt = performance.now();
+      snapshot = await manager.save(snapshot.sessionId);
+      repeatedSaveMs.push(performance.now() - repeatedSaveStartedAt);
+    }
+
     const reopenStartedAt = performance.now();
     const reopened = await verifier.openMainOnly({ targetPath });
     const reopenMs = performance.now() - reopenStartedAt;
@@ -147,6 +197,8 @@ const benchmarkRuntime = async (
       commandP95Ms: rounded(percentile(samples.slice(20), 0.95)),
       commandSamples: samples.length - 20,
       saveMs: rounded(saveMs),
+      repeatedSaveP95Ms: rounded(percentile(repeatedSaveMs, 0.95)),
+      repeatedSaveSamples: repeatedSaveMs.length,
       reopenMs: rounded(reopenMs),
       reopenedSlides: reopened.document.slides.length,
     };
@@ -168,6 +220,7 @@ const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-benchmark-'));
 try {
   const validation = benchmarkValidation();
   const gesture = benchmarkGesture();
+  const exports = benchmarkExports();
   const runtime = await benchmarkRuntime(directory);
   const result = {
     schemaVersion: 1,
@@ -176,6 +229,7 @@ try {
     node: process.version,
     validation,
     gesture: { ...gesture, thresholdMs: 16.7, passed: gesture.p95Ms < 16.7 },
+    exports,
     runtime: {
       ...runtime,
       commandThresholdMs: 100,
