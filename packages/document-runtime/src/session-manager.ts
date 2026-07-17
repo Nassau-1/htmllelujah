@@ -238,6 +238,7 @@ const internalAssetsFromParsed = (parsed: ParsedHdeck): Map<string, InternalAsse
 
 export class DocumentSessionManager implements DocumentRuntimeService {
   readonly #sessions = new Map<string, SessionState>();
+  readonly #recoveringSessionIds = new Set<string>();
   readonly #listeners = new Set<RuntimeEventListener>();
   readonly #audit: InternalAuditEntry[] = [];
   readonly #recovery: RuntimeRecoveryStore;
@@ -351,7 +352,12 @@ export class DocumentSessionManager implements DocumentRuntimeService {
   }
 
   #enqueue<T>(state: SessionState, operation: () => Promise<T>): Promise<T> {
-    const result = state.queue.then(operation);
+    const result = state.queue.then(() => {
+      if (this.#sessions.get(state.sessionId) !== state) {
+        throw new DocumentRuntimeError('SESSION_NOT_FOUND', 'Document session does not exist.');
+      }
+      return operation();
+    });
     state.queue = result.then(
       () => undefined,
       () => undefined,
@@ -1096,6 +1102,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
   public close(sessionId: string, options: CloseSessionOptions = {}): Promise<void> {
     const state = this.#requireSession(sessionId);
     return this.#enqueue(state, async () => {
+      if (options.expectedRevision !== undefined && options.expectedRevision !== state.revision) {
+        throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
+      }
       const dirty = this.#dirty(state);
       if (dirty && options.discardUnsaved !== true) {
         throw new DocumentRuntimeError(
@@ -1104,15 +1113,19 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         );
       }
       if (state.autosaveTimer !== undefined) clearTimeout(state.autosaveTimer);
-      await this.#recovery.removeSession(state.sessionId, this.#journal);
+      if (options.preserveRecovery !== true) {
+        await this.#recovery.removeSession(state.sessionId, this.#journal);
+      }
       this.#sessions.delete(state.sessionId);
       this.#emit({
         type: 'session-closed',
         sessionId: state.sessionId,
         documentId: state.documentId,
-        dirtyDiscarded: dirty,
+        dirtyDiscarded: dirty && options.preserveRecovery !== true,
       });
-      await this.collectRecoveryGarbageMainOnly().catch(() => undefined);
+      if (options.preserveRecovery !== true) {
+        await this.collectRecoveryGarbageMainOnly().catch(() => undefined);
+      }
     });
   }
 
@@ -1363,9 +1376,18 @@ export class DocumentSessionManager implements DocumentRuntimeService {
 
   /** Main-process-only recovery boundary. Replays the longest checksummed prefix. */
   public async recoverMainOnly(candidateId: string): Promise<DocumentSessionSnapshot> {
-    if (this.#sessions.has(candidateId)) {
+    if (this.#sessions.has(candidateId) || this.#recoveringSessionIds.has(candidateId)) {
       throw new DocumentRuntimeError('SESSION_EXISTS', 'Recovery session is already open.');
     }
+    this.#recoveringSessionIds.add(candidateId);
+    try {
+      return await this.#recoverReservedMainOnly(candidateId);
+    } finally {
+      this.#recoveringSessionIds.delete(candidateId);
+    }
+  }
+
+  async #recoverReservedMainOnly(candidateId: string): Promise<DocumentSessionSnapshot> {
     const metadata = await this.#recovery.readMetadata(candidateId);
     let parsed: ParsedHdeck;
     try {
@@ -1431,6 +1453,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       savedRevision: metadata.savedRevision,
       journalSequence: replay.records.length,
     });
+    if (this.#sessions.has(candidateId)) {
+      throw new DocumentRuntimeError('SESSION_EXISTS', 'Recovery session is already open.');
+    }
     this.#sessions.set(candidateId, state);
     this.#emit({
       type: 'session-opened',

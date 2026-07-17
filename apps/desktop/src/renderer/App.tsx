@@ -102,7 +102,7 @@ import type {
   SessionView,
 } from '../shared/desktop-api';
 import { EditorButton } from './components/EditorButton';
-import { CanonicalSlideCanvas } from './components/CanonicalSlideCanvas';
+import { CanonicalSlideCanvas, sameCanvasSelection } from './components/CanonicalSlideCanvas';
 import { CollaborationParticipants } from './components/CollaborationParticipants';
 import {
   contentFromPlainText,
@@ -137,9 +137,16 @@ import {
   type DesignSurface,
 } from './editor/design-editor';
 import {
+  activeElementNeedsBlurCommit,
   adjacentSlideIndex,
   canAutoCommitInlineText,
+  consumeInlineTextBlurSuppression,
+  inlineTextCanCloseWithoutApply,
+  retainInlineTextEditingTarget,
   runInlineTextCommitOnce,
+  shouldPreserveDetachedTextDraft,
+  textDraftAutosaveMayAttempt,
+  textDraftTargetHasChanged,
 } from './editor/editor-interactions';
 import {
   calculateFitScale,
@@ -296,12 +303,17 @@ const initialTextDraft = (
   };
 };
 
-const textEditingFingerprint = (element: TextElement): string =>
+const textEditingFingerprint = (
+  element: TextElement,
+  document: DeckDocument,
+  slide: Slide,
+): string =>
   JSON.stringify({
     styleRole: element.styleRole,
     verticalAlignment: element.verticalAlignment,
     content: element.content,
     style: element.style,
+    resolvedDraft: initialTextDraft(element, document, slide),
   });
 
 const duplicateGuides = (guides: readonly Guide[]): readonly Guide[] =>
@@ -606,16 +618,26 @@ function EditorApp() {
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
   const [textDraftDirty, setTextDraftDirty] = useState(false);
   const [textDraftConflict, setTextDraftConflict] = useState(false);
+  const [textApplyPending, setTextApplyPending] = useState(false);
+  const [textEditingLocked, setTextEditingLocked] = useState(false);
   const [inlineTextElementId, setInlineTextElementId] = useState<string | null>(null);
   const [textLeaseStatus, setTextLeaseStatus] = useState<CollaborationTextLeaseStatus | null>(null);
   const [textLeasePending, setTextLeasePending] = useState(false);
   const textBaselineRef = useRef<{ readonly id: string; readonly value: string } | null>(null);
-  const textApplyInFlightRef = useRef(false);
+  const textDraftRef = useRef<TextDraft | null>(null);
+  const textDraftDirtyRef = useRef(false);
+  const textDraftConflictRef = useRef(false);
+  const inlineTextElementIdRef = useRef<string | null>(null);
+  const textApplyInFlightRef = useRef<Promise<boolean> | null>(null);
+  const textEditingLockedRef = useRef(false);
   const inlineCommitInFlightRef = useRef(false);
   const inlineCommitPromiseRef = useRef<Promise<boolean> | null>(null);
+  const suppressNextInlineBlurRef = useRef(false);
   const textLeasePendingRef = useRef(false);
   const textLeaseRequestRef = useRef<CollaborationTextLeaseInput | null>(null);
   const textEditorFocusedRef = useRef(false);
+  const textDraftVersionRef = useRef(0);
+  const textDraftAutosaveFailedVersionRef = useRef<number | null>(null);
   const [tableTsv, setTableTsv] = useState('');
   const [selectedTableCellId, setSelectedTableCellId] = useState('');
   const [designMasterId, setDesignMasterId] = useState('');
@@ -626,6 +648,10 @@ function EditorApp() {
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
   const executeQueueRef = useRef<Promise<void>>(Promise.resolve());
   const pendingExecuteCountRef = useRef(0);
+  const canLeaveInlineTextEditorRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
+  const closePreparationInFlightRef = useRef(false);
+  const allowExecuteDuringCloseBlurRef = useRef(false);
+  const closeBlurExecutionResultsRef = useRef<Promise<boolean>[] | null>(null);
 
   const acceptSession = useCallback((next: SessionView): void => {
     sessionRef.current = next;
@@ -642,10 +668,35 @@ function EditorApp() {
     setToast({ message, kind });
   }, []);
 
-  const editTextDraft = useCallback((next: TextDraft): void => {
-    setTextDraft(next);
-    setTextDraftDirty(true);
+  const updateTextDraftDirty = useCallback((dirty: boolean): void => {
+    textDraftDirtyRef.current = dirty;
+    setTextDraftDirty(dirty);
   }, []);
+
+  const updateTextDraft = useCallback((draft: TextDraft | null): void => {
+    textDraftRef.current = draft;
+    setTextDraft(draft);
+  }, []);
+
+  const updateTextDraftConflict = useCallback((conflict: boolean): void => {
+    textDraftConflictRef.current = conflict;
+    setTextDraftConflict(conflict);
+  }, []);
+
+  const updateInlineTextElementId = useCallback((elementId: string | null): void => {
+    inlineTextElementIdRef.current = elementId;
+    setInlineTextElementId(elementId);
+  }, []);
+
+  const editTextDraft = useCallback(
+    (next: TextDraft): void => {
+      if (textEditingLockedRef.current) return;
+      textDraftVersionRef.current += 1;
+      updateTextDraft(next);
+      updateTextDraftDirty(true);
+    },
+    [updateTextDraft, updateTextDraftDirty],
+  );
 
   useEffect(() => {
     if (toast === null) return;
@@ -742,6 +793,10 @@ function EditorApp() {
   );
   const primaryElement = selectedElements.at(-1);
   const primaryText = primaryElement?.type === 'text' ? primaryElement : undefined;
+  const textDraftMatchesPrimary =
+    primaryText !== undefined && textBaselineRef.current?.id === primaryText.id;
+  const hasOrphanedTextDraft = textDraft !== null && textDraftDirty && !textDraftMatchesPrimary;
+  const renderedTextDraftVersion = textDraftVersionRef.current;
   const primaryImage = primaryElement?.type === 'image' ? primaryElement : undefined;
   const primaryTable = primaryElement?.type === 'table' ? primaryElement : undefined;
   const selectedTableCell = primaryTable?.cells.find((cell) => cell.id === selectedTableCellId);
@@ -756,6 +811,13 @@ function EditorApp() {
         : undefined;
   const canvasScale = resolveCanvasScale(zoom, fitScale);
   const zoomPercent = effectiveZoomPercent(zoom, fitScale);
+
+  useLayoutEffect(() => {
+    const retained = retainInlineTextEditingTarget(inlineTextElementId, primaryText?.id);
+    if (retained === inlineTextElementId) return;
+    textEditorFocusedRef.current = false;
+    updateInlineTextElementId(retained);
+  }, [inlineTextElementId, primaryText?.id, updateInlineTextElementId]);
 
   useEffect(() => {
     if (
@@ -817,31 +879,54 @@ function EditorApp() {
   }, [document]);
 
   useEffect(() => {
+    if (
+      shouldPreserveDetachedTextDraft(
+        textDraftDirtyRef.current,
+        textDraft !== null,
+        textBaselineRef.current?.id,
+        primaryText?.id,
+      )
+    ) {
+      updateTextDraftConflict(true);
+      return;
+    }
     if (primaryText === undefined || document === undefined || activeSlide === undefined) {
-      setTextDraft(null);
-      setTextDraftDirty(false);
-      setTextDraftConflict(false);
+      textDraftVersionRef.current += 1;
+      updateTextDraft(null);
+      updateTextDraftDirty(false);
+      updateTextDraftConflict(false);
       textBaselineRef.current = null;
       return;
     }
-    const value = textEditingFingerprint(primaryText);
+    const value = textEditingFingerprint(primaryText, document, activeSlide);
     const baseline = textBaselineRef.current;
     if (baseline === null || baseline.id !== primaryText.id) {
-      setTextDraft(initialTextDraft(primaryText, document, activeSlide));
-      setTextDraftDirty(false);
-      setTextDraftConflict(false);
+      textDraftVersionRef.current += 1;
+      updateTextDraft(initialTextDraft(primaryText, document, activeSlide));
+      updateTextDraftDirty(false);
+      updateTextDraftConflict(false);
       textBaselineRef.current = { id: primaryText.id, value };
       return;
     }
     if (baseline.value === value) return;
     if (textDraftDirty) {
-      setTextDraftConflict(true);
+      updateTextDraftConflict(true);
       return;
     }
-    setTextDraft(initialTextDraft(primaryText, document, activeSlide));
-    setTextDraftConflict(false);
+    textDraftVersionRef.current += 1;
+    updateTextDraft(initialTextDraft(primaryText, document, activeSlide));
+    updateTextDraftConflict(false);
     textBaselineRef.current = { id: primaryText.id, value };
-  }, [activeSlide, document, primaryText, textDraftDirty]);
+  }, [
+    activeSlide,
+    document,
+    primaryText,
+    textDraft,
+    textDraftDirty,
+    updateTextDraftConflict,
+    updateTextDraft,
+    updateTextDraftDirty,
+  ]);
 
   useEffect(() => {
     if (primaryTable === undefined) {
@@ -1014,58 +1099,91 @@ function EditorApp() {
   ]);
 
   const execute = useCallback(
-    (
+    async (
       label: string,
       commandSource: CommandSource,
-      options: { readonly select?: readonly string[]; readonly message?: string } = {},
+      options: {
+        readonly select?: readonly string[];
+        readonly message?: string;
+        readonly preserveInlineTextDraft?: boolean;
+      } = {},
     ): Promise<boolean> => {
-      const requestedSession = sessionRef.current;
-      if (requestedSession === null || (Array.isArray(commandSource) && commandSource.length === 0))
-        return Promise.resolve(false);
-      if (busy && pendingExecuteCountRef.current === 0) return Promise.resolve(false);
-      const requestedSessionId = requestedSession.snapshot.sessionId;
-      pendingExecuteCountRef.current += 1;
-      setBusy(true);
-      const run = async (): Promise<boolean> => {
-        try {
-          const current = sessionRef.current;
-          if (current === null || current.snapshot.sessionId !== requestedSessionId) return false;
-          const commands =
-            typeof commandSource === 'function'
-              ? commandSource(current.snapshot.document)
-              : commandSource;
-          if (commands.length === 0) return false;
-          const result = await window.htmllelujah.execute({
-            sessionId: requestedSessionId,
-            expectedRevision: current.snapshot.revision,
-            label,
-            commands,
-          });
-          if (!result.ok) {
-            showFailure(result);
-            return false;
-          }
-          acceptSession(result.value);
-          if (options.select !== undefined) setSelectedIds(options.select);
-          if (options.message !== undefined) notify(options.message, 'success');
-          return true;
-        } finally {
-          pendingExecuteCountRef.current -= 1;
-          if (pendingExecuteCountRef.current === 0) setBusy(false);
+      const closeBlurResults =
+        closePreparationInFlightRef.current && allowExecuteDuringCloseBlurRef.current
+          ? closeBlurExecutionResultsRef.current
+          : null;
+      const operation = (async (): Promise<boolean> => {
+        if (
+          closePreparationInFlightRef.current &&
+          !allowExecuteDuringCloseBlurRef.current &&
+          options.preserveInlineTextDraft !== true
+        )
+          return false;
+        if (
+          options.preserveInlineTextDraft !== true &&
+          !(await canLeaveInlineTextEditorRef.current())
+        ) {
+          return false;
         }
-      };
-      const queued = executeQueueRef.current.then(run, run);
-      executeQueueRef.current = queued.then(
-        () => undefined,
-        () => undefined,
+        const requestedSession = sessionRef.current;
+        if (
+          requestedSession === null ||
+          (Array.isArray(commandSource) && commandSource.length === 0)
+        )
+          return false;
+        if (busy && pendingExecuteCountRef.current === 0) return false;
+        const requestedSessionId = requestedSession.snapshot.sessionId;
+        pendingExecuteCountRef.current += 1;
+        setBusy(true);
+        const run = async (): Promise<boolean> => {
+          try {
+            const current = sessionRef.current;
+            if (current === null || current.snapshot.sessionId !== requestedSessionId) return false;
+            const commands =
+              typeof commandSource === 'function'
+                ? commandSource(current.snapshot.document)
+                : commandSource;
+            if (commands.length === 0) return false;
+            const result = await window.htmllelujah.execute({
+              sessionId: requestedSessionId,
+              expectedRevision: current.snapshot.revision,
+              label,
+              commands,
+            });
+            if (!result.ok) {
+              showFailure(result);
+              return false;
+            }
+            acceptSession(result.value);
+            if (options.select !== undefined) setSelectedIds(options.select);
+            if (options.message !== undefined) notify(options.message, 'success');
+            return true;
+          } finally {
+            pendingExecuteCountRef.current -= 1;
+            if (pendingExecuteCountRef.current === 0) setBusy(false);
+          }
+        };
+        const queued = executeQueueRef.current.then(run, run);
+        executeQueueRef.current = queued.then(
+          () => undefined,
+          () => undefined,
+        );
+        return queued;
+      })();
+      if (closeBlurResults === null) return operation;
+      const tracked = operation.then(
+        (applied) => applied,
+        () => false,
       );
-      return queued;
+      closeBlurResults.push(tracked);
+      return tracked;
     },
     [acceptSession, busy, notify, showFailure],
   );
 
   const save = useCallback(
     async (saveAs = false): Promise<void> => {
+      if (!(await canLeaveInlineTextEditorRef.current())) return;
       const current = sessionRef.current;
       if (current === null || busy) return;
       setBusy(true);
@@ -1088,6 +1206,7 @@ function EditorApp() {
 
   const replaceDocument = useCallback(
     async (kind: 'new' | 'open'): Promise<void> => {
+      if (!(await canLeaveInlineTextEditorRef.current())) return;
       if (busy) return;
       setBusy(true);
       try {
@@ -1113,6 +1232,7 @@ function EditorApp() {
 
   const recoverPresentation = useCallback(
     async (candidateId: string): Promise<void> => {
+      if (!(await canLeaveInlineTextEditorRef.current())) return;
       if (busy) return;
       setBusy(true);
       try {
@@ -1135,6 +1255,7 @@ function EditorApp() {
 
   const undo = useCallback(
     async (redo = false): Promise<void> => {
+      if (!(await canLeaveInlineTextEditorRef.current())) return;
       const current = sessionRef.current;
       if (current === null || busy) return;
       const result = redo
@@ -1166,6 +1287,7 @@ function EditorApp() {
 
   const importImage = useCallback(
     async (replace?: ImageElement): Promise<void> => {
+      if (!(await canLeaveInlineTextEditorRef.current())) return;
       const current = sessionRef.current;
       if (current === null || activeSlide === undefined || designSurface !== 'slide' || busy)
         return;
@@ -1192,6 +1314,7 @@ function EditorApp() {
   );
 
   const addSlide = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     if (document === undefined) return;
     let createdSlide: Slide | undefined;
     const activeSlideIdAtRequest = activeSlide?.id;
@@ -1211,6 +1334,7 @@ function EditorApp() {
   }, [activeSlide?.id, document, execute]);
 
   const duplicateSlide = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     if (document === undefined || activeSlide === undefined) return;
     const sourceSlideId = activeSlide.id;
     let duplicate: Slide | undefined;
@@ -1239,6 +1363,7 @@ function EditorApp() {
   );
 
   const deleteSlide = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     if (document === undefined || activeSlide === undefined || document.slides.length <= 1) return;
     const index = document.slides.findIndex((slide) => slide.id === activeSlide.id);
     const next = document.slides[index + 1] ?? document.slides[index - 1];
@@ -1249,6 +1374,7 @@ function EditorApp() {
   }, [activeSlide, document, execute]);
 
   const deleteSelection = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     if (designSurface !== 'slide' || activeSlide === undefined || selectedIds.length === 0) return;
     if (
       await execute('Delete objects', [
@@ -1259,6 +1385,7 @@ function EditorApp() {
   }, [activeSlide, designSurface, execute, selectedIds]);
 
   const duplicateSelection = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     if (designSurface !== 'slide' || activeSlide === undefined || selectedIds.length === 0) return;
     const sourceSlideId = activeSlide.id;
     const selectedAtRequest = [...selectedIds];
@@ -1431,16 +1558,42 @@ function EditorApp() {
   );
 
   const applyTextDraft = useCallback(
-    async (options: Readonly<{ readonly confirmConflict?: boolean }> = {}): Promise<boolean> => {
+    async (
+      options: Readonly<{
+        readonly confirmConflict?: boolean;
+        readonly lockEditing?: boolean;
+      }> = {},
+    ): Promise<boolean> => {
+      const draft = textDraftRef.current;
       if (
         activeSlide === undefined ||
         primaryText === undefined ||
-        textDraft === null ||
+        draft === null ||
         document === undefined
       )
         return false;
-      if (textDraftConflict) {
-        if (options.confirmConflict === false) return false;
+      const draftVersion = textDraftVersionRef.current;
+      const targetTextId = primaryText.id;
+      const latestDocument = sessionRef.current?.snapshot.document;
+      const latestSlide = latestDocument?.slides.find((slide) => slide.id === activeSlide.id);
+      const latestText = latestSlide?.elements.find(
+        (element): element is TextElement => element.id === targetTextId && element.type === 'text',
+      );
+      if (latestDocument === undefined || latestSlide === undefined || latestText === undefined) {
+        updateTextDraftConflict(true);
+        return false;
+      }
+      const latestFingerprint = textEditingFingerprint(latestText, latestDocument, latestSlide);
+      const recordedBaseline = textBaselineRef.current;
+      const hasExternalConflict = textDraftTargetHasChanged(
+        recordedBaseline,
+        targetTextId,
+        latestFingerprint,
+        textDraftConflictRef.current,
+      );
+      if (hasExternalConflict) {
+        updateTextDraftConflict(true);
+        if (options.confirmConflict !== true) return false;
         if (
           !window.confirm(
             'This text changed elsewhere while you were editing. Replace it with your draft?',
@@ -1448,43 +1601,44 @@ function EditorApp() {
         )
           return false;
       }
-      const baseline = initialTextDraft(primaryText, document, activeSlide);
+      const expectedFingerprint = latestFingerprint;
+      const baseline = initialTextDraft(latestText, latestDocument, latestSlide);
       const markPatch: MutableTextMarksPatch = {};
-      if (textDraft.bold !== baseline.bold) {
-        markPatch.bold = textDraft.bold;
-        markPatch.fontWeight = textDraft.bold ? 700 : 400;
+      if (draft.bold !== baseline.bold) {
+        markPatch.bold = draft.bold;
+        markPatch.fontWeight = draft.bold ? 700 : 400;
       }
-      if (textDraft.italic !== baseline.italic) markPatch.italic = textDraft.italic;
-      if (textDraft.underline !== baseline.underline) markPatch.underline = textDraft.underline;
-      if (textDraft.strikethrough !== baseline.strikethrough)
-        markPatch.strikethrough = textDraft.strikethrough;
-      if (textDraft.color !== baseline.color) markPatch.color = textDraft.color;
-      if (textDraft.fontFamily !== baseline.fontFamily) markPatch.fontFamily = textDraft.fontFamily;
-      if (textDraft.fontSizePt !== baseline.fontSizePt) markPatch.fontSizePt = textDraft.fontSizePt;
+      if (draft.italic !== baseline.italic) markPatch.italic = draft.italic;
+      if (draft.underline !== baseline.underline) markPatch.underline = draft.underline;
+      if (draft.strikethrough !== baseline.strikethrough)
+        markPatch.strikethrough = draft.strikethrough;
+      if (draft.color !== baseline.color) markPatch.color = draft.color;
+      if (draft.fontFamily !== baseline.fontFamily) markPatch.fontFamily = draft.fontFamily;
+      if (draft.fontSizePt !== baseline.fontSizePt) markPatch.fontSizePt = draft.fontSizePt;
       const marksChanged = Object.keys(markPatch).length > 0;
-      const alignmentChanged = textDraft.alignment !== baseline.alignment;
-      const kindChanged = textDraft.kind !== baseline.kind;
-      const headingLevelChanged = textDraft.headingLevel !== baseline.headingLevel;
-      const listLevelChanged = textDraft.listLevel !== baseline.listLevel;
-      const textChanged = textDraft.text !== baseline.text;
-      let content = textDraft.contentOverride ?? primaryText.content;
-      if (kindChanged && textDraft.contentOverride === null) {
-        const first = firstMarks(primaryText.content);
-        content = contentFromPlainText(textDraft.text, {
-          kind: textDraft.kind,
-          alignment: textDraft.alignment,
+      const alignmentChanged = draft.alignment !== baseline.alignment;
+      const kindChanged = draft.kind !== baseline.kind;
+      const headingLevelChanged = draft.headingLevel !== baseline.headingLevel;
+      const listLevelChanged = draft.listLevel !== baseline.listLevel;
+      const textChanged = draft.text !== baseline.text;
+      let content = draft.contentOverride ?? latestText.content;
+      if (kindChanged && draft.contentOverride === null) {
+        const first = firstMarks(latestText.content);
+        content = contentFromPlainText(draft.text, {
+          kind: draft.kind,
+          alignment: draft.alignment,
           marks: {
             ...first,
-            bold: textDraft.bold,
-            italic: textDraft.italic,
-            underline: textDraft.underline,
-            strikethrough: textDraft.strikethrough,
-            color: textDraft.color,
-            fontFamily: textDraft.fontFamily,
-            fontSizePt: textDraft.fontSizePt,
-            fontWeight: textDraft.bold ? 700 : 400,
+            bold: draft.bold,
+            italic: draft.italic,
+            underline: draft.underline,
+            strikethrough: draft.strikethrough,
+            color: draft.color,
+            fontFamily: draft.fontFamily,
+            fontSizePt: draft.fontSizePt,
+            fontWeight: draft.bold ? 700 : 400,
           },
-          headingLevel: textDraft.headingLevel,
+          headingLevel: draft.headingLevel,
         });
       } else if (
         textChanged ||
@@ -1492,33 +1646,33 @@ function EditorApp() {
         alignmentChanged ||
         listLevelChanged ||
         headingLevelChanged ||
-        textDraft.contentOverride !== null
+        draft.contentOverride !== null
       ) {
         if (
-          textDraft.contentOverride === null ||
-          contentToPlainText(textDraft.contentOverride) !== textDraft.text
+          draft.contentOverride === null ||
+          contentToPlainText(draft.contentOverride) !== draft.text
         ) {
-          content = replacePlainTextPreservingStyles(content, textDraft.text);
+          content = replacePlainTextPreservingStyles(content, draft.text);
         }
-        if (headingLevelChanged && textDraft.kind === 'heading') {
-          content = updateHeadingLevel(content, textDraft.headingLevel);
+        if (headingLevelChanged && draft.kind === 'heading') {
+          content = updateHeadingLevel(content, draft.headingLevel);
         }
         content = updateRichTextPresentation(content, {
-          ...(alignmentChanged ? { alignment: textDraft.alignment } : {}),
+          ...(alignmentChanged ? { alignment: draft.alignment } : {}),
           ...(marksChanged ? { marks: markPatch } : {}),
         });
       }
       if (
         (listLevelChanged || kindChanged) &&
-        textDraft.kind !== 'paragraph' &&
-        textDraft.kind !== 'heading'
+        draft.kind !== 'paragraph' &&
+        draft.kind !== 'heading'
       ) {
         content = {
           blocks: content.blocks.map((block) =>
             block.type === 'list'
               ? {
                   ...block,
-                  items: block.items.map((item) => ({ ...item, level: textDraft.listLevel })),
+                  items: block.items.map((item) => ({ ...item, level: draft.listLevel })),
                 }
               : block,
           ),
@@ -1526,15 +1680,15 @@ function EditorApp() {
       }
 
       const styleChanged =
-        textDraft.role !== baseline.role ||
+        draft.role !== baseline.role ||
         alignmentChanged ||
-        textDraft.fontFamily !== baseline.fontFamily ||
-        textDraft.fontSizePt !== baseline.fontSizePt ||
-        textDraft.bold !== baseline.bold ||
-        textDraft.italic !== baseline.italic ||
-        textDraft.color !== baseline.color ||
-        textDraft.lineHeight !== baseline.lineHeight ||
-        textDraft.letterSpacingPt !== baseline.letterSpacingPt;
+        draft.fontFamily !== baseline.fontFamily ||
+        draft.fontSizePt !== baseline.fontSizePt ||
+        draft.bold !== baseline.bold ||
+        draft.italic !== baseline.italic ||
+        draft.color !== baseline.color ||
+        draft.lineHeight !== baseline.lineHeight ||
+        draft.letterSpacingPt !== baseline.letterSpacingPt;
       const commands: DocumentCommand[] = [];
       if (
         kindChanged ||
@@ -1543,55 +1697,119 @@ function EditorApp() {
         alignmentChanged ||
         listLevelChanged ||
         headingLevelChanged ||
-        textDraft.contentOverride !== null
+        draft.contentOverride !== null
       ) {
         commands.push({
           type: 'text.replace-content',
-          slideId: activeSlide.id,
-          textId: primaryText.id,
+          slideId: latestSlide.id,
+          textId: latestText.id,
           content,
         });
       }
       if (styleChanged) {
         commands.push({
           type: 'element.update-style',
-          slideId: activeSlide.id,
-          elementId: primaryText.id,
+          slideId: latestSlide.id,
+          elementId: latestText.id,
           patch: {
             kind: 'text',
-            styleRole: textDraft.role,
+            styleRole: draft.role,
             style: {
-              alignment: textDraft.alignment,
-              fontFamily: textDraft.fontFamily,
-              fontSizePt: textDraft.fontSizePt,
-              fontWeight: textDraft.bold ? 700 : 400,
-              italic: textDraft.italic,
-              color: textDraft.color,
-              lineHeight: textDraft.lineHeight,
-              letterSpacingPt: textDraft.letterSpacingPt,
+              alignment: draft.alignment,
+              fontFamily: draft.fontFamily,
+              fontSizePt: draft.fontSizePt,
+              fontWeight: draft.bold ? 700 : 400,
+              italic: draft.italic,
+              color: draft.color,
+              lineHeight: draft.lineHeight,
+              letterSpacingPt: draft.letterSpacingPt,
             },
           },
         });
       }
       if (commands.length === 0) {
-        setTextDraftDirty(false);
-        setTextDraftConflict(false);
+        updateTextDraftDirty(false);
+        updateTextDraftConflict(false);
         return true;
       }
-      if (textApplyInFlightRef.current) return false;
-      textApplyInFlightRef.current = true;
-      try {
-        const applied = await execute('Edit text', commands);
-        if (applied) {
-          setTextDraftDirty(false);
-          setTextDraftConflict(false);
+      const currentApply = textApplyInFlightRef.current;
+      if (currentApply !== null) {
+        if (options.lockEditing !== true) return currentApply;
+        textEditingLockedRef.current = true;
+        setTextEditingLocked(true);
+        try {
+          return await currentApply;
+        } finally {
+          textEditingLockedRef.current = false;
+          setTextEditingLocked(false);
         }
-        return applied;
+      }
+      const lockEditing = options.lockEditing === true;
+      if (lockEditing) {
+        textEditingLockedRef.current = true;
+        setTextEditingLocked(true);
+      }
+      setTextApplyPending(true);
+      const apply = (async (): Promise<boolean> => {
+        const applied = await execute(
+          'Edit text',
+          (queuedDocument) => {
+            const queuedSlide = queuedDocument.slides.find((slide) => slide.id === latestSlide.id);
+            const queuedText = queuedSlide?.elements.find(
+              (element): element is TextElement =>
+                element.id === targetTextId && element.type === 'text',
+            );
+            if (
+              queuedSlide === undefined ||
+              queuedText === undefined ||
+              textEditingFingerprint(queuedText, queuedDocument, queuedSlide) !==
+                expectedFingerprint
+            ) {
+              updateTextDraftConflict(true);
+              return [];
+            }
+            return commands;
+          },
+          { preserveInlineTextDraft: true },
+        );
+        if (!applied) return false;
+        const committedDocument = sessionRef.current?.snapshot.document;
+        const committedSlide = committedDocument?.slides.find(
+          (slide) => slide.id === latestSlide.id,
+        );
+        const committedText = committedSlide?.elements.find(
+          (element): element is TextElement =>
+            element.id === targetTextId && element.type === 'text',
+        );
+        const targetUnchanged =
+          textBaselineRef.current?.id === targetTextId &&
+          committedDocument !== undefined &&
+          committedSlide !== undefined &&
+          committedText !== undefined;
+        if (targetUnchanged) {
+          textBaselineRef.current = {
+            id: targetTextId,
+            value: textEditingFingerprint(committedText, committedDocument, committedSlide),
+          };
+        }
+        if (!targetUnchanged || textDraftVersionRef.current !== draftVersion) return false;
+        updateTextDraftDirty(false);
+        updateTextDraftConflict(false);
+        return true;
+      })();
+      textApplyInFlightRef.current = apply;
+      try {
+        return await apply;
       } finally {
-        textApplyInFlightRef.current = false;
+        if (textApplyInFlightRef.current === apply) textApplyInFlightRef.current = null;
+        setTextApplyPending(false);
+        if (lockEditing) {
+          textEditingLockedRef.current = false;
+          setTextEditingLocked(false);
+        }
       }
     },
-    [activeSlide, document, execute, primaryText, textDraft, textDraftConflict],
+    [activeSlide, document, execute, primaryText, updateTextDraftConflict, updateTextDraftDirty],
   );
   const pasteRichText = useCallback(
     (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
@@ -1632,73 +1850,159 @@ function EditorApp() {
   );
 
   const finishInlineTextEditing = useCallback((): void => {
-    setInlineTextElementId(null);
+    updateInlineTextElementId(null);
     textEditorFocusedRef.current = false;
     void releaseTextLease();
-  }, [releaseTextLease]);
+  }, [releaseTextLease, updateInlineTextElementId]);
 
-  const cancelInlineText = useCallback((): void => {
-    inlineCommitInFlightRef.current = true;
+  const revertTextDraft = useCallback((): void => {
+    if (textApplyInFlightRef.current !== null) return;
+    if (
+      window.document.activeElement instanceof HTMLElement &&
+      window.document.activeElement.classList.contains('canonical-inline-text-input')
+    ) {
+      suppressNextInlineBlurRef.current = true;
+      window.setTimeout(() => {
+        suppressNextInlineBlurRef.current = false;
+      }, 0);
+    }
+    textDraftVersionRef.current += 1;
     if (primaryText !== undefined && document !== undefined && activeSlide !== undefined) {
-      setTextDraft(initialTextDraft(primaryText, document, activeSlide));
-      setTextDraftDirty(false);
-      setTextDraftConflict(false);
+      updateTextDraft(initialTextDraft(primaryText, document, activeSlide));
+      updateTextDraftDirty(false);
+      updateTextDraftConflict(false);
       textBaselineRef.current = {
         id: primaryText.id,
-        value: textEditingFingerprint(primaryText),
+        value: textEditingFingerprint(primaryText, document, activeSlide),
       };
+    } else {
+      updateTextDraft(null);
+      updateTextDraftDirty(false);
+      updateTextDraftConflict(false);
+      textBaselineRef.current = null;
     }
     finishInlineTextEditing();
-  }, [activeSlide, document, finishInlineTextEditing, primaryText]);
+  }, [
+    activeSlide,
+    document,
+    finishInlineTextEditing,
+    primaryText,
+    updateTextDraft,
+    updateTextDraftConflict,
+    updateTextDraftDirty,
+  ]);
 
-  const commitInlineText = useCallback((): Promise<boolean> => {
-    const current = inlineCommitPromiseRef.current;
-    if (current !== null) return current;
-    const commit = (async (): Promise<boolean> => {
-      let canLeaveEditor = false;
-      try {
-        const ran = await runInlineTextCommitOnce(
-          inlineCommitInFlightRef,
-          async () => {
-            if (!canAutoCommitInlineText(textDraftConflict)) {
-              notify('Remote change detected. Your draft is preserved in the inspector.', 'error');
-              return;
-            }
-            const applied = await applyTextDraft({ confirmConflict: false });
-            canLeaveEditor = applied;
-            if (!applied && textDraftDirty) {
-              notify(
-                'The inline draft could not be applied and remains available in the inspector.',
-                'error',
-              );
-            }
-          },
-          finishInlineTextEditing,
-        );
-        return ran && canLeaveEditor;
-      } catch {
-        notify(
-          'The inline draft could not be applied and remains available in the inspector.',
-          'error',
-        );
-        return false;
-      }
-    })();
-    inlineCommitPromiseRef.current = commit;
-    void commit.then(() => {
-      if (inlineCommitPromiseRef.current === commit) inlineCommitPromiseRef.current = null;
-    });
-    return commit;
-  }, [applyTextDraft, finishInlineTextEditing, notify, textDraftConflict, textDraftDirty]);
+  const commitInlineText = useCallback(
+    (options: Readonly<{ readonly confirmConflict?: boolean }> = {}): Promise<boolean> => {
+      const current = inlineCommitPromiseRef.current;
+      if (current !== null) return current;
+      const commit = (async (): Promise<boolean> => {
+        let canLeaveEditor = false;
+        try {
+          const ran = await runInlineTextCommitOnce(
+            inlineCommitInFlightRef,
+            async () => {
+              const draftDirty = textDraftDirtyRef.current;
+              const draftConflict = textDraftConflictRef.current;
+              if (inlineTextCanCloseWithoutApply(draftDirty, draftConflict)) {
+                canLeaveEditor = true;
+                return;
+              }
+              if (!canAutoCommitInlineText(draftConflict) && options.confirmConflict !== true) {
+                notify(
+                  'Remote change detected. Your draft is preserved in the inspector.',
+                  'error',
+                );
+                return;
+              }
+              const applied = await applyTextDraft({
+                confirmConflict: options.confirmConflict === true,
+                lockEditing: true,
+              });
+              canLeaveEditor = applied;
+              if (!applied && textDraftDirtyRef.current) {
+                notify(
+                  'The inline draft could not be applied and remains available in the inspector.',
+                  'error',
+                );
+              }
+            },
+            finishInlineTextEditing,
+          );
+          return ran && canLeaveEditor;
+        } catch {
+          notify(
+            'The inline draft could not be applied and remains available in the inspector.',
+            'error',
+          );
+          return false;
+        }
+      })();
+      inlineCommitPromiseRef.current = commit;
+      void commit.then(() => {
+        if (inlineCommitPromiseRef.current === commit) inlineCommitPromiseRef.current = null;
+      });
+      return commit;
+    },
+    [applyTextDraft, finishInlineTextEditing, notify],
+  );
   const canLeaveInlineTextEditor = useCallback(async (): Promise<boolean> => {
-    if (inlineTextElementId !== null || inlineCommitPromiseRef.current !== null)
+    if (
+      inlineTextElementIdRef.current !== null ||
+      inlineCommitPromiseRef.current !== null ||
+      textDraftDirtyRef.current
+    )
       return commitInlineText();
-    if (textDraftConflict && textDraftDirty) {
+    if (textDraftConflictRef.current) {
       notify('Resolve the preserved text conflict before changing selection.', 'error');
       return false;
     }
     return true;
-  }, [commitInlineText, inlineTextElementId, notify, textDraftConflict, textDraftDirty]);
+  }, [commitInlineText, notify]);
+  useLayoutEffect(() => {
+    canLeaveInlineTextEditorRef.current = canLeaveInlineTextEditor;
+  }, [canLeaveInlineTextEditor]);
+  useEffect(
+    () =>
+      window.htmllelujah.onWindowCloseRequested(async (request) => {
+        if (Date.now() >= request.deadlineAtMs || closePreparationInFlightRef.current)
+          return 'blocked';
+        closePreparationInFlightRef.current = true;
+        try {
+          const closeBlurResults: Promise<boolean>[] = [];
+          closeBlurExecutionResultsRef.current = closeBlurResults;
+          allowExecuteDuringCloseBlurRef.current = true;
+          try {
+            const activeElement = window.document.activeElement;
+            if (
+              activeElement instanceof HTMLElement &&
+              activeElementNeedsBlurCommit(activeElement.tagName, activeElement.isContentEditable)
+            ) {
+              activeElement.blur();
+            }
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+          } finally {
+            allowExecuteDuringCloseBlurRef.current = false;
+            closeBlurExecutionResultsRef.current = null;
+          }
+          if (!(await Promise.all(closeBlurResults)).every((applied) => applied)) return 'blocked';
+          if (!(await canLeaveInlineTextEditorRef.current())) return 'blocked';
+          for (;;) {
+            const queued = executeQueueRef.current;
+            await queued;
+            if (queued === executeQueueRef.current && pendingExecuteCountRef.current === 0) break;
+          }
+          return Date.now() < request.deadlineAtMs ? 'ready' : 'blocked';
+        } catch {
+          return 'blocked';
+        } finally {
+          allowExecuteDuringCloseBlurRef.current = false;
+          closeBlurExecutionResultsRef.current = null;
+          closePreparationInFlightRef.current = false;
+        }
+      }),
+    [],
+  );
   useEffect(() => {
     if (inlineTextElementId === null || primaryText?.id !== inlineTextElementId) return;
     textEditorFocusedRef.current = true;
@@ -1710,12 +2014,45 @@ function EditorApp() {
       inlineTextElementId !== null ||
       !textDraftDirty ||
       textDraftConflict ||
-      primaryText === undefined
+      primaryText === undefined ||
+      textApplyPending ||
+      textApplyInFlightRef.current !== null ||
+      !textDraftAutosaveMayAttempt(
+        textDraftAutosaveFailedVersionRef.current,
+        renderedTextDraftVersion,
+      )
     )
       return;
-    const timer = window.setTimeout(() => void applyTextDraft(), 800);
+    const draftVersion = renderedTextDraftVersion;
+    const timer = window.setTimeout(() => {
+      if (
+        textApplyInFlightRef.current !== null ||
+        !textDraftAutosaveMayAttempt(textDraftAutosaveFailedVersionRef.current, draftVersion)
+      )
+        return;
+      void applyTextDraft()
+        .then((applied) => {
+          if (applied) {
+            textDraftAutosaveFailedVersionRef.current = null;
+          } else if (textDraftVersionRef.current === draftVersion) {
+            textDraftAutosaveFailedVersionRef.current = draftVersion;
+          }
+        })
+        .catch(() => {
+          if (textDraftVersionRef.current === draftVersion)
+            textDraftAutosaveFailedVersionRef.current = draftVersion;
+        });
+    }, 800);
     return () => window.clearTimeout(timer);
-  }, [applyTextDraft, inlineTextElementId, primaryText, textDraftConflict, textDraftDirty]);
+  }, [
+    applyTextDraft,
+    inlineTextElementId,
+    primaryText,
+    renderedTextDraftVersion,
+    textApplyPending,
+    textDraftConflict,
+    textDraftDirty,
+  ]);
 
   useEffect(() => {
     const requested = textLeaseRequestRef.current;
@@ -2092,6 +2429,7 @@ function EditorApp() {
 
   const exportDocument = useCallback(
     async (format: 'html' | 'pdf'): Promise<void> => {
+      if (!(await canLeaveInlineTextEditorRef.current())) return;
       const current = sessionRef.current;
       if (current === null || busy) return;
       setBusy(true);
@@ -2116,14 +2454,15 @@ function EditorApp() {
   );
 
   const present = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     const current = sessionRef.current;
-    if (current === null) return;
+    if (current === null || busy) return;
     const result = await window.htmllelujah.present({
       sessionId: current.snapshot.sessionId,
       ...(activeSlide === undefined ? {} : { startSlideId: activeSlide.id }),
     });
     if (!result.ok) showFailure(result);
-  }, [activeSlide, showFailure]);
+  }, [activeSlide, busy, showFailure]);
 
   const openMcp = useCallback(async (): Promise<void> => {
     setMcpOpen(true);
@@ -2134,6 +2473,7 @@ function EditorApp() {
   }, [acceptShareStatus, showFailure]);
 
   const createMcpApproval = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     const current = sessionRef.current;
     if (current === null) return;
     const result = await window.htmllelujah.mcpCreateApproval({
@@ -2162,6 +2502,7 @@ function EditorApp() {
   }, [showFailure]);
 
   const hostCollaboration = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     const current = sessionRef.current;
     if (current === null || startingCollaborationRef.current) return;
     startingCollaborationRef.current = true;
@@ -2187,6 +2528,7 @@ function EditorApp() {
   }, [acceptSession, acceptShareStatus, discovery, displayName, showFailure]);
 
   const joinCollaboration = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     const current = sessionRef.current;
     if (current === null || joiningCollaborationRef.current) return;
     joiningCollaborationRef.current = true;
@@ -2251,6 +2593,7 @@ function EditorApp() {
   );
 
   const leaveCollaboration = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
     const current = sessionRef.current;
     if (current === null) return;
     const result = await window.htmllelujah.collaborationLeave({
@@ -2651,7 +2994,12 @@ function EditorApp() {
             <button type="button" className="share-button" onClick={() => void openShare()}>
               <Share2 size={15} aria-hidden="true" /> Share
             </button>
-            <button type="button" className="present-button" onClick={() => void present()}>
+            <button
+              type="button"
+              className="present-button"
+              disabled={busy}
+              onClick={() => void present()}
+            >
               <Play size={14} fill="currentColor" aria-hidden="true" /> Present
             </button>
           </div>
@@ -2912,11 +3260,13 @@ function EditorApp() {
             inlineTextEditor={
               canvasEditableSource === 'slide' &&
               inlineTextElementId === primaryText?.id &&
+              textDraftMatchesPrimary &&
               textDraft !== null
                 ? {
                     elementId: inlineTextElementId,
                     value: textDraft.text,
-                    disabled: textLeaseBlocked,
+                    disabled: textLeaseBlocked || textEditingLocked,
+                    pending: textEditingLocked,
                     conflict: textDraftConflict,
                     maxLength: RICH_CLIPBOARD_LIMITS.maxTextLength,
                     fontFamily: textDraft.fontFamily,
@@ -2932,23 +3282,37 @@ function EditorApp() {
             }
             selectedIds={selectedIds}
             onSelect={(ids) => {
-              if (inlineTextElementId === null || ids.at(-1) === inlineTextElementId) {
+              if (sameCanvasSelection(ids, selectedIds)) {
                 setSelectedIds(ids);
-                return;
+                return true;
               }
-              void commitInlineText().then((canLeave) => {
+              return canLeaveInlineTextEditorRef.current().then((canLeave) => {
                 if (canLeave) setSelectedIds(ids);
+                return canLeave;
               });
             }}
             onTransform={transformCanvasElements}
             onEditText={(elementId) => {
-              setSelectedIds([elementId]);
-              if (canvasEditableSource === 'slide') {
-                setInspectorTab('properties');
-                inlineCommitInFlightRef.current = false;
-                inlineCommitPromiseRef.current = null;
-                setInlineTextElementId(elementId);
+              const beginEditing = (): void => {
+                setSelectedIds([elementId]);
+                if (canvasEditableSource === 'slide') {
+                  setInspectorTab('properties');
+                  inlineCommitInFlightRef.current = false;
+                  updateInlineTextElementId(elementId);
+                }
+              };
+              if (
+                textApplyInFlightRef.current === null &&
+                inlineCommitPromiseRef.current === null &&
+                primaryText?.id === elementId &&
+                sameCanvasSelection(selectedIds, [elementId])
+              ) {
+                beginEditing();
+                return;
               }
+              void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                if (canLeave) beginEditing();
+              });
             }}
             onInlineTextChange={(text) => {
               if (textDraft === null) return;
@@ -2962,8 +3326,18 @@ function EditorApp() {
               });
             }}
             onInlineTextPaste={pasteRichText}
-            onInlineTextCommit={() => void commitInlineText()}
-            onInlineTextCancel={cancelInlineText}
+            onInlineTextCommit={(confirmConflict, relatedTarget) => {
+              if (!confirmConflict) {
+                if (consumeInlineTextBlurSuppression(suppressNextInlineBlurRef)) return;
+                if (
+                  relatedTarget instanceof HTMLElement &&
+                  relatedTarget.closest('.text-editor-section') !== null
+                )
+                  return;
+              }
+              void commitInlineText({ confirmConflict });
+            }}
+            onInlineTextCancel={revertTextDraft}
             onInlineTextFocus={() => {
               textEditorFocusedRef.current = true;
               if (collaborationTextActive) void beginTextLease();
@@ -2987,9 +3361,12 @@ function EditorApp() {
               aria-selected={inspectorTab === 'properties'}
               className={inspectorTab === 'properties' ? 'is-active' : ''}
               onClick={() => {
-                setInspectorTab('properties');
-                setDesignSurface('slide');
-                setSelectedIds([]);
+                void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                  if (!canLeave) return;
+                  setInspectorTab('properties');
+                  setDesignSurface('slide');
+                  setSelectedIds([]);
+                });
               }}
             >
               <SlidersHorizontal size={14} /> Properties
@@ -2999,11 +3376,42 @@ function EditorApp() {
               role="tab"
               aria-selected={inspectorTab === 'design'}
               className={inspectorTab === 'design' ? 'is-active' : ''}
-              onClick={() => setInspectorTab('design')}
+              onClick={() => {
+                void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                  if (canLeave) setInspectorTab('design');
+                });
+              }}
             >
               <Palette size={14} /> Design
             </button>
           </div>
+          {hasOrphanedTextDraft && textDraft !== null ? (
+            <section className="inspector-section text-draft-recovery" role="alert">
+              <div className="section-heading-row">
+                <h3>Preserved text draft</h3>
+                <span className="section-status">Copy before discarding</span>
+              </div>
+              <p className="field-hint">
+                The original text object is no longer selected or available. Your local draft is
+                preserved below.
+              </p>
+              <textarea
+                className="text-content-editor"
+                aria-label="Preserved text draft"
+                readOnly
+                rows={6}
+                value={textDraft.text}
+              />
+              <button
+                type="button"
+                className="danger-action"
+                disabled={textApplyPending}
+                onClick={revertTextDraft}
+              >
+                Discard preserved draft
+              </button>
+            </section>
+          ) : null}
           {inspectorTab === 'design' ? (
             <div className="inspector-scroll" role="tabpanel">
               <nav className="design-breadcrumb" aria-label="Design editing scope">
@@ -3014,8 +3422,11 @@ function EditorApp() {
                     className={designSurface === surface ? 'is-active' : ''}
                     aria-pressed={designSurface === surface}
                     onClick={() => {
-                      setDesignSurface(surface);
-                      setSelectedIds([]);
+                      void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                        if (!canLeave) return;
+                        setDesignSurface(surface);
+                        setSelectedIds([]);
+                      });
                     }}
                   >
                     {surface.slice(0, 1).toUpperCase() + surface.slice(1)}
@@ -3289,22 +3700,24 @@ function EditorApp() {
                       const layout = document.layouts.find(
                         (candidate) => candidate.id === layoutId,
                       );
-                      setDesignSurface('slide');
-                      setDesignLayoutId(layoutId);
-                      if (layout !== undefined) {
-                        setDesignMasterId(layout.masterId);
-                        const master = document.masters.find(
-                          (candidate) => candidate.id === layout.masterId,
-                        );
-                        if (master !== undefined) setDesignThemeId(master.themeId);
-                      }
                       void execute('Change slide layout', [
                         {
                           type: 'slide.set-layout',
                           slideId: activeSlide.id,
                           layoutId,
                         },
-                      ]);
+                      ]).then((applied) => {
+                        if (!applied) return;
+                        setDesignSurface('slide');
+                        setDesignLayoutId(layoutId);
+                        if (layout !== undefined) {
+                          setDesignMasterId(layout.masterId);
+                          const master = document.masters.find(
+                            (candidate) => candidate.id === layout.masterId,
+                          );
+                          if (master !== undefined) setDesignThemeId(master.themeId);
+                        }
+                      });
                     }}
                   >
                     {document.layouts.map((layout) => (
@@ -3349,19 +3762,23 @@ function EditorApp() {
                   <select
                     value={designLayout?.id ?? ''}
                     onChange={(event) => {
+                      const layoutId = event.currentTarget.value;
                       const layout = document.layouts.find(
-                        (candidate) => candidate.id === event.currentTarget.value,
+                        (candidate) => candidate.id === layoutId,
                       );
-                      setDesignLayoutId(event.currentTarget.value);
-                      setDesignSurface('layout');
-                      setSelectedIds([]);
-                      if (layout !== undefined) {
-                        setDesignMasterId(layout.masterId);
-                        const master = document.masters.find(
-                          (candidate) => candidate.id === layout.masterId,
-                        );
-                        if (master !== undefined) setDesignThemeId(master.themeId);
-                      }
+                      void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                        if (!canLeave) return;
+                        setDesignLayoutId(layoutId);
+                        setDesignSurface('layout');
+                        setSelectedIds([]);
+                        if (layout !== undefined) {
+                          setDesignMasterId(layout.masterId);
+                          const master = document.masters.find(
+                            (candidate) => candidate.id === layout.masterId,
+                          );
+                          if (master !== undefined) setDesignThemeId(master.themeId);
+                        }
+                      });
                     }}
                   >
                     {document.layouts.map((layout) => (
@@ -3668,13 +4085,17 @@ function EditorApp() {
                   <select
                     value={designMaster?.id ?? ''}
                     onChange={(event) => {
+                      const masterId = event.currentTarget.value;
                       const master = document.masters.find(
-                        (candidate) => candidate.id === event.currentTarget.value,
+                        (candidate) => candidate.id === masterId,
                       );
-                      setDesignMasterId(event.currentTarget.value);
-                      setDesignSurface('master');
-                      setSelectedIds([]);
-                      if (master !== undefined) setDesignThemeId(master.themeId);
+                      void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                        if (!canLeave) return;
+                        setDesignMasterId(masterId);
+                        setDesignSurface('master');
+                        setSelectedIds([]);
+                        if (master !== undefined) setDesignThemeId(master.themeId);
+                      });
                     }}
                   >
                     {document.masters.map((master) => (
@@ -3765,8 +4186,11 @@ function EditorApp() {
                           className="master-object-select"
                           aria-pressed={selectedIds.includes(element.id)}
                           onClick={() => {
-                            setDesignSurface('master');
-                            setSelectedIds([element.id]);
+                            void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                              if (!canLeave) return;
+                              setDesignSurface('master');
+                              setSelectedIds([element.id]);
+                            });
                           }}
                         >
                           <strong>{element.name}</strong>
@@ -4304,7 +4728,7 @@ function EditorApp() {
                   </EditorButton>
                 </div>
               </section>
-              {primaryText !== undefined && textDraft !== null ? (
+              {primaryText !== undefined && textDraft !== null && textDraftMatchesPrimary ? (
                 <section
                   className="inspector-section text-editor-section"
                   onFocusCapture={() => {
@@ -4314,15 +4738,17 @@ function EditorApp() {
                   onBlurCapture={(event) => {
                     if (event.currentTarget.contains(event.relatedTarget)) return;
                     textEditorFocusedRef.current = false;
-                    const applied =
-                      textDraftDirty && !textDraftConflict ? applyTextDraft() : Promise.resolve();
-                    void applied.finally(() => releaseTextLease());
+                    void commitInlineText();
                   }}
                 >
                   <div className="section-heading-row">
                     <h3>Text</h3>
                     <span className="section-status" aria-live="polite">
-                      {textLeaseLabel}
+                      {textEditingLocked
+                        ? 'Applying text...'
+                        : textApplyPending
+                          ? 'Saving draft...'
+                          : textLeaseLabel}
                     </span>
                   </div>
                   {textLeaseBlocked ? (
@@ -4340,26 +4766,23 @@ function EditorApp() {
                       </span>
                     </button>
                   ) : null}
-                  <fieldset className="text-editor-controls" disabled={textLeaseBlocked}>
-                    {textDraftConflict ? (
-                      <div className="draft-conflict" role="alert">
-                        <span>The same text changed elsewhere. Your draft has not been lost.</span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setTextDraft(initialTextDraft(primaryText, document, activeSlide));
-                            setTextDraftDirty(false);
-                            setTextDraftConflict(false);
-                            textBaselineRef.current = {
-                              id: primaryText.id,
-                              value: textEditingFingerprint(primaryText),
-                            };
-                          }}
-                        >
-                          Use latest
-                        </button>
-                      </div>
-                    ) : null}
+                  {textDraftDirty ? (
+                    <div className="draft-conflict" role={textDraftConflict ? 'alert' : 'status'}>
+                      <span>
+                        {textDraftConflict
+                          ? 'The same text changed elsewhere. Your draft has not been lost.'
+                          : 'This text has an unapplied local draft.'}
+                      </span>
+                      <button type="button" disabled={textApplyPending} onClick={revertTextDraft}>
+                        Revert draft
+                      </button>
+                    </div>
+                  ) : null}
+                  <fieldset
+                    className="text-editor-controls"
+                    disabled={textLeaseBlocked || textEditingLocked}
+                    aria-busy={textEditingLocked || undefined}
+                  >
                     <div className="rich-toolbar" role="toolbar" aria-label="Text formatting">
                       <button
                         type="button"
@@ -4497,7 +4920,7 @@ function EditorApp() {
                       onKeyDown={(event) => {
                         if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
                           event.preventDefault();
-                          void applyTextDraft();
+                          void commitInlineText({ confirmConflict: true });
                         }
                       }}
                     />
@@ -4651,9 +5074,9 @@ function EditorApp() {
                     <button
                       type="button"
                       className="primary-inspector-action"
-                      onClick={() => void applyTextDraft()}
+                      onClick={() => void commitInlineText({ confirmConflict: true })}
                     >
-                      Apply text <kbd>Ctrl Enter</kbd>
+                      {textEditingLocked ? 'Applying...' : 'Apply text'} <kbd>Ctrl Enter</kbd>
                     </button>
                   </fieldset>
                 </section>

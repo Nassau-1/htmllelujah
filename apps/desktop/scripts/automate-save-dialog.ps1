@@ -192,15 +192,15 @@ function Find-Window {
   )
 
   $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-    [System.Windows.Automation.TreeScope]::Children,
-    [System.Windows.Automation.Condition]::TrueCondition
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.PropertyCondition]::new(
+      [System.Windows.Automation.AutomationElement]::NameProperty,
+      $Title
+    )
   )
   foreach ($window in $windows) {
     try {
-      if (
-        $window.Current.Name -eq $Title -and
-        $AllowedProcessIds.Contains([int]$window.Current.ProcessId)
-      ) {
+      if ($AllowedProcessIds.Contains([int]$window.Current.ProcessId)) {
         return $window
       }
     }
@@ -209,6 +209,33 @@ function Find-Window {
     }
   }
   return $null
+}
+
+function Describe-ProcessWindows {
+  param([System.Collections.Generic.HashSet[int]]$AllowedProcessIds)
+
+  $descriptions = [System.Collections.Generic.List[object]]::new()
+  $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+    [System.Windows.Automation.TreeScope]::Children,
+    [System.Windows.Automation.Condition]::TrueCondition
+  )
+  foreach ($window in $windows) {
+    try {
+      if ($AllowedProcessIds.Contains([int]$window.Current.ProcessId)) {
+        $descriptions.Add([ordered]@{
+          processId = [int]$window.Current.ProcessId
+          name = [string]$window.Current.Name
+          className = [string]$window.Current.ClassName
+          controlType = [string]$window.Current.ControlType.ProgrammaticName
+          nativeWindowHandle = [int]$window.Current.NativeWindowHandle
+        })
+      }
+    }
+    catch {
+      # A top-level window can disappear while its metadata is inspected.
+    }
+  }
+  return $descriptions
 }
 
 function Find-FileNameEditor {
@@ -416,7 +443,13 @@ while ([DateTime]::UtcNow -lt $deadline -and $null -eq $dialog) {
   }
 }
 if ($null -eq $dialog) {
-  throw 'The expected Windows save dialog did not appear before the timeout.'
+  $candidates = Describe-ProcessWindows -AllowedProcessIds $allowedProcessIds
+  $detail = ConvertTo-Json -InputObject ([ordered]@{
+    requestedTitle = $WindowTitle
+    allowedProcessIds = @($allowedProcessIds)
+    processWindows = @($candidates)
+  }) -Compress -Depth 4
+  throw "The expected Windows save dialog did not appear before the timeout. Diagnostics: $detail"
 }
 
 $editorResult = $null

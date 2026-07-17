@@ -41,6 +41,7 @@ export type InlineTextCanvasEditor = Readonly<{
   elementId: string;
   value: string;
   disabled: boolean;
+  pending: boolean;
   conflict: boolean;
   maxLength: number;
   fontFamily: string;
@@ -64,7 +65,7 @@ type CanonicalSlideCanvasProps = {
   readonly includeTemplatePlaceholders?: boolean | undefined;
   readonly inlineTextEditor?: InlineTextCanvasEditor | null | undefined;
   readonly selectedIds: readonly string[];
-  readonly onSelect: (ids: readonly string[]) => void;
+  readonly onSelect: (ids: readonly string[]) => boolean | Promise<boolean>;
   readonly onTransform: (
     frames: readonly { readonly elementId: string; readonly frame: Frame }[],
   ) => void;
@@ -72,7 +73,8 @@ type CanonicalSlideCanvasProps = {
   readonly onInlineTextChange?: ((value: string) => void) | undefined;
   readonly onInlineTextPaste?:
     ((event: ReactClipboardEvent<HTMLTextAreaElement>) => void) | undefined;
-  readonly onInlineTextCommit?: (() => void) | undefined;
+  readonly onInlineTextCommit?:
+    ((confirmConflict: boolean, relatedTarget: EventTarget | null) => void) | undefined;
   readonly onInlineTextCancel?: (() => void) | undefined;
   readonly onInlineTextFocus?: (() => void) | undefined;
 };
@@ -181,6 +183,7 @@ export const rotationControlPlacement = (frame: Frame, scale: number): RotationC
 
 type MoveGesture = {
   readonly kind: 'move';
+  readonly selectionAuthorized: Promise<boolean>;
   readonly pointerId: number;
   readonly startX: number;
   readonly startY: number;
@@ -209,6 +212,25 @@ type RotateGesture = {
 };
 
 type Gesture = MoveGesture | ResizeGesture | RotateGesture;
+
+export const sameCanvasSelection = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((id, index) => id === right[index]);
+
+export type CanvasTransform = Readonly<{ elementId: string; frame: Frame }>;
+
+export const commitCanvasTransformsWhenAuthorized = async (
+  authorization: Promise<boolean>,
+  transforms: readonly CanvasTransform[],
+  onTransform: (frames: readonly CanvasTransform[]) => void,
+): Promise<boolean> => {
+  try {
+    if (!(await authorization) || transforms.length === 0) return false;
+    onTransform(transforms);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 const handles: readonly ResizeHandle[] = [
   'north-west',
@@ -399,7 +421,7 @@ export function InlineTextCanvasEditorOverlay({
   editor: InlineTextCanvasEditor;
   onChange: (value: string) => void;
   onPaste: (event: ReactClipboardEvent<HTMLTextAreaElement>) => void;
-  onCommit: () => void;
+  onCommit: (confirmConflict: boolean, relatedTarget: EventTarget | null) => void;
   onCancel: () => void;
   onFocus: () => void;
 }>) {
@@ -424,6 +446,7 @@ export function InlineTextCanvasEditorOverlay({
         aria-label={`Edit ${element.name} on slide`}
         aria-describedby={`${helpId}${editor.conflict ? ` ${conflictId}` : ''}`}
         aria-invalid={editor.conflict || undefined}
+        aria-busy={editor.pending || undefined}
         className="canonical-inline-text-input"
         disabled={editor.disabled}
         maxLength={editor.maxLength}
@@ -439,7 +462,7 @@ export function InlineTextCanvasEditorOverlay({
           lineHeight: editor.lineHeight,
           textAlign: editor.alignment,
         }}
-        onBlur={onCommit}
+        onBlur={(event) => onCommit(false, event.relatedTarget)}
         onChange={(event) => onChange(event.currentTarget.value)}
         onFocus={onFocus}
         onPaste={onPaste}
@@ -452,7 +475,7 @@ export function InlineTextCanvasEditorOverlay({
           if (action === 'none') return;
           event.preventDefault();
           event.stopPropagation();
-          if (action === 'commit') onCommit();
+          if (action === 'commit') onCommit(true, null);
           else onCancel();
         }}
       />
@@ -504,6 +527,8 @@ export function CanonicalSlideCanvas({
   const draftFramesRef = useRef<DraftFrames>({});
   const [draftFrames, setDraftFrames] = useState<DraftFrames>({});
   const [smartGuides, setSmartGuides] = useState<readonly SmartGuide[]>([]);
+  const requestSelection = (ids: readonly string[]): Promise<boolean> =>
+    Promise.resolve(onSelect(ids)).catch(() => false);
   const localElements = editableElements ?? slide.elements;
   const localById = useMemo(
     () => new Map(localElements.map((element) => [element.id, element])),
@@ -671,7 +696,16 @@ export function CanonicalSlideCanvas({
       gesture.current = null;
       setSmartGuides([]);
       updateDraftFrames({});
-      if (transforms.length > 0) onTransform(transforms);
+      if (transforms.length === 0) return;
+      if (active.kind !== 'move') {
+        onTransform(transforms);
+        return;
+      }
+      void commitCanvasTransformsWhenAuthorized(
+        active.selectionAuthorized,
+        transforms,
+        onTransform,
+      );
     };
     const onUp = (event: PointerEvent): void => finishGesture(event, true);
     const onCancel = (event: PointerEvent): void => finishGesture(event, false);
@@ -699,8 +733,11 @@ export function CanonicalSlideCanvas({
         ? selectedIds
         : [localElement.id];
     const stableSelection = nextSelection.length === 0 ? [localElement.id] : nextSelection;
-    onSelect(stableSelection);
-    if (localElement.locked) return;
+    const selectionAuthorized = requestSelection(stableSelection);
+    if (localElement.locked) {
+      void selectionAuthorized;
+      return;
+    }
     const items = editableProjection
       .filter(
         (candidate) =>
@@ -718,6 +755,7 @@ export function CanonicalSlideCanvas({
       }));
     gesture.current = {
       kind: 'move',
+      selectionAuthorized,
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
@@ -815,7 +853,7 @@ export function CanonicalSlideCanvas({
         className={`canonical-canvas-scaled${gridEnabled ? ' has-grid' : ''}`}
         style={scaledStyle}
         onPointerDown={(event) => {
-          if (event.target === event.currentTarget) onSelect([]);
+          if (event.target === event.currentTarget) void requestSelection([]);
         }}
       >
         <SlideSurface
@@ -851,11 +889,12 @@ export function CanonicalSlideCanvas({
                   onKeyDown={(event) => {
                     if (event.key === 'Enter') {
                       event.preventDefault();
-                      onSelect([localElement.id]);
-                      if (localElement.type === 'text') onEditText(localElement.id);
+                      void requestSelection([localElement.id]).then((authorized) => {
+                        if (authorized && localElement.type === 'text') onEditText(localElement.id);
+                      });
                     } else if (event.key === ' ') {
                       event.preventDefault();
-                      onSelect([localElement.id]);
+                      void requestSelection([localElement.id]);
                     }
                   }}
                 >

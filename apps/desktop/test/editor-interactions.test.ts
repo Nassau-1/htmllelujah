@@ -13,24 +13,34 @@ import {
   canvasTransformsToCommit,
   canvasKeyboardRotationFrame,
   CanonicalSlideCanvas,
+  commitCanvasTransformsWhenAuthorized,
   connectorAfterInteractionFrameTransform,
   MINIMUM_ROTATION_TOUCH_TARGET_PX,
   pointAfterInteractionFrameTransform,
   resolveCanvasEditableElements,
   rotationControlMetrics,
   rotationControlPlacement,
+  sameCanvasSelection,
 } from '../src/renderer/components/CanonicalSlideCanvas.js';
 import {
   createConnectorElement,
   createShapeElement,
 } from '../src/renderer/editor/canonical-factories.js';
 import {
+  activeElementNeedsBlurCommit,
   adjacentSlideIndex,
   canAutoCommitInlineText,
   claimInlineTextCommit,
+  consumeInlineTextBlurSuppression,
+  inlineTextCanCloseWithoutApply,
   inlineTextEditorKeyAction,
+  renderedTextDraftIsCurrent,
+  retainInlineTextEditingTarget,
   rotationFrameForKeyboard,
   runInlineTextCommitOnce,
+  shouldPreserveDetachedTextDraft,
+  textDraftAutosaveMayAttempt,
+  textDraftTargetHasChanged,
 } from '../src/renderer/editor/editor-interactions.js';
 
 const frame = (rotationDeg: number) => ({
@@ -42,6 +52,73 @@ const frame = (rotationDeg: number) => ({
 });
 
 describe('accessible editor interactions', () => {
+  it('identifies focused controls whose onBlur value must commit before close', () => {
+    expect(activeElementNeedsBlurCommit('input', false)).toBe(true);
+    expect(activeElementNeedsBlurCommit('TEXTAREA', false)).toBe(true);
+    expect(activeElementNeedsBlurCommit('select', false)).toBe(true);
+    expect(activeElementNeedsBlurCommit('DIV', true)).toBe(true);
+    expect(activeElementNeedsBlurCommit('button', false)).toBe(false);
+    expect(activeElementNeedsBlurCommit('body', false)).toBe(false);
+  });
+
+  it('authorizes only an exact stable canvas selection', () => {
+    expect(sameCanvasSelection(['shape-1'], ['shape-1'])).toBe(true);
+    expect(sameCanvasSelection([], [])).toBe(true);
+    expect(sameCanvasSelection(['shape-1'], ['shape-1', 'text-1'])).toBe(false);
+    expect(sameCanvasSelection(['shape-1', 'text-1'], ['text-1', 'shape-1'])).toBe(false);
+  });
+
+  it('consumes inline blur suppression exactly once', () => {
+    const suppression = { current: true };
+    expect(consumeInlineTextBlurSuppression(suppression)).toBe(true);
+    expect(suppression.current).toBe(false);
+    expect(consumeInlineTextBlurSuppression(suppression)).toBe(false);
+  });
+
+  it('fails closed for stale, externally changed, or detached text drafts', () => {
+    const baseline = { id: 'text-1', value: 'revision-a' };
+    expect(renderedTextDraftIsCurrent(4, 4)).toBe(true);
+    expect(renderedTextDraftIsCurrent(4, 5)).toBe(false);
+    expect(textDraftAutosaveMayAttempt(null, 4)).toBe(true);
+    expect(textDraftAutosaveMayAttempt(3, 4)).toBe(true);
+    expect(textDraftAutosaveMayAttempt(4, 4)).toBe(false);
+    expect(textDraftTargetHasChanged(baseline, 'text-1', 'revision-a', false)).toBe(false);
+    expect(textDraftTargetHasChanged(baseline, 'text-1', 'revision-b', false)).toBe(true);
+    expect(textDraftTargetHasChanged(baseline, 'text-2', 'revision-a', false)).toBe(true);
+    expect(textDraftTargetHasChanged(null, 'text-1', 'revision-a', false)).toBe(true);
+    expect(textDraftTargetHasChanged(baseline, 'text-1', undefined, false)).toBe(true);
+    expect(textDraftTargetHasChanged(baseline, 'text-1', 'revision-a', true)).toBe(true);
+    expect(shouldPreserveDetachedTextDraft(true, true, 'text-1', undefined)).toBe(true);
+    expect(shouldPreserveDetachedTextDraft(true, true, 'text-1', 'text-2')).toBe(true);
+    expect(shouldPreserveDetachedTextDraft(false, true, 'text-1', undefined)).toBe(false);
+    expect(shouldPreserveDetachedTextDraft(true, false, 'text-1', undefined)).toBe(false);
+  });
+
+  it('commits a drag transform only after selection authorization', async () => {
+    const transforms = [{ elementId: 'shape-1', frame: frame(0) }];
+    const committed: (typeof transforms)[] = [];
+    const onTransform = (next: typeof transforms): void => {
+      committed.push(next);
+    };
+
+    expect(
+      await commitCanvasTransformsWhenAuthorized(Promise.resolve(false), transforms, onTransform),
+    ).toBe(false);
+    expect(committed).toHaveLength(0);
+    expect(
+      await commitCanvasTransformsWhenAuthorized(Promise.resolve(true), transforms, onTransform),
+    ).toBe(true);
+    expect(committed).toEqual([transforms]);
+    expect(
+      await commitCanvasTransformsWhenAuthorized(
+        Promise.reject(new Error('denied')),
+        transforms,
+        onTransform,
+      ),
+    ).toBe(false);
+    expect(committed).toHaveLength(1);
+  });
+
   it('rotates one degree with arrow keys and snaps Shift rotation to 15 degrees', () => {
     expect(rotationFrameForKeyboard(frame(0), 'ArrowRight', false)?.rotationDeg).toBe(1);
     expect(rotationFrameForKeyboard(frame(7), 'ArrowRight', true)?.rotationDeg).toBe(15);
@@ -154,6 +231,7 @@ describe('accessible editor interactions', () => {
           elementId: localText.id,
           value: 'Projected draft',
           disabled: false,
+          pending: false,
           conflict: false,
           maxLength: 500_000,
           fontFamily: 'Arial',
@@ -165,7 +243,7 @@ describe('accessible editor interactions', () => {
           letterSpacingPt: 0,
           alignment: 'left',
         },
-        onSelect: () => undefined,
+        onSelect: () => true,
         onTransform: () => undefined,
         onEditText: () => undefined,
         onInlineTextChange: () => undefined,
@@ -541,6 +619,13 @@ describe('accessible editor interactions', () => {
   it('blocks automatic remote-conflict overwrite and renders a bounded rotated zoomed overlay', () => {
     expect(canAutoCommitInlineText(true)).toBe(false);
     expect(canAutoCommitInlineText(false)).toBe(true);
+    expect(inlineTextCanCloseWithoutApply(false, false)).toBe(true);
+    expect(inlineTextCanCloseWithoutApply(true, false)).toBe(false);
+    expect(inlineTextCanCloseWithoutApply(false, true)).toBe(false);
+    expect(retainInlineTextEditingTarget('text-1', 'text-1')).toBe('text-1');
+    expect(retainInlineTextEditingTarget('text-1', 'text-2')).toBeNull();
+    expect(retainInlineTextEditingTarget('text-1', undefined)).toBeNull();
+    expect(retainInlineTextEditingTarget(null, 'text-1')).toBeNull();
 
     const deck = createNeutralDemoDeck();
     const sourceSlide = deck.slides[0]!;
@@ -568,6 +653,7 @@ describe('accessible editor interactions', () => {
           elementId: text.id,
           value: 'Local draft',
           disabled: false,
+          pending: false,
           conflict: true,
           maxLength: 500_000,
           fontFamily: 'Arial',
@@ -579,7 +665,7 @@ describe('accessible editor interactions', () => {
           letterSpacingPt: 0,
           alignment: 'left',
         },
-        onSelect: () => undefined,
+        onSelect: () => true,
         onTransform: () => undefined,
         onEditText: () => undefined,
         onInlineTextChange: () => undefined,

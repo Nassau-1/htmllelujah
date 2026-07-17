@@ -27,6 +27,12 @@ export const adjacentSlideIndex = (
   return next < 0 || next >= slideCount ? null : next;
 };
 
+export const activeElementNeedsBlurCommit = (
+  tagName: string,
+  isContentEditable: boolean,
+): boolean =>
+  isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(tagName.trim().toUpperCase());
+
 export type InlineTextEditorKeyAction = 'commit' | 'cancel' | 'none';
 
 export const inlineTextEditorKeyAction = (
@@ -44,6 +50,15 @@ export const inlineTextEditorKeyAction = (
 };
 
 export type InlineTextCommitGate = { current: boolean };
+export type InlineTextBlurSuppression = { current: boolean };
+
+export const consumeInlineTextBlurSuppression = (
+  suppression: InlineTextBlurSuppression,
+): boolean => {
+  if (!suppression.current) return false;
+  suppression.current = false;
+  return true;
+};
 
 export const claimInlineTextCommit = (gate: InlineTextCommitGate): boolean => {
   if (gate.current) return false;
@@ -52,6 +67,54 @@ export const claimInlineTextCommit = (gate: InlineTextCommitGate): boolean => {
 };
 
 export const canAutoCommitInlineText = (hasRemoteConflict: boolean): boolean => !hasRemoteConflict;
+
+export const inlineTextCanCloseWithoutApply = (
+  draftDirty: boolean,
+  hasRemoteConflict: boolean,
+): boolean => !draftDirty && !hasRemoteConflict;
+
+export const retainInlineTextEditingTarget = (
+  editingElementId: string | null,
+  primaryTextElementId: string | undefined,
+): string | null =>
+  editingElementId !== null && editingElementId === primaryTextElementId ? editingElementId : null;
+
+export type TextDraftBaseline = Readonly<{ id: string; value: string }> | null;
+
+export const textDraftTargetHasChanged = (
+  baseline: TextDraftBaseline,
+  targetElementId: string,
+  currentFingerprint: string | undefined,
+  knownConflict: boolean,
+): boolean =>
+  knownConflict ||
+  baseline === null ||
+  baseline.id !== targetElementId ||
+  currentFingerprint === undefined ||
+  baseline.value !== currentFingerprint;
+
+export const shouldPreserveDetachedTextDraft = (
+  draftDirty: boolean,
+  hasDraft: boolean,
+  baselineElementId: string | undefined,
+  targetElementId: string | undefined,
+): boolean =>
+  draftDirty &&
+  hasDraft &&
+  (baselineElementId === undefined ||
+    targetElementId === undefined ||
+    baselineElementId !== targetElementId);
+
+export const renderedTextDraftIsCurrent = (
+  renderedVersion: number,
+  currentVersion: number,
+): boolean => renderedVersion === currentVersion;
+
+export const textDraftAutosaveMayAttempt = (
+  failedVersion: number | null,
+  currentVersion: number,
+): boolean => failedVersion === null || failedVersion !== currentVersion;
+
 export const runInlineTextCommitOnce = async (
   gate: InlineTextCommitGate,
   work: () => Promise<void>,

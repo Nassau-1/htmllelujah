@@ -20,6 +20,7 @@ import {
   type HtmllelujahDesktopApi,
   type ImportImageResult,
   type InitializeResult,
+  isWindowCloseRequest,
   type McpStatus,
   type McpApproval,
   type McpApprovalInput,
@@ -28,11 +29,44 @@ import {
   type SafeDocumentChangedEvent,
   type SessionInput,
   type SessionView,
+  settleWindowCloseListeners,
+  type WindowCloseRequestListener,
 } from '../shared/desktop-api.js';
 import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
 
 const invoke = <T>(channel: string, input?: unknown): Promise<DesktopResult<T>> =>
   ipcRenderer.invoke(channel, input) as Promise<DesktopResult<T>>;
+
+const windowCloseListeners = new Set<WindowCloseRequestListener>();
+const activeWindowCloseRequests = new Set<string>();
+
+ipcRenderer.on(DESKTOP_IPC.windowCloseRequested, (_electronEvent, value: unknown): void => {
+  if (!isWindowCloseRequest(value) || activeWindowCloseRequests.has(value.requestId)) return;
+  const request = Object.freeze({
+    requestId: value.requestId,
+    deadlineAtMs: value.deadlineAtMs,
+  });
+  const listeners = [...windowCloseListeners];
+  activeWindowCloseRequests.add(request.requestId);
+  void settleWindowCloseListeners(listeners, request)
+    .then((decision) => {
+      try {
+        ipcRenderer.send(DESKTOP_IPC.windowCloseResponse, {
+          requestId: request.requestId,
+          decision: Date.now() < request.deadlineAtMs ? decision : 'blocked',
+        });
+      } catch {
+        // The main-process timeout remains the fail-closed authority if IPC is unavailable.
+      }
+    })
+    .finally(() => activeWindowCloseRequests.delete(request.requestId));
+});
+
+const onWindowCloseRequested = (listener: WindowCloseRequestListener): (() => void) => {
+  if (typeof listener !== 'function') throw new TypeError('A window-close listener is required.');
+  windowCloseListeners.add(listener);
+  return () => windowCloseListeners.delete(listener);
+};
 
 const onDocumentChanged = (listener: (event: SafeDocumentChangedEvent) => void): (() => void) => {
   const wrapped = (_electronEvent: Electron.IpcRendererEvent, value: unknown): void => {
@@ -131,6 +165,7 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
   mcpStatus: (): Promise<DesktopResult<McpStatus>> => invoke(DESKTOP_IPC.mcpStatus),
   mcpCreateApproval: (input: McpApprovalInput): Promise<DesktopResult<McpApproval>> =>
     invoke(DESKTOP_IPC.mcpCreateApproval, input),
+  onWindowCloseRequested,
   onDocumentChanged,
   onPresentationChanged,
 });

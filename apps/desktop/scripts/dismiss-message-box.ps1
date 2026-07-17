@@ -5,6 +5,13 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$WindowTitle,
 
+  [string]$ButtonName = '',
+
+  [ValidateRange(0, 10000)]
+  [int]$DelayMilliseconds = 0,
+
+  [string]$ReleasePath = '',
+
   [ValidateRange(1, 120)]
   [int]$TimeoutSeconds = 30
 )
@@ -38,31 +45,23 @@ function Get-ProcessTreeIds {
   $accepted = [System.Collections.Generic.HashSet[int]]::new()
   [void]$accepted.Add($ProcessId)
   try {
-    $root = Get-Process -Id $ProcessId -ErrorAction Stop
-    $targetPath = $root.Path
-    if (-not [string]::IsNullOrWhiteSpace($targetPath)) {
-      $siblings = Get-Process -Name $root.ProcessName -ErrorAction SilentlyContinue
-      foreach ($sibling in $siblings) {
-        try {
-          if (
-            -not [string]::IsNullOrWhiteSpace($sibling.Path) -and
-            [string]::Equals(
-              [System.IO.Path]::GetFullPath($sibling.Path),
-              [System.IO.Path]::GetFullPath($targetPath),
-              [System.StringComparison]::OrdinalIgnoreCase
-            )
-          ) {
-            [void]$accepted.Add([int]$sibling.Id)
-          }
-        }
-        catch {
-          # A helper can exit while its executable path is inspected.
+    $processes = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
+    $added = $true
+    while ($added) {
+      $added = $false
+      foreach ($process in $processes) {
+        if (
+          $accepted.Contains([int]$process.ParentProcessId) -and
+          $accepted.Add([int]$process.ProcessId)
+        ) {
+          $added = $true
         }
       }
     }
   }
   catch {
-    # The root PID alone remains a strict, safe fallback.
+    # Native Electron message boxes normally belong to the main process.
+    # Continue with the root PID if process enumeration is unavailable.
   }
   return $accepted
 }
@@ -74,15 +73,15 @@ function Find-Window {
   )
 
   $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-    [System.Windows.Automation.TreeScope]::Children,
-    [System.Windows.Automation.Condition]::TrueCondition
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.PropertyCondition]::new(
+      [System.Windows.Automation.AutomationElement]::NameProperty,
+      $Title
+    )
   )
   foreach ($window in $windows) {
     try {
-      if (
-        $window.Current.Name -eq $Title -and
-        $AllowedProcessIds.Contains([int]$window.Current.ProcessId)
-      ) {
+      if ($AllowedProcessIds.Contains([int]$window.Current.ProcessId)) {
         return $window
       }
     }
@@ -94,7 +93,10 @@ function Find-Window {
 }
 
 function Find-ConfirmationButton {
-  param([System.Windows.Automation.AutomationElement]$Window)
+  param(
+    [System.Windows.Automation.AutomationElement]$Window,
+    [string]$RequestedName
+  )
 
   $buttons = $Window.FindAll(
     [System.Windows.Automation.TreeScope]::Descendants,
@@ -103,6 +105,19 @@ function Find-ConfirmationButton {
       [System.Windows.Automation.ControlType]::Button
     )
   )
+  if (-not [string]::IsNullOrWhiteSpace($RequestedName)) {
+    foreach ($button in $buttons) {
+      try {
+        if ($button.Current.IsEnabled -and $button.Current.Name -eq $RequestedName) {
+          return $button
+        }
+      }
+      catch {
+        # A button can disappear between discovery and inspection.
+      }
+    }
+    return $null
+  }
   foreach ($button in $buttons) {
     try {
       if ($button.Current.IsEnabled -and $button.Current.IsDefaultButton) {
@@ -139,9 +154,25 @@ if ($null -eq $dialog) {
   throw 'The expected native message box did not appear before the timeout.'
 }
 
-$button = Find-ConfirmationButton -Window $dialog
+$button = Find-ConfirmationButton -Window $dialog -RequestedName $ButtonName
 if ($null -eq $button) {
   throw 'The native message box confirmation button was not found.'
+}
+
+Write-Output '__HTMLLELUJAH_MESSAGE_BOX_READY__'
+
+if ($DelayMilliseconds -gt 0) {
+  Start-Sleep -Milliseconds $DelayMilliseconds
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ReleasePath)) {
+  $releaseDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  while ([DateTime]::UtcNow -lt $releaseDeadline -and -not (Test-Path -LiteralPath $ReleasePath)) {
+    Start-Sleep -Milliseconds 50
+  }
+  if (-not (Test-Path -LiteralPath $ReleasePath)) {
+    throw 'The native message box release signal did not appear before the timeout.'
+  }
 }
 
 $nativeClick = [HtmllelujahMessageBoxInput]::ClickNativeButton(

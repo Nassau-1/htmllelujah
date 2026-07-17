@@ -3,6 +3,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { LocalRpcClient } from '@htmllelujah/mcp-server';
+
 import { assessInteractiveReadiness, assertInteractiveReadiness } from './ui-smoke-performance.mjs';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
@@ -12,6 +14,8 @@ const screenshotPath = path.join(evidenceDirectory, 'v1-editor-electron.png');
 const presentationScreenshotPath = path.join(evidenceDirectory, 'v1-presentation-electron.png');
 const reportPath = path.join(evidenceDirectory, 'v1-editor-electron.json');
 const dialogAutomationPath = path.join(import.meta.dirname, 'automate-save-dialog.ps1');
+const messageBoxAutomationPath = path.join(import.meta.dirname, 'dismiss-message-box.ps1');
+const windowCloseAutomationPath = path.join(import.meta.dirname, 'request-window-close.ps1');
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const waitFor = async (operation, timeoutMs, label) => {
@@ -127,6 +131,138 @@ const automateFileDialog = (rootProcessId, windowTitle, targetPath) =>
       clearTimeout(timer);
       if (code === 0) resolve();
       else reject(new Error(`Native file-dialog automation exited ${code ?? signal}. ${stderr}`));
+    });
+  });
+
+const automateMessageBox = (
+  rootProcessId,
+  windowTitle,
+  buttonName,
+  delayMilliseconds = 0,
+  releasePath = '',
+) => {
+  let child;
+  let cancelled = false;
+  let signalReady;
+  let readySignaled = false;
+  const ready = new Promise((resolve) => {
+    signalReady = (value) => {
+      if (readySignaled) return;
+      readySignaled = true;
+      resolve(value);
+    };
+  });
+  const completion = new Promise((resolve, reject) => {
+    child = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        messageBoxAutomationPath,
+        '-RootProcessId',
+        String(rootProcessId),
+        '-WindowTitle',
+        windowTitle,
+        '-ButtonName',
+        buttonName,
+        '-DelayMilliseconds',
+        String(delayMilliseconds),
+        '-ReleasePath',
+        releasePath,
+        '-TimeoutSeconds',
+        '30',
+      ],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout = (stdout + chunk.toString('utf8')).slice(-2_000);
+      if (stdout.includes('__HTMLLELUJAH_MESSAGE_BOX_READY__')) signalReady(true);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString('utf8')).slice(-2_000);
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      signalReady(false);
+      if (cancelled) {
+        resolve();
+        return;
+      }
+      reject(new Error(`Native message-box automation timed out for "${windowTitle}".`));
+    }, 45_000);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      signalReady(false);
+      if (cancelled) resolve();
+      else reject(error);
+    });
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      if (!readySignaled) signalReady(false);
+      if (cancelled || code === 0) resolve();
+      else
+        reject(
+          new Error(
+            `Native message-box automation for "${windowTitle}" / "${buttonName}" exited ${code ?? signal}. ${stderr}`,
+          ),
+        );
+    });
+  });
+  const cancel = () => {
+    if (cancelled) return;
+    cancelled = true;
+    signalReady(false);
+    if (child !== undefined && !hasExited(child)) child.kill();
+  };
+  return Object.assign(completion, { ready, cancel });
+};
+
+const requestNativeWindowClose = (rootProcessId) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        windowCloseAutomationPath,
+        '-RootProcessId',
+        String(rootProcessId),
+        '-TimeoutSeconds',
+        '10',
+      ],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout = (stdout + chunk.toString('utf8')).slice(-2_000);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString('utf8')).slice(-2_000);
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('Native window-close automation timed out.'));
+    }, 20_000);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout.includes('__HTMLLELUJAH_NATIVE_CLOSE_REQUESTED__')) {
+        resolve();
+      } else {
+        reject(
+          new Error(`Native window-close automation exited ${code ?? signal}. ${stderr || stdout}`),
+        );
+      }
     });
   });
 
@@ -251,6 +387,57 @@ const evaluateCdp = async (session, expression, userGesture = false) => {
   return response.result?.value;
 };
 
+const waitForDecodedImages = async (session, selector, label, timeoutMs = 10_000) => {
+  let latestState;
+  try {
+    return await waitFor(
+      async () => {
+        latestState = await evaluateCdp(
+          session,
+          `(async () => {
+            const images = [...document.querySelectorAll(${JSON.stringify(selector)})].filter(
+              (candidate) => candidate instanceof HTMLImageElement,
+            );
+            const states = await Promise.all(images.map(async (image) => {
+              const decoded = typeof image.decode !== 'function'
+                ? true
+                : await Promise.race([
+                    image.decode().then(() => true, () => false),
+                    new Promise((resolve) => setTimeout(() => resolve(false), 250)),
+                  ]);
+              return {
+                complete: image.complete,
+                naturalWidth: image.naturalWidth,
+                naturalHeight: image.naturalHeight,
+                decoded,
+              };
+            }));
+            return {
+              ready: states.length > 0 && states.every(
+                (state) =>
+                  state.complete &&
+                  state.naturalWidth > 0 &&
+                  state.naturalHeight > 0 &&
+                  state.decoded,
+              ),
+              count: states.length,
+              states,
+            };
+          })()`,
+        );
+        return latestState?.ready === true ? latestState : undefined;
+      },
+      timeoutMs,
+      label,
+    );
+  } catch (error) {
+    const detail = latestState === undefined ? 'no image state' : JSON.stringify(latestState);
+    throw new Error(
+      `${label} failed (${detail}).${error instanceof Error ? ` ${error.message}` : ''}`,
+    );
+  }
+};
+
 const warmUpApplication = async ({
   launchCommand,
   launchArguments,
@@ -317,6 +504,8 @@ const warmUpApplication = async ({
 
 const userData = await mkdtemp(path.join(tmpdir(), 'htmllelujah-ui-smoke-'));
 const imageFixturePath = path.join(userData, 'native-image-import.png');
+const closeHandshakeDeckPath = path.join(userData, 'close-handshake.hdeck');
+const staleDiscardReleasePath = path.join(userData, 'release-stale-discard.signal');
 await writeFile(
   imageFixturePath,
   Buffer.from(
@@ -360,7 +549,7 @@ const launchStartedAt = performance.now();
 const application = spawn(launchCommand, createLaunchArguments(true), {
   cwd: desktopRoot,
   env: launchEnvironment,
-  windowsHide: true,
+  windowsHide: false,
   stdio: ['ignore', 'ignore', 'pipe'],
 });
 let applicationError = '';
@@ -374,6 +563,7 @@ application.stderr.on('data', (chunk) => {
 
 let cdp;
 let evaluateRenderer;
+let closeRaceRpc;
 try {
   const debuggingPort = await waitForDebuggingPort(
     application,
@@ -418,6 +608,34 @@ try {
       return true;
     })()`);
     if (!clicked) throw new Error(`${label} was not found.`);
+  };
+
+  const clickWithPointer = async (selector, label) => {
+    const point = await evaluate(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!(element instanceof HTMLButtonElement)) return null;
+      if (element.disabled) throw new Error(${JSON.stringify(`${label} is disabled.`)});
+      const bounds = element.getBoundingClientRect();
+      return { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+    })()`);
+    if (point === null) throw new Error(`${label} was not found.`);
+    await cdp.send('Page.bringToFront');
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: point.x,
+      y: point.y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: point.x,
+      y: point.y,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
   };
 
   const dragElement = async (selector, deltaX, deltaY, label) => {
@@ -472,7 +690,7 @@ try {
       };
     })()`);
 
-  const setInputValue = async (selector, value, label, blur = false) => {
+  const setInputValue = async (selector, value, label, blur = false, focus = false) => {
     const updated = await evaluate(`(() => {
       const element = document.querySelector(${JSON.stringify(selector)});
       if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement))
@@ -481,6 +699,7 @@ try {
         ? HTMLTextAreaElement.prototype
         : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+      if (${JSON.stringify(focus)}) element.focus();
       setter?.call(element, ${JSON.stringify(String(value))});
       element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
       element.dispatchEvent(new Event('change', { bubbles: true }));
@@ -591,6 +810,86 @@ try {
     'Applied text rendered on canvas',
   );
 
+  const preservedConflictDraft = 'Local draft preserved across an external text revision';
+  const externalTextValue = 'External text revision accepted by the runtime';
+  await setInputValue(
+    '.text-content-editor',
+    preservedConflictDraft,
+    'Conflicting local text draft',
+  );
+  const externalTextApplied = await evaluate(`(async () => {
+    const initialized = await window.htmllelujah.initialize();
+    if (!initialized.ok) return false;
+    const session = initialized.value.session;
+    const selectedId = document
+      .querySelector('.canonical-hitbox.is-selected')
+      ?.getAttribute('data-canvas-element-id');
+    const slide = session.snapshot.document.slides.find((candidate) =>
+      candidate.elements.some((element) => element.id === selectedId && element.type === 'text'),
+    );
+    const text = slide?.elements.find(
+      (element) => element.id === selectedId && element.type === 'text',
+    );
+    if (slide === undefined || text === undefined || text.type !== 'text') return false;
+    const firstRun = text.content.blocks
+      .flatMap((block) => block.type === 'paragraph' || block.type === 'heading' ? block.runs : [])
+      .at(0);
+    const result = await window.htmllelujah.execute({
+      sessionId: session.snapshot.sessionId,
+      expectedRevision: session.snapshot.revision,
+      label: 'UI smoke external text revision',
+      commands: [{
+        type: 'text.replace-content',
+        slideId: slide.id,
+        textId: text.id,
+        content: {
+          blocks: [{
+            id: crypto.randomUUID(),
+            type: 'paragraph',
+            alignment: 'left',
+            runs: [{
+              text: ${JSON.stringify(externalTextValue)},
+              marks: firstRun?.marks ?? {
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+              },
+            }],
+          }],
+        },
+      }],
+    });
+    return result.ok;
+  })()`);
+  if (!externalTextApplied) throw new Error('The external text revision could not be applied.');
+  await waitForRenderer(
+    `document.querySelector('.draft-conflict') !== null &&
+      document.querySelector('.text-content-editor')?.value === ${JSON.stringify(preservedConflictDraft)}`,
+    'External text conflict preserves the local draft',
+  );
+  await click('[aria-label="Add shape"]', 'Blocked shape insertion during text conflict');
+  await sleep(300);
+  const countWhileConflicted = Number(
+    await evaluate(`document.querySelectorAll('[data-canvas-element-id]').length`),
+  );
+  if (countWhileConflicted !== initial.elementCount) {
+    throw new Error('A document mutation bypassed the preserved text conflict.');
+  }
+  await click('.draft-conflict button', 'Revert conflicting text draft');
+  await waitForRenderer(
+    `document.querySelector('.draft-conflict') === null &&
+      document.querySelector('.canonical-slide-surface')?.textContent?.includes(${JSON.stringify(externalTextValue)})`,
+    'External text retained after reverting the local draft',
+  );
+  const postRecoveryDraft = 'Text editing remains writable after conflict recovery';
+  await setInputValue('.text-content-editor', postRecoveryDraft, 'Post-recovery text draft');
+  await click('.text-editor-section .primary-inspector-action', 'Apply post-recovery text draft');
+  await waitForRenderer(
+    `document.querySelector('.canonical-slide-surface')?.textContent?.includes(${JSON.stringify(postRecoveryDraft)})`,
+    'Post-recovery text commit',
+  );
+
   await click('[aria-label="Add shape"]', 'Add shape');
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 1}`,
@@ -600,6 +899,15 @@ try {
     `document.querySelectorAll('.canonical-hitbox.is-selected').length === 1`,
     'Inserted shape selection',
   );
+  const insertedShapeId = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox.is-selected')].find(
+      (candidate) => candidate.getAttribute('aria-label')?.includes(', shape'),
+    );
+    return element?.getAttribute('data-canvas-element-id') ?? null;
+  })()`);
+  if (typeof insertedShapeId !== 'string' || insertedShapeId === '') {
+    throw new Error('The inserted shape identity is unavailable.');
+  }
 
   await click('[aria-label="Undo"]', 'Undo');
   await waitForRenderer(
@@ -611,9 +919,16 @@ try {
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 1}`,
     'Redo shape insertion',
   );
+  await waitForRenderer(
+    `document.querySelectorAll('.canonical-hitbox.is-selected').length === 0`,
+    'Redone shape starts unselected',
+  );
   const reselected = await evaluate(`(() => {
     const elements = [...document.querySelectorAll('[data-canvas-element-id]')];
-    const element = elements.at(-1);
+    const element = elements.find(
+      (candidate) =>
+        candidate.getAttribute('data-canvas-element-id') === ${JSON.stringify(insertedShapeId)},
+    );
     if (!(element instanceof HTMLElement)) return false;
     element.focus();
     element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
@@ -621,13 +936,21 @@ try {
   })()`);
   if (!reselected) throw new Error('The redone shape could not be selected.');
   await waitForRenderer(
-    `document.querySelectorAll('.canonical-hitbox.is-selected').length === 1`,
+    `(() => {
+      const selected = [...document.querySelectorAll('.canonical-hitbox.is-selected')];
+      return selected.length === 1 &&
+        selected[0]?.getAttribute('data-canvas-element-id') === ${JSON.stringify(insertedShapeId)};
+    })()`,
     'Redone shape keyboard selection',
+  );
+  await waitForRenderer(
+    `document.querySelector('.app-shell')?.getAttribute('aria-busy') !== 'true'`,
+    'Editor idle before native image import',
   );
 
   if (application.pid === undefined) throw new Error('The Electron process ID is unavailable.');
   const imageDialog = automateFileDialog(application.pid, 'Insert image', imageFixturePath);
-  await click('[aria-label="Add image"]', 'Add image');
+  await clickWithPointer('[aria-label="Add image"]', 'Add image');
   await imageDialog;
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 2}`,
@@ -647,6 +970,12 @@ try {
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 2}`,
     'Redo native image import',
+  );
+
+  await waitForDecodedImages(
+    cdp,
+    '.canonical-canvas-scaled .canonical-slide-surface img[alt="Presentation image"]',
+    'Decoded imported image in editor canvas',
   );
 
   await click('[aria-label="Add table"]', 'Add table');
@@ -756,6 +1085,11 @@ try {
       },
       10_000,
       'Presentation surface',
+    );
+    await waitForDecodedImages(
+      presentationCdp,
+      '[data-testid="presentation-root"] img[alt="Presentation image"]',
+      'Decoded imported image in presentation',
     );
     const presentationScreenshot = await presentationCdp.send('Page.captureScreenshot', {
       format: 'png',
@@ -1136,6 +1470,291 @@ try {
     'Final stable slide selection',
   );
 
+  if (application.pid === undefined) throw new Error('The Electron process ID is unavailable.');
+  const saveBeforeCloseDialog = automateFileDialog(
+    application.pid,
+    'Save presentation',
+    closeHandshakeDeckPath,
+  );
+  await clickButtonWithText('File', 'File menu before close-handshake save');
+  await waitForRenderer(
+    `document.querySelector('[role="menu"][aria-label="File menu"]') !== null`,
+    'File menu before close-handshake save',
+  );
+  const savedBeforeClose = await evaluate(`(() => {
+    const element = [...document.querySelectorAll(
+      '[role="menu"][aria-label="File menu"] button',
+    )].find((candidate) => candidate.textContent?.trim().startsWith('Save as'));
+    if (!(element instanceof HTMLButtonElement) || element.disabled) return false;
+    element.click();
+    return true;
+  })()`);
+  await saveBeforeCloseDialog;
+  if (!savedBeforeClose) throw new Error('The close-handshake baseline could not be saved.');
+  await waitForRenderer(
+    `document.querySelector('.save-state.is-saved') !== null`,
+    'Clean close-handshake baseline',
+  );
+  await click('[role="tab"]:not(.is-active)', 'Design tab before rejected close commit');
+  await waitForRenderer(
+    `document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() === 'Design'`,
+    'Design tab before rejected close commit',
+  );
+  const originalThemeName = await evaluate(
+    `document.querySelector('.theme-card input[maxlength="120"]')?.value ?? null`,
+  );
+  if (typeof originalThemeName !== 'string' || originalThemeName === '') {
+    throw new Error('The theme name field was unavailable for the rejected close-commit test.');
+  }
+  const invalidThemeName = 'x'.repeat(300);
+  await setInputValue(
+    '.theme-card input[maxlength="120"]',
+    invalidThemeName,
+    'Invalid focused theme name',
+    false,
+    true,
+  );
+  const acknowledgeInvalidFieldFailure = automateMessageBox(
+    application.pid,
+    'Presentation remains open',
+    'OK',
+  );
+  void acknowledgeInvalidFieldFailure.catch(() => undefined);
+  let applicationExitListener;
+  const unexpectedApplicationExit = new Promise((resolve) => {
+    applicationExitListener = () => resolve('closed');
+    application.once('exit', applicationExitListener);
+  });
+  try {
+    await requestNativeWindowClose(application.pid);
+    const rejectedCommitCloseResult = await Promise.race([
+      acknowledgeInvalidFieldFailure.ready.then((visible) =>
+        visible ? 'failure' : new Promise(() => undefined),
+      ),
+      unexpectedApplicationExit,
+      sleep(12_000).then(() => 'timeout'),
+    ]);
+    if (rejectedCommitCloseResult !== 'failure') {
+      throw new Error(
+        rejectedCommitCloseResult === 'closed'
+          ? 'A rejected focused-field commit was allowed to close the presentation.'
+          : 'A rejected focused-field commit did not produce a bounded close failure.',
+      );
+    }
+    await acknowledgeInvalidFieldFailure;
+  } finally {
+    if (applicationExitListener !== undefined) application.off('exit', applicationExitListener);
+    acknowledgeInvalidFieldFailure.cancel();
+    await Promise.allSettled([acknowledgeInvalidFieldFailure]);
+  }
+  const rejectedThemeCommitRetainedWindow = await evaluate(`(async () => {
+    const initialized = await window.htmllelujah.initialize();
+    return initialized.ok &&
+      !initialized.value.session.snapshot.dirty &&
+      initialized.value.session.snapshot.document.themes.every(
+        (theme) => theme.name !== ${JSON.stringify(invalidThemeName)},
+      );
+  })()`);
+  if (!rejectedThemeCommitRetainedWindow) {
+    throw new Error('The rejected close-time theme edit changed the clean presentation.');
+  }
+  await setInputValue(
+    '.theme-card input[maxlength="120"]',
+    originalThemeName,
+    'Restore rejected theme name field',
+    true,
+    true,
+  );
+  await click('[role="tab"]:not(.is-active)', 'Properties tab after rejected close commit');
+  await waitForRenderer(
+    `document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() === 'Properties'`,
+    'Properties tab after rejected close commit',
+  );
+  const closeCellSelected = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].find(
+      (candidate) => candidate.getAttribute('aria-label')?.includes(', table'),
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+    return true;
+  })()`);
+  if (!closeCellSelected) throw new Error('The close-handshake table was unavailable.');
+  await waitForRenderer(
+    `document.querySelector('[role="gridcell"]') !== null`,
+    'Table cell before native close',
+  );
+  const closeHandshakeCellValue = 'Focused cell committed by native close';
+  await setInputValue(
+    '[role="gridcell"]',
+    closeHandshakeCellValue,
+    'Immediate-close table cell',
+    false,
+    true,
+  );
+  const cancelFocusedCellDialog = automateMessageBox(application.pid, 'Unsaved changes', 'Cancel');
+  const acknowledgeFocusedCellFailure = automateMessageBox(
+    application.pid,
+    'Presentation remains open',
+    'OK',
+  );
+  void cancelFocusedCellDialog.catch(() => undefined);
+  void acknowledgeFocusedCellFailure.catch(() => undefined);
+  try {
+    await requestNativeWindowClose(application.pid);
+    const focusedCellCloseDialog = await Promise.race([
+      cancelFocusedCellDialog.ready.then((visible) =>
+        visible ? 'unsaved' : new Promise(() => undefined),
+      ),
+      acknowledgeFocusedCellFailure.ready.then((visible) =>
+        visible ? 'failure' : new Promise(() => undefined),
+      ),
+      sleep(12_000).then(() => 'timeout'),
+    ]);
+    if (focusedCellCloseDialog !== 'unsaved') {
+      throw new Error(
+        focusedCellCloseDialog === 'failure'
+          ? 'The renderer could not flush the focused table cell before close.'
+          : 'Neither the focused-cell unsaved prompt nor a bounded close failure appeared.',
+      );
+    }
+    await cancelFocusedCellDialog;
+  } finally {
+    cancelFocusedCellDialog.cancel();
+    acknowledgeFocusedCellFailure.cancel();
+    await Promise.allSettled([cancelFocusedCellDialog, acknowledgeFocusedCellFailure]);
+  }
+  await waitForRenderer(
+    `document.querySelector('.app-shell') !== null &&
+      document.querySelector('.save-state:not(.is-saved)') !== null &&
+      document.querySelector('.canonical-slide-surface')?.textContent?.includes(${JSON.stringify(closeHandshakeCellValue)})`,
+    'Native close handshake committed the focused table cell before Cancel',
+    10_000,
+  );
+  const closeDraftSelected = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].find(
+      (candidate) => candidate.getAttribute('aria-label')?.includes(', text'),
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    return true;
+  })()`);
+  if (!closeDraftSelected) throw new Error('The close-handshake text object was unavailable.');
+  await waitForRenderer(
+    `document.querySelector('.canonical-inline-text-input') !== null`,
+    'Inline editor before native close',
+  );
+  const closeHandshakeDraft = 'Immediate close preserves this inline draft';
+  await setInputValue(
+    '.canonical-inline-text-input',
+    closeHandshakeDraft,
+    'Immediate-close inline draft',
+  );
+  const cancelUnsavedDialog = automateMessageBox(application.pid, 'Unsaved changes', 'Cancel');
+  const acknowledgeHandshakeFailure = automateMessageBox(
+    application.pid,
+    'Presentation remains open',
+    'OK',
+  );
+  void cancelUnsavedDialog.catch(() => undefined);
+  void acknowledgeHandshakeFailure.catch(() => undefined);
+  try {
+    await requestNativeWindowClose(application.pid);
+    const firstCloseDialog = await Promise.race([
+      cancelUnsavedDialog.ready.then((visible) =>
+        visible ? 'unsaved' : new Promise(() => undefined),
+      ),
+      acknowledgeHandshakeFailure.ready.then((visible) =>
+        visible ? 'failure' : new Promise(() => undefined),
+      ),
+      sleep(12_000).then(() => 'timeout'),
+    ]);
+    if (firstCloseDialog !== 'unsaved') {
+      throw new Error(
+        firstCloseDialog === 'failure'
+          ? 'The renderer could not flush the immediate inline draft before close.'
+          : 'Neither the unsaved prompt nor a bounded close failure appeared.',
+      );
+    }
+    await cancelUnsavedDialog;
+  } finally {
+    cancelUnsavedDialog.cancel();
+    acknowledgeHandshakeFailure.cancel();
+    await Promise.allSettled([cancelUnsavedDialog, acknowledgeHandshakeFailure]);
+  }
+  await waitForRenderer(
+    `document.querySelector('.app-shell') !== null &&
+      document.querySelector('.save-state:not(.is-saved)') !== null &&
+      document.querySelector('.canonical-slide-surface')?.textContent?.includes(${JSON.stringify(closeHandshakeDraft)})`,
+    'Native close handshake flushed the draft before Cancel',
+    10_000,
+  );
+
+  const concurrentCloseName = 'Concurrent agent edit retained after stale Discard consent';
+  closeRaceRpc = new LocalRpcClient(path.join(userData, 'mcp', 'endpoint-v1.json'));
+  const closeRaceDocuments = await closeRaceRpc.listOpenDocuments();
+  const closeRaceDocument = closeRaceDocuments.at(0);
+  if (
+    closeRaceDocument === undefined ||
+    typeof closeRaceDocument.documentId !== 'string' ||
+    typeof closeRaceDocument.revision !== 'string'
+  ) {
+    throw new Error('The local MCP bridge did not expose the active presentation.');
+  }
+  const discardStaleSnapshot = automateMessageBox(
+    application.pid,
+    'Unsaved changes',
+    'Discard',
+    0,
+    staleDiscardReleasePath,
+  );
+  const acknowledgeRetainedWindow = automateMessageBox(
+    application.pid,
+    'Presentation remains open',
+    'OK',
+  );
+  void discardStaleSnapshot.catch(() => undefined);
+  void acknowledgeRetainedWindow.catch(() => undefined);
+  try {
+    await requestNativeWindowClose(application.pid);
+    if (!(await discardStaleSnapshot.ready)) await discardStaleSnapshot;
+    const concurrentCloseProposal = await closeRaceRpc.proposeCommands({
+      documentId: closeRaceDocument.documentId,
+      expectedRevision: closeRaceDocument.revision,
+      label: 'UI smoke concurrent close mutation',
+      commands: [{ type: 'deck.rename', name: concurrentCloseName }],
+    });
+    if (concurrentCloseProposal.requiresApproval) {
+      throw new Error('The safe close-race rename unexpectedly required approval.');
+    }
+    await closeRaceRpc.commitProposal({ proposalId: concurrentCloseProposal.proposalId });
+    await writeFile(staleDiscardReleasePath, 'release\n', 'utf8');
+    await discardStaleSnapshot;
+    await acknowledgeRetainedWindow;
+    const concurrentMutationRetained = await evaluate(`(async () => {
+      const initialized = await window.htmllelujah.initialize();
+      return initialized.ok &&
+        initialized.value.session.snapshot.dirty &&
+        initialized.value.session.snapshot.document.name === ${JSON.stringify(concurrentCloseName)};
+    })()`);
+    if (!concurrentMutationRetained) {
+      throw new Error('Stale Discard consent removed a concurrent agent mutation.');
+    }
+  } finally {
+    discardStaleSnapshot.cancel();
+    acknowledgeRetainedWindow.cancel();
+    await Promise.allSettled([discardStaleSnapshot, acknowledgeRetainedWindow]);
+  }
+  await closeRaceRpc.close();
+  closeRaceRpc = undefined;
+  await waitForRenderer(
+    `document.querySelector('.app-shell') !== null &&
+      document.querySelector('.save-state:not(.is-saved)') !== null`,
+    'Concurrent close mutation retained after stale Discard',
+    10_000,
+  );
+
   await evaluate(`(() => {
     const toastClose = document.querySelector('.toast button[aria-label="Dismiss"]');
     if (toastClose instanceof HTMLButtonElement) toastClose.click();
@@ -1160,6 +1779,11 @@ try {
     throw new Error('The editor did not return to a stable post-interaction state.');
   }
 
+  await waitForDecodedImages(
+    cdp,
+    '.canonical-canvas-scaled .canonical-slide-surface img[alt="Presentation image"]',
+    'Decoded imported image before editor evidence capture',
+  );
   const screenshot = await cdp.send('Page.captureScreenshot', {
     format: 'png',
     fromSurface: true,
@@ -1188,7 +1812,7 @@ try {
       'one unmeasured warm-up and one measured launch reused the same user-data profile',
       'essential editor surfaces rendered',
       'shape insertion, undo, and redo converged',
-      'native image chooser imported one decoded image with atomic undo and redo',
+      'native image chooser imported and decoded one image in the editor with atomic undo and redo',
       'native table insertion and literal TSV paste undid and redid cleanly',
       'native icon, Unicode flag, and connector insertions rendered',
       'File menu opened and closed',
@@ -1199,9 +1823,13 @@ try {
       'master object drag, resize, rotate, undo, and selection retention stayed inside the master',
       'layout placeholder resize, undo, and selection retention stayed inside the layout',
       'new slide instantiated title/body frames from the active layout exactly',
+      'a rejected focused onBlur commit kept the clean presentation open',
+      'Alt+F4-equivalent close committed a focused onBlur table cell before the native save prompt',
+      'Alt+F4-equivalent close flushed an immediate inline draft before the native save prompt',
+      'stale Discard consent could not discard a concurrent agent mutation',
       'Design and Properties inspector tabs switched',
       'stable PNG screenshot captured from the real window',
-      'stable PNG screenshot captured from the real presentation window',
+      'stable PNG screenshot captured after the real presentation window decoded its image',
     ],
   };
   await mkdir(evidenceDirectory, { recursive: true });
@@ -1218,12 +1846,17 @@ try {
 } catch (error) {
   if (evaluateRenderer !== undefined) {
     try {
-      const diagnostic = await evaluateRenderer(`(() => ({
-        readyState: document.readyState,
-        title: document.title,
-        bodyText: document.body?.innerText?.slice(0, 1_000) ?? '',
-        bodyHtml: document.body?.innerHTML?.slice(0, 1_000) ?? '',
-      }))()`);
+      const diagnostic = await Promise.race([
+        evaluateRenderer(`(() => ({
+          readyState: document.readyState,
+          title: document.title,
+          bodyText: document.body?.innerText?.slice(0, 1_000) ?? '',
+          bodyHtml: document.body?.innerHTML?.slice(0, 1_000) ?? '',
+        }))()`),
+        sleep(2_000).then(() => {
+          throw new Error('Renderer diagnostic timed out.');
+        }),
+      ]);
       process.stderr.write(`[renderer diagnostic]\n${JSON.stringify(diagnostic, null, 2)}\n`);
     } catch (diagnosticError) {
       process.stderr.write(`[renderer diagnostic failed] ${String(diagnosticError)}\n`);
@@ -1234,6 +1867,7 @@ try {
   }
   throw error;
 } finally {
+  await closeRaceRpc?.close().catch(() => undefined);
   cdp?.close();
   await terminate(application);
   await waitFor(

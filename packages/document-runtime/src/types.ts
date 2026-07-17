@@ -57,6 +57,12 @@ export interface HistoryRequest {
 
 export interface CloseSessionOptions {
   readonly discardUnsaved?: boolean | undefined;
+  readonly expectedRevision?: string | undefined;
+  /**
+   * Main-process rollback only. Unregisters the in-memory session while leaving its recovery
+   * base, metadata, journal, and referenced blobs available for a later recoverMainOnly call.
+   */
+  readonly preserveRecovery?: boolean | undefined;
 }
 
 export interface SaveAsOptions {

@@ -30,6 +30,8 @@ export const DESKTOP_IPC = Object.freeze({
   collaborationTextLeaseEnd: 'htmllelujah:v1:collaboration-text-lease-end',
   mcpStatus: 'htmllelujah:v1:mcp-status',
   mcpCreateApproval: 'htmllelujah:v1:mcp-create-approval',
+  windowCloseRequested: 'htmllelujah:v1:event-window-close-requested',
+  windowCloseResponse: 'htmllelujah:v1:window-close-response',
   documentChanged: 'htmllelujah:v1:event-document-changed',
   presentationChanged: 'htmllelujah:v1:event-presentation-changed',
 } as const);
@@ -230,6 +232,77 @@ export interface PresentationChangedEvent {
   readonly closed: boolean;
 }
 
+export interface WindowCloseRequest {
+  readonly requestId: string;
+  readonly deadlineAtMs: number;
+}
+
+export type WindowCloseDecision = 'ready' | 'blocked';
+
+export interface WindowCloseResponse {
+  readonly requestId: string;
+  readonly decision: WindowCloseDecision;
+}
+
+export type WindowCloseRequestListener = (
+  request: WindowCloseRequest,
+) => WindowCloseDecision | Promise<WindowCloseDecision>;
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+const isStrictRecord = (
+  value: unknown,
+  keys: readonly string[],
+): value is Record<string, unknown> =>
+  typeof value === 'object' &&
+  value !== null &&
+  !Array.isArray(value) &&
+  Object.keys(value).length === keys.length &&
+  keys.every((key) => Object.hasOwn(value, key));
+
+export const isWindowCloseRequest = (value: unknown): value is WindowCloseRequest =>
+  isStrictRecord(value, ['requestId', 'deadlineAtMs']) &&
+  typeof value.requestId === 'string' &&
+  UUID_PATTERN.test(value.requestId) &&
+  typeof value.deadlineAtMs === 'number' &&
+  Number.isSafeInteger(value.deadlineAtMs) &&
+  value.deadlineAtMs > 0;
+
+export const isWindowCloseResponse = (value: unknown): value is WindowCloseResponse =>
+  isStrictRecord(value, ['requestId', 'decision']) &&
+  typeof value.requestId === 'string' &&
+  UUID_PATTERN.test(value.requestId) &&
+  (value.decision === 'ready' || value.decision === 'blocked');
+
+/** A native close is safe only when every registered renderer participant explicitly agrees. */
+export const settleWindowCloseListeners = async (
+  listeners: readonly WindowCloseRequestListener[],
+  request: WindowCloseRequest,
+): Promise<WindowCloseDecision> => {
+  const remainingMs = request.deadlineAtMs - Date.now();
+  if (listeners.length === 0 || remainingMs <= 0) return 'blocked';
+  const decisions = Promise.all(
+    listeners.map(async (listener): Promise<WindowCloseDecision> => {
+      try {
+        const decision = await listener(request);
+        return decision === 'ready' ? 'ready' : 'blocked';
+      } catch {
+        return 'blocked';
+      }
+    }),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<readonly WindowCloseDecision[]>((resolve) => {
+    timer = setTimeout(() => resolve(['blocked']), remainingMs);
+  });
+  try {
+    const settled = await Promise.race([decisions, deadline]);
+    return settled.every((decision) => decision === 'ready') ? 'ready' : 'blocked';
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};
+
 export interface HtmllelujahDesktopApi {
   readonly version: typeof DESKTOP_API_VERSION;
   getAppInfo(): Promise<DesktopResult<AppInfo>>;
@@ -270,6 +343,7 @@ export interface HtmllelujahDesktopApi {
   ): Promise<DesktopResult<CollaborationTextLeaseStatus>>;
   mcpStatus(): Promise<DesktopResult<McpStatus>>;
   mcpCreateApproval(input: McpApprovalInput): Promise<DesktopResult<McpApproval>>;
+  onWindowCloseRequested(listener: WindowCloseRequestListener): () => void;
   onDocumentChanged(listener: (event: SafeDocumentChangedEvent) => void): () => void;
   onPresentationChanged(listener: (event: PresentationChangedEvent) => void): () => void;
 }

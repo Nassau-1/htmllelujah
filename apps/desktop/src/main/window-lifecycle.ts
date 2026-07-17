@@ -1,3 +1,12 @@
+import { randomUUID } from 'node:crypto';
+
+import {
+  isWindowCloseRequest,
+  isWindowCloseResponse,
+  type WindowCloseDecision,
+  type WindowCloseRequest,
+} from '../shared/desktop-api.js';
+
 export interface DestroyableWindow {
   isDestroyed(): boolean;
   destroy(): void;
@@ -35,3 +44,219 @@ export const retainWindowOnFailure = async (
     return false;
   }
 };
+
+/**
+ * Cleans a replacement session only while it remains detached from every native window.
+ * Ownership is checked both before asynchronous preparation and immediately before close so a
+ * stale operation cannot tear down a session that another assignment made visible meanwhile.
+ */
+export const cleanupSessionIfUnowned = async (
+  hasWindowOwner: () => boolean,
+  prepare: () => Promise<void>,
+  close: () => Promise<void>,
+): Promise<boolean> => {
+  if (hasWindowOwner()) return false;
+  await prepare();
+  if (hasWindowOwner()) return false;
+  await close();
+  return true;
+};
+
+/**
+ * Exposes a close authorization only for the synchronous native close dispatch. The close event
+ * may consume it during dispatch; every throw or no-event return revokes it before a later retry.
+ */
+export const runAuthorizedWindowClose = (
+  preparedCloses: Set<number>,
+  webContentsId: number,
+  close: () => void,
+): void => {
+  preparedCloses.add(webContentsId);
+  try {
+    close();
+  } finally {
+    preparedCloses.delete(webContentsId);
+  }
+};
+
+const DEFAULT_CLOSE_HANDSHAKE_TIMEOUT_MS = 5_000;
+const MAX_CLOSE_HANDSHAKE_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_PENDING_CLOSE_HANDSHAKES = 64;
+const MAX_PENDING_CLOSE_HANDSHAKES = 1_024;
+
+export type RendererCloseHandshakeReason =
+  | 'renderer-ready'
+  | 'renderer-blocked'
+  | 'timeout'
+  | 'send-failed'
+  | 'cancelled'
+  | 'capacity'
+  | 'invalid-target'
+  | 'invalid-request-id';
+
+export interface RendererCloseHandshakeResult {
+  readonly decision: WindowCloseDecision;
+  readonly reason: RendererCloseHandshakeReason;
+  readonly requestId?: string | undefined;
+}
+
+export interface RendererCloseHandshakeBrokerOptions {
+  readonly timeoutMs?: number | undefined;
+  readonly maxPending?: number | undefined;
+  readonly now?: (() => number) | undefined;
+  readonly createRequestId?: (() => string) | undefined;
+}
+
+type PendingCloseHandshake = {
+  readonly request: WindowCloseRequest;
+  readonly promise: Promise<RendererCloseHandshakeResult>;
+  readonly resolve: (result: RendererCloseHandshakeResult) => void;
+  timer: ReturnType<typeof setTimeout> | undefined;
+};
+
+const boundedInteger = (value: number, minimum: number, maximum: number, label: string): number => {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${label} must be an integer between ${minimum} and ${maximum}.`);
+  }
+  return value;
+};
+
+const blockedResult = (
+  reason: Exclude<RendererCloseHandshakeReason, 'renderer-ready'>,
+  requestId?: string,
+): RendererCloseHandshakeResult => ({
+  decision: 'blocked',
+  reason,
+  ...(requestId === undefined ? {} : { requestId }),
+});
+
+/**
+ * Coordinates one renderer flush request per native window. Only a schema-valid response from
+ * the exact WebContents and unguessable request nonce can release the close. Every other path is
+ * fail-closed and bounded by a timer so an unresponsive renderer cannot strand broker state.
+ */
+export class RendererCloseHandshakeBroker {
+  readonly #timeoutMs: number;
+  readonly #maxPending: number;
+  readonly #now: () => number;
+  readonly #createRequestId: () => string;
+  readonly #pending = new Map<number, PendingCloseHandshake>();
+
+  public constructor(options: RendererCloseHandshakeBrokerOptions = {}) {
+    this.#timeoutMs = boundedInteger(
+      options.timeoutMs ?? DEFAULT_CLOSE_HANDSHAKE_TIMEOUT_MS,
+      1,
+      MAX_CLOSE_HANDSHAKE_TIMEOUT_MS,
+      'Close handshake timeout',
+    );
+    this.#maxPending = boundedInteger(
+      options.maxPending ?? DEFAULT_MAX_PENDING_CLOSE_HANDSHAKES,
+      1,
+      MAX_PENDING_CLOSE_HANDSHAKES,
+      'Pending close handshake limit',
+    );
+    this.#now = options.now ?? Date.now;
+    this.#createRequestId = options.createRequestId ?? randomUUID;
+  }
+
+  public get pendingCount(): number {
+    return this.#pending.size;
+  }
+
+  public request(
+    webContentsId: number,
+    send: (request: WindowCloseRequest) => void,
+  ): Promise<RendererCloseHandshakeResult> {
+    if (!Number.isSafeInteger(webContentsId) || webContentsId <= 0) {
+      return Promise.resolve(blockedResult('invalid-target'));
+    }
+    const existing = this.#pending.get(webContentsId);
+    if (existing !== undefined) return existing.promise;
+    if (this.#pending.size >= this.#maxPending) {
+      return Promise.resolve(blockedResult('capacity'));
+    }
+
+    const request = {
+      requestId: this.#createRequestId(),
+      deadlineAtMs: this.#now() + this.#timeoutMs,
+    };
+    if (!isWindowCloseRequest(request)) {
+      return Promise.resolve(blockedResult('invalid-request-id'));
+    }
+
+    let resolve!: (result: RendererCloseHandshakeResult) => void;
+    const promise = new Promise<RendererCloseHandshakeResult>((done) => {
+      resolve = done;
+    });
+    const pending: PendingCloseHandshake = {
+      request: Object.freeze(request),
+      promise,
+      resolve,
+      timer: undefined,
+    };
+    this.#pending.set(webContentsId, pending);
+    pending.timer = setTimeout(() => {
+      this.#settle(webContentsId, request.requestId, blockedResult('timeout', request.requestId));
+    }, this.#timeoutMs);
+
+    try {
+      send(pending.request);
+    } catch {
+      this.#settle(
+        webContentsId,
+        request.requestId,
+        blockedResult('send-failed', request.requestId),
+      );
+    }
+    return promise;
+  }
+
+  public receive(webContentsId: number, value: unknown): boolean {
+    if (!isWindowCloseResponse(value)) return false;
+    const pending = this.#pending.get(webContentsId);
+    if (pending === undefined || pending.request.requestId !== value.requestId) return false;
+    if (this.#now() >= pending.request.deadlineAtMs) {
+      this.#settle(
+        webContentsId,
+        pending.request.requestId,
+        blockedResult('timeout', pending.request.requestId),
+      );
+      return false;
+    }
+    return this.#settle(
+      webContentsId,
+      pending.request.requestId,
+      value.decision === 'ready'
+        ? {
+            decision: 'ready',
+            reason: 'renderer-ready',
+            requestId: pending.request.requestId,
+          }
+        : blockedResult('renderer-blocked', pending.request.requestId),
+    );
+  }
+
+  public cancel(webContentsId: number): boolean {
+    const pending = this.#pending.get(webContentsId);
+    return pending === undefined
+      ? false
+      : this.#settle(
+          webContentsId,
+          pending.request.requestId,
+          blockedResult('cancelled', pending.request.requestId),
+        );
+  }
+
+  public dispose(): void {
+    for (const webContentsId of [...this.#pending.keys()]) this.cancel(webContentsId);
+  }
+
+  #settle(webContentsId: number, requestId: string, result: RendererCloseHandshakeResult): boolean {
+    const pending = this.#pending.get(webContentsId);
+    if (pending === undefined || pending.request.requestId !== requestId) return false;
+    this.#pending.delete(webContentsId);
+    if (pending.timer !== undefined) clearTimeout(pending.timer);
+    pending.resolve(result);
+    return true;
+  }
+}

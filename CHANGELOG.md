@@ -84,6 +84,24 @@ No user-facing change is queued after the V1 release candidate.
   hashes, avoiding false mutation alarms for sibling files and prefixed directories.
 - Pinned release-child debug namespaces off and CI mode on so the locked Electron
   Builder cannot emit internal diagnostic sidecars into the public candidate directory.
+- Serialized inline-text commits before document, history, selection, and design-surface
+  transitions so a single keyboard or assistive activation cannot be discarded.
+- Kept the newest inline-text payload in a synchronous, target-checked draft snapshot so an
+  immediate native close cannot observe an older React render or apply text to another object.
+- Made close and session replacement revision-bound, drained queued mutations before teardown,
+  preserved recovery artifacts during rollback, and removed every late presentation window before
+  remapping an editor session.
+- Reserved each recovery candidate before asynchronous replay, rechecked native-window ownership
+  before replacement cleanup, and made renderer close authorization single-dispatch so concurrent
+  recovery or a failed native close cannot invalidate a visible session.
+- Blurred focused form editors during the close handshake and required every resulting mutation to
+  succeed before teardown, keeping the window open when any uncontrolled-field or inline-text commit
+  is rejected.
+- Allowed the capability-scoped local asset protocol only on the renderer image CSP surface and made
+  the Windows smoke require successful image decoding in both editor and presentation windows.
+- Opened the measured Windows smoke window visibly and exercised real pointer input, parented
+  native dialogs, and `WM_CLOSE`; the suite now proves Cancel retention and rejects a stale
+  Discard after a concurrent authenticated MCP edit.
 
 ### Known V1 boundaries
 

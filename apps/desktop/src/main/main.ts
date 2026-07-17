@@ -13,6 +13,7 @@ import { CollaborationError, RemoteTransportError } from '@htmllelujah/collabora
 import {
   DocumentRuntimeError,
   DocumentSessionManager,
+  type CloseSessionOptions,
   type DocumentSessionSnapshot,
 } from '@htmllelujah/document-runtime';
 import { createPrintHtml, createStandaloneHtml, ExporterError } from '@htmllelujah/exporter';
@@ -40,7 +41,13 @@ import {
 import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
 import { isTrustedRendererUrl, resolveRendererEntryUrl } from './renderer-entry.js';
 import { resolveSaveTarget } from './save-target.js';
-import { initializeWindowSafely, retainWindowOnFailure } from './window-lifecycle.js';
+import {
+  cleanupSessionIfUnowned,
+  initializeWindowSafely,
+  RendererCloseHandshakeBroker,
+  retainWindowOnFailure,
+  runAuthorizedWindowClose,
+} from './window-lifecycle.js';
 import {
   DESKTOP_API_VERSION,
   DESKTOP_IPC,
@@ -85,6 +92,16 @@ const collaboration = new DesktopCollaborationCoordinator(runtime);
 
 type WindowMode = 'editor' | 'presentation';
 
+interface ReplaceAuthorization {
+  readonly sessionId?: string | undefined;
+  readonly closeOptions?: CloseSessionOptions | undefined;
+}
+
+interface AssignSessionOptions {
+  readonly targetPath?: string | undefined;
+  readonly preserveRecoveryOnFailure?: boolean | undefined;
+}
+
 const windowSessions = new Map<number, string>();
 const windowModes = new Map<number, WindowMode>();
 const sessionTargetPaths = new Map<string, string>();
@@ -95,6 +112,8 @@ const assetTokens = new Map<
 const tokensByWebContents = new Map<number, Set<string>>();
 const closingWindows = new Set<number>();
 const closingDecisions = new Set<number>();
+const rendererPreparedCloses = new Set<number>();
+const rendererCloseHandshake = new RendererCloseHandshakeBroker();
 let pendingOpenPath: string | undefined;
 
 class DesktopMainError extends Error {
@@ -997,9 +1016,9 @@ const saveWithTargetFallback = async (
   return runtime.save(sessionId);
 };
 
-const confirmReplace = async (event: IpcMainInvokeEvent): Promise<boolean> => {
+const confirmReplace = async (event: IpcMainInvokeEvent): Promise<ReplaceAuthorization | null> => {
   const currentId = windowSessions.get(event.sender.id);
-  if (currentId === undefined) return true;
+  if (currentId === undefined) return {};
   const collaborationMode = collaboration.mode(currentId);
   if (collaborationMode !== 'offline') {
     const parent = findWindow(event.sender);
@@ -1016,7 +1035,7 @@ const confirmReplace = async (event: IpcMainInvokeEvent): Promise<boolean> => {
       cancelId: 1,
       noLink: true,
     });
-    if (choice.response !== 0) return false;
+    if (choice.response !== 0) return null;
     const ended = await collaboration.leave(currentId);
     if (ended?.preserveDetached === true) {
       sessionTargetPaths.delete(currentId);
@@ -1032,12 +1051,21 @@ const confirmReplace = async (event: IpcMainInvokeEvent): Promise<boolean> => {
         buttons: ['OK'],
         noLink: true,
       });
-      return false;
+      return null;
     }
-    return true;
+    const finalSnapshot = runtime.getSnapshot(currentId);
+    return {
+      sessionId: currentId,
+      closeOptions: { expectedRevision: finalSnapshot.revision },
+    };
   }
   const snapshot = runtime.getSnapshot(currentId);
-  if (!snapshot.dirty) return true;
+  if (!snapshot.dirty) {
+    return {
+      sessionId: currentId,
+      closeOptions: { expectedRevision: snapshot.revision },
+    };
+  }
   const parent = findWindow(event.sender);
   const choice = await messageBox(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
     type: 'warning',
@@ -1050,29 +1078,102 @@ const confirmReplace = async (event: IpcMainInvokeEvent): Promise<boolean> => {
     cancelId: 2,
     noLink: true,
   });
-  if (choice.response === 2) return false;
-  if (choice.response === 0 && (await saveWithTargetFallback(event, currentId)) === undefined)
-    return false;
-  return true;
+  if (choice.response !== 0 && choice.response !== 1) return null;
+  if (choice.response === 0) {
+    const saved = await saveWithTargetFallback(event, currentId);
+    if (saved === undefined) return null;
+    return {
+      sessionId: currentId,
+      closeOptions: { expectedRevision: saved.revision },
+    };
+  }
+  return {
+    sessionId: currentId,
+    closeOptions: {
+      discardUnsaved: true,
+      expectedRevision: snapshot.revision,
+    },
+  };
 };
 
 const assignSession = async (
   event: IpcMainInvokeEvent,
   snapshot: DocumentSessionSnapshot,
-  targetPath?: string,
+  authorization: ReplaceAuthorization,
+  options: AssignSessionOptions = {},
 ): Promise<SessionView> => {
   const previous = windowSessions.get(event.sender.id);
-  windowSessions.set(event.sender.id, snapshot.sessionId);
-  if (targetPath === undefined) sessionTargetPaths.delete(snapshot.sessionId);
-  else sessionTargetPaths.set(snapshot.sessionId, targetPath);
+  const cleanupReplacement = async (): Promise<void> => {
+    await cleanupSessionIfUnowned(
+      () => [...windowSessions.values()].includes(snapshot.sessionId),
+      () => collaboration.shutdown(snapshot.sessionId),
+      () =>
+        runtime.close(snapshot.sessionId, {
+          discardUnsaved: true,
+          ...(options.preserveRecoveryOnFailure === true ? { preserveRecovery: true } : {}),
+        }),
+    );
+  };
+  if (authorization.sessionId !== previous) {
+    await cleanupReplacement();
+    throw new DesktopMainError(
+      'REVISION_CONFLICT',
+      'The presentation changed before it could be replaced.',
+    );
+  }
   if (previous !== undefined && previous !== snapshot.sessionId) {
-    const stillUsed = [...windowSessions.values()].includes(previous);
-    if (!stillUsed) {
+    const siblingOwnerIds = [...windowSessions.entries()]
+      .filter(
+        ([candidateId, candidateSessionId]) =>
+          candidateId !== event.sender.id && candidateSessionId === previous,
+      )
+      .map(([candidateId]) => candidateId);
+    if (siblingOwnerIds.some((candidateId) => windowModes.get(candidateId) !== 'presentation')) {
+      await cleanupReplacement();
+      throw new DesktopMainError(
+        'REVISION_CONFLICT',
+        'Another editor still owns the presentation being replaced.',
+      );
+    }
+    if (authorization.closeOptions === undefined) {
+      await cleanupReplacement();
+      throw new DesktopMainError(
+        'REVISION_CONFLICT',
+        'The presentation changed before it could be replaced.',
+      );
+    }
+    try {
       await collaboration.shutdown(previous);
-      await runtime.close(previous, { discardUnsaved: true });
-      sessionTargetPaths.delete(previous);
+      await runtime.close(previous, authorization.closeOptions);
+    } catch (error) {
+      await cleanupReplacement();
+      throw error;
+    }
+    sessionTargetPaths.delete(previous);
+    const remainingOwnerIds = [...windowSessions.entries()]
+      .filter(
+        ([candidateId, candidateSessionId]) =>
+          candidateId !== event.sender.id && candidateSessionId === previous,
+      )
+      .map(([candidateId]) => candidateId);
+    for (const candidate of BrowserWindow.getAllWindows()) {
+      if (remainingOwnerIds.includes(candidate.webContents.id) && !candidate.isDestroyed()) {
+        try {
+          candidate.destroy();
+        } catch {
+          // A stale native presentation window cannot be allowed to block the authorized handoff.
+        }
+      }
+    }
+    for (const remainingOwnerId of remainingOwnerIds) {
+      revokeWebContentsTokens(remainingOwnerId);
+      windowSessions.delete(remainingOwnerId);
+      windowModes.delete(remainingOwnerId);
     }
   }
+  windowSessions.set(event.sender.id, snapshot.sessionId);
+  if (options.targetPath === undefined) sessionTargetPaths.delete(snapshot.sessionId);
+  else sessionTargetPaths.set(snapshot.sessionId, options.targetPath);
   const window = findWindow(event.sender);
   window?.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
   event.sender.send(DESKTOP_IPC.documentChanged, {
@@ -1085,9 +1186,10 @@ const assignSession = async (
 
 const openPathInEditorWindow = async (window: BrowserWindow, targetPath: string): Promise<void> => {
   const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
-  if (!(await confirmReplace(syntheticEvent))) return;
+  const authorization = await confirmReplace(syntheticEvent);
+  if (authorization === null) return;
   const opened = await runtime.openMainOnly({ targetPath });
-  await assignSession(syntheticEvent, opened, targetPath);
+  await assignSession(syntheticEvent, opened, authorization, { targetPath });
 };
 
 interface SelectedImageFile {
@@ -1372,11 +1474,45 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
         windowSessions.delete(webContentsId);
         closingWindows.delete(webContentsId);
         closingDecisions.delete(webContentsId);
+        rendererPreparedCloses.delete(webContentsId);
+        rendererCloseHandshake.cancel(webContentsId);
       });
       window.once('ready-to-show', () => window.show());
       window.on('close', (event) => {
         const webContentsId = window.webContents.id;
         if (closingWindows.has(webContentsId)) return;
+        const rendererPrepared = rendererPreparedCloses.delete(webContentsId);
+        if (!rendererPrepared) {
+          event.preventDefault();
+          if (closingDecisions.has(webContentsId)) return;
+          closingDecisions.add(webContentsId);
+          void (async (): Promise<void> => {
+            let handedOff = false;
+            try {
+              const result = await rendererCloseHandshake.request(webContentsId, (request) => {
+                if (window.isDestroyed() || window.webContents.isDestroyed()) {
+                  throw new Error('The editor window closed before its draft could be flushed.');
+                }
+                window.webContents.send(DESKTOP_IPC.windowCloseRequested, request);
+              });
+              if (result.decision !== 'ready') {
+                if (!window.isDestroyed()) {
+                  await reportCloseFailure(window).catch(() => undefined);
+                }
+                return;
+              }
+              if (window.isDestroyed()) return;
+              closingDecisions.delete(webContentsId);
+              handedOff = true;
+              runAuthorizedWindowClose(rendererPreparedCloses, webContentsId, () => window.close());
+            } catch {
+              if (!window.isDestroyed()) await reportCloseFailure(window).catch(() => undefined);
+            } finally {
+              if (!handedOff) closingDecisions.delete(webContentsId);
+            }
+          })();
+          return;
+        }
         if (closingDecisions.has(webContentsId)) {
           event.preventDefault();
           return;
@@ -1390,8 +1526,11 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
           void retainWindowOnFailure(
             window,
             async () => {
+              let discardDetachedChanges = false;
+              let closeRevision: string | undefined;
               try {
                 const ended = await collaboration.leave(sessionId);
+                closeRevision = runtime.getSnapshot(sessionId).revision;
                 if (ended?.preserveDetached === true) {
                   sessionTargetPaths.delete(sessionId);
                   const choice = await dialog.showMessageBox(window, {
@@ -1408,10 +1547,13 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
                     cancelId: 2,
                     noLink: true,
                   });
-                  if (choice.response === 2) return;
+                  if (choice.response !== 0 && choice.response !== 1) return;
+                  discardDetachedChanges = choice.response === 1;
                   if (choice.response === 0) {
                     const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
-                    if ((await saveAs(syntheticEvent, sessionId)) === undefined) return;
+                    const saved = await saveAs(syntheticEvent, sessionId);
+                    if (saved === undefined) return;
+                    closeRevision = saved.revision;
                   }
                 }
               } catch {
@@ -1427,7 +1569,16 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
                 });
                 return;
               }
-              await runtime.close(sessionId, { discardUnsaved: true });
+              if (closeRevision === undefined) {
+                throw new DesktopMainError(
+                  'REVISION_CONFLICT',
+                  'The presentation changed before it could close.',
+                );
+              }
+              await runtime.close(sessionId, {
+                expectedRevision: closeRevision,
+                ...(discardDetachedChanges ? { discardUnsaved: true } : {}),
+              });
               sessionTargetPaths.delete(sessionId);
               closingWindows.add(webContentsId);
               for (const candidate of BrowserWindow.getAllWindows()) {
@@ -1448,7 +1599,7 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
             window,
             async () => {
               await collaboration.shutdown(sessionId);
-              await runtime.close(sessionId, { discardUnsaved: true });
+              await runtime.close(sessionId, { expectedRevision: snapshot.revision });
               sessionTargetPaths.delete(sessionId);
               closingWindows.add(webContentsId);
               for (const candidate of BrowserWindow.getAllWindows()) {
@@ -1475,12 +1626,20 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
               cancelId: 2,
               noLink: true,
             });
-            if (choice.response === 2) return;
+            if (choice.response !== 0 && choice.response !== 1) return;
+            let closeOptions: CloseSessionOptions;
             if (choice.response === 0) {
               const syntheticEvent = { sender: window.webContents } as IpcMainInvokeEvent;
-              if ((await saveWithTargetFallback(syntheticEvent, sessionId)) === undefined) return;
+              const saved = await saveWithTargetFallback(syntheticEvent, sessionId);
+              if (saved === undefined) return;
+              closeOptions = { expectedRevision: saved.revision };
+            } else {
+              closeOptions = {
+                discardUnsaved: true,
+                expectedRevision: snapshot.revision,
+              };
             }
-            await runtime.close(sessionId, { discardUnsaved: true });
+            await runtime.close(sessionId, closeOptions);
             sessionTargetPaths.delete(sessionId);
             closingWindows.add(webContentsId);
             for (const candidate of BrowserWindow.getAllWindows()) {
@@ -1628,6 +1787,10 @@ const createPresentationWindow = async (
 };
 
 const configureIpc = (): void => {
+  ipcMain.on(DESKTOP_IPC.windowCloseResponse, (event, value: unknown) => {
+    rendererCloseHandshake.receive(event.sender.id, value);
+  });
+
   handle(DESKTOP_IPC.getAppInfo, z.undefined(), (): AppInfo => ({
     apiVersion: DESKTOP_API_VERSION,
     name: app.getName(),
@@ -1651,9 +1814,10 @@ const configureIpc = (): void => {
   handle(DESKTOP_IPC.createDocument, z.undefined(), async (event) => {
     if (windowModes.get(event.sender.id) !== 'editor')
       throw new DesktopMainError('READ_ONLY', 'Presentation windows are read-only.');
-    if (!(await confirmReplace(event)))
+    const authorization = await confirmReplace(event);
+    if (authorization === null)
       throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-    return assignSession(event, await runtime.createMainOnly());
+    return assignSession(event, await runtime.createMainOnly(), authorization);
   });
 
   handle(DESKTOP_IPC.openDocument, z.undefined(), async (event) => {
@@ -1668,9 +1832,12 @@ const configureIpc = (): void => {
     const targetPath = result.filePaths[0];
     if (result.canceled || targetPath === undefined)
       throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-    if (!(await confirmReplace(event)))
+    const authorization = await confirmReplace(event);
+    if (authorization === null)
       throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-    return assignSession(event, await runtime.openMainOnly({ targetPath }), targetPath);
+    return assignSession(event, await runtime.openMainOnly({ targetPath }), authorization, {
+      targetPath,
+    });
   });
 
   handle(DESKTOP_IPC.execute, executeInputSchema, async (event, input) => {
@@ -1746,9 +1913,12 @@ const configureIpc = (): void => {
   handle(DESKTOP_IPC.recover, identifier, async (event, candidateId) => {
     if (windowModes.get(event.sender.id) !== 'editor')
       throw new DesktopMainError('READ_ONLY', 'Presentation windows are read-only.');
-    if (!(await confirmReplace(event)))
+    const authorization = await confirmReplace(event);
+    if (authorization === null)
       throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-    return assignSession(event, await runtime.recoverMainOnly(candidateId));
+    return assignSession(event, await runtime.recoverMainOnly(candidateId), authorization, {
+      preserveRecoveryOnFailure: true,
+    });
   });
 
   handle(DESKTOP_IPC.present, presentationInputSchema, async (event, input) => {
@@ -1833,8 +2003,13 @@ const configureIpc = (): void => {
         'Save this presentation as a .hdeck before hosting.',
       );
     }
-    const source = runtime.getSnapshot(input.sessionId);
-    if (source.dirty) await saveWithTargetFallback(event, input.sessionId);
+    let source = runtime.getSnapshot(input.sessionId);
+    if (source.dirty) {
+      const saved = await saveWithTargetFallback(event, input.sessionId);
+      if (saved === undefined)
+        throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+      source = saved;
+    }
     let transition;
     try {
       transition = await collaboration.host({ ...input, targetPath });
@@ -1859,7 +2034,15 @@ const configureIpc = (): void => {
       }
       transition = await collaboration.host({ ...input, targetPath, allowExpiredTakeover: true });
     }
-    await assignSession(event, transition.snapshot, targetPath);
+    await assignSession(
+      event,
+      transition.snapshot,
+      {
+        sessionId: transition.previousSessionId,
+        closeOptions: { expectedRevision: source.revision },
+      },
+      { targetPath },
+    );
     return transition.status;
   });
   handle(DESKTOP_IPC.collaborationJoin, joinInputSchema, async (event, input) => {
@@ -1871,14 +2054,23 @@ const configureIpc = (): void => {
         "Open the host's shared .hdeck before joining.",
       );
     }
-    if (runtime.getSnapshot(input.sessionId).dirty) {
+    const source = runtime.getSnapshot(input.sessionId);
+    if (source.dirty) {
       throw new DesktopMainError(
         'DIRTY_DOCUMENT',
         'Reopen the shared .hdeck before joining so local unsaved edits are not discarded.',
       );
     }
     const transition = await collaboration.join({ ...input, targetPath });
-    await assignSession(event, transition.snapshot, targetPath);
+    await assignSession(
+      event,
+      transition.snapshot,
+      {
+        sessionId: transition.previousSessionId,
+        closeOptions: { expectedRevision: source.revision },
+      },
+      { targetPath },
+    );
     return transition.status;
   });
   handle(DESKTOP_IPC.collaborationLeave, sessionInputSchema, async (event, input) => {
@@ -1886,8 +2078,17 @@ const configureIpc = (): void => {
     const ended = await collaboration.leave(input.sessionId);
     if (ended === undefined) return collaboration.status(input.sessionId);
     if (ended.mode === 'host' && !ended.preserveDetached) {
+      const previousSnapshot = runtime.getSnapshot(input.sessionId);
       const reopened = await runtime.openMainOnly({ targetPath: ended.targetPath });
-      await assignSession(event, reopened, ended.targetPath);
+      await assignSession(
+        event,
+        reopened,
+        {
+          sessionId: input.sessionId,
+          closeOptions: { expectedRevision: previousSnapshot.revision },
+        },
+        { targetPath: ended.targetPath },
+      );
     } else {
       // Keep the converged guest snapshot open as an unsaved local copy. Reopening the shared
       // target here could regress to the host's last explicit save.
@@ -2045,6 +2246,7 @@ else {
     if (gracefulShutdownStarted) return;
     gracefulShutdownStarted = true;
     event.preventDefault();
+    rendererCloseHandshake.dispose();
     mcpBridge.revokeApprovals();
     void Promise.allSettled([collaboration.shutdownAll(), mcpRpcServer?.close()]).finally(() => {
       app.exit(0);

@@ -207,8 +207,95 @@ describe('document session authority', () => {
       code: 'DIRTY_DOCUMENT',
     });
     expect(manager.getSnapshot(session.sessionId).dirty).toBe(true);
-    await manager.close(session.sessionId, { discardUnsaved: true });
+    await expect(
+      manager.close(session.sessionId, {
+        discardUnsaved: true,
+        expectedRevision: 'stale-revision',
+      }),
+    ).rejects.toMatchObject({ code: 'REVISION_CONFLICT' });
+    await manager.close(session.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: session.revision,
+    });
     expect(() => manager.getSnapshot(session.sessionId)).toThrow(DocumentRuntimeError);
+  });
+
+  it('retains a session when a queued mutation wins the close revision race', async () => {
+    const directory = await temporaryDirectory();
+    let releaseAppend: (() => void) | undefined;
+    let appendEnteredResolve: (() => void) | undefined;
+    const appendEntered = new Promise<void>((resolve) => {
+      appendEnteredResolve = resolve;
+    });
+    const appendGate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    const journal: JournalDurabilityCapability = {
+      ...defaultJournalDurability,
+      append: async (target, record) => {
+        appendEnteredResolve?.();
+        await appendGate;
+        await defaultJournalDurability.append(target, record);
+      },
+    };
+    const manager = managerFor(directory, { journal });
+    const session = await manager.createMainOnly();
+    const mutation = manager.execute(session.sessionId, {
+      expectedRevision: session.revision,
+      commands: [{ type: 'deck.rename', name: 'Concurrent mutation' }],
+      metadata: metadata(1),
+    });
+    await appendEntered;
+    const closing = manager.close(session.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: session.revision,
+    });
+    releaseAppend?.();
+    const changed = await mutation;
+    await expect(closing).rejects.toMatchObject({ code: 'REVISION_CONFLICT' });
+    expect(manager.getSnapshot(session.sessionId).revision).toBe(changed.revision);
+    expect(manager.getSnapshot(session.sessionId).document.name).toBe('Concurrent mutation');
+    await manager.close(session.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: changed.revision,
+    });
+  });
+
+  it('rejects a mutation queued behind a completed close', async () => {
+    const directory = await temporaryDirectory();
+    let releaseRemove: (() => void) | undefined;
+    let removeEnteredResolve: (() => void) | undefined;
+    const removeEntered = new Promise<void>((resolve) => {
+      removeEnteredResolve = resolve;
+    });
+    const removeGate = new Promise<void>((resolve) => {
+      releaseRemove = resolve;
+    });
+    const journal: JournalDurabilityCapability = {
+      ...defaultJournalDurability,
+      remove: async (target) => {
+        removeEnteredResolve?.();
+        await removeGate;
+        await defaultJournalDurability.remove(target);
+      },
+    };
+    const manager = managerFor(directory, { journal });
+    const session = await manager.createMainOnly();
+    const closing = manager.close(session.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: session.revision,
+    });
+    await removeEntered;
+    const mutation = manager.execute(session.sessionId, {
+      expectedRevision: session.revision,
+      commands: [{ type: 'deck.rename', name: 'Must not resurrect' }],
+      metadata: metadata(1),
+    });
+    releaseRemove?.();
+    await closing;
+    await expect(mutation).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND' });
+    expect(manager.listSessions()).toHaveLength(0);
+    expect(await manager.listRecoveryCandidatesMainOnly()).toHaveLength(0);
   });
 });
 
@@ -693,6 +780,88 @@ describe('recovery and agent proposals', () => {
     const recovered = await afterCrash.recoverMainOnly(session.sessionId);
     expect(recovered.document.name).toBe('Untitled presentation');
     expect(recovered.revision).toBe(undone.revision);
+  });
+
+  it('preserves the exact recovery candidate when a recovered session is rolled back', async () => {
+    const directory = await temporaryDirectory();
+    const crashed = managerFor(directory);
+    const session = await crashed.createMainOnly();
+    const changed = await crashed.execute(session.sessionId, {
+      expectedRevision: session.revision,
+      commands: [{ type: 'deck.rename', name: 'Recoverable rollback' }],
+      metadata: metadata(4),
+    });
+    const artifactPaths = [
+      path.join(directory, `${session.sessionId}.base.hdeck`),
+      path.join(directory, `${session.sessionId}.journal`),
+      path.join(directory, `${session.sessionId}.meta.json`),
+    ];
+    const artifactsBefore = await Promise.all(
+      artifactPaths.map(async (artifactPath) => readFile(artifactPath)),
+    );
+    const orphanBytes = Buffer.from('rollback must not trigger recovery garbage collection');
+    const orphanPath = path.join(directory, 'blobs', sha256(orphanBytes));
+    await writeFile(orphanPath, orphanBytes);
+
+    const recovering = managerFor(directory, { recoveryBlobGcMinAgeMs: 0 });
+    const candidatesBefore = await recovering.listRecoveryCandidatesMainOnly();
+    expect(candidatesBefore).toEqual([
+      expect.objectContaining({
+        candidateId: session.sessionId,
+        recordCount: 1,
+        complete: true,
+      }),
+    ]);
+    const recovered = await recovering.recoverMainOnly(session.sessionId);
+    await recovering.close(recovered.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: recovered.revision,
+      preserveRecovery: true,
+    });
+
+    expect(recovering.listSessions()).toHaveLength(0);
+    expect(
+      await Promise.all(artifactPaths.map(async (artifactPath) => readFile(artifactPath))),
+    ).toEqual(artifactsBefore);
+    expect(await readFile(orphanPath)).toEqual(orphanBytes);
+    expect(await recovering.listRecoveryCandidatesMainOnly()).toEqual(candidatesBefore);
+
+    const recoveredAgain = await recovering.recoverMainOnly(session.sessionId);
+    expect(recoveredAgain.revision).toBe(changed.revision);
+    expect(recoveredAgain.document).toEqual(changed.document);
+    await recovering.close(recoveredAgain.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: recoveredAgain.revision,
+    });
+  });
+
+  it('reserves a recovery candidate before asynchronous replay begins', async () => {
+    const directory = await temporaryDirectory();
+    const crashed = managerFor(directory);
+    const session = await crashed.createMainOnly();
+    const changed = await crashed.execute(session.sessionId, {
+      expectedRevision: session.revision,
+      commands: [{ type: 'deck.rename', name: 'Recover exactly once' }],
+      metadata: metadata(5),
+    });
+
+    const recovering = managerFor(directory);
+    const firstRecovery = recovering.recoverMainOnly(session.sessionId);
+    const duplicateRecovery = recovering.recoverMainOnly(session.sessionId);
+
+    await expect(duplicateRecovery).rejects.toMatchObject({ code: 'SESSION_EXISTS' });
+    await expect(firstRecovery).resolves.toMatchObject({
+      sessionId: session.sessionId,
+      revision: changed.revision,
+      document: expect.objectContaining({ name: 'Recover exactly once' }),
+    });
+    expect(recovering.listSessions()).toHaveLength(1);
+
+    const recovered = recovering.getSnapshot(session.sessionId);
+    await recovering.close(recovered.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: recovered.revision,
+    });
   });
 
   it('expires proposals and rejects proposals whose base revision changed', async () => {
