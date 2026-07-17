@@ -82,6 +82,8 @@ No user-facing change is queued after the V1 release candidate.
   hook so the assisted NSIS installer compiles without redefining its native callback.
 - Compared release-inventory confirmation paths in the same global order as their
   hashes, avoiding false mutation alarms for sibling files and prefixed directories.
+- Pinned release-child debug namespaces off and CI mode on so the locked Electron
+  Builder cannot emit internal diagnostic sidecars into the public candidate directory.
 
 ### Known V1 boundaries
 

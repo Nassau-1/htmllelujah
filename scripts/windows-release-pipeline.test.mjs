@@ -174,11 +174,13 @@ test('finalizer CLI loads the mandatory functional evidence contract', () => {
 test('release children cannot inherit publication credentials or renderer overrides', () => {
   const environment = createReleaseEnvironment({
     PATH: 'fixture-path',
-    CI: 'true',
+    CI: 'false',
     GH_TOKEN: 'github-secret',
     GITHUB_TOKEN: 'actions-secret',
     GITLAB_TOKEN: 'gitlab-secret',
     AWS_ACCESS_KEY_ID: 'cloud-secret',
+    DEBUG: 'electron-builder,*',
+    ELECTRON_BUILDER_DEBUG: '1',
     NODE_OPTIONS: '--inspect',
     ELECTRON_RUN_AS_NODE: '1',
     VITE_DEV_SERVER_URL: 'https://renderer.invalid/',
@@ -189,6 +191,9 @@ test('release children cannot inherit publication credentials or renderer overri
     GIT_CONFIG_KEY_0: 'filter.release.clean',
     GIT_CONFIG_VALUE_0: 'unsafe-filter',
     github_token: 'case-insensitive-secret',
+    ci: 'false',
+    debug: 'electron-builder:case-insensitive',
+    electron_builder_debug: '1',
     electron_run_as_node: '1',
     git_replace_ref_base: 'refs/case-insensitive-unsafe/',
   });
@@ -207,8 +212,44 @@ test('release children cannot inherit publication credentials or renderer overri
     }
   }
   assert.equal(environment.CSC_IDENTITY_AUTO_DISCOVERY, 'false');
+  assert.equal(environment.DEBUG, '-electron-builder');
+  assert.equal(environment.ELECTRON_BUILDER_DEBUG, undefined);
+  assert.equal(
+    Object.keys(environment).some((key) => key.toUpperCase() === 'ELECTRON_BUILDER_DEBUG'),
+    false,
+  );
+  assert.equal(Object.keys(environment).filter((key) => key.toUpperCase() === 'CI').length, 1);
+  assert.equal(Object.keys(environment).filter((key) => key.toUpperCase() === 'DEBUG').length, 1);
   assert.equal(environment.GIT_NO_REPLACE_OBJECTS, '1');
   assert.equal(environment.GIT_TERMINAL_PROMPT, '0');
+});
+
+test('release environment explicitly disables Electron Builder debug artifacts', () => {
+  const probe = `
+    const { createRequire } = require('node:module');
+    const load = createRequire(require.resolve('electron-builder/package.json'));
+    const util = load('builder-util');
+    process.stdout.write(JSON.stringify({
+      raw: util.log.isDebugEnabled,
+      constructed: new util.DebugLogger(util.log.isDebugEnabled).isEnabled,
+    }));
+  `;
+  const result = spawnSync(process.execPath, ['-e', probe], {
+    cwd: path.join(repositoryRoot, 'apps', 'desktop'),
+    encoding: 'utf8',
+    env: createReleaseEnvironment({
+      ...process.env,
+      DEBUG: 'electron-builder,*',
+      ELECTRON_BUILDER_DEBUG: '1',
+    }),
+    shell: false,
+    timeout: 30_000,
+    windowsHide: true,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null);
+  assert.equal(result.status, 0, String(result.stderr ?? ''));
+  assert.deepEqual(JSON.parse(result.stdout), { raw: false, constructed: false });
 });
 
 test('Windows Corepack resolves to a JavaScript entry instead of a cmd shim', () => {

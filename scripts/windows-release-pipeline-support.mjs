@@ -39,7 +39,10 @@ const RELEASE_PUBLISH_CREDENTIAL_KEYS = [
 
 const RELEASE_ENVIRONMENT_KEYS_TO_REMOVE = [
   ...RELEASE_PUBLISH_CREDENTIAL_KEYS,
+  'CI',
   'CSC_IDENTITY_AUTO_DISCOVERY',
+  'DEBUG',
+  'ELECTRON_BUILDER_DEBUG',
   'ELECTRON_RUN_AS_NODE',
   'NODE_OPTIONS',
   'VITE_DEV_SERVER_URL',
@@ -90,7 +93,15 @@ export const createReleaseEnvironment = (source = process.env) => {
       delete environment[key];
     }
   }
+  // Electron Builder writes builder-effective-config.yaml only for an
+  // interactive non-CI terminal. Pinning CI keeps the candidate file set
+  // identical whether the release is started by automation or by a person.
+  environment.CI = 'true';
   environment.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
+  // builder-util 26.15.3 exposes an undefined disabled state, which activates
+  // DebugLogger's true default and emits builder-debug.yml. A negative-only
+  // namespace makes the disabled state explicitly false across release children.
+  environment.DEBUG = '-electron-builder';
   environment.GIT_NO_REPLACE_OBJECTS = '1';
   environment.GIT_TERMINAL_PROMPT = '0';
   return environment;
