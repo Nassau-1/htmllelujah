@@ -43,6 +43,7 @@ import {
   regularFileIdentity,
   trackedSourceIdentity,
 } from './build-provenance-support.mjs';
+import { UI_SMOKE_TIMEOUT_MS } from './ui-smoke-performance.mjs';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
@@ -57,6 +58,8 @@ const harnessPaths = [
   path.join(import.meta.dirname, 'smoke-ui-electron.mjs'),
   path.join(import.meta.dirname, 'ui-smoke-performance.mjs'),
   path.join(import.meta.dirname, 'automate-save-dialog.ps1'),
+  path.join(import.meta.dirname, 'dismiss-message-box.ps1'),
+  path.join(import.meta.dirname, 'request-window-close.ps1'),
   path.join(import.meta.dirname, 'smoke-mcp-electron.mjs'),
   path.join(import.meta.dirname, 'mcp-smoke-support.mjs'),
   path.join(import.meta.dirname, 'mcp-json-line-router.mjs'),
@@ -929,7 +932,7 @@ try {
   await stage('installedEditor', () =>
     run(process.execPath, [path.join(desktopRoot, 'scripts', 'smoke-ui-electron.mjs')], {
       label: 'Installed editor UI smoke',
-      timeoutMs: 150_000,
+      timeoutMs: UI_SMOKE_TIMEOUT_MS,
       env: {
         ...process.env,
         HTMLLELUJAH_EXECUTABLE: installedExecutable,

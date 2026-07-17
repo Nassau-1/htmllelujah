@@ -47,6 +47,12 @@ No user-facing change is queued after the V1 release candidate.
   provenance ledger. The review does not replace qualified legal approval for
   commercial distribution.
 
+### Fixed
+
+- Made the Windows warm-start release gate close every probe through the real native
+  close handshake, reject residual recovery state, retain three phase-level samples,
+  and enforce the unchanged three-second budget against their deterministic median.
+
 ### Security
 
 - Made image registration plus insertion or replacement one durable, undoable transaction;

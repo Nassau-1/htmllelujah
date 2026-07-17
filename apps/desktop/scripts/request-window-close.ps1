@@ -133,3 +133,5 @@ if (-not [HtmllelujahWindowCloseInput]::RequestClose($editorWindow.Current.Nativ
 }
 
 Write-Output '__HTMLLELUJAH_NATIVE_CLOSE_REQUESTED__'
+$processTree = ConvertTo-Json -InputObject @($allowedProcessIds) -Compress
+Write-Output "__HTMLLELUJAH_PROCESS_TREE__$processTree"

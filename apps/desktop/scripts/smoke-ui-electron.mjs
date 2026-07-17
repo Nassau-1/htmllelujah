@@ -1,11 +1,14 @@
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { LocalRpcClient } from '@htmllelujah/mcp-server';
 
-import { assessInteractiveReadiness, assertInteractiveReadiness } from './ui-smoke-performance.mjs';
+import {
+  assessInteractiveReadinessSamples,
+  assertInteractiveReadiness,
+} from './ui-smoke-performance.mjs';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
@@ -257,7 +260,26 @@ const requestNativeWindowClose = (rootProcessId) =>
     child.once('close', (code, signal) => {
       clearTimeout(timer);
       if (code === 0 && stdout.includes('__HTMLLELUJAH_NATIVE_CLOSE_REQUESTED__')) {
-        resolve();
+        const processTreeLine = stdout
+          .split(/\r?\n/u)
+          .find((line) => line.startsWith('__HTMLLELUJAH_PROCESS_TREE__'));
+        let processIds;
+        try {
+          processIds = JSON.parse(processTreeLine?.slice('__HTMLLELUJAH_PROCESS_TREE__'.length));
+        } catch {
+          processIds = undefined;
+        }
+        if (
+          !Array.isArray(processIds) ||
+          processIds.length < 1 ||
+          processIds.some((processId) => !Number.isInteger(processId) || processId < 1)
+        ) {
+          reject(
+            new Error(`Native window-close automation returned no valid process tree. ${stdout}`),
+          );
+          return;
+        }
+        resolve({ processIds: [...new Set(processIds)] });
       } else {
         reject(
           new Error(`Native window-close automation exited ${code ?? signal}. ${stderr || stdout}`),
@@ -265,6 +287,27 @@ const requestNativeWindowClose = (rootProcessId) =>
       }
     });
   });
+
+const processIsAlive = (processId) => {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    return true;
+  }
+};
+
+const waitForProcessTreeExit = (processIds, label) =>
+  waitFor(
+    () => {
+      const remaining = processIds.filter(processIsAlive);
+      if (remaining.length === 0) return true;
+      throw new Error(`${remaining.length} scoped process(es) remain.`);
+    },
+    15_000,
+    `${label} process-tree exit`,
+  );
 
 class CdpSession {
   #nextId = 1;
@@ -438,70 +481,196 @@ const waitForDecodedImages = async (session, selector, label, timeoutMs = 10_000
   }
 };
 
-const warmUpApplication = async ({
+const recoveryArtifactPaths = (userData, sessionId) => [
+  path.join(userData, 'recovery', `${sessionId}.base.hdeck`),
+  path.join(userData, 'recovery', `${sessionId}.journal`),
+  path.join(userData, 'recovery', `${sessionId}.meta.json`),
+];
+
+const assertRecoveryArtifactsRemoved = async (userData, sessionId, label) => {
+  for (const artifactPath of recoveryArtifactPaths(userData, sessionId)) {
+    try {
+      await access(artifactPath);
+      throw new Error(`${label} left a recovery artifact behind: ${artifactPath}.`);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+  }
+};
+
+const closeLaunchGracefully = async ({
+  child,
+  userData,
+  sessionId,
+  label,
+  expectUnsavedPrompt,
+}) => {
+  if (child.pid === undefined) throw new Error(`${label} process ID is unavailable.`);
+  const discard = expectUnsavedPrompt
+    ? automateMessageBox(child.pid, 'Unsaved changes', 'Discard')
+    : undefined;
+  let nativeClose;
+  void discard?.catch(() => undefined);
+  try {
+    nativeClose = await requestNativeWindowClose(child.pid);
+    if (discard !== undefined) {
+      if (!(await discard.ready)) await discard;
+      await discard;
+    }
+    if (!(await waitForExit(child, 15_000))) {
+      throw new Error(`${label} did not exit after its native close request.`);
+    }
+    if (child.exitCode !== 0 || child.signalCode !== null) {
+      throw new Error(
+        `${label} exited abnormally after its native close request (code ${child.exitCode}, signal ${child.signalCode}).`,
+      );
+    }
+    await waitForProcessTreeExit(nativeClose.processIds, label);
+  } finally {
+    discard?.cancel();
+    if (discard !== undefined) await Promise.allSettled([discard]);
+  }
+  await assertRecoveryArtifactsRemoved(userData, sessionId, label);
+  return {
+    requestedViaNativeWindowClose: true,
+    unsavedChoice: expectUnsavedPrompt ? 'discard' : 'not-required',
+    processExited: true,
+    exitCode: child.exitCode,
+    signalCode: child.signalCode,
+    processTreeSize: nativeClose.processIds.length,
+    processTreeExited: true,
+    recoveryArtifactsRemoved: true,
+  };
+};
+
+const runCleanLaunchProbe = async ({
   launchCommand,
   launchArguments,
   launchEnvironment,
   userData,
+  label,
+  role,
+  ordinal,
+  expectedDeckName,
+  expectUnsavedPrompt,
 }) => {
   const debuggingPortPath = path.join(userData, 'DevToolsActivePort');
   await rm(debuggingPortPath, { force: true });
 
   const startedAt = performance.now();
-  const warmup = spawn(launchCommand, launchArguments, {
+  const child = spawn(launchCommand, launchArguments, {
     cwd: desktopRoot,
     env: launchEnvironment,
-    windowsHide: true,
+    windowsHide: false,
     stdio: ['ignore', 'ignore', 'pipe'],
   });
-  let warmupError = '';
-  let warmupSpawnError;
-  warmup.once('error', (error) => {
-    warmupSpawnError = error;
+  let launchError = '';
+  let launchSpawnError;
+  child.once('error', (error) => {
+    launchSpawnError = error;
   });
-  warmup.stderr.on('data', (chunk) => {
-    warmupError += chunk.toString('utf8');
+  child.stderr.on('data', (chunk) => {
+    launchError += chunk.toString('utf8');
   });
 
-  let warmupCdp;
+  let launchCdp;
   try {
     const debuggingPort = await waitForDebuggingPort(
-      warmup,
+      child,
       userData,
-      () => warmupError,
-      () => warmupSpawnError,
-      'Electron warm-up',
+      () => launchError,
+      () => launchSpawnError,
+      label,
     );
-    const target = await waitForRendererTarget(debuggingPort, 'Electron warm-up');
-    warmupCdp = await CdpSession.connect(target.webSocketDebuggerUrl);
-    await warmupCdp.send('Runtime.enable');
+    const debuggingPortReadyAt = performance.now();
+    const target = await waitForRendererTarget(debuggingPort, label);
+    const rendererTargetReadyAt = performance.now();
+    launchCdp = await CdpSession.connect(target.webSocketDebuggerUrl);
+    await launchCdp.send('Runtime.enable');
     await waitFor(
       async () =>
         (await evaluateCdp(
-          warmupCdp,
+          launchCdp,
           `document.readyState === 'complete' && document.querySelector('.app-shell') !== null`,
         )) || undefined,
       15_000,
-      'Electron warm-up application shell',
+      `${label} application shell`,
     );
-    await evaluateCdp(warmupCdp, `document.fonts.ready.then(() => true)`);
+    const applicationShellReadyAt = performance.now();
+    await evaluateCdp(launchCdp, `document.fonts.ready.then(() => true)`);
+    const fontsReadyAt = performance.now();
+    const initialized = await evaluateCdp(
+      launchCdp,
+      `(async () => {
+        const result = await window.htmllelujah.initialize();
+        if (!result.ok) return { ok: false, errorCode: result.error.code };
+        return {
+          ok: true,
+          sessionId: result.value.session.snapshot.sessionId,
+          documentName: result.value.session.snapshot.document.name,
+          recoveryCandidates: result.value.recoveryCandidates.length,
+        };
+      })()`,
+    );
+    if (
+      initialized?.ok !== true ||
+      typeof initialized.sessionId !== 'string' ||
+      initialized.recoveryCandidates !== 0
+    ) {
+      throw new Error(`${label} did not initialize cleanly: ${JSON.stringify(initialized)}.`);
+    }
+    if (expectedDeckName !== undefined && initialized.documentName !== expectedDeckName) {
+      throw new Error(
+        `${label} opened ${initialized.documentName} instead of ${expectedDeckName}.`,
+      );
+    }
+    const duration = (end, start) => Number((end - start).toFixed(3));
+    const gracefulClose = await closeLaunchGracefully({
+      child,
+      userData,
+      sessionId: initialized.sessionId,
+      label,
+      expectUnsavedPrompt,
+    });
     return {
-      completed: true,
-      interactiveReadyMs: Number((performance.now() - startedAt).toFixed(3)),
+      role,
+      ordinal,
+      interactiveReadyMs: duration(fontsReadyAt, startedAt),
+      milestonesMs: {
+        debuggingPort: duration(debuggingPortReadyAt, startedAt),
+        rendererTarget: duration(rendererTargetReadyAt, startedAt),
+        applicationShell: duration(applicationShellReadyAt, startedAt),
+        fontsReady: duration(fontsReadyAt, startedAt),
+      },
+      phasesMs: {
+        spawnToDebuggingPort: duration(debuggingPortReadyAt, startedAt),
+        debuggingPortToRendererTarget: duration(rendererTargetReadyAt, debuggingPortReadyAt),
+        rendererTargetToApplicationShell: duration(applicationShellReadyAt, rendererTargetReadyAt),
+        applicationShellToFontsReady: duration(fontsReadyAt, applicationShellReadyAt),
+      },
+      recoveryCandidatesAtReady: initialized.recoveryCandidates,
       profileReusedForMeasuredLaunch: true,
+      documentName: initialized.documentName,
+      gracefulClose,
     };
   } catch (error) {
-    if (warmupError !== '') {
-      process.stderr.write(`[warm-up desktop stderr]\n${warmupError.slice(0, 4_000)}\n`);
+    if (launchError !== '') {
+      process.stderr.write(`[${label} desktop stderr]\n${launchError.slice(0, 4_000)}\n`);
     }
     throw error;
   } finally {
-    warmupCdp?.close();
-    await terminate(warmup, 'Electron warm-up process');
+    launchCdp?.close();
+    if (!hasExited(child)) await terminate(child, `${label} process`);
     await rm(debuggingPortPath, { force: true });
   }
 };
 
+await Promise.all(
+  [reportPath, screenshotPath, presentationScreenshotPath].map((outputPath) =>
+    rm(outputPath, { force: true }),
+  ),
+);
 const userData = await mkdtemp(path.join(tmpdir(), 'htmllelujah-ui-smoke-'));
 const imageFixturePath = path.join(userData, 'native-image-import.png');
 const closeHandshakeDeckPath = path.join(userData, 'close-handshake.hdeck');
@@ -533,13 +702,35 @@ const createLaunchArguments = (includeOpenPath) => [
   '--force-device-scale-factor=1',
 ];
 let warmupEvidence;
+let measuredProbeEvidence;
 try {
-  warmupEvidence = await warmUpApplication({
+  warmupEvidence = await runCleanLaunchProbe({
     launchCommand,
-    launchArguments: createLaunchArguments(false),
+    launchArguments: createLaunchArguments(true),
     launchEnvironment,
     userData,
+    label: 'Electron unmeasured warm-up',
+    role: 'warmup',
+    ordinal: 0,
+    expectedDeckName,
+    expectUnsavedPrompt: openPath === undefined,
   });
+  measuredProbeEvidence = [];
+  for (const ordinal of [1, 2]) {
+    measuredProbeEvidence.push(
+      await runCleanLaunchProbe({
+        launchCommand,
+        launchArguments: createLaunchArguments(true),
+        launchEnvironment,
+        userData,
+        label: `Electron measured probe ${ordinal}`,
+        role: 'probe',
+        ordinal,
+        expectedDeckName,
+        expectUnsavedPrompt: openPath === undefined,
+      }),
+    );
+  }
 } catch (error) {
   await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
   throw error;
@@ -572,8 +763,10 @@ try {
     () => applicationSpawnError,
     'Electron measured launch',
   );
+  const debuggingPortReadyAt = performance.now();
 
   const target = await waitForRendererTarget(debuggingPort, 'HTMLlelujah measured launch');
+  const rendererTargetReadyAt = performance.now();
 
   cdp = await CdpSession.connect(target.webSocketDebuggerUrl);
   await cdp.send('Page.enable');
@@ -714,11 +907,66 @@ try {
     'Editor application shell',
     15_000,
   );
+  const applicationShellReadyAt = performance.now();
   await evaluate(`document.fonts.ready.then(() => true)`);
-  const interactiveReadyMs = Number((performance.now() - launchStartedAt).toFixed(3));
-  const performanceReport = {
-    ...assessInteractiveReadiness(interactiveReadyMs),
-    measurement: 'second-launch-same-profile',
+  const fontsReadyAt = performance.now();
+  const measuredInitialization = await evaluate(`(async () => {
+    const result = await window.htmllelujah.initialize();
+    if (!result.ok) return { ok: false, errorCode: result.error.code };
+    return {
+      ok: true,
+      sessionId: result.value.session.snapshot.sessionId,
+      documentName: result.value.session.snapshot.document.name,
+      recoveryCandidates: result.value.recoveryCandidates.length,
+    };
+  })()`);
+  if (
+    measuredInitialization?.ok !== true ||
+    typeof measuredInitialization.sessionId !== 'string' ||
+    measuredInitialization.recoveryCandidates !== 0
+  ) {
+    throw new Error(
+      `Electron functional launch did not initialize cleanly: ${JSON.stringify(
+        measuredInitialization,
+      )}.`,
+    );
+  }
+  if (expectedDeckName !== undefined && measuredInitialization.documentName !== expectedDeckName) {
+    throw new Error('The measured launch opened the wrong presentation.');
+  }
+  const duration = (end, start) => Number((end - start).toFixed(3));
+  const functionalPerformanceSample = {
+    role: 'functional',
+    ordinal: 3,
+    interactiveReadyMs: duration(fontsReadyAt, launchStartedAt),
+    milestonesMs: {
+      debuggingPort: duration(debuggingPortReadyAt, launchStartedAt),
+      rendererTarget: duration(rendererTargetReadyAt, launchStartedAt),
+      applicationShell: duration(applicationShellReadyAt, launchStartedAt),
+      fontsReady: duration(fontsReadyAt, launchStartedAt),
+    },
+    phasesMs: {
+      spawnToDebuggingPort: duration(debuggingPortReadyAt, launchStartedAt),
+      debuggingPortToRendererTarget: duration(rendererTargetReadyAt, debuggingPortReadyAt),
+      rendererTargetToApplicationShell: duration(applicationShellReadyAt, rendererTargetReadyAt),
+      applicationShellToFontsReady: duration(fontsReadyAt, applicationShellReadyAt),
+    },
+    recoveryCandidatesAtReady: measuredInitialization.recoveryCandidates,
+    profileReusedForMeasuredLaunch: true,
+    documentName: measuredInitialization.documentName,
+  };
+  const readiness = assessInteractiveReadinessSamples([
+    ...measuredProbeEvidence.map((sample) => sample.interactiveReadyMs),
+    functionalPerformanceSample.interactiveReadyMs,
+  ]);
+  let performanceReport = {
+    ...readiness,
+    measurement: 'median-of-three-clean-warm-starts-same-profile',
+    samples: [...measuredProbeEvidence, functionalPerformanceSample],
+    warnings: readiness.samplesAboveBudget.map(
+      (sample) =>
+        `Warm-start sample ${sample.sample} took ${sample.interactiveReadyMs} ms, above the 3000 ms budget.`,
+    ),
     warmup: warmupEvidence,
   };
   try {
@@ -1795,6 +2043,20 @@ try {
   if (presentationScreenshotBytes === undefined) {
     throw new Error('Presentation visual evidence was not captured.');
   }
+  const finalGracefulClose = await closeLaunchGracefully({
+    child: application,
+    userData,
+    sessionId: measuredInitialization.sessionId,
+    label: 'Electron functional launch',
+    expectUnsavedPrompt: true,
+  });
+  performanceReport = {
+    ...performanceReport,
+    samples: [
+      ...measuredProbeEvidence,
+      { ...functionalPerformanceSample, gracefulClose: finalGracefulClose },
+    ],
+  };
 
   const report = {
     passed: true,
@@ -1809,7 +2071,8 @@ try {
       ...(executable === undefined
         ? []
         : ['packaged application ignored a hostile development-renderer environment override']),
-      'one unmeasured warm-up and one measured launch reused the same user-data profile',
+      'one clean warm-up and three clean measured launches reused the same user-data profile',
+      'all measured launches started with zero recovery candidates and closed without residue',
       'essential editor surfaces rendered',
       'shape insertion, undo, and redo converged',
       'native image chooser imported and decoded one image in the editor with atomic undo and redo',

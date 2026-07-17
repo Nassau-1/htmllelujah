@@ -7,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { buildDirectoryInventory } from '../apps/desktop/scripts/build-provenance-support.mjs';
+import { UI_SMOKE_TIMEOUT_MS } from '../apps/desktop/scripts/ui-smoke-performance.mjs';
 import {
   DEFAULT_LAN_DURATION_MS,
   EXTERNAL_VALIDATION_LIMITATIONS,
@@ -61,11 +62,58 @@ const allTrue = {
   third: true,
 };
 
+const uiLaunchSample = (role, ordinal, interactiveReadyMs = 100) => ({
+  role,
+  ordinal,
+  interactiveReadyMs,
+  milestonesMs: {
+    debuggingPort: 25,
+    rendererTarget: 50,
+    applicationShell: 75,
+    fontsReady: interactiveReadyMs,
+  },
+  phasesMs: {
+    spawnToDebuggingPort: 25,
+    debuggingPortToRendererTarget: 25,
+    rendererTargetToApplicationShell: 25,
+    applicationShellToFontsReady: interactiveReadyMs - 75,
+  },
+  recoveryCandidatesAtReady: 0,
+  profileReusedForMeasuredLaunch: true,
+  documentName: 'V1 candidate',
+  gracefulClose: {
+    requestedViaNativeWindowClose: true,
+    unsavedChoice: 'discard',
+    processExited: true,
+    exitCode: 0,
+    signalCode: null,
+    processTreeSize: 4,
+    processTreeExited: true,
+    recoveryArtifactsRemoved: true,
+  },
+});
+
 const uiReport = () => ({
   passed: true,
   testedAt: nowIso(),
   launchMode: 'packaged-executable',
-  performance: { interactiveReadyMs: 100, warmStartBudgetMs: 3_000, withinWarmStartBudget: true },
+  performance: {
+    interactiveReadyMs: 100,
+    warmStartBudgetMs: 3_000,
+    withinWarmStartBudget: true,
+    aggregation: 'median',
+    sampleCount: 3,
+    sampleInteractiveReadyMs: [100, 110, 90],
+    samplesAboveBudget: [],
+    measurement: 'median-of-three-clean-warm-starts-same-profile',
+    samples: [
+      uiLaunchSample('probe', 1, 100),
+      uiLaunchSample('probe', 2, 110),
+      uiLaunchSample('functional', 3, 90),
+    ],
+    warnings: [],
+    warmup: uiLaunchSample('warmup', 0, 120),
+  },
   checks: Array.from({ length: 12 }, (_, index) => `UI check ${index + 1}`),
 });
 
@@ -552,6 +600,22 @@ test('pure finalization verifier binds canonical public bytes and rejects all pa
 
   assert.throws(
     () =>
+      verifyFunctionalValidationPair(
+        rebuildPairWithReportBytes(
+          pair,
+          { gateId: 'installer-lifecycle', role: 'installed-ui-report' },
+          (bytes) => {
+            const report = JSON.parse(bytes.toString('utf8'));
+            report.performance.samples[0].gracefulClose.processTreeExited = false;
+            return jsonBytes(report);
+          },
+        ),
+      ),
+    /installed UI child smoke/u,
+  );
+
+  assert.throws(
+    () =>
       verifyFunctionalValidationPair({
         ...pair.options,
         manifestBytes: Buffer.from(JSON.stringify(verified.manifest), 'utf8'),
@@ -730,6 +794,16 @@ test('command plan exactly covers every required candidate gate', () => {
     plan.find((gate) => gate.id === 'single-instance-final-artifact').args.at(-1),
     '--final-artifact',
   );
+  assert.equal(plan.find((gate) => gate.id === 'ui-packaged').timeoutMs, UI_SMOKE_TIMEOUT_MS);
+});
+
+test('installed and unpacked editor smokes share the same six-minute timeout', async () => {
+  assert.equal(UI_SMOKE_TIMEOUT_MS, 6 * 60_000);
+  const installerSource = await readFile(
+    new URL('../apps/desktop/scripts/smoke-installer-windows.mjs', import.meta.url),
+    'utf8',
+  );
+  assert.match(installerSource, /timeoutMs: UI_SMOKE_TIMEOUT_MS/u);
 });
 
 test('public invocation normalization is independent from the caller working directory', () => {
@@ -905,6 +979,48 @@ test('public ZIP is deterministic, sorted, and rejects traversal', () => {
   const secondCentralOffset = centralOffset + 46 + firstCentralNameLength;
   Buffer.from('a.json').copy(duplicate, secondCentralOffset + 46);
   assert.throws(() => readPublicEvidenceZipEntries(duplicate), /duplicate/u);
+});
+
+test('packaged UI gate recomputes the median and requires clean recovery-free closes', () => {
+  const startedAt = new Date(Date.now() - 1_000).toISOString();
+  const completedAt = new Date(Date.now() + 1_000).toISOString();
+  const gate = { id: 'ui-packaged', startedAt, completedAt, durationMs: 2_000 };
+  const errorsFor = (report) =>
+    gateReportErrors({
+      gate,
+      evidenceFiles: [{ gateId: gate.id, role: 'report', bytes: jsonBytes(report) }],
+      target: {},
+    });
+  const valid = uiReport();
+  assert.deepEqual(errorsFor(valid), []);
+
+  const wrongMedian = structuredClone(valid);
+  wrongMedian.performance.interactiveReadyMs = 90;
+  assert.match(errorsFor(wrongMedian).join(' '), /warm-start threshold/u);
+
+  const residualRecovery = structuredClone(valid);
+  residualRecovery.performance.samples[0].recoveryCandidatesAtReady = 1;
+  assert.match(errorsFor(residualRecovery).join(' '), /warm-start threshold/u);
+
+  const forcedClose = structuredClone(valid);
+  forcedClose.performance.samples[2].gracefulClose.processExited = false;
+  assert.match(errorsFor(forcedClose).join(' '), /warm-start threshold/u);
+
+  const abnormalExit = structuredClone(valid);
+  abnormalExit.performance.samples[2].gracefulClose.exitCode = 1;
+  assert.match(errorsFor(abnormalExit).join(' '), /warm-start threshold/u);
+
+  const lingeringProcessTree = structuredClone(valid);
+  lingeringProcessTree.performance.samples[2].gracefulClose.processTreeExited = false;
+  assert.match(errorsFor(lingeringProcessTree).join(' '), /warm-start threshold/u);
+
+  const hiddenRawSample = structuredClone(valid);
+  hiddenRawSample.performance.sampleInteractiveReadyMs[1] = 100;
+  assert.match(errorsFor(hiddenRawSample).join(' '), /warm-start threshold/u);
+
+  const inconsistentPhase = structuredClone(valid);
+  inconsistentPhase.performance.samples[1].phasesMs.applicationShellToFontsReady += 1;
+  assert.match(errorsFor(inconsistentPhase).join(' '), /warm-start threshold/u);
 });
 
 test('LAN and expanded-limit performance caps are exclusive at their boundaries', () => {

@@ -334,6 +334,89 @@ export const buildPublicValidationEnvironment = ({
 const jsonEqual = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 const safeNumber = (value, minimum = 0) => Number.isFinite(value) && value >= minimum;
+const approximatelyEqual = (left, right, tolerance = 0.01) =>
+  safeNumber(left) && safeNumber(right) && Math.abs(left - right) <= tolerance;
+
+const validUiLaunchSample = (sample, role, ordinal) => {
+  const milestones = sample?.milestonesMs;
+  const phases = sample?.phasesMs;
+  return (
+    sample?.role === role &&
+    sample?.ordinal === ordinal &&
+    safeNumber(sample?.interactiveReadyMs) &&
+    sample?.recoveryCandidatesAtReady === 0 &&
+    sample?.profileReusedForMeasuredLaunch === true &&
+    typeof sample?.documentName === 'string' &&
+    sample.documentName.length > 0 &&
+    safeNumber(milestones?.debuggingPort) &&
+    safeNumber(milestones?.rendererTarget) &&
+    safeNumber(milestones?.applicationShell) &&
+    milestones?.fontsReady === sample.interactiveReadyMs &&
+    milestones.debuggingPort <= milestones.rendererTarget &&
+    milestones.rendererTarget <= milestones.applicationShell &&
+    milestones.applicationShell <= milestones.fontsReady &&
+    safeNumber(phases?.spawnToDebuggingPort) &&
+    safeNumber(phases?.debuggingPortToRendererTarget) &&
+    safeNumber(phases?.rendererTargetToApplicationShell) &&
+    safeNumber(phases?.applicationShellToFontsReady) &&
+    approximatelyEqual(phases.spawnToDebuggingPort, milestones.debuggingPort) &&
+    approximatelyEqual(
+      phases.debuggingPortToRendererTarget,
+      milestones.rendererTarget - milestones.debuggingPort,
+    ) &&
+    approximatelyEqual(
+      phases.rendererTargetToApplicationShell,
+      milestones.applicationShell - milestones.rendererTarget,
+    ) &&
+    approximatelyEqual(
+      phases.applicationShellToFontsReady,
+      milestones.fontsReady - milestones.applicationShell,
+    ) &&
+    sample?.gracefulClose?.requestedViaNativeWindowClose === true &&
+    (sample.gracefulClose.unsavedChoice === 'discard' ||
+      sample.gracefulClose.unsavedChoice === 'not-required') &&
+    sample.gracefulClose.processExited === true &&
+    sample.gracefulClose.exitCode === 0 &&
+    sample.gracefulClose.signalCode === null &&
+    Number.isInteger(sample.gracefulClose.processTreeSize) &&
+    sample.gracefulClose.processTreeSize >= 1 &&
+    sample.gracefulClose.processTreeExited === true &&
+    sample.gracefulClose.recoveryArtifactsRemoved === true
+  );
+};
+
+const validUiPerformanceReport = (performance) => {
+  const samples = performance?.samples;
+  if (
+    performance?.measurement !== 'median-of-three-clean-warm-starts-same-profile' ||
+    performance?.aggregation !== 'median' ||
+    performance?.sampleCount !== 3 ||
+    performance?.warmStartBudgetMs !== 3_000 ||
+    performance?.withinWarmStartBudget !== true ||
+    !Array.isArray(samples) ||
+    samples.length !== 3 ||
+    !validUiLaunchSample(samples[0], 'probe', 1) ||
+    !validUiLaunchSample(samples[1], 'probe', 2) ||
+    !validUiLaunchSample(samples[2], 'functional', 3) ||
+    !validUiLaunchSample(performance?.warmup, 'warmup', 0)
+  ) {
+    return false;
+  }
+  const values = samples.map((sample) => sample.interactiveReadyMs);
+  const median = [...values].sort((left, right) => left - right)[1];
+  const expectedAboveBudget = values.flatMap((interactiveReadyMs, index) =>
+    interactiveReadyMs > 3_000 ? [{ sample: index + 1, interactiveReadyMs }] : [],
+  );
+  return (
+    performance.interactiveReadyMs === median &&
+    performance.interactiveReadyMs <= 3_000 &&
+    JSON.stringify(performance.sampleInteractiveReadyMs) === JSON.stringify(values) &&
+    JSON.stringify(performance.samplesAboveBudget) === JSON.stringify(expectedAboveBudget) &&
+    Array.isArray(performance.warnings) &&
+    performance.warnings.length === expectedAboveBudget.length &&
+    performance.warnings.every((warning) => typeof warning === 'string' && warning.length > 0)
+  );
+};
 const validDate = (value) =>
   typeof value === 'string' && ISO_DATE.test(value) && Number.isFinite(Date.parse(value));
 
@@ -1010,8 +1093,7 @@ export const gateReportErrors = ({
     if (
       report.passed !== true ||
       report.launchMode !== 'packaged-executable' ||
-      report.performance?.withinWarmStartBudget !== true ||
-      !safeNumber(report.performance?.interactiveReadyMs) ||
+      !validUiPerformanceReport(report.performance) ||
       !Array.isArray(report.checks) ||
       report.checks.length < 10
     ) {
@@ -1232,7 +1314,9 @@ export const gateReportErrors = ({
     if (
       ui?.passed !== true ||
       ui?.launchMode !== 'packaged-executable' ||
-      ui?.performance?.withinWarmStartBudget !== true ||
+      !validUiPerformanceReport(ui?.performance) ||
+      !Array.isArray(ui?.checks) ||
+      ui.checks.length < 10 ||
       !reportTimeWithinGate(ui, gate)
     ) {
       fail('installed UI child smoke did not pass');

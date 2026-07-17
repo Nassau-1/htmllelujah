@@ -14,6 +14,7 @@ import {
   regularFileIdentity,
   sha256File,
 } from '../apps/desktop/scripts/build-provenance-support.mjs';
+import { UI_SMOKE_TIMEOUT_MS } from '../apps/desktop/scripts/ui-smoke-performance.mjs';
 import { assertCandidateManifest } from './release-candidate-manifest.mjs';
 import { captureSourceSnapshot, gitSourceState } from './release-source-state.mjs';
 import {
@@ -333,7 +334,7 @@ export const buildCandidateValidationPlan = ({
       command: node,
       args: [desktopScript('smoke-ui-electron.mjs')],
       env: commonEnv,
-      timeoutMs: 6 * 60_000,
+      timeoutMs: UI_SMOKE_TIMEOUT_MS,
       outputs: [
         output(evidenceDirectory, 'v1-editor-electron.json', 'report'),
         output(evidenceDirectory, 'v1-editor-electron.png', 'screenshot'),
