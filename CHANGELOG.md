@@ -80,6 +80,8 @@ No user-facing change is queued after the V1 release candidate.
   within the legacy Windows path budget used by the unsigned V1 builder.
 - Chained installer-cancellation association rollback through MUI2's supported abort
   hook so the assisted NSIS installer compiles without redefining its native callback.
+- Compared release-inventory confirmation paths in the same global order as their
+  hashes, avoiding false mutation alarms for sibling files and prefixed directories.
 
 ### Known V1 boundaries
 

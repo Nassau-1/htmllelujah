@@ -11,6 +11,7 @@ import {
   DESKTOP_BUILD_COMMAND,
   WINDOWS_CANDIDATE_BUILD_COMMAND,
   assertBuildProvenance,
+  buildDirectoryInventory,
   gitSourceState,
   readPackagedBuildProvenance,
 } from '../scripts/build-provenance-support.mjs';
@@ -202,6 +203,25 @@ describe('release build provenance', () => {
     await asar.createPackage(input, archive);
 
     expect(readPackagedBuildProvenance(archive, desktopRoot)).toEqual(provenance);
+  });
+
+  it('confirms a stable nested inventory in the same global order as its hashes', async () => {
+    const fixture = await mkdtemp(path.join(os.tmpdir(), 'htmllelujah-inventory-order-'));
+    temporaryRoots.push(fixture);
+    await mkdir(path.join(fixture, 'resources'), { recursive: true });
+    await writeFile(path.join(fixture, 'resources.pak'), 'root resource\n');
+    await writeFile(path.join(fixture, 'resources', 'app.asar'), 'nested resource\n');
+    await writeFile(path.join(fixture, 'snapshot_blob.bin'), 'snapshot\n');
+
+    const inventory = await buildDirectoryInventory(fixture);
+
+    expect(inventory.files.map((entry) => entry.path)).toEqual([
+      'resources.pak',
+      'resources/app.asar',
+      'snapshot_blob.bin',
+    ]);
+    expect(inventory.fileCount).toBe(3);
+    expect(await buildDirectoryInventory(fixture)).toEqual(inventory);
   });
 
   it('pins public packaging scripts to the detached release orchestrator', async () => {

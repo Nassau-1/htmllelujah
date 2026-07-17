@@ -43,6 +43,7 @@ export const regularFileIdentity = async (filePath, minimumSize = 1) => {
 };
 
 const normalizePath = (value) => value.split(path.sep).join('/');
+const compareEnglishPaths = (left, right) => left.localeCompare(right, 'en');
 
 export const aggregateInventory = (entries, stripPrefix = '') => {
   const digest = createHash('sha256');
@@ -91,7 +92,7 @@ export const buildDirectoryInventory = async (root) => {
     }
   };
   await visit(resolvedRoot);
-  files.sort((left, right) => left.path.localeCompare(right.path, 'en'));
+  files.sort((left, right) => compareEnglishPaths(left.path, right.path));
   const confirmation = [];
   const collectPaths = async (directory) => {
     const entries = await readdir(directory, { withFileTypes: true });
@@ -106,7 +107,12 @@ export const buildDirectoryInventory = async (root) => {
     }
   };
   await collectPaths(resolvedRoot);
-  if (confirmation.join('\n') !== files.map((entry) => entry.path).join('\n')) {
+  confirmation.sort(compareEnglishPaths);
+  const expectedPaths = files.map((entry) => entry.path);
+  if (
+    confirmation.length !== expectedPaths.length ||
+    confirmation.some((entry, index) => entry !== expectedPaths[index])
+  ) {
     throw new Error('Release file set changed while it was inventoried.');
   }
   return {
