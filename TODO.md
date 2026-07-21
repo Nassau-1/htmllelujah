@@ -134,6 +134,15 @@ reported as passed until their results are recorded.
       V1 rejects them safely and leaves the source unchanged.
 - [ ] Add caret-range rich-text formatting and disconnected text merge after a
       separate editing/undo contract is approved.
+- [ ] Return the instrumented packaged warm-start median to the three-second target
+      by overlapping renderer loading with fail-safe session initialization and
+      covering close-before-initialize plus orphan-journal cleanup races.
+- [ ] Reuse already validated document projections and virtualize slide thumbnails
+      so large decks do not repeat full-deck validation or mount every thumbnail at
+      initial render.
+- [ ] Harden exceptional Windows validation-harness cleanup by snapshotting descendant
+      process IDs and proving pipe closure after a forced timeout; normal release probes
+      already prove native close and complete process-tree exit.
 
 ## Explicitly deferred
 

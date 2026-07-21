@@ -7,7 +7,11 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { buildDirectoryInventory } from '../apps/desktop/scripts/build-provenance-support.mjs';
-import { UI_SMOKE_TIMEOUT_MS } from '../apps/desktop/scripts/ui-smoke-performance.mjs';
+import {
+  UI_SMOKE_TIMEOUT_MS,
+  WARM_START_BUDGET_MS,
+  WARM_START_TARGET_MS,
+} from '../apps/desktop/scripts/ui-smoke-performance.mjs';
 import {
   DEFAULT_LAN_DURATION_MS,
   EXTERNAL_VALIDATION_LIMITATIONS,
@@ -100,11 +104,14 @@ const uiReport = (testedAt = FIXTURE_CLOCK_START) => ({
   launchMode: 'packaged-executable',
   performance: {
     interactiveReadyMs: 100,
-    warmStartBudgetMs: 3_000,
+    warmStartTargetMs: WARM_START_TARGET_MS,
+    warmStartBudgetMs: WARM_START_BUDGET_MS,
+    withinWarmStartTarget: true,
     withinWarmStartBudget: true,
     aggregation: 'median',
     sampleCount: 3,
     sampleInteractiveReadyMs: [100, 110, 90],
+    samplesAboveTarget: [],
     samplesAboveBudget: [],
     measurement: 'median-of-three-clean-warm-starts-same-profile',
     samples: [

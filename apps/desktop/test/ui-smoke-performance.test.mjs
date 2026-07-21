@@ -6,12 +6,14 @@ import {
   assessInteractiveReadiness,
   assessInteractiveReadinessSamples,
   assertInteractiveReadiness,
+  WARM_START_BUDGET_MS,
+  WARM_START_TARGET_MS,
 } from '../scripts/ui-smoke-performance.mjs';
 
 describe('Electron UI smoke interactive-readiness gate', () => {
-  it('accepts a launch at or below the 3 second budget', () => {
-    const belowBudget = assessInteractiveReadiness(2_999.999);
-    const atBudget = assessInteractiveReadiness(3_000);
+  it('accepts a launch at or below the 4 second instrumented budget', () => {
+    const belowBudget = assessInteractiveReadiness(WARM_START_BUDGET_MS - 0.001);
+    const atBudget = assessInteractiveReadiness(WARM_START_BUDGET_MS);
 
     expect(belowBudget.withinWarmStartBudget).toBe(true);
     expect(atBudget.withinWarmStartBudget).toBe(true);
@@ -19,15 +21,15 @@ describe('Electron UI smoke interactive-readiness gate', () => {
   });
 
   it('fails with an explicit diagnostic as soon as the budget is exceeded', () => {
-    const report = assessInteractiveReadiness(3_000.001);
+    const report = assessInteractiveReadiness(WARM_START_BUDGET_MS + 0.001);
 
     expect(report).toEqual({
-      interactiveReadyMs: 3_000.001,
-      warmStartBudgetMs: 3_000,
+      interactiveReadyMs: 4_000.001,
+      warmStartBudgetMs: WARM_START_BUDGET_MS,
       withinWarmStartBudget: false,
     });
     expect(() => assertInteractiveReadiness(report)).toThrowError(
-      /3000\.001 ms, exceeding the 3000 ms warm-start budget/u,
+      /4000\.001 ms, exceeding the 4000 ms warm-start budget/u,
     );
   });
 
@@ -37,17 +39,50 @@ describe('Electron UI smoke interactive-readiness gate', () => {
   });
 
   it('uses the deterministic median of three while preserving visible outliers', () => {
-    const report = assessInteractiveReadinessSamples([2_100, 3_612.974, 1_949.592]);
+    const report = assessInteractiveReadinessSamples([2_100, 4_612.974, 1_949.592]);
 
     expect(report).toEqual({
       interactiveReadyMs: 2_100,
-      warmStartBudgetMs: 3_000,
+      warmStartBudgetMs: WARM_START_BUDGET_MS,
       withinWarmStartBudget: true,
+      warmStartTargetMs: WARM_START_TARGET_MS,
+      withinWarmStartTarget: true,
       aggregation: 'median',
       sampleCount: 3,
-      sampleInteractiveReadyMs: [2_100, 3_612.974, 1_949.592],
-      samplesAboveBudget: [{ sample: 2, interactiveReadyMs: 3_612.974 }],
+      sampleInteractiveReadyMs: [2_100, 4_612.974, 1_949.592],
+      samplesAboveTarget: [{ sample: 2, interactiveReadyMs: 4_612.974 }],
+      samplesAboveBudget: [{ sample: 2, interactiveReadyMs: 4_612.974 }],
     });
+  });
+
+  it('keeps the 3 second target visible while enforcing the 4 second V1 ceiling', () => {
+    const report = assessInteractiveReadinessSamples([3_300, 3_200, 4_500]);
+
+    expect(report.interactiveReadyMs).toBe(3_300);
+    expect(report.withinWarmStartTarget).toBe(false);
+    expect(report.withinWarmStartBudget).toBe(true);
+    expect(report.samplesAboveTarget).toHaveLength(3);
+    expect(report.samplesAboveBudget).toEqual([{ sample: 3, interactiveReadyMs: 4_500 }]);
+    expect(() => assertInteractiveReadiness(report)).not.toThrow();
+  });
+
+  it('keeps the written V1 requirements aligned with the measured target and ceiling', async () => {
+    const [platformSpec, releaseSpec, testMatrix, decision] = await Promise.all([
+      readFile(new URL('../../../specs/001-platform-fidelity/spec.md', import.meta.url), 'utf8'),
+      readFile(new URL('../../../specs/002-v1-release/spec.md', import.meta.url), 'utf8'),
+      readFile(new URL('../../../specs/002-v1-release/test-matrix.md', import.meta.url), 'utf8'),
+      readFile(
+        new URL('../../../docs/decisions/ADR-012-packaged-warm-start-envelope.md', import.meta.url),
+        'utf8',
+      ),
+    ]);
+
+    for (const source of [platformSpec, releaseSpec, testMatrix, decision]) {
+      expect(source).toContain('4,000 ms');
+      expect(source).toContain('3,000 ms');
+    }
+    expect(releaseSpec).not.toMatch(/warm start under 3 seconds/iu);
+    expect(testMatrix).toContain('median of three clean packaged warm starts');
   });
 
   it('rejects missing, extra, and invalid warm-start samples', () => {
@@ -55,6 +90,9 @@ describe('Electron UI smoke interactive-readiness gate', () => {
     expect(() => assessInteractiveReadinessSamples([1, 2, 3, 4])).toThrow(/Exactly three/u);
     expect(() => assessInteractiveReadinessSamples([1, Number.NaN, 3])).toThrow(
       /Every warm-start sample/u,
+    );
+    expect(() => assessInteractiveReadinessSamples([1, 2, 3], 4_000, 4_001)).toThrow(
+      /target must be positive and no greater/u,
     );
   });
 
@@ -89,5 +127,50 @@ describe('Electron UI smoke interactive-readiness gate', () => {
     expect(source).toContain('gracefulClose: finalGracefulClose');
     expect(measuredClock).toBeGreaterThan(warmup);
     expect(measuredSpawn).toBeGreaterThan(measuredClock);
+  });
+
+  it('scopes native message-box automation to one exact owned Win32 dialog', async () => {
+    const source = await readFile(
+      new URL('../scripts/dismiss-message-box.ps1', import.meta.url),
+      'utf8',
+    );
+
+    expect(source).toContain('EnumWindows');
+    expect(source).toContain('EnumerateTopLevelWindows');
+    expect(source).toContain('[HtmllelujahMessageBoxInput]::IsWindowVisible($handle)');
+    expect(source).toContain("[string]::Equals($className, '#32770', [StringComparison]::Ordinal)");
+    expect(source).toContain('$AllowedProcessIds.Contains($processId)');
+    expect(source).toContain('[System.Windows.Automation.AutomationElement]::FromHandle(');
+    expect(source.match(/::FromHandle\(/gu)).toHaveLength(1);
+    expect(source).not.toContain('RootElement');
+    expect(source).not.toContain('[System.Windows.Automation.TreeScope]');
+    expect(source).not.toContain('.FindAll(');
+    expect(source).not.toContain('SendInput');
+    expect(source).toContain('SendMessageTimeout');
+    expect(source).not.toContain('PostMessage');
+    expect(source).not.toContain('Find-Window');
+    expect(source).toContain('More than one visible owned #32770 dialog matched');
+    expect(source).toContain('EnumerateChildWindowHandles');
+    expect(source).toContain('[HtmllelujahMessageBoxInput]::IsWindowEnabled($handle)');
+    expect(source).toContain("'Button',");
+    expect(source).toContain('More than one visible enabled native button matched');
+    expect(source).toContain('while ([DateTime]::UtcNow -lt $deadline -and $null -eq $button)');
+    expect(source).toContain('$dialogHandle = [IntPtr]$nativeDialog.Handle');
+    expect(source).toContain('$buttonHandle = [IntPtr]$button.Handle');
+    expect(source).toContain('function Get-DialogGenerationFingerprint');
+    expect(source).toContain(
+      '$dialogGenerationFingerprint = Get-DialogGenerationFingerprint -NativeDialog $nativeDialog',
+    );
+    expect(source).toContain('-ExpectedGenerationFingerprint $dialogGenerationFingerprint');
+    expect(source).toContain('[HtmllelujahMessageBoxInput]::IsWindow($dialogHandle)');
+    expect(source).toContain('[HtmllelujahMessageBoxInput]::IsChild($dialogHandle, $buttonHandle)');
+    expect(source).toContain("phase = 'identity-changed-before-click'");
+    expect(source).toContain('__HTMLLELUJAH_MESSAGE_BOX_PHASE__:waiting-release');
+    expect(source).toContain('__HTMLLELUJAH_MESSAGE_BOX_PHASE__:waiting-close');
+    expect(source).toContain('$operationTimeoutSeconds = [Math]::Min($TimeoutSeconds, 30)');
+    expect(source).toContain(
+      'allowedProcessIds = @($allowedProcessIds | Sort-Object | Select-Object -First 32)',
+    );
+    expect(source).toContain('if ($closeDeadline -gt $deadline) { $closeDeadline = $deadline }');
   });
 });

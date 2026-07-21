@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -8,6 +8,8 @@ import { LocalRpcClient } from '@htmllelujah/mcp-server';
 import {
   assessInteractiveReadinessSamples,
   assertInteractiveReadiness,
+  WARM_START_BUDGET_MS,
+  WARM_START_TARGET_MS,
 } from './ui-smoke-performance.mjs';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
@@ -59,21 +61,14 @@ const waitForExit = (child, timeoutMs) => {
 
 const terminate = async (child, label = 'Electron process') => {
   if (hasExited(child) || child.pid === undefined) return;
+  let taskkillResult;
   if (process.platform === 'win32' && child.pid !== undefined) {
-    const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+    taskkillResult = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
       windowsHide: true,
       stdio: 'ignore',
+      timeout: 10_000,
     });
-    await new Promise((resolve) => {
-      const timer = setTimeout(resolve, 5_000);
-      const finish = () => {
-        clearTimeout(timer);
-        resolve();
-      };
-      killer.once('error', finish);
-      killer.once('exit', finish);
-    });
-    if (await waitForExit(child, 2_000)) return;
+    if (await waitForExit(child, 5_000)) return;
   }
 
   try {
@@ -94,12 +89,28 @@ const terminate = async (child, label = 'Electron process') => {
   child.stdout?.destroy();
   child.stderr?.destroy();
   child.unref();
-  throw new Error(`${label} did not exit within the termination deadline.`);
+  throw new Error(
+    `${label} did not exit within the termination deadline.` +
+      (taskkillResult === undefined
+        ? ''
+        : ` taskkill status=${taskkillResult.status ?? 'none'} signal=${taskkillResult.signal ?? 'none'} error=${taskkillResult.error?.message ?? 'none'}.`),
+  );
 };
 
-const automateFileDialog = (rootProcessId, windowTitle, targetPath) =>
-  new Promise((resolve, reject) => {
-    const child = spawn(
+const automateFileDialog = (rootProcessId, windowTitle, targetPath) => {
+  let child;
+  let cancelled = false;
+  let timedOut = false;
+  let termination;
+  let stdout = '';
+  let stderr = '';
+  const stopAutomation = () => {
+    if (child === undefined || hasExited(child)) return Promise.resolve();
+    termination ??= terminate(child, `Native file-dialog automation for "${windowTitle}"`);
+    return termination;
+  };
+  const completion = new Promise((resolve, reject) => {
+    child = spawn(
       'powershell.exe',
       [
         '-NoProfile',
@@ -118,24 +129,70 @@ const automateFileDialog = (rootProcessId, windowTitle, targetPath) =>
       ],
       { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
     );
-    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout = (stdout + chunk.toString('utf8')).slice(-2_000);
+    });
     child.stderr.on('data', (chunk) => {
       stderr = (stderr + chunk.toString('utf8')).slice(-2_000);
     });
     const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error('Native file-dialog automation timed out.'));
+      timedOut = true;
+      const diagnostics = [stdout.trim(), stderr.trim()].filter(Boolean).join(' | ');
+      void stopAutomation().then(
+        () => {
+          if (cancelled) resolve();
+          else
+            reject(
+              new Error(
+                `Native file-dialog automation timed out for "${windowTitle}".` +
+                  (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
+              ),
+            );
+        },
+        (terminationError) =>
+          reject(
+            new AggregateError(
+              [terminationError],
+              `Native file-dialog automation timed out for "${windowTitle}" and its process tree could not be drained.` +
+                (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
+            ),
+          ),
+      );
     }, 45_000);
     child.once('error', (error) => {
       clearTimeout(timer);
-      reject(error);
+      if (timedOut) return;
+      if (cancelled) resolve();
+      else reject(error);
     });
-    child.once('exit', (code, signal) => {
+    child.once('close', (code, signal) => {
       clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`Native file-dialog automation exited ${code ?? signal}. ${stderr}`));
+      if (timedOut) return;
+      if (cancelled || code === 0) resolve();
+      else {
+        const diagnostics = [stdout.trim(), stderr.trim()].filter(Boolean).join(' | ');
+        reject(
+          new Error(
+            `Native file-dialog automation for "${windowTitle}" exited ${code ?? signal}.` +
+              (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
+          ),
+        );
+      }
     });
   });
+  void completion.catch(() => undefined);
+  const cancel = async () => {
+    if (cancelled) {
+      await stopAutomation();
+      await Promise.allSettled([completion]);
+      return;
+    }
+    cancelled = true;
+    await stopAutomation();
+    await Promise.allSettled([completion]);
+  };
+  return Object.assign(completion, { cancel });
+};
 
 const automateMessageBox = (
   rootProcessId,
@@ -146,8 +203,17 @@ const automateMessageBox = (
 ) => {
   let child;
   let cancelled = false;
+  let timedOut = false;
+  let termination;
   let signalReady;
   let readySignaled = false;
+  let stdout = '';
+  let stderr = '';
+  const stopAutomation = () => {
+    if (child === undefined || hasExited(child)) return Promise.resolve();
+    termination ??= terminate(child, `Native message-box automation for "${windowTitle}"`);
+    return termination;
+  };
   const ready = new Promise((resolve) => {
     signalReady = (value) => {
       if (readySignaled) return;
@@ -179,8 +245,6 @@ const automateMessageBox = (
       ],
       { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
     );
-    let stdout = '';
-    let stderr = '';
     child.stdout.on('data', (chunk) => {
       stdout = (stdout + chunk.toString('utf8')).slice(-2_000);
       if (stdout.includes('__HTMLLELUJAH_MESSAGE_BOX_READY__')) signalReady(true);
@@ -189,39 +253,67 @@ const automateMessageBox = (
       stderr = (stderr + chunk.toString('utf8')).slice(-2_000);
     });
     const timer = setTimeout(() => {
-      child.kill();
+      timedOut = true;
       signalReady(false);
-      if (cancelled) {
-        resolve();
-        return;
-      }
-      reject(new Error(`Native message-box automation timed out for "${windowTitle}".`));
+      const diagnostics = [stdout.trim(), stderr.trim()].filter(Boolean).join(' | ');
+      void stopAutomation().then(
+        () => {
+          if (cancelled) resolve();
+          else
+            reject(
+              new Error(
+                `Native message-box automation timed out for "${windowTitle}".` +
+                  (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
+              ),
+            );
+        },
+        (terminationError) =>
+          reject(
+            new AggregateError(
+              [terminationError],
+              `Native message-box automation timed out for "${windowTitle}" and its process tree could not be drained.` +
+                (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
+            ),
+          ),
+      );
     }, 45_000);
     child.once('error', (error) => {
       clearTimeout(timer);
       signalReady(false);
+      if (timedOut) return;
       if (cancelled) resolve();
       else reject(error);
     });
     child.once('close', (code, signal) => {
       clearTimeout(timer);
       if (!readySignaled) signalReady(false);
+      if (timedOut) return;
       if (cancelled || code === 0) resolve();
       else
         reject(
           new Error(
-            `Native message-box automation for "${windowTitle}" / "${buttonName}" exited ${code ?? signal}. ${stderr}`,
+            `Native message-box automation for "${windowTitle}" / "${buttonName}" exited ${code ?? signal}.` +
+              ([stdout.trim(), stderr.trim()].filter(Boolean).length === 0
+                ? ''
+                : ` Diagnostics: ${[stdout.trim(), stderr.trim()].filter(Boolean).join(' | ')}`),
           ),
         );
     });
   });
-  const cancel = () => {
-    if (cancelled) return;
+  void completion.catch(() => undefined);
+  const cancel = async () => {
+    if (cancelled) {
+      await stopAutomation();
+      await Promise.allSettled([completion]);
+      return;
+    }
     cancelled = true;
     signalReady(false);
-    if (child !== undefined && !hasExited(child)) child.kill();
+    await stopAutomation();
+    await Promise.allSettled([completion]);
   };
-  return Object.assign(completion, { ready, cancel });
+  const diagnostics = () => [stdout.trim(), stderr.trim()].filter(Boolean).join(' | ');
+  return Object.assign(completion, { ready, cancel, diagnostics });
 };
 
 const requestNativeWindowClose = (rootProcessId) =>
@@ -518,8 +610,14 @@ const closeLaunchGracefully = async ({
       if (!(await discard.ready)) await discard;
       await discard;
     }
-    if (!(await waitForExit(child, 15_000))) {
-      throw new Error(`${label} did not exit after its native close request.`);
+    if (!(await waitForExit(child, 30_000))) {
+      const automationDiagnostics = discard?.diagnostics() ?? '';
+      throw new Error(
+        `${label} did not exit after its native close request.` +
+          (automationDiagnostics === ''
+            ? ''
+            : ` Native message-box diagnostics: ${automationDiagnostics}`),
+      );
     }
     if (child.exitCode !== 0 || child.signalCode !== null) {
       throw new Error(
@@ -528,8 +626,7 @@ const closeLaunchGracefully = async ({
     }
     await waitForProcessTreeExit(nativeClose.processIds, label);
   } finally {
-    discard?.cancel();
-    if (discard !== undefined) await Promise.allSettled([discard]);
+    if (discard !== undefined) await discard.cancel();
   }
   await assertRecoveryArtifactsRemoved(userData, sessionId, label);
   return {
@@ -575,6 +672,7 @@ const runCleanLaunchProbe = async ({
   });
 
   let launchCdp;
+  let probeError;
   try {
     const debuggingPort = await waitForDebuggingPort(
       child,
@@ -655,13 +753,26 @@ const runCleanLaunchProbe = async ({
       gracefulClose,
     };
   } catch (error) {
+    probeError = error;
     if (launchError !== '') {
       process.stderr.write(`[${label} desktop stderr]\n${launchError.slice(0, 4_000)}\n`);
     }
     throw error;
   } finally {
     launchCdp?.close();
-    if (!hasExited(child)) await terminate(child, `${label} process`);
+    if (!hasExited(child)) {
+      try {
+        await terminate(child, `${label} process`);
+      } catch (cleanupError) {
+        if (probeError !== undefined) {
+          throw new AggregateError(
+            [probeError, cleanupError],
+            `${label} failed and its process tree could not be drained.`,
+          );
+        }
+        throw cleanupError;
+      }
+    }
     await rm(debuggingPortPath, { force: true });
   }
 };
@@ -963,9 +1074,9 @@ try {
     ...readiness,
     measurement: 'median-of-three-clean-warm-starts-same-profile',
     samples: [...measuredProbeEvidence, functionalPerformanceSample],
-    warnings: readiness.samplesAboveBudget.map(
+    warnings: readiness.samplesAboveTarget.map(
       (sample) =>
-        `Warm-start sample ${sample.sample} took ${sample.interactiveReadyMs} ms, above the 3000 ms budget.`,
+        `Warm-start sample ${sample.sample} took ${sample.interactiveReadyMs} ms, above the ${WARM_START_TARGET_MS} ms optimization target; the blocking V1 ceiling is ${WARM_START_BUDGET_MS} ms.`,
     ),
     warmup: warmupEvidence,
   };
@@ -1198,7 +1309,19 @@ try {
 
   if (application.pid === undefined) throw new Error('The Electron process ID is unavailable.');
   const imageDialog = automateFileDialog(application.pid, 'Insert image', imageFixturePath);
-  await clickWithPointer('[aria-label="Add image"]', 'Add image');
+  try {
+    await clickWithPointer('[aria-label="Add image"]', 'Add image');
+  } catch (error) {
+    try {
+      await imageDialog.cancel();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        'Add image failed and its native file-dialog automation could not be drained.',
+      );
+    }
+    throw error;
+  }
   await imageDialog;
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 2}`,
@@ -1724,21 +1847,33 @@ try {
     'Save presentation',
     closeHandshakeDeckPath,
   );
-  await clickButtonWithText('File', 'File menu before close-handshake save');
-  await waitForRenderer(
-    `document.querySelector('[role="menu"][aria-label="File menu"]') !== null`,
-    'File menu before close-handshake save',
-  );
-  const savedBeforeClose = await evaluate(`(() => {
-    const element = [...document.querySelectorAll(
-      '[role="menu"][aria-label="File menu"] button',
-    )].find((candidate) => candidate.textContent?.trim().startsWith('Save as'));
-    if (!(element instanceof HTMLButtonElement) || element.disabled) return false;
-    element.click();
-    return true;
-  })()`);
-  await saveBeforeCloseDialog;
-  if (!savedBeforeClose) throw new Error('The close-handshake baseline could not be saved.');
+  try {
+    await clickButtonWithText('File', 'File menu before close-handshake save');
+    await waitForRenderer(
+      `document.querySelector('[role="menu"][aria-label="File menu"]') !== null`,
+      'File menu before close-handshake save',
+    );
+    const savedBeforeClose = await evaluate(`(() => {
+      const element = [...document.querySelectorAll(
+        '[role="menu"][aria-label="File menu"] button',
+      )].find((candidate) => candidate.textContent?.trim().startsWith('Save as'));
+      if (!(element instanceof HTMLButtonElement) || element.disabled) return false;
+      element.click();
+      return true;
+    })()`);
+    if (!savedBeforeClose) throw new Error('The close-handshake baseline could not be saved.');
+    await saveBeforeCloseDialog;
+  } catch (error) {
+    try {
+      await saveBeforeCloseDialog.cancel();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        'Save presentation failed and its native file-dialog automation could not be drained.',
+      );
+    }
+    throw error;
+  }
   await waitForRenderer(
     `document.querySelector('.save-state.is-saved') !== null`,
     'Clean close-handshake baseline',
@@ -1792,8 +1927,7 @@ try {
     await acknowledgeInvalidFieldFailure;
   } finally {
     if (applicationExitListener !== undefined) application.off('exit', applicationExitListener);
-    acknowledgeInvalidFieldFailure.cancel();
-    await Promise.allSettled([acknowledgeInvalidFieldFailure]);
+    await acknowledgeInvalidFieldFailure.cancel();
   }
   const rejectedThemeCommitRetainedWindow = await evaluate(`(async () => {
     const initialized = await window.htmllelujah.initialize();
@@ -1868,9 +2002,7 @@ try {
     }
     await cancelFocusedCellDialog;
   } finally {
-    cancelFocusedCellDialog.cancel();
-    acknowledgeFocusedCellFailure.cancel();
-    await Promise.allSettled([cancelFocusedCellDialog, acknowledgeFocusedCellFailure]);
+    await Promise.all([cancelFocusedCellDialog.cancel(), acknowledgeFocusedCellFailure.cancel()]);
   }
   await waitForRenderer(
     `document.querySelector('.app-shell') !== null &&
@@ -1927,9 +2059,7 @@ try {
     }
     await cancelUnsavedDialog;
   } finally {
-    cancelUnsavedDialog.cancel();
-    acknowledgeHandshakeFailure.cancel();
-    await Promise.allSettled([cancelUnsavedDialog, acknowledgeHandshakeFailure]);
+    await Promise.all([cancelUnsavedDialog.cancel(), acknowledgeHandshakeFailure.cancel()]);
   }
   await waitForRenderer(
     `document.querySelector('.app-shell') !== null &&
@@ -1990,9 +2120,7 @@ try {
       throw new Error('Stale Discard consent removed a concurrent agent mutation.');
     }
   } finally {
-    discardStaleSnapshot.cancel();
-    acknowledgeRetainedWindow.cancel();
-    await Promise.allSettled([discardStaleSnapshot, acknowledgeRetainedWindow]);
+    await Promise.all([discardStaleSnapshot.cancel(), acknowledgeRetainedWindow.cancel()]);
   }
   await closeRaceRpc.close();
   closeRaceRpc = undefined;

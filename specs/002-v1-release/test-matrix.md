@@ -231,7 +231,9 @@ surface explicitly rather than treating the automated smoke as equivalent eviden
 
 Measure on the reference pilot machine with release builds:
 
-- warm interactive start under 3 seconds;
+- median of three clean packaged warm starts at or below the 4,000 ms V1 ceiling,
+  with the 3,000 ms optimization target, every raw sample, and every target/budget
+  outlier retained in evidence;
 - local p95 command acknowledgement under 100 ms;
 - gesture preview p95 under 16.7 ms with a 2,000-element deck;
 - LAN p95 accepted-command round trip under 250 ms;

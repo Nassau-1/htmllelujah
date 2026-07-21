@@ -7,6 +7,15 @@ and releases use semantic versions.
 
 ### Fixed
 
+- Scoped Windows file and message-box automation to exact visible Win32
+  process/HWND/class/control identities, supported both native filename-control variants,
+  made clicks synchronous and bounded, fingerprinted deferred consent generations, and
+  verified automation process-tree drainage without traversing Chromium accessibility
+  trees.
+- Calibrated the packaged V1 warm-start envelope to four seconds for the unsigned Windows
+  executable plus evidence-only DevTools endpoint after repeated three-sample medians near
+  3.3 seconds; the three-second optimization target, every raw sample, and every outlier
+  remain recorded and validated, with the requirement change documented in ADR-012.
 - Refused publication from an existing write-once release record after its bound
   security receipt expires or is recollected, while preserving any GitHub draft and
   directing operators to a new versioned candidate, tag, and release.

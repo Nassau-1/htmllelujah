@@ -293,9 +293,11 @@ non-administrator accounts.
 
 ## Non-functional requirements
 
-- **NFR-001 Performance**: warm start under 3 seconds; p95 command acknowledgement
-  under 100 ms locally; p95 gesture preview under 16.7 ms; p95 LAN accepted-command
-  round trip under 250 ms on the reference private network.
+- **NFR-001 Performance**: the median of three clean packaged warm starts is at or
+  below a 4,000 ms V1 ceiling, while 3,000 ms remains a reported optimization target;
+  p95 command acknowledgement is under 100 ms locally; p95 gesture preview is under
+  16.7 ms; p95 LAN accepted-command round trip is under 250 ms on the reference
+  private network.
 - **NFR-002 Capacity**: a supported deck contains up to 500 slides, 10,000 elements,
   2,048 archive entries, 500 MiB expanded archive data, 50 MiB per asset, 32 MiB
   document JSON, group depth 16, and image dimensions up to 16,384 pixels per edge

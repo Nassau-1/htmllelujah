@@ -99,10 +99,28 @@ const exists = async (filePath) => {
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
+const hasExited = (child) => child.exitCode !== null || child.signalCode !== null;
+
+const waitForChildExit = (child, timeoutMs) => {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.off('exit', onExit);
+      resolve(hasExited(child));
+    }, timeoutMs);
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    child.once('exit', onExit);
+  });
+};
+
 const terminateTree = async (child) => {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (hasExited(child)) return;
+  let taskkillResult;
   if (process.platform === 'win32' && child.pid !== undefined) {
-    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+    taskkillResult = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
       windowsHide: true,
       stdio: 'ignore',
       timeout: 10_000,
@@ -110,12 +128,19 @@ const terminateTree = async (child) => {
   } else {
     child.kill('SIGTERM');
   }
-  await Promise.race([
-    new Promise((resolve) => child.once('exit', resolve)),
-    sleep(5_000).then(() => {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    }),
-  ]);
+  if (await waitForChildExit(child, 5_000)) return;
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // The verified exit check below remains authoritative.
+  }
+  if (await waitForChildExit(child, 3_000)) return;
+  throw new Error(
+    `Process tree ${child.pid ?? 'unknown'} did not drain after termination` +
+      (taskkillResult === undefined
+        ? '.'
+        : ` (taskkill status ${taskkillResult.status ?? 'none'}, signal ${taskkillResult.signal ?? 'none'}, error ${taskkillResult.error?.message ?? 'none'}).`),
+  );
 };
 
 const run = (command, arguments_, options = {}) =>
@@ -127,6 +152,7 @@ const run = (command, arguments_, options = {}) =>
     });
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
     child.stdout.on('data', (chunk) => {
       stdout = (stdout + chunk.toString('utf8')).slice(-4_000);
     });
@@ -134,27 +160,48 @@ const run = (command, arguments_, options = {}) =>
       stderr = (stderr + chunk.toString('utf8')).slice(-4_000);
     });
     const timer = setTimeout(() => {
-      if (child.pid !== undefined && process.platform === 'win32') {
-        spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
-          windowsHide: true,
-          stdio: 'ignore',
-          timeout: 5_000,
-        });
-      } else child.kill('SIGKILL');
-      reject(new Error(`${options.label ?? path.basename(command)} timed out.`));
+      timedOut = true;
+      const diagnostics = [stdout.trim(), stderr.trim()]
+        .filter(Boolean)
+        .map((value) => value.slice(-1_500))
+        .join(' | ');
+      void terminateTree(child).then(
+        () =>
+          reject(
+            new Error(
+              `${options.label ?? path.basename(command)} timed out.` +
+                (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
+            ),
+          ),
+        (terminationError) =>
+          reject(
+            new AggregateError(
+              [terminationError],
+              `${options.label ?? path.basename(command)} timed out and its process tree could not be drained.` +
+                (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
+            ),
+          ),
+      );
     }, options.timeoutMs ?? 45_000);
     child.once('error', (error) => {
       clearTimeout(timer);
+      if (timedOut) return;
       reject(error);
     });
-    child.once('exit', (code, signal) => {
+    child.once('close', (code, signal) => {
       clearTimeout(timer);
+      if (timedOut) return;
       if (code === 0) resolve({ stdout, stderr });
       else
         reject(
           new Error(
             `${options.label ?? path.basename(command)} exited ${code ?? signal}.` +
-              (stderr === '' ? '' : ` ${stderr.slice(-1_000)}`),
+              ([stdout.trim(), stderr.trim()].filter(Boolean).length === 0
+                ? ''
+                : ` Diagnostics: ${[stdout.trim(), stderr.trim()]
+                    .filter(Boolean)
+                    .map((value) => value.slice(-1_500))
+                    .join(' | ')}`),
           ),
         );
     });

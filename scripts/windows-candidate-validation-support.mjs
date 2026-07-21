@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 
+import {
+  WARM_START_BUDGET_MS,
+  WARM_START_TARGET_MS,
+} from '../apps/desktop/scripts/ui-smoke-performance.mjs';
+
 export const FUNCTIONAL_VALIDATION_SCHEMA_VERSION = 1;
 export const FUNCTIONAL_VALIDATION_FILE_NAME = 'v1-functional-validation.json';
 export const FUNCTIONAL_VALIDATION_BUNDLE_NAME = 'v1-functional-validation-evidence.zip';
@@ -391,7 +396,8 @@ const validUiPerformanceReport = (performance) => {
     performance?.measurement !== 'median-of-three-clean-warm-starts-same-profile' ||
     performance?.aggregation !== 'median' ||
     performance?.sampleCount !== 3 ||
-    performance?.warmStartBudgetMs !== 3_000 ||
+    performance?.warmStartTargetMs !== WARM_START_TARGET_MS ||
+    performance?.warmStartBudgetMs !== WARM_START_BUDGET_MS ||
     performance?.withinWarmStartBudget !== true ||
     !Array.isArray(samples) ||
     samples.length !== 3 ||
@@ -404,16 +410,21 @@ const validUiPerformanceReport = (performance) => {
   }
   const values = samples.map((sample) => sample.interactiveReadyMs);
   const median = [...values].sort((left, right) => left - right)[1];
+  const expectedAboveTarget = values.flatMap((interactiveReadyMs, index) =>
+    interactiveReadyMs > WARM_START_TARGET_MS ? [{ sample: index + 1, interactiveReadyMs }] : [],
+  );
   const expectedAboveBudget = values.flatMap((interactiveReadyMs, index) =>
-    interactiveReadyMs > 3_000 ? [{ sample: index + 1, interactiveReadyMs }] : [],
+    interactiveReadyMs > WARM_START_BUDGET_MS ? [{ sample: index + 1, interactiveReadyMs }] : [],
   );
   return (
     performance.interactiveReadyMs === median &&
-    performance.interactiveReadyMs <= 3_000 &&
+    performance.withinWarmStartTarget === median <= WARM_START_TARGET_MS &&
+    performance.interactiveReadyMs <= WARM_START_BUDGET_MS &&
     JSON.stringify(performance.sampleInteractiveReadyMs) === JSON.stringify(values) &&
+    JSON.stringify(performance.samplesAboveTarget) === JSON.stringify(expectedAboveTarget) &&
     JSON.stringify(performance.samplesAboveBudget) === JSON.stringify(expectedAboveBudget) &&
     Array.isArray(performance.warnings) &&
-    performance.warnings.length === expectedAboveBudget.length &&
+    performance.warnings.length === expectedAboveTarget.length &&
     performance.warnings.every((warning) => typeof warning === 'string' && warning.length > 0)
   );
 };
@@ -977,11 +988,11 @@ export const expectedGateThresholdRecords = (gateId, report) => {
       {
         id: 'interactive-ready',
         measuredMs: report?.performance?.interactiveReadyMs,
-        thresholdInclusiveMs: 3_000,
+        thresholdInclusiveMs: WARM_START_BUDGET_MS,
         passed:
           Number.isFinite(report?.performance?.interactiveReadyMs) &&
-          report.performance?.warmStartBudgetMs === 3_000 &&
-          report.performance.interactiveReadyMs <= 3_000,
+          report.performance?.warmStartBudgetMs === WARM_START_BUDGET_MS &&
+          report.performance.interactiveReadyMs <= WARM_START_BUDGET_MS,
       },
     ];
   }

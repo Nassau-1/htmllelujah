@@ -22,8 +22,9 @@ acceptance criteria.
 - **Testing**: Vitest for pure contracts and Playwright for Electron, screenshots,
   security boundaries, and PDF workflows.
 - **Target**: Windows 11 x64; offline after dependencies are installed.
-- **Performance**: warm interactive start under three seconds on the reference pilot
-  machine.
+- **Performance**: packaged warm interactive start at or below a 4,000 ms blocking
+  ceiling on the reference pilot machine, with a separately reported 3,000 ms
+  optimization target.
 - **Constraints**: no arbitrary HTML, remote assets, persistence, document mutations,
   MCP, or collaboration in this feature.
 

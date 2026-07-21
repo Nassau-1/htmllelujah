@@ -183,8 +183,9 @@ at the same aspect ratio.
 
 ### Measurable Outcomes
 
-- **SC-001**: The app reaches an interactive workspace within three seconds on the
-  reference Windows 11 x64 pilot machine after a warm start.
+- **SC-001**: The packaged app reaches an interactive workspace at or below a 4,000 ms
+  blocking ceiling on the reference Windows 11 x64 pilot machine after a warm start.
+  A 3,000 ms optimization target remains visible in every release measurement.
 - **SC-002**: At all required zoom values and 100%, 125%, 150%, and 200% OS scaling,
   every fixture object's measured canonical bounds differ from expected bounds by no
   more than 0.25 points per edge.

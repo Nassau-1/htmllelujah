@@ -268,6 +268,14 @@ packaged executable as a same-user Node runtime. This grants no elevation, but i
 an explicit V1 tradeoff; a dedicated signed helper should be evaluated for a later
 release. ADR-008 records the decision.
 
+## Packaged startup evidence
+
+The release harness measures exactly three clean warm starts of the real packaged
+executable, separated by native close, process-tree drainage, and recovery cleanup.
+The V1 blocking median is 4,000 ms while 3,000 ms remains a visible optimization
+target; raw samples and target/budget outliers are retained. See
+[`ADR-012`](decisions/ADR-012-packaged-warm-start-envelope.md).
+
 ## Packaging and distribution
 
 The Windows x64 build is packaged as an ASAR application and a per-user NSIS
