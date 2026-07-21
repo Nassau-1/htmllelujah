@@ -187,8 +187,9 @@ const connectRaw = async (
   closed: Promise<[number, Buffer]>;
 }> => {
   const socket = new WebSocket(rawUrl(invitation), {
-    // lgtm[js/disabling-certificate-validation] Test-only raw peer for the server's ephemeral
-    // self-signed certificate; production pin verification is exercised by createClient().
+    // Test-only raw peer for the server's ephemeral self-signed certificate; production pin
+    // verification is exercised by createClient().
+    // codeql[js/disabling-certificate-validation]
     rejectUnauthorized: false,
     perMessageDeflate: false,
     maxPayload: 1024 * 1024,
@@ -313,6 +314,8 @@ describe('WSS collaboration transport', () => {
     try {
       await expectRemoteCode(wrongSecret.connect(), 'AUTH_FAILED');
       await expectRemoteCode(wrongFingerprint.connect(), 'FINGERPRINT_MISMATCH');
+      await waitFor(() => server.connectionCount === 0);
+      expect(server.authenticatedPeerCount).toBe(0);
     } finally {
       await wrongSecret.close();
       await wrongFingerprint.close();
@@ -1293,8 +1296,9 @@ describe('WSS collaboration transport', () => {
       const partialTls = connectTls({
         host: invitation.host,
         port: invitation.port,
-        // lgtm[js/disabling-certificate-validation] Test-only incomplete TLS handshake against
-        // the local ephemeral self-signed server; no application data is accepted or sent.
+        // Test-only incomplete TLS handshake against the local ephemeral self-signed server; no
+        // application data is accepted or sent.
+        // codeql[js/disabling-certificate-validation]
         rejectUnauthorized: false,
       });
       sockets.push(partialTls);

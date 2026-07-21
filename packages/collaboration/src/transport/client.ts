@@ -230,9 +230,11 @@ export class CollaborationTransportClient {
       : this.invitation.host;
     const url = `wss://${formattedHost}:${this.invitation.port}/v1/session/${this.invitation.sessionId}`;
     const socket = new WebSocket(url, {
-      // lgtm[js/disabling-certificate-validation] The host uses an ephemeral self-signed
-      // certificate. Its out-of-band SHA-256 invitation pin is checked in constant time on the
-      // upgrade event below, before any authentication challenge or application frame is trusted.
+      // The host uses an ephemeral self-signed certificate. Its out-of-band SHA-256 invitation
+      // pin is checked in constant time on the upgrade event below. Authentication refuses to
+      // answer the challenge until that pin is verified, so no secret-derived proof or application
+      // frame is sent to an unpinned peer.
+      // codeql[js/disabling-certificate-validation]
       rejectUnauthorized: false,
       perMessageDeflate: false,
       maxPayload: this.maxPayloadBytes,
