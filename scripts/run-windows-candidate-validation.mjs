@@ -44,6 +44,11 @@ import {
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const defaultRepositoryRoot = path.resolve(scriptDirectory, '..');
 
+// `pnpm verify` intentionally repeats the full release-pipeline suite and the local license
+// inventory. The latter alone can take several minutes on Windows, so this gate needs enough
+// headroom for a busy but healthy release machine while remaining strictly bounded.
+export const SOURCE_VERIFY_TIMEOUT_MS = 60 * 60_000;
+
 const usage = () => `Usage: node scripts/run-windows-candidate-validation.mjs [options]
 
 Runs the V1 matrix bound to the exact promoted candidate. Packaged gates target the unpacked or
@@ -217,6 +222,11 @@ const terminateProcessTree = async (child) => {
       resolve();
     });
   });
+  if (child.exitCode === null && child.signalCode === null) {
+    throw new Error(
+      `Validation process tree rooted at PID ${child.pid} remained alive after termination.`,
+    );
+  }
 };
 
 export const runValidationCommand = ({ command, args, cwd, env, timeoutMs, label }) =>
@@ -229,6 +239,7 @@ export const runValidationCommand = ({ command, args, cwd, env, timeoutMs, label
       windowsHide: true,
     });
     let settled = false;
+    let timedOut = false;
     const finish = (error) => {
       if (settled) return;
       settled = true;
@@ -237,12 +248,24 @@ export const runValidationCommand = ({ command, args, cwd, env, timeoutMs, label
       else resolve();
     };
     const timer = setTimeout(() => {
-      void terminateProcessTree(child).finally(() =>
-        finish(new Error(`${label} exceeded its ${timeoutMs} ms timeout.`)),
+      timedOut = true;
+      const timeoutError = new Error(`${label} exceeded its ${timeoutMs} ms timeout.`);
+      void terminateProcessTree(child).then(
+        () => finish(timeoutError),
+        (cleanupError) =>
+          finish(
+            new AggregateError(
+              [timeoutError, cleanupError],
+              `${label} timed out and its process tree could not be drained.`,
+            ),
+          ),
       );
     }, timeoutMs);
-    child.once('error', (error) => finish(error));
+    child.once('error', (error) => {
+      if (!timedOut) finish(error);
+    });
     child.once('exit', (code, signal) => {
+      if (timedOut) return;
       if (code === 0 && signal === null) finish();
       else finish(new Error(`${label} exited with ${signal ?? code ?? 'unknown status'}.`));
     });
@@ -325,7 +348,7 @@ export const buildCandidateValidationPlan = ({
       id: 'source-verify',
       ...throughCorepack(['pnpm', 'verify']),
       env: {},
-      timeoutMs: 25 * 60_000,
+      timeoutMs: SOURCE_VERIFY_TIMEOUT_MS,
       outputs: [],
       syntheticReceipt: true,
     },

@@ -7,6 +7,9 @@ and releases use semantic versions.
 
 ### Fixed
 
+- Gave the complete Windows source-verification gate a measured one-hour ceiling,
+  preserved the timeout diagnosis across process termination, and failed closed when
+  its validation process tree cannot be drained.
 - Scoped Windows file and message-box automation to exact visible Win32
   process/HWND/class/control identities, supported both native filename-control variants,
   made clicks synchronous and bounded, fingerprinted deferred consent generations, and

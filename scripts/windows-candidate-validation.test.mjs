@@ -32,6 +32,7 @@ import {
   verifyFunctionalValidationPair,
 } from './windows-candidate-validation-support.mjs';
 import {
+  SOURCE_VERIFY_TIMEOUT_MS,
   buildCandidateValidationPlan,
   createCandidateHarnessEnvironment,
   normalizedPublicInvocation,
@@ -870,6 +871,8 @@ test(
     });
     const sourceGate = plan.find((gate) => gate.id === 'source-verify');
     assert.equal(sourceGate.command, process.execPath);
+    assert.equal(sourceGate.timeoutMs, SOURCE_VERIFY_TIMEOUT_MS);
+    assert.equal(sourceGate.timeoutMs, 60 * 60_000);
     assert.match(sourceGate.args[0], /corepack[\\/]dist[\\/]corepack\.js$/iu);
     await runValidationCommand({
       command: sourceGate.command,
@@ -904,6 +907,20 @@ test(
     assert.match(probe.stdout.trim(), /^v43\./u);
   },
 );
+
+test('validation command preserves timeout diagnosis while terminating the child', async () => {
+  await assert.rejects(
+    runValidationCommand({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => process.exit(1), 150); setInterval(() => {}, 1_000);'],
+      cwd: process.cwd(),
+      env: process.env,
+      timeoutMs: 100,
+      label: 'timeout-diagnosis-probe',
+    }),
+    /timeout-diagnosis-probe exceeded its 100 ms timeout/u,
+  );
+});
 
 test('public evidence screening rejects private identity and PNG text metadata', () => {
   assert.deepEqual(publicEvidenceJsonErrors(jsonBytes({ passed: true })), []);
