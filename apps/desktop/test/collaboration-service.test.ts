@@ -724,6 +724,79 @@ describe('DesktopCollaborationCoordinator', () => {
     expect(recovered.document.name).toBe('Must remain recoverable');
   }, 30_000);
 
+  it('drains an admitted host edit before leave saves and releases writer authority', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-leave-drain-'));
+    const targetPath = path.join(directory, 'shared.hdeck');
+    const runtime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'recovery'),
+      autosaveDelayMs: 0,
+    });
+    const host = new DesktopCollaborationCoordinator(runtime, {
+      bindHost: '127.0.0.1',
+      advertisedHost: '127.0.0.1',
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() => closeRuntime(runtime));
+    cleanup.push(() => host.shutdownAll());
+
+    const source = await runtime.createMainOnly();
+    await runtime.saveAsMainOnly(source.sessionId, { targetPath, expectedFingerprint: null });
+    const hosted = await host.host({
+      sessionId: source.sessionId,
+      targetPath,
+      displayName: 'Host',
+      enableDiscovery: false,
+    });
+
+    let markSubmissionEntered!: () => void;
+    let releaseSubmission!: () => void;
+    const submissionEntered = new Promise<void>((resolve) => {
+      markSubmissionEntered = resolve;
+    });
+    const submissionGate = new Promise<void>((resolve) => {
+      releaseSubmission = resolve;
+    });
+    const execute = runtime.execute.bind(runtime);
+    let suspendNextSubmission = true;
+    vi.spyOn(runtime, 'execute').mockImplementation(async (sessionId, request) => {
+      if (sessionId === hosted.snapshot.sessionId && suspendNextSubmission) {
+        suspendNextSubmission = false;
+        markSubmissionEntered();
+        await submissionGate;
+      }
+      return execute(sessionId, request);
+    });
+
+    const admitted = host.execute({
+      sessionId: hosted.snapshot.sessionId,
+      expectedRevision: hosted.snapshot.revision,
+      label: 'Admitted before leave',
+      commands: [{ type: 'deck.rename', name: 'Saved after admission drain' }],
+    });
+    await submissionEntered;
+
+    const leaving = host.leave(hosted.snapshot.sessionId);
+    await expect(
+      host.execute({
+        sessionId: hosted.snapshot.sessionId,
+        expectedRevision: hosted.snapshot.revision,
+        label: 'Rejected after leave begins',
+        commands: [{ type: 'deck.rename', name: 'Must not be committed' }],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    expect(parseHdeckArchive(await readFile(targetPath)).document.name).toBe(source.document.name);
+    await expect(readFile(`${targetPath}.writer.json`)).resolves.toBeInstanceOf(Buffer);
+
+    releaseSubmission();
+    await admitted;
+    await expect(leaving).resolves.toMatchObject({ mode: 'host', preserveDetached: false });
+    expect(parseHdeckArchive(await readFile(targetPath)).document.name).toBe(
+      'Saved after admission drain',
+    );
+    await expect(readFile(`${targetPath}.writer.json`)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(host.mode(hosted.snapshot.sessionId)).toBe('offline');
+  }, 30_000);
+
   it('serializes heartbeat behind the complete target-commit and sidecar-record window', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-save-heartbeat-'));
     const targetPath = path.join(directory, 'shared.hdeck');
@@ -755,7 +828,7 @@ describe('DesktopCollaborationCoordinator', () => {
     const host = new DesktopCollaborationCoordinator(runtime, {
       bindHost: '127.0.0.1',
       advertisedHost: '127.0.0.1',
-      writerLeaseTtlMs: 250,
+      writerLeaseTtlMs: 5_000,
       heartbeatIntervalMs: 20,
     });
     cleanup.push(async () => rm(directory, { recursive: true, force: true }));
@@ -826,7 +899,7 @@ describe('DesktopCollaborationCoordinator', () => {
     const host = new DesktopCollaborationCoordinator(runtime, {
       bindHost: '127.0.0.1',
       advertisedHost: '127.0.0.1',
-      writerLeaseTtlMs: 500,
+      writerLeaseTtlMs: 5_000,
       heartbeatIntervalMs: 100,
     });
     cleanup.push(async () => rm(directory, { recursive: true, force: true }));
@@ -881,7 +954,7 @@ describe('DesktopCollaborationCoordinator', () => {
     const host = new DesktopCollaborationCoordinator(hostRuntime, {
       bindHost: '127.0.0.1',
       advertisedHost: '127.0.0.1',
-      writerLeaseTtlMs: 200,
+      writerLeaseTtlMs: 5_000,
       heartbeatIntervalMs: 20,
     });
     cleanup.push(async () => rm(directory, { recursive: true, force: true }));

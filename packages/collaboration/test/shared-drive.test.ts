@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, rm, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -18,8 +18,18 @@ import {
 const DOCUMENT_ID = '95000000-0000-4000-8000-000000000001';
 const SESSION_A = '95000000-0000-4000-8000-000000000002';
 const SESSION_B = '95000000-0000-4000-8000-000000000003';
+const SESSION_C = '95000000-0000-4000-8000-000000000004';
 const SECRET = Buffer.alloc(32, 0x51);
+const TARGET_FINGERPRINT = fingerprintSharedTargetBytes(Buffer.from('snapshot-one'));
 const temporaryDirectories: string[] = [];
+
+const deferred = (): { readonly promise: Promise<void>; readonly resolve: () => void } => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settled) => {
+    resolve = settled;
+  });
+  return { promise, resolve };
+};
 
 const createTarget = async (): Promise<string> => {
   const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-collaboration-'));
@@ -42,6 +52,7 @@ const createStore = (
     leaseTtlMs: input.leaseTtlMs ?? 45_000,
     ...(input.clock === undefined ? {} : { clock: input.clock }),
     ...(input.idFactory === undefined ? {} : { idFactory: input.idFactory }),
+    ...(input.fileSystem === undefined ? {} : { fileSystem: input.fileSystem }),
   });
 
 const expectCode = async (operation: Promise<unknown>, code: CollaborationError['code']) => {
@@ -103,11 +114,213 @@ class InterleavingFileSystem extends NodeSharedDriveFileSystem {
   }
 }
 
-const installCompetingLease = async (
-  fileSystem: NodeSharedDriveFileSystem,
-  target: string,
-  targetFingerprint?: string,
-): Promise<void> => {
+class AtomicSwapObservationFileSystem extends NodeSharedDriveFileSystem {
+  public readonly observations: Array<string | undefined> = [];
+
+  public constructor(private readonly observedPath: string) {
+    super();
+  }
+
+  private async observeActivePath(filePath: string): Promise<void> {
+    if (filePath === this.observedPath) this.observations.push(await this.readText(filePath));
+  }
+
+  public override async writeExclusive(filePath: string, content: string): Promise<void> {
+    await this.observeActivePath(filePath);
+    await super.writeExclusive(filePath, content);
+  }
+
+  protected override async commitAtomicText(
+    filePath: string,
+    content: string,
+    temporaryId: string,
+    beforeRename?: () => Promise<void>,
+  ): Promise<void> {
+    await this.observeActivePath(filePath);
+    await super.commitAtomicText(filePath, content, temporaryId, beforeRename);
+  }
+}
+
+class PausedAtomicSwapFileSystem extends NodeSharedDriveFileSystem {
+  public readonly firstWriteEntered = deferred();
+  public readonly releaseFirstWrite = deferred();
+  private atomicWrites = 0;
+
+  protected override async commitAtomicText(
+    filePath: string,
+    content: string,
+    temporaryId: string,
+    beforeRename?: () => Promise<void>,
+  ): Promise<void> {
+    this.atomicWrites += 1;
+    if (this.atomicWrites === 1) {
+      this.firstWriteEntered.resolve();
+      await this.releaseFirstWrite.promise;
+    }
+    await super.commitAtomicText(filePath, content, temporaryId, beforeRename);
+  }
+}
+
+class FailingExclusiveWriteFileSystem extends NodeSharedDriveFileSystem {
+  protected override async persistExclusiveContent(
+    handle: FileHandle,
+    content: string,
+  ): Promise<void> {
+    await handle.writeFile(content.slice(0, 4), 'utf8');
+    throw new Error('injected exclusive persistence failure');
+  }
+}
+
+class ReplacedFailedExclusiveWriteFileSystem extends NodeSharedDriveFileSystem {
+  public constructor(private readonly replacementContent: string) {
+    super();
+  }
+
+  protected override async persistExclusiveContent(
+    handle: FileHandle,
+    content: string,
+    filePath: string,
+  ): Promise<void> {
+    await handle.writeFile(content.slice(0, 4), 'utf8');
+    await handle.close();
+    await unlink(filePath);
+    await writeFile(filePath, this.replacementContent, 'utf8');
+    throw new Error('injected exclusive persistence failure after replacement');
+  }
+}
+
+class MemorySharedDriveFileSystem implements SharedDriveFileSystem {
+  public sidecar: string | undefined;
+  public exclusiveWrites = 0;
+
+  public constructor(public targetFingerprint: string | null) {}
+
+  public readText(): Promise<string | undefined> {
+    return Promise.resolve(this.sidecar);
+  }
+
+  public writeExclusive(_filePath: string, content: string): Promise<void> {
+    this.exclusiveWrites += 1;
+    if (this.sidecar !== undefined) {
+      return Promise.reject(Object.assign(new Error('exists'), { code: 'EEXIST' }));
+    }
+    this.sidecar = content;
+    return Promise.resolve();
+  }
+
+  public compareAndSwapText(
+    _filePath: string,
+    expectedContent: string,
+    replacementContent: string,
+  ): Promise<boolean> {
+    if (this.sidecar !== expectedContent) return Promise.resolve(false);
+    this.sidecar = replacementContent;
+    return Promise.resolve(true);
+  }
+
+  public compareAndDeleteText(_filePath: string, expectedContent: string): Promise<boolean> {
+    if (this.sidecar !== expectedContent) return Promise.resolve(false);
+    this.sidecar = undefined;
+    return Promise.resolve(true);
+  }
+
+  public deleteFile(): Promise<boolean> {
+    const deleted = this.sidecar !== undefined;
+    this.sidecar = undefined;
+    return Promise.resolve(deleted);
+  }
+
+  public fingerprint(): Promise<string | null> {
+    return Promise.resolve(this.targetFingerprint);
+  }
+
+  public watch(): () => void {
+    return () => undefined;
+  }
+}
+
+class ClaimVerificationFileSystem extends MemorySharedDriveFileSystem {
+  public provisionalContent: string | undefined;
+  public rollbackExpectedContent: string | undefined;
+  private readbackPending = false;
+
+  public constructor(
+    targetFingerprint: string | null,
+    private readonly readback: 'fail' | 'replace',
+    private readonly replacementContent = '{"writer":"other"}',
+  ) {
+    super(targetFingerprint);
+  }
+
+  public override async writeExclusive(filePath: string, content: string): Promise<void> {
+    await super.writeExclusive(filePath, content);
+    this.provisionalContent = content;
+    this.readbackPending = true;
+  }
+
+  public override readText(): Promise<string | undefined> {
+    if (this.readbackPending) {
+      this.readbackPending = false;
+      if (this.readback === 'fail') return Promise.reject(new Error('readback failed'));
+      this.sidecar = this.replacementContent;
+    }
+    return super.readText();
+  }
+
+  public override compareAndDeleteText(
+    filePath: string,
+    expectedContent: string,
+  ): Promise<boolean> {
+    this.rollbackExpectedContent = expectedContent;
+    return super.compareAndDeleteText(filePath, expectedContent);
+  }
+}
+
+class DeferredClaimRollbackFileSystem extends ClaimVerificationFileSystem {
+  private deferRollback = true;
+
+  public override compareAndDeleteText(
+    filePath: string,
+    expectedContent: string,
+  ): Promise<boolean> {
+    this.rollbackExpectedContent = expectedContent;
+    if (this.deferRollback) {
+      this.deferRollback = false;
+      return Promise.resolve(false);
+    }
+    return super.compareAndDeleteText(filePath, expectedContent);
+  }
+}
+
+class RetryableReleaseFileSystem extends MemorySharedDriveFileSystem {
+  public deleteAttempts = 0;
+
+  public override compareAndDeleteText(
+    filePath: string,
+    expectedContent: string,
+  ): Promise<boolean> {
+    this.deleteAttempts += 1;
+    if (this.deleteAttempts === 1) {
+      return Promise.reject(new Error('injected transient release failure'));
+    }
+    return super.compareAndDeleteText(filePath, expectedContent);
+  }
+}
+
+class ReplacedReleaseFileSystem extends MemorySharedDriveFileSystem {
+  public readonly replacementContent = '{"writer":"different"}';
+  private replaceOnDelete = true;
+
+  public override compareAndDeleteText(): Promise<boolean> {
+    if (this.replaceOnDelete) {
+      this.replaceOnDelete = false;
+      this.sidecar = this.replacementContent;
+    }
+    return Promise.resolve(false);
+  }
+}
+
+const installCompetingLease = async (target: string, targetFingerprint?: string): Promise<void> => {
   const sidecar = `${target}.writer.json`;
   const current = JSON.parse(await readFile(sidecar, 'utf8')) as Record<string, unknown>;
   const { signature: _signature, ...body } = current;
@@ -118,10 +331,10 @@ const installCompetingLease = async (
     heartbeatSeq: Number(body.heartbeatSeq) + 1,
     ...(targetFingerprint === undefined ? {} : { targetFingerprint }),
   });
-  await fileSystem.writeAtomic(
+  await writeFile(
     sidecar,
     JSON.stringify({ ...parsed, signature: signCanonicalPayload(SECRET, parsed) }),
-    '95900000-0000-4000-8000-000000000098',
+    'utf8',
   );
 };
 
@@ -134,6 +347,205 @@ afterEach(async () => {
 });
 
 describe('shared-drive writer lease', () => {
+  it('atomically replaces a sidecar without exposing an unclaimed pathname', async () => {
+    const target = await createTarget();
+    const sidecar = `${target}.writer.json`;
+    await writeFile(sidecar, 'old-lease', 'utf8');
+    const fileSystem = new AtomicSwapObservationFileSystem(sidecar);
+
+    await expect(
+      fileSystem.compareAndSwapText(sidecar, 'old-lease', 'new-lease', 'atomic-swap'),
+    ).resolves.toBe(true);
+
+    expect(fileSystem.observations).toEqual(['old-lease']);
+    await expect(readFile(sidecar, 'utf8')).resolves.toBe('new-lease');
+    await expect(
+      fileSystem.compareAndSwapText(sidecar, 'old-lease', 'unexpected', 'mismatch'),
+    ).resolves.toBe(false);
+    await expect(readFile(sidecar, 'utf8')).resolves.toBe('new-lease');
+  });
+
+  it('serializes the read-to-rename interval so only one competing swap can succeed', async () => {
+    const target = await createTarget();
+    const sidecar = `${target}.writer.json`;
+    await writeFile(sidecar, 'old-lease', 'utf8');
+    const firstFileSystem = new PausedAtomicSwapFileSystem();
+    const secondFileSystem = new NodeSharedDriveFileSystem();
+
+    const first = firstFileSystem.compareAndSwapText(
+      sidecar,
+      'old-lease',
+      'first-lease',
+      'first-competing-swap',
+    );
+    await firstFileSystem.firstWriteEntered.promise;
+    const second = secondFileSystem.compareAndSwapText(
+      sidecar,
+      'old-lease',
+      'second-lease',
+      'second-competing-swap',
+    );
+
+    await expect(second).resolves.toBe(false);
+    firstFileSystem.releaseFirstWrite.resolve();
+    await expect(first).resolves.toBe(true);
+    await expect(readFile(sidecar, 'utf8')).resolves.toBe('first-lease');
+    await expect(lstat(`${sidecar}.mutation-lock`)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('never recovers an abandoned mutation lock from a normal swap', async () => {
+    const target = await createTarget();
+    const sidecar = `${target}.writer.json`;
+    const mutationLock = `${sidecar}.mutation-lock`;
+    await writeFile(sidecar, 'old-lease', 'utf8');
+    await writeFile(mutationLock, 'abandoned-lock-token', 'utf8');
+
+    await expect(
+      new NodeSharedDriveFileSystem().compareAndSwapText(
+        sidecar,
+        'old-lease',
+        'recovered-lease',
+        'expired-mutation-lock',
+      ),
+    ).resolves.toBe(false);
+    await expect(readFile(sidecar, 'utf8')).resolves.toBe('old-lease');
+    await expect(readFile(mutationLock, 'utf8')).resolves.toBe('abandoned-lock-token');
+  });
+
+  it('requires stable explicit recovery when a crashed writer left only its mutation lock', async () => {
+    const target = await createTarget();
+    const sidecar = `${target}.writer.json`;
+    const mutationLock = `${sidecar}.mutation-lock`;
+    await writeFile(mutationLock, 'orphaned-lock-token', 'utf8');
+    const store = createStore(target, {
+      writerInstanceId: 'writer-after-orphaned-lock',
+      leaseTtlMs: 1,
+    });
+
+    await expectCode(
+      store.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT }),
+      'WRITER_LEASE_STALE',
+    );
+    await expect(readFile(mutationLock, 'utf8')).resolves.toBe('orphaned-lock-token');
+
+    await expect(
+      store.claim({
+        expectedTargetFingerprint: TARGET_FINGERPRINT,
+        allowExpiredTakeover: true,
+      }),
+    ).resolves.toMatchObject({ writerInstanceId: 'writer-after-orphaned-lock' });
+    await expect(lstat(mutationLock)).rejects.toMatchObject({ code: 'ENOENT' });
+    await store.close();
+  });
+
+  it('cleans only its exact partial file when an exclusive write fails', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-exclusive-write-'));
+    temporaryDirectories.push(directory);
+    const partialPath = path.join(directory, 'partial.writer.json');
+
+    await expect(
+      new FailingExclusiveWriteFileSystem().writeExclusive(partialPath, 'partial-lease'),
+    ).rejects.toThrow('injected exclusive persistence failure');
+    await expect(readFile(partialPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+
+    const replacementPath = path.join(directory, 'replacement.writer.json');
+    await expect(
+      new ReplacedFailedExclusiveWriteFileSystem('replacement-lease').writeExclusive(
+        replacementPath,
+        'partial-lease',
+      ),
+    ).rejects.toThrow('injected exclusive persistence failure after replacement');
+    await expect(readFile(replacementPath, 'utf8')).resolves.toBe('replacement-lease');
+  });
+
+  it('compare-deletes its exact provisional sidecar when claim readback fails', async () => {
+    const fileSystem = new ClaimVerificationFileSystem(TARGET_FINGERPRINT, 'fail');
+    const store = createStore(path.resolve('failed-claim-readback.hdeck'), {
+      writerInstanceId: 'writer-readback-failure',
+      fileSystem,
+    });
+
+    await expect(store.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT })).rejects.toThrow(
+      'readback failed',
+    );
+
+    expect(fileSystem.rollbackExpectedContent).toBe(fileSystem.provisionalContent);
+    expect(fileSystem.sidecar).toBeUndefined();
+    await store.close({ release: false });
+  });
+
+  it('retains provisional ownership so a failed claim rollback can be retried safely', async () => {
+    const fileSystem = new DeferredClaimRollbackFileSystem(TARGET_FINGERPRINT, 'fail');
+    const store = createStore(path.resolve('deferred-claim-rollback.hdeck'), {
+      writerInstanceId: 'writer-deferred-rollback',
+      fileSystem,
+    });
+
+    await expect(store.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT })).rejects.toThrow(
+      'readback failed',
+    );
+    expect(fileSystem.sidecar).toBe(fileSystem.provisionalContent);
+
+    await expect(store.close()).resolves.toBeUndefined();
+    expect(fileSystem.sidecar).toBeUndefined();
+  });
+
+  it('does not delete different bytes observed during claim verification', async () => {
+    const replacementContent = '{"writer":"other"}';
+    const fileSystem = new ClaimVerificationFileSystem(
+      TARGET_FINGERPRINT,
+      'replace',
+      replacementContent,
+    );
+    const store = createStore(path.resolve('replaced-claim-readback.hdeck'), {
+      writerInstanceId: 'writer-readback-replaced',
+      fileSystem,
+    });
+
+    await expectCode(store.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT }), 'SPLIT_BRAIN');
+
+    expect(fileSystem.rollbackExpectedContent).toBe(fileSystem.provisionalContent);
+    expect(fileSystem.sidecar).toBe(replacementContent);
+    await store.close({ release: false });
+  });
+
+  it('rejects a changed target before granting writer authority', async () => {
+    const sourceFingerprint = fingerprintSharedTargetBytes(Buffer.from('source-generation'));
+    const currentFingerprint = fingerprintSharedTargetBytes(Buffer.from('current-generation'));
+    const fileSystem = new MemorySharedDriveFileSystem(currentFingerprint);
+    const store = createStore(path.resolve('source-target-identity.hdeck'), {
+      writerInstanceId: 'writer-source-identity',
+      fileSystem,
+    });
+
+    await expectCode(
+      store.claim({ expectedTargetFingerprint: sourceFingerprint }),
+      'TARGET_CHANGED',
+    );
+    expect(fileSystem.exclusiveWrites).toBe(0);
+    expect(fileSystem.sidecar).toBeUndefined();
+    await store.close({ release: false });
+  });
+
+  it('represents an absent Save As target without a hash sentinel', async () => {
+    const fileSystem = new MemorySharedDriveFileSystem(null);
+    const store = createStore(path.resolve('absent-save-as-target.hdeck'), {
+      writerInstanceId: 'writer-save-as',
+      fileSystem,
+    });
+
+    const claimed = await store.claim({ expectedTargetFingerprint: null });
+    expect(claimed.targetFingerprint).toBeNull();
+    expect(await store.preflightTarget(null)).toBeNull();
+
+    const committedFingerprint = fingerprintSharedTargetBytes(Buffer.from('created-target'));
+    fileSystem.targetFingerprint = committedFingerprint;
+    const recorded = await store.recordSnapshot(null, committedFingerprint);
+    expect(recorded.targetFingerprint).toBe(committedFingerprint);
+    expect(await store.preflightTarget(committedFingerprint)).toBe(committedFingerprint);
+    await store.close();
+  });
+
   it('claims, heartbeats, preflights, releases, and cleans up idempotently', async () => {
     let now = 1_000;
     let id = 10;
@@ -143,7 +555,7 @@ describe('shared-drive writer lease', () => {
       clock: () => now,
       idFactory: () => `95100000-0000-4000-8000-${String(id++).padStart(12, '0')}`,
     });
-    const claimed = await store.claim();
+    const claimed = await store.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
     expect((await store.inspect()).state).toBe('active-self');
 
     expect(await store.preflightTarget(claimed.targetFingerprint)).toBe(claimed.targetFingerprint);
@@ -163,6 +575,91 @@ describe('shared-drive writer lease', () => {
     await store.close();
   });
 
+  it('allows close to retry an exact sidecar release after the target commit changed', async () => {
+    const fileSystem = new RetryableReleaseFileSystem(TARGET_FINGERPRINT);
+    const store = createStore(path.resolve('retry-release-after-commit.hdeck'), {
+      writerInstanceId: 'writer-retry-release',
+      fileSystem,
+    });
+    await store.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
+    const committedFingerprint = fingerprintSharedTargetBytes(Buffer.from('committed-snapshot'));
+    fileSystem.targetFingerprint = committedFingerprint;
+
+    await expect(store.close()).rejects.toThrow('injected transient release failure');
+    expect(fileSystem.sidecar).toBeDefined();
+    await expect(store.close()).resolves.toBeUndefined();
+
+    expect(fileSystem.deleteAttempts).toBe(2);
+    expect(fileSystem.sidecar).toBeUndefined();
+
+    const nextSave = createStore(path.resolve('retry-release-after-commit.hdeck'), {
+      writerInstanceId: 'writer-next-save',
+      sessionId: SESSION_B,
+      fileSystem,
+    });
+    await expect(
+      nextSave.claim({ expectedTargetFingerprint: committedFingerprint }),
+    ).resolves.toMatchObject({ targetFingerprint: committedFingerprint });
+    await nextSave.close();
+    expect(fileSystem.sidecar).toBeUndefined();
+  });
+
+  it('exposes the current target generation for explicit recovery of an expired prior save', async () => {
+    let now = 1_000;
+    const fileSystem = new MemorySharedDriveFileSystem(TARGET_FINGERPRINT);
+    const first = createStore(path.resolve('expired-release-after-commit.hdeck'), {
+      writerInstanceId: 'writer-before-crash',
+      leaseTtlMs: 1,
+      clock: () => now,
+      fileSystem,
+    });
+    await first.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
+    const committedFingerprint = fingerprintSharedTargetBytes(
+      Buffer.from('committed-before-crash'),
+    );
+    fileSystem.targetFingerprint = committedFingerprint;
+    now += 2;
+
+    const successor = createStore(path.resolve('expired-release-after-commit.hdeck'), {
+      writerInstanceId: 'writer-after-restart',
+      sessionId: SESSION_B,
+      documentSecret: Buffer.alloc(32, 0x52),
+      leaseTtlMs: 1,
+      clock: () => now,
+      fileSystem,
+    });
+    expect(await successor.inspect()).toMatchObject({
+      state: 'stale',
+      verified: false,
+      actualTargetFingerprint: committedFingerprint,
+    });
+    await expect(
+      successor.claim({
+        expectedTargetFingerprint: committedFingerprint,
+        allowExpiredTakeover: true,
+      }),
+    ).resolves.toMatchObject({ targetFingerprint: committedFingerprint });
+
+    await first.close({ release: false });
+    await successor.close();
+    expect(fileSystem.sidecar).toBeUndefined();
+  });
+
+  it('never deletes different sidecar bytes while retrying close', async () => {
+    const fileSystem = new ReplacedReleaseFileSystem(TARGET_FINGERPRINT);
+    const store = createStore(path.resolve('different-release-retry.hdeck'), {
+      writerInstanceId: 'writer-different-release',
+      fileSystem,
+    });
+    await store.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
+    fileSystem.targetFingerprint = fingerprintSharedTargetBytes(Buffer.from('committed-snapshot'));
+
+    await expectCode(store.close(), 'SPLIT_BRAIN');
+    await expectCode(store.close(), 'SPLIT_BRAIN');
+    expect(fileSystem.sidecar).toBe(fileSystem.replacementContent);
+    await store.close({ release: false });
+  });
+
   it('requires explicit takeover of stale leases and detects the old writer as split-brain', async () => {
     let now = 2_000;
     const target = await createTarget();
@@ -171,7 +668,7 @@ describe('shared-drive writer lease', () => {
       leaseTtlMs: 100,
       clock: () => now,
     });
-    await first.claim();
+    await first.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
     now += 101;
     await expectCode(first.preflightTarget(), 'WRITER_LEASE_STALE');
     const second = createStore(target, {
@@ -181,12 +678,77 @@ describe('shared-drive writer lease', () => {
       clock: () => now,
     });
     expect((await second.inspect()).state).toBe('stale');
-    await expectCode(second.claim(), 'WRITER_LEASE_STALE');
-    await second.claim({ allowExpiredTakeover: true });
+    await expectCode(
+      second.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT }),
+      'WRITER_LEASE_STALE',
+    );
+    const abandonedMutationLock = `${target}.writer.json.mutation-lock`;
+    await writeFile(abandonedMutationLock, 'abandoned-lock-token', 'utf8');
+    await second.claim({
+      expectedTargetFingerprint: TARGET_FINGERPRINT,
+      allowExpiredTakeover: true,
+    });
+    await expect(lstat(abandonedMutationLock)).rejects.toMatchObject({ code: 'ENOENT' });
     expect((await first.inspect()).state).toBe('split-brain');
     await first.close({ release: false });
     await second.close();
   });
+
+  it('keeps exactly one writer when two explicit stale takeovers overlap', async () => {
+    let now = 2_500;
+    const target = await createTarget();
+    const firstOwner = createStore(target, {
+      writerInstanceId: 'writer-original',
+      leaseTtlMs: 1,
+      clock: () => now,
+    });
+    await firstOwner.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
+    now += 2;
+
+    const pausedFileSystem = new PausedAtomicSwapFileSystem();
+    const firstSuccessor = createStore(target, {
+      writerInstanceId: 'writer-first-successor',
+      sessionId: SESSION_B,
+      documentSecret: Buffer.alloc(32, 0x61),
+      leaseTtlMs: 1,
+      clock: () => now,
+      fileSystem: pausedFileSystem,
+    });
+    const secondSuccessor = createStore(target, {
+      writerInstanceId: 'writer-second-successor',
+      sessionId: SESSION_C,
+      documentSecret: Buffer.alloc(32, 0x62),
+      leaseTtlMs: 1,
+      clock: () => now,
+    });
+
+    const firstTakeover = firstSuccessor.claim({
+      expectedTargetFingerprint: TARGET_FINGERPRINT,
+      allowExpiredTakeover: true,
+    });
+    await pausedFileSystem.firstWriteEntered.promise;
+
+    await expect(
+      secondSuccessor.claim({
+        expectedTargetFingerprint: TARGET_FINGERPRINT,
+        allowExpiredTakeover: true,
+      }),
+    ).resolves.toMatchObject({ writerInstanceId: 'writer-second-successor' });
+
+    pausedFileSystem.releaseFirstWrite.resolve();
+    await expectCode(firstTakeover, 'SPLIT_BRAIN');
+    await expect(secondSuccessor.inspect()).resolves.toMatchObject({
+      state: 'active-self',
+      lease: { writerInstanceId: 'writer-second-successor' },
+    });
+    await expect(lstat(`${target}.writer.json.mutation-lock`)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    await firstOwner.close({ release: false });
+    await firstSuccessor.close({ release: false });
+    await secondSuccessor.close();
+  }, 15_000);
 
   it('recognizes a crashed foreign-secret lease and requires stable explicit takeover', async () => {
     let now = 3_000;
@@ -197,7 +759,7 @@ describe('shared-drive writer lease', () => {
       leaseTtlMs: 20,
       clock: () => now,
     });
-    await first.claim();
+    await first.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
     const successor = createStore(target, {
       writerInstanceId: 'writer-new-secret',
       sessionId: SESSION_B,
@@ -206,12 +768,24 @@ describe('shared-drive writer lease', () => {
       clock: () => now,
     });
     expect(await successor.inspect()).toMatchObject({ state: 'active-other', verified: false });
-    await expectCode(successor.claim({ allowExpiredTakeover: true }), 'WRITER_LEASE_ACTIVE');
+    await expectCode(
+      successor.claim({
+        expectedTargetFingerprint: TARGET_FINGERPRINT,
+        allowExpiredTakeover: true,
+      }),
+      'WRITER_LEASE_ACTIVE',
+    );
     now += 21;
     expect(await successor.inspect()).toMatchObject({ state: 'stale', verified: false });
-    await expectCode(successor.claim(), 'WRITER_LEASE_STALE');
+    await expectCode(
+      successor.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT }),
+      'WRITER_LEASE_STALE',
+    );
     const startedAt = Date.now();
-    await successor.claim({ allowExpiredTakeover: true });
+    await successor.claim({
+      expectedTargetFingerprint: TARGET_FINGERPRINT,
+      allowExpiredTakeover: true,
+    });
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(15);
     expect((await first.inspect()).state).toBe('split-brain');
     await first.close({ release: false });
@@ -229,8 +803,8 @@ describe('shared-drive writer lease', () => {
       documentSecret: SECRET,
       fileSystem: heartbeatFs,
     });
-    await heartbeatOwner.claim();
-    heartbeatFs.beforeSwap = () => installCompetingLease(heartbeatFs, heartbeatTarget);
+    await heartbeatOwner.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
+    heartbeatFs.beforeSwap = () => installCompetingLease(heartbeatTarget);
     await expectCode(heartbeatOwner.heartbeat(), 'SPLIT_BRAIN');
     expect(JSON.parse(await readFile(`${heartbeatTarget}.writer.json`, 'utf8'))).toMatchObject({
       writerInstanceId: 'writer-racer',
@@ -247,11 +821,13 @@ describe('shared-drive writer lease', () => {
       documentSecret: SECRET,
       fileSystem: recordFs,
     });
-    const recordedLease = await recordOwner.claim();
+    const recordedLease = await recordOwner.claim({
+      expectedTargetFingerprint: TARGET_FINGERPRINT,
+    });
     const nextBytes = Buffer.from('snapshot-after-race');
     await writeFile(recordTarget, nextBytes);
     const nextFingerprint = fingerprintSharedTargetBytes(nextBytes);
-    recordFs.beforeSwap = () => installCompetingLease(recordFs, recordTarget, nextFingerprint);
+    recordFs.beforeSwap = () => installCompetingLease(recordTarget, nextFingerprint);
     await expectCode(
       recordOwner.recordSnapshot(recordedLease.targetFingerprint, nextFingerprint),
       'SPLIT_BRAIN',
@@ -272,8 +848,8 @@ describe('shared-drive writer lease', () => {
       documentSecret: SECRET,
       fileSystem: releaseFs,
     });
-    await releaseOwner.claim();
-    releaseFs.beforeDelete = () => installCompetingLease(releaseFs, releaseTarget);
+    await releaseOwner.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
+    releaseFs.beforeDelete = () => installCompetingLease(releaseTarget);
     await expectCode(releaseOwner.release(), 'SPLIT_BRAIN');
     expect(JSON.parse(await readFile(`${releaseTarget}.writer.json`, 'utf8'))).toMatchObject({
       writerInstanceId: 'writer-racer',
@@ -284,20 +860,23 @@ describe('shared-drive writer lease', () => {
   it('rejects tampered sidecars and changed target fingerprints', async () => {
     const target = await createTarget();
     const first = createStore(target, { writerInstanceId: 'writer-a' });
-    await first.claim();
+    await first.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
     const sidecar = `${target}.writer.json`;
     const parsed = JSON.parse(await readFile(sidecar, 'utf8')) as Record<string, unknown>;
     parsed.writerInstanceId = 'attacker';
     await writeFile(sidecar, JSON.stringify(parsed), 'utf8');
     const observer = createStore(target, { writerInstanceId: 'writer-b', sessionId: SESSION_B });
     expect((await observer.inspect()).state).toBe('tampered');
-    await expectCode(observer.claim(), 'SIDECAR_TAMPERED');
+    await expectCode(
+      observer.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT }),
+      'SIDECAR_TAMPERED',
+    );
     await first.close({ release: false });
     await observer.close({ release: false });
 
     const secondTarget = await createTarget();
     const owner = createStore(secondTarget, { writerInstanceId: 'writer-c' });
-    await owner.claim();
+    await owner.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
     await writeFile(secondTarget, 'external-snapshot', 'utf8');
     await expectCode(owner.heartbeat(), 'TARGET_CHANGED');
     expect((await owner.inspect()).state).toBe('split-brain');
@@ -308,7 +887,10 @@ describe('shared-drive writer lease', () => {
     const target = await createTarget();
     const first = createStore(target, { writerInstanceId: 'writer-a' });
     const second = createStore(target, { writerInstanceId: 'writer-b', sessionId: SESSION_B });
-    const results = await Promise.allSettled([first.claim(), second.claim()]);
+    const results = await Promise.allSettled([
+      first.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT }),
+      second.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT }),
+    ]);
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
     await first.close({ release: results[0]?.status === 'fulfilled' });
@@ -344,7 +926,7 @@ describe('shared-drive writer lease', () => {
       documentSecret: SECRET,
       fileSystem,
     });
-    const lease = await store.claim();
+    const lease = await store.claim({ expectedTargetFingerprint: TARGET_FINGERPRINT });
     const eventPromise = new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Watch event timed out.')), 2_000);
       store.watch((event) => {

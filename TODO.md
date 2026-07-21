@@ -1,6 +1,6 @@
 # Roadmap and TODO
 
-Status: **V1 release candidate**, last reviewed 2026-07-17.
+Status: **V1 release candidate**, last reviewed 2026-07-21.
 
 The usable V1 implementation is present. Publication remains gated by observed
 release evidence for the exact Windows installer; unchecked items below must not be
@@ -48,6 +48,28 @@ reported as passed until their results are recorded.
       commit and annotated tag objects, and generate the final observed release
       record as an artifact so recording hashes cannot change the producing commit.
 
+### Security remediation closed in source (checkpoint 2026-07-21)
+
+- [x] Enforce complete canonical-document representability, table-area, archive-range,
+      export-projection, repeated-asset, decode-concurrency, and rich-clipboard budgets
+      before mutation or expensive processing.
+- [x] Serialize Save and Save As per document session, make the runtime target
+      authoritative at commit time, recheck the destination after asynchronous guards,
+      require explicit confirmation before stale or orphan-lock writer-reservation
+      takeover, and keep sidecar cleanup identity-safe.
+- [x] Reserve LAN admission and retained-state capacity before asynchronous work, bind
+      to one explicitly selected named private address, authenticate that address in
+      discovery, deliver lossless join bootstrap, drain admitted work before host
+      departure, clean failed joins, extend leases to indirect master/layout writes,
+      and fence shared-file commits with current host authority.
+- [x] Reuse identical image imports atomically under one content-addressed asset and
+      reuse immutable validation proofs across transactions, history, and save
+      preparation without weakening archive verification.
+- [x] Align the local security gate with pnpm 11 audit output and the signed Microsoft
+      on-demand Defender policy, and exclude the unused installed elevation helper.
+- [ ] Complete the final independent review, full repository verification, clean-build
+      evidence, and scan fix report before classifying all remediations as verified.
+
 ### Final evidence gates
 
 - [ ] Run the complete clean-checkout `pnpm verify` gate and record the exact commit,
@@ -89,8 +111,10 @@ reported as passed until their results are recorded.
       complete `LICENSES.chromium.html`.
 - [ ] Generate the locked production npm SBOM plus an exact packaged-file and native
       runtime inventory covering Electron, Chromium, FFmpeg, and NSIS.
-- [ ] Scan the exact installer and installed files for vulnerabilities, licenses,
-      secrets, private paths, source maps, debug services, and unexpected binaries.
+- [ ] Audit the exact locked JavaScript graphs for known vulnerabilities, scan the
+      installer and installed files for malware, and inspect licenses, secrets,
+      private paths, source maps, debug services, and unexpected binaries. Native
+      runtime CVE coverage is not claimed by the V1 inventory.
 - [ ] Generate final SHA-256 checksums and verify Authenticode state. Label every
       artifact unsigned when no release certificate is supplied.
 - [ ] Tag the verified commit, publish the release notes and artifacts, re-download

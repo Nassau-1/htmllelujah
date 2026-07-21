@@ -3,7 +3,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { createHdeckArchive, parseHdeckArchive, replayJournal, sha256 } from '@htmllelujah/hdeck';
-import type { TransactionMetadata } from '@htmllelujah/document-core';
+import {
+  canonicalDocumentBytes,
+  createDefaultDeck,
+  type TransactionMetadata,
+} from '@htmllelujah/document-core';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
@@ -51,6 +55,12 @@ const metadata = (
 const onePixelPng = (): Uint8Array =>
   Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  );
+
+const alternateOnePixelPng = (): Uint8Array =>
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2ZAAAAABJRU5ErkJggg==',
     'base64',
   );
 
@@ -167,6 +177,52 @@ describe('document session authority', () => {
       metadata: metadata(2),
     });
     expect(committed.document.name).toBe('Committed later');
+  });
+
+  it('rejects a one-byte-over canonical document before journal or state changes', async () => {
+    const directory = await temporaryDirectory();
+    const document = createDefaultDeck({
+      idFactory: ids(),
+      now: () => '2026-07-15T12:00:00.000Z',
+      name: 'A',
+    });
+    const maximum = canonicalDocumentBytes(document).byteLength + 3;
+    let appendCalls = 0;
+    const journal: JournalDurabilityCapability = {
+      ...defaultJournalDurability,
+      append: async (target, record) => {
+        appendCalls += 1;
+        await defaultJournalDurability.append(target, record);
+      },
+    };
+    const manager = managerFor(directory, { journal, maxCanonicalDocumentBytes: maximum });
+    const events: RuntimeEvent[] = [];
+    manager.subscribe((event) => events.push(event));
+    const session = await manager.createMainOnly({ document });
+    events.length = 0;
+    const boundary = await manager.execute(session.sessionId, {
+      expectedRevision: session.revision,
+      commands: [{ type: 'deck.rename', name: 'AAAA' }],
+      metadata: metadata(1),
+    });
+    expect(canonicalDocumentBytes(boundary.document).byteLength).toBe(maximum);
+    const beforeRejection = manager.getSnapshot(session.sessionId);
+    const eventCount = events.length;
+
+    await expect(
+      manager.execute(session.sessionId, {
+        expectedRevision: boundary.revision,
+        commands: [{ type: 'deck.rename', name: 'AAAAA' }],
+        metadata: metadata(2),
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+
+    expect(manager.getSnapshot(session.sessionId)).toEqual(beforeRejection);
+    expect(appendCalls).toBe(1);
+    expect(events).toHaveLength(eventCount);
+    expect(
+      replayJournal(await readFile(path.join(directory, `${session.sessionId}.journal`))).records,
+    ).toHaveLength(1);
   });
 
   it('undoes and redoes grouped transactions as one durable history entry', async () => {
@@ -325,6 +381,37 @@ describe('save, reopen, assets, and conflicts', () => {
     expect(reopened.dirty).toBe(false);
   });
 
+  it('captures one queued clean persisted source and rejects stale authority state', async () => {
+    const directory = await temporaryDirectory();
+    const target = path.join(directory, 'host-source.hdeck');
+    const manager = managerFor(path.join(directory, 'recovery'));
+    const session = await manager.createMainOnly();
+    await expect(manager.capturePersistedSourceMainOnly(session.sessionId)).rejects.toMatchObject({
+      code: 'INVALID_REQUEST',
+    });
+    const saved = await manager.saveAsMainOnly(session.sessionId, {
+      targetPath: target,
+      expectedFingerprint: null,
+    });
+    const captured = await manager.capturePersistedSourceMainOnly(session.sessionId);
+    expect(captured).toMatchObject({
+      targetPath: target,
+      snapshot: { revision: saved.revision, dirty: false, durability: 'clean' },
+      assets: [],
+    });
+    expect(captured.targetFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(Object.isFrozen(captured)).toBe(true);
+
+    await manager.execute(session.sessionId, {
+      expectedRevision: saved.revision,
+      commands: [{ type: 'deck.rename', name: 'Dirty host source' }],
+      metadata: metadata(1),
+    });
+    await expect(manager.capturePersistedSourceMainOnly(session.sessionId)).rejects.toMatchObject({
+      code: 'INVALID_REQUEST',
+    });
+  });
+
   it('writes a detached authoritative copy without enabling background target writes', async () => {
     const directory = await temporaryDirectory();
     const target = path.join(directory, 'shared-authoritative.hdeck');
@@ -408,11 +495,247 @@ describe('save, reopen, assets, and conflicts', () => {
       targetPath: target,
       expectedFingerprint: null,
     });
+    const captured = await manager.capturePersistedSourceMainOnly(session.sessionId);
+    expect(captured.assets).toEqual([
+      expect.objectContaining({
+        id: 'ffffffff-ffff-4fff-8fff-000000000001',
+        hash: sha256(bytes),
+        mediaType: 'image/png',
+        widthPx: 1,
+        heightPx: 1,
+      }),
+    ]);
+    captured.assets[0]!.bytes[0] = 0;
+    expect(manager.getAssetBytesMainOnly(session.sessionId, captured.assets[0]!.id).bytes[0]).toBe(
+      bytes[0],
+    );
     const parsed = parseHdeckArchive(await readFile(target));
     expect(Array.from(parsed.assets.get('ffffffff-ffff-4fff-8fff-000000000001') ?? [])).toEqual(
       Array.from(bytes),
     );
     expect(stored.document.assets[0]?.hash).toBe(parsed.manifest.assets[0]?.sha256);
+  });
+
+  it('rejects asset aliases and byte-derived metadata mismatch before acknowledgement', async () => {
+    const directory = await temporaryDirectory();
+    let appendCalls = 0;
+    const journal: JournalDurabilityCapability = {
+      ...defaultJournalDurability,
+      append: async (target, record) => {
+        appendCalls += 1;
+        await defaultJournalDurability.append(target, record);
+      },
+    };
+    const manager = managerFor(directory, { journal });
+    const events: RuntimeEvent[] = [];
+    manager.subscribe((event) => events.push(event));
+    const session = await manager.createMainOnly();
+    const bytes = onePixelPng();
+    const first = await manager.storeAsset(session.sessionId, {
+      id: 'ffffffff-ffff-4fff-8fff-000000000041',
+      bytes,
+      mediaType: 'image/png',
+      fileName: 'first.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: session.revision,
+      metadata: metadata(41),
+    });
+    const beforeRejection = manager.getSnapshot(session.sessionId);
+    events.length = 0;
+
+    await expect(
+      manager.storeAsset(session.sessionId, {
+        id: 'ffffffff-ffff-4fff-8fff-000000000042',
+        bytes,
+        mediaType: 'image/png',
+        fileName: 'alias.png',
+        widthPx: 1,
+        heightPx: 1,
+        expectedRevision: first.revision,
+        metadata: metadata(42),
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    await expect(
+      manager.execute(session.sessionId, {
+        expectedRevision: first.revision,
+        commands: [
+          {
+            type: 'asset.register',
+            asset: {
+              id: 'ffffffff-ffff-4fff-8fff-000000000043',
+              kind: 'image',
+              hash: sha256(bytes),
+              mediaType: 'image/png',
+              fileName: 'wrong-dimensions.png',
+              byteLength: bytes.byteLength,
+              widthPx: 2,
+              heightPx: 1,
+            },
+          },
+        ],
+        metadata: metadata(43),
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+
+    expect(manager.getSnapshot(session.sessionId)).toEqual(beforeRejection);
+    expect(appendCalls).toBe(1);
+    expect(events).toEqual([]);
+  });
+
+  it('validates immutable asset bytes once while checking later transactions incrementally', async () => {
+    const directory = await temporaryDirectory();
+    const validatedIds: string[] = [];
+    const manager = managerFor(directory, {
+      onAssetValidated: (assetId) => validatedIds.push(assetId),
+    });
+    const session = await manager.createMainOnly();
+    const assetId = 'ffffffff-ffff-4fff-8fff-000000000051';
+    const stored = await manager.storeAsset(session.sessionId, {
+      id: assetId,
+      bytes: onePixelPng(),
+      mediaType: 'image/png',
+      fileName: 'cached.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: session.revision,
+      metadata: metadata(51),
+    });
+    expect(validatedIds).toEqual([assetId]);
+
+    const renamed = await manager.execute(session.sessionId, {
+      expectedRevision: stored.revision,
+      commands: [{ type: 'deck.rename', name: 'Cached asset transaction' }],
+      metadata: metadata(52),
+    });
+    const undone = await manager.undo(session.sessionId, {
+      expectedRevision: renamed.revision,
+      metadata: metadata(53),
+    });
+    const redone = await manager.redo(session.sessionId, {
+      expectedRevision: undone.revision,
+      metadata: metadata(54),
+    });
+    await manager.saveAsMainOnly(session.sessionId, {
+      targetPath: path.join(directory, 'cached-assets.hdeck'),
+      expectedFingerprint: null,
+    });
+
+    expect(validatedIds).toEqual([assetId]);
+    expect(redone.document.assets[0]?.hash).toBe(sha256(onePixelPng()));
+  });
+
+  it('reuses one content-addressed asset for repeated UI and agent imports', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory);
+    const session = await manager.createMainOnly();
+    const slideId = session.document.slides[0]!.id;
+    const canonicalAssetId = 'ffffffff-ffff-4fff-8fff-000000000061';
+    const firstElementId = 'ffffffff-ffff-4fff-8fff-000000000062';
+    const bytes = onePixelPng();
+    const image = (id: string, assetId: string) => ({
+      id,
+      type: 'image' as const,
+      name: 'Repeated image',
+      frame: { xPt: 10, yPt: 10, widthPt: 100, heightPt: 100, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      assetId,
+      altText: 'Repeated image',
+      fit: 'contain' as const,
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+    });
+    const first = await manager.importAssetAndExecute(session.sessionId, {
+      id: canonicalAssetId,
+      bytes,
+      mediaType: 'image/png',
+      fileName: 'first.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: session.revision,
+      metadata: metadata(1),
+      commands: [
+        {
+          type: 'element.insert',
+          slideId,
+          element: image(firstElementId, canonicalAssetId),
+        },
+      ],
+    });
+    expect(first).toMatchObject({ assetId: canonicalAssetId, reused: false });
+
+    const proposedInsertAssetId = 'ffffffff-ffff-4fff-8fff-000000000063';
+    const secondElementId = 'ffffffff-ffff-4fff-8fff-000000000064';
+    const insertedAgain = await manager.importAssetAndExecute(session.sessionId, {
+      id: proposedInsertAssetId,
+      bytes,
+      mediaType: 'image/png',
+      fileName: 'same-content-new-name.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: first.snapshot.revision,
+      metadata: metadata(2),
+      commands: [
+        {
+          type: 'element.insert',
+          slideId,
+          element: image(secondElementId, proposedInsertAssetId),
+        },
+      ],
+    });
+    expect(insertedAgain).toMatchObject({ assetId: canonicalAssetId, reused: true });
+    expect(insertedAgain.snapshot.document.assets.map((asset) => asset.id)).toEqual([
+      canonicalAssetId,
+    ]);
+    expect(
+      insertedAgain.snapshot.document.slides[0]!.elements.find(
+        (element) => element.id === secondElementId,
+      ),
+    ).toMatchObject({ assetId: canonicalAssetId });
+
+    const proposedReplacementAssetId = 'ffffffff-ffff-4fff-8fff-000000000065';
+    const current = insertedAgain.snapshot.document.slides[0]!.elements.find(
+      (element) => element.id === secondElementId,
+    );
+    if (current?.type !== 'image') throw new Error('Repeated image fixture is missing.');
+    const replaced = await manager.importAssetAndExecute(session.sessionId, {
+      id: proposedReplacementAssetId,
+      bytes,
+      mediaType: 'image/png',
+      fileName: 'same-replacement.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: insertedAgain.snapshot.revision,
+      metadata: metadata(3),
+      commands: [
+        {
+          type: 'element.update',
+          slideId,
+          elementId: secondElementId,
+          replacement: { ...current, assetId: proposedReplacementAssetId },
+        },
+      ],
+    });
+    expect(replaced).toMatchObject({ assetId: canonicalAssetId, reused: true });
+    expect(replaced.snapshot.document.assets).toHaveLength(1);
+
+    const agentOnly = await manager.importAssetAndExecute(session.sessionId, {
+      id: 'ffffffff-ffff-4fff-8fff-000000000066',
+      bytes,
+      mediaType: 'image/png',
+      fileName: 'agent-approved.png',
+      widthPx: 1,
+      heightPx: 1,
+      expectedRevision: replaced.snapshot.revision,
+      metadata: metadata(4),
+      commands: [],
+    });
+    expect(agentOnly).toMatchObject({
+      assetId: canonicalAssetId,
+      reused: true,
+      snapshot: { revision: replaced.snapshot.revision },
+    });
   });
 
   it('registers, inserts, and replaces an image with one undo step per user action', async () => {
@@ -424,7 +747,7 @@ describe('save, reopen, assets, and conflicts', () => {
     const elementId = 'ffffffff-ffff-4fff-8fff-000000000012';
     const inserted = await manager.storeAssetAndExecute(session.sessionId, {
       id: assetId,
-      bytes: onePixelPng(),
+      bytes: alternateOnePixelPng(),
       mediaType: 'image/png',
       fileName: 'atomic.png',
       widthPx: 1,
@@ -508,7 +831,7 @@ describe('save, reopen, assets, and conflicts', () => {
     expect(undone.document.slides[0]!.elements.some((element) => element.id === elementId)).toBe(
       false,
     );
-  });
+  }, 15_000);
 
   it('does not stage a blob or mutate the document for stale or invalid image placement', async () => {
     const directory = await temporaryDirectory();

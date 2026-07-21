@@ -109,6 +109,33 @@ describe('V2 command access classification', () => {
     expect(reset.writeSet).toContain(elementEntityKey(bound.id));
   });
 
+  it('protects bound slide element trees from master and layout remapping commands', () => {
+    const deck = createDefaultDeck({ idFactory: deterministicIds() });
+    const slide = deck.slides[0]!;
+    const bound = slide.elements[0]!;
+    const master = deck.masters[0]!;
+    const layout = deck.layouts[0]!;
+    const commands: readonly DocumentCommand[] = [
+      {
+        type: 'master.update',
+        masterId: master.id,
+        replacement: { ...master, name: 'Updated master' },
+      },
+      { type: 'master.delete', masterId: master.id },
+      {
+        type: 'layout.update',
+        layoutId: layout.id,
+        replacement: { ...layout, name: 'Updated layout' },
+      },
+    ];
+
+    commands.forEach((command) => {
+      const access = analyzeCommandAccess([command], deck);
+      expect(access.writeSet).toContain(slideEntityKey(slide.id));
+      expect(access.writeSet).toContain(elementEntityKey(bound.id));
+    });
+  });
+
   it('keeps independent element commands independent while serializing table mutations', () => {
     const deck = createNeutralDemoDeck();
     const slide = deck.slides[0]!;

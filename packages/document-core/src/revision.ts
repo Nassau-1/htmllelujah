@@ -14,6 +14,10 @@ const canonicalize = (value: unknown): unknown => {
 /** Stable JSON used for revision comparison, fixtures, and adapter hand-off. */
 export const canonicalSerialize = (value: unknown): string => JSON.stringify(canonicalize(value));
 
+/** Canonical UTF-8 bytes used by every persistence representability boundary. */
+export const canonicalDocumentBytes = (document: DeckDocument): Uint8Array =>
+  new TextEncoder().encode(canonicalSerialize(document));
+
 const MASK_64 = 0xffff_ffff_ffff_ffffn;
 const FNV_PRIME_64 = 0x0000_0100_0000_01b3n;
 
@@ -31,7 +35,7 @@ const fnv1a64 = (bytes: Uint8Array, seed: bigint): bigint => {
  * It is a concurrency token, not a security digest.
  */
 export const createRevisionToken = (document: DeckDocument): string => {
-  const bytes = new TextEncoder().encode(canonicalSerialize(document));
+  const bytes = canonicalDocumentBytes(document);
   const first = fnv1a64(bytes, 0xcbf2_9ce4_8422_2325n);
   const second = fnv1a64(bytes, 0x8422_2325_cbf2_9ce4n);
   return `rev1-${first.toString(16).padStart(16, '0')}${second.toString(16).padStart(16, '0')}`;

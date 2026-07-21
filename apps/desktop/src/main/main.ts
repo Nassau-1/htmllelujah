@@ -42,6 +42,12 @@ import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
 import { isTrustedRendererUrl, resolveRendererEntryUrl } from './renderer-entry.js';
 import { resolveSaveTarget } from './save-target.js';
 import {
+  runSerializedStandaloneCollaborationTransition,
+  StandaloneSaveQueue,
+  StandaloneWriterReservationAggregateError,
+  withExplicitStandaloneWriterRecovery,
+} from './standalone-writer-reservation.js';
+import {
   cleanupSessionIfUnowned,
   initializeWindowSafely,
   RendererCloseHandshakeBroker,
@@ -98,13 +104,12 @@ interface ReplaceAuthorization {
 }
 
 interface AssignSessionOptions {
-  readonly targetPath?: string | undefined;
   readonly preserveRecoveryOnFailure?: boolean | undefined;
 }
 
 const windowSessions = new Map<number, string>();
 const windowModes = new Map<number, WindowMode>();
-const sessionTargetPaths = new Map<string, string>();
+const standaloneSaveQueue = new StandaloneSaveQueue();
 const assetTokens = new Map<
   string,
   { readonly sessionId: string; readonly webContentsId: number }
@@ -129,7 +134,11 @@ class DesktopMainError extends Error {
 
 const success = <T>(value: T): DesktopResult<T> => ({ ok: true, value });
 
-const failure = (error: unknown): DesktopResult<never> => {
+const failure = (inputError: unknown): DesktopResult<never> => {
+  const error =
+    inputError instanceof StandaloneWriterReservationAggregateError
+      ? inputError.actionableError
+      : inputError;
   if (error instanceof DesktopMainError) {
     return {
       ok: false,
@@ -142,6 +151,7 @@ const failure = (error: unknown): DesktopResult<never> => {
       NOT_FOUND: 'One of the presentation resources is unavailable.',
       ASSET_INVALID: 'One of the presentation images is invalid.',
       ASSET_LIMIT_EXCEEDED: 'The presentation images are too large to export safely.',
+      EXPORT_LIMIT_EXCEEDED: 'The presentation is too large to export safely.',
       RENDER_NOT_READY: 'The presentation did not become ready for export.',
       EXPORT_FAILED: 'The presentation could not be exported.',
     };
@@ -440,7 +450,11 @@ const exportInputSchema = historyInputSchema
   .extend({ format: z.enum(['html', 'pdf']), includeHidden: z.boolean() })
   .strict();
 const hostInputSchema = sessionInputSchema
-  .extend({ displayName: collaborationDisplayName, enableDiscovery: z.boolean() })
+  .extend({
+    displayName: collaborationDisplayName,
+    enableDiscovery: z.boolean(),
+    hostAddress: z.string().trim().min(7).max(45),
+  })
   .strict();
 const joinInputSchema = sessionInputSchema
   .extend({
@@ -933,20 +947,27 @@ const exportSessionDocument = async (
   };
 };
 
-const assertNoWriterSidecar = async (targetPath: string): Promise<void> => {
-  try {
-    await lstat(`${targetPath}.writer.json`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw error;
+const confirmStandaloneWriterRecovery = async (
+  parent: BrowserWindow | undefined,
+): Promise<boolean> => {
+  const choice = await messageBox(parent, {
+    type: 'warning',
+    title: 'Recover expired writer reservation?',
+    message: 'A previous HTMLlelujah writer stopped renewing its file reservation.',
+    detail:
+      'Continue only if the other app or device is closed. HTMLlelujah will verify the reservation and observe an untrusted prior writer for a full lease window before taking ownership; any change cancels recovery.',
+    buttons: ['Verify and recover', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (choice.response !== 0) {
+    throw new DesktopMainError('CANCELLED', 'Writer reservation recovery was cancelled.');
   }
-  throw new CollaborationError(
-    'WRITER_LEASE_ACTIVE',
-    'A collaboration host currently owns this shared file.',
-  );
+  return true;
 };
 
-const saveAs = async (
+const saveAsSerialized = async (
   event: IpcMainInvokeEvent,
   sessionId: string,
 ): Promise<DocumentSessionSnapshot | undefined> => {
@@ -965,12 +986,7 @@ const saveAs = async (
   const approved = await resolveSaveTarget({
     selectedPath: result.filePath,
     extension: '.hdeck',
-    inspect: async (targetPath) => {
-      await assertNoWriterSidecar(targetPath);
-      const state = await exportTargetState(targetPath);
-      await assertNoWriterSidecar(targetPath);
-      return state;
-    },
+    inspect: exportTargetState,
     confirmAddedExtensionOverwrite: async (targetPath) => {
       const confirmation = await messageBox(
         parent ?? BrowserWindow.getFocusedWindow() ?? undefined,
@@ -989,15 +1005,60 @@ const saveAs = async (
   });
   if (approved === undefined) return undefined;
   const targetPath = approved.path;
-  await assertNoWriterSidecar(targetPath);
-  const saved = await runtime.saveAsMainOnly(sessionId, {
-    targetPath,
-    // The relevant dialog supplied overwrite consent; pin that exact post-dialog file so a
-    // later external change is rejected instead of being mistaken for the approved bytes.
-    expectedFingerprint: approved.state.fingerprint ?? null,
+  return withExplicitStandaloneWriterRecovery(
+    {
+      targetPath,
+      documentId: snapshot.documentId,
+      sessionId,
+    },
+    () => confirmStandaloneWriterRecovery(parent ?? BrowserWindow.getFocusedWindow() ?? undefined),
+    (guard) =>
+      runtime.saveAsMainOnly(sessionId, {
+        targetPath,
+        // The relevant dialog supplied overwrite consent; pin that exact post-dialog file so a
+        // later external change is rejected instead of being mistaken for the approved bytes.
+        expectedFingerprint: approved.state.fingerprint ?? null,
+        beforeCommit: guard.beforeCommit,
+      }),
+  );
+};
+
+const saveAs = (
+  event: IpcMainInvokeEvent,
+  sessionId: string,
+): Promise<DocumentSessionSnapshot | undefined> =>
+  standaloneSaveQueue.run(sessionId, () => {
+    assertSessionAccess(event, sessionId);
+    collaboration.assertStandaloneOperation(sessionId, 'Save As');
+    return saveAsSerialized(event, sessionId);
   });
-  sessionTargetPaths.set(sessionId, targetPath);
-  return saved;
+
+const saveStandaloneWithTargetFallbackSerialized = async (
+  event: IpcMainInvokeEvent,
+  sessionId: string,
+): Promise<DocumentSessionSnapshot | undefined> => {
+  assertSessionAccess(event, sessionId);
+  collaboration.assertStandaloneOperation(sessionId, 'Save');
+  const snapshot = runtime.getSnapshot(sessionId);
+  if (!snapshot.hasSaveTarget) return saveAsSerialized(event, sessionId);
+  const targetPath = await runtime.getSaveTargetMainOnly(sessionId);
+  if (targetPath === undefined) {
+    throw new DesktopMainError('NO_SAVE_TARGET', 'Choose where to save this presentation.');
+  }
+  const parent = findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+  return withExplicitStandaloneWriterRecovery(
+    {
+      targetPath,
+      documentId: snapshot.documentId,
+      sessionId,
+    },
+    () => confirmStandaloneWriterRecovery(parent),
+    (guard) =>
+      runtime.save(sessionId, {
+        expectedTargetPath: targetPath,
+        beforeCommit: guard.beforeCommit,
+      }),
+  );
 };
 
 const saveWithTargetFallback = async (
@@ -1006,14 +1067,9 @@ const saveWithTargetFallback = async (
 ): Promise<DocumentSessionSnapshot | undefined> => {
   const collaborative = await collaboration.saveHost(sessionId);
   if (collaborative !== undefined) return collaborative;
-  const snapshot = runtime.getSnapshot(sessionId);
-  if (!snapshot.hasSaveTarget) return saveAs(event, sessionId);
-  const targetPath = sessionTargetPaths.get(sessionId);
-  if (targetPath === undefined) {
-    throw new DesktopMainError('NO_SAVE_TARGET', 'Choose where to save this presentation.');
-  }
-  await assertNoWriterSidecar(targetPath);
-  return runtime.save(sessionId);
+  return standaloneSaveQueue.run(sessionId, () =>
+    saveStandaloneWithTargetFallbackSerialized(event, sessionId),
+  );
 };
 
 const confirmReplace = async (event: IpcMainInvokeEvent): Promise<ReplaceAuthorization | null> => {
@@ -1038,7 +1094,6 @@ const confirmReplace = async (event: IpcMainInvokeEvent): Promise<ReplaceAuthori
     if (choice.response !== 0) return null;
     const ended = await collaboration.leave(currentId);
     if (ended?.preserveDetached === true) {
-      sessionTargetPaths.delete(currentId);
       await messageBox(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
         type: 'warning',
         title: 'Save a recovery copy first',
@@ -1149,7 +1204,6 @@ const assignSession = async (
       await cleanupReplacement();
       throw error;
     }
-    sessionTargetPaths.delete(previous);
     const remainingOwnerIds = [...windowSessions.entries()]
       .filter(
         ([candidateId, candidateSessionId]) =>
@@ -1172,8 +1226,6 @@ const assignSession = async (
     }
   }
   windowSessions.set(event.sender.id, snapshot.sessionId);
-  if (options.targetPath === undefined) sessionTargetPaths.delete(snapshot.sessionId);
-  else sessionTargetPaths.set(snapshot.sessionId, options.targetPath);
   const window = findWindow(event.sender);
   window?.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
   event.sender.send(DESKTOP_IPC.documentChanged, {
@@ -1189,7 +1241,7 @@ const openPathInEditorWindow = async (window: BrowserWindow, targetPath: string)
   const authorization = await confirmReplace(syntheticEvent);
   if (authorization === null) return;
   const opened = await runtime.openMainOnly({ targetPath });
-  await assignSession(syntheticEvent, opened, authorization, { targetPath });
+  await assignSession(syntheticEvent, opened, authorization);
 };
 
 interface SelectedImageFile {
@@ -1302,14 +1354,14 @@ const importImageAssetForSession = async (input: {
 }): Promise<{ readonly snapshot: DocumentSessionSnapshot; readonly assetId: string }> => {
   collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
   const selected = await selectImageFile(input.parent);
-  const assetId = randomUUID();
-  const snapshot = await runtime.storeAsset(input.sessionId, {
-    id: assetId,
+  const imported = await runtime.importAssetAndExecute(input.sessionId, {
+    id: randomUUID(),
     ...selected,
     expectedRevision: input.expectedRevision,
     metadata: input.metadata,
+    commands: [],
   });
-  return { snapshot, assetId };
+  return { snapshot: imported.snapshot, assetId: imported.assetId };
 };
 
 const importImageForSession = async (input: {
@@ -1347,7 +1399,7 @@ const importImageForSession = async (input: {
     }
     element = { ...existing, assetId };
   }
-  const snapshot = await runtime.storeAssetAndExecute(input.sessionId, {
+  const imported = await runtime.importAssetAndExecute(input.sessionId, {
     id: assetId,
     ...selected,
     expectedRevision: input.expectedRevision,
@@ -1363,7 +1415,11 @@ const importImageForSession = async (input: {
           },
     ],
   });
-  return { snapshot, assetId, elementId: element.id };
+  return {
+    snapshot: imported.snapshot,
+    assetId: imported.assetId,
+    elementId: element.id,
+  };
 };
 
 const visibleEditorSessionIds = (): readonly string[] => [
@@ -1462,7 +1518,6 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
           : await runtime.openMainOnly({ targetPath: initialPath });
       windowSessions.set(window.webContents.id, snapshot.sessionId);
       createdSessionId = snapshot.sessionId;
-      if (initialPath !== undefined) sessionTargetPaths.set(snapshot.sessionId, initialPath);
       window.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
 
       window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -1532,7 +1587,6 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
                 const ended = await collaboration.leave(sessionId);
                 closeRevision = runtime.getSnapshot(sessionId).revision;
                 if (ended?.preserveDetached === true) {
-                  sessionTargetPaths.delete(sessionId);
                   const choice = await dialog.showMessageBox(window, {
                     type: 'warning',
                     title: 'Save detached collaboration copy?',
@@ -1579,7 +1633,6 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
                 expectedRevision: closeRevision,
                 ...(discardDetachedChanges ? { discardUnsaved: true } : {}),
               });
-              sessionTargetPaths.delete(sessionId);
               closingWindows.add(webContentsId);
               for (const candidate of BrowserWindow.getAllWindows()) {
                 if (candidate === window) continue;
@@ -1600,7 +1653,6 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
             async () => {
               await collaboration.shutdown(sessionId);
               await runtime.close(sessionId, { expectedRevision: snapshot.revision });
-              sessionTargetPaths.delete(sessionId);
               closingWindows.add(webContentsId);
               for (const candidate of BrowserWindow.getAllWindows()) {
                 if (candidate === window) continue;
@@ -1640,7 +1692,6 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
               };
             }
             await runtime.close(sessionId, closeOptions);
-            sessionTargetPaths.delete(sessionId);
             closingWindows.add(webContentsId);
             for (const candidate of BrowserWindow.getAllWindows()) {
               if (candidate === window) continue;
@@ -1667,7 +1718,6 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
       windowModes.delete(webContentsId);
       windowSessions.delete(webContentsId);
       if (createdSessionId !== undefined) {
-        sessionTargetPaths.delete(createdSessionId);
         await collaboration.shutdown(createdSessionId).catch(() => undefined);
         await runtime.close(createdSessionId, { discardUnsaved: true }).catch(() => undefined);
       }
@@ -1835,9 +1885,7 @@ const configureIpc = (): void => {
     const authorization = await confirmReplace(event);
     if (authorization === null)
       throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-    return assignSession(event, await runtime.openMainOnly({ targetPath }), authorization, {
-      targetPath,
-    });
+    return assignSession(event, await runtime.openMainOnly({ targetPath }), authorization);
   });
 
   handle(DESKTOP_IPC.execute, executeInputSchema, async (event, input) => {
@@ -1995,83 +2043,94 @@ const configureIpc = (): void => {
     },
   );
   handle(DESKTOP_IPC.collaborationHost, hostInputSchema, async (event, input) => {
-    assertSessionAccess(event, input.sessionId);
-    const targetPath = sessionTargetPaths.get(input.sessionId);
-    if (targetPath === undefined) {
-      throw new DesktopMainError(
-        'COLLABORATION_REQUIRES_SAVED_FILE',
-        'Save this presentation as a .hdeck before hosting.',
-      );
-    }
-    let source = runtime.getSnapshot(input.sessionId);
-    if (source.dirty) {
-      const saved = await saveWithTargetFallback(event, input.sessionId);
-      if (saved === undefined)
-        throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-      source = saved;
-    }
-    let transition;
-    try {
-      transition = await collaboration.host({ ...input, targetPath });
-    } catch (error) {
-      if (!(error instanceof CollaborationError) || error.code !== 'WRITER_LEASE_STALE') {
-        throw error;
-      }
-      const parent = findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
-      const choice = await messageBox(parent, {
-        type: 'warning',
-        title: 'Take over expired writer lease?',
-        message: 'The previous collaboration host stopped renewing its writer lease.',
-        detail:
-          'Continue only if that host is closed. HTMLlelujah will observe the shared file for a full lease window before taking ownership; any active heartbeat cancels the takeover.',
-        buttons: ['Verify and take over', 'Cancel'],
-        defaultId: 1,
-        cancelId: 1,
-        noLink: true,
-      });
-      if (choice.response !== 0) {
-        throw new DesktopMainError('CANCELLED', 'Writer takeover was cancelled.');
-      }
-      transition = await collaboration.host({ ...input, targetPath, allowExpiredTakeover: true });
-    }
-    await assignSession(
-      event,
-      transition.snapshot,
-      {
-        sessionId: transition.previousSessionId,
-        closeOptions: { expectedRevision: source.revision },
+    const result = await runSerializedStandaloneCollaborationTransition(standaloneSaveQueue, {
+      sessionId: input.sessionId,
+      assertCurrent: () => {
+        assertSessionAccess(event, input.sessionId);
+        collaboration.assertStandaloneOperation(input.sessionId, 'Start collaboration');
       },
-      { targetPath },
-    );
-    return transition.status;
+      getSnapshot: () => runtime.getSnapshot(input.sessionId),
+      getTargetPath: () => runtime.getSaveTargetMainOnly(input.sessionId),
+      saveDirty: () => saveStandaloneWithTargetFallbackSerialized(event, input.sessionId),
+      missingTarget: () => {
+        throw new DesktopMainError(
+          'COLLABORATION_REQUIRES_SAVED_FILE',
+          'Save this presentation as a .hdeck before hosting.',
+        );
+      },
+      transition: async ({ source, targetPath }) => {
+        let transition;
+        try {
+          transition = await collaboration.host({ ...input, targetPath });
+        } catch (error) {
+          if (!(error instanceof CollaborationError) || error.code !== 'WRITER_LEASE_STALE') {
+            throw error;
+          }
+          const parent = findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+          const choice = await messageBox(parent, {
+            type: 'warning',
+            title: 'Take over expired writer lease?',
+            message: 'The previous collaboration host stopped renewing its writer lease.',
+            detail:
+              'Continue only if that host is closed. HTMLlelujah will observe the shared file for a full lease window before taking ownership; any active heartbeat cancels the takeover.',
+            buttons: ['Verify and take over', 'Cancel'],
+            defaultId: 1,
+            cancelId: 1,
+            noLink: true,
+          });
+          if (choice.response !== 0) {
+            throw new DesktopMainError('CANCELLED', 'Writer takeover was cancelled.');
+          }
+          transition = await collaboration.host({
+            ...input,
+            targetPath,
+            allowExpiredTakeover: true,
+          });
+        }
+        await assignSession(event, transition.snapshot, {
+          sessionId: transition.previousSessionId,
+          closeOptions: { expectedRevision: source.revision },
+        });
+        return transition.status;
+      },
+    });
+    if (result === undefined)
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    return result;
   });
   handle(DESKTOP_IPC.collaborationJoin, joinInputSchema, async (event, input) => {
-    assertSessionAccess(event, input.sessionId);
-    const targetPath = sessionTargetPaths.get(input.sessionId);
-    if (targetPath === undefined) {
-      throw new DesktopMainError(
-        'COLLABORATION_REQUIRES_SAVED_FILE',
-        "Open the host's shared .hdeck before joining.",
-      );
-    }
-    const source = runtime.getSnapshot(input.sessionId);
-    if (source.dirty) {
-      throw new DesktopMainError(
-        'DIRTY_DOCUMENT',
-        'Reopen the shared .hdeck before joining so local unsaved edits are not discarded.',
-      );
-    }
-    const transition = await collaboration.join({ ...input, targetPath });
-    await assignSession(
-      event,
-      transition.snapshot,
-      {
-        sessionId: transition.previousSessionId,
-        closeOptions: { expectedRevision: source.revision },
+    const result = await runSerializedStandaloneCollaborationTransition(standaloneSaveQueue, {
+      sessionId: input.sessionId,
+      assertCurrent: () => {
+        assertSessionAccess(event, input.sessionId);
+        collaboration.assertStandaloneOperation(input.sessionId, 'Join collaboration');
       },
-      { targetPath },
-    );
-    return transition.status;
+      getSnapshot: () => runtime.getSnapshot(input.sessionId),
+      getTargetPath: () => runtime.getSaveTargetMainOnly(input.sessionId),
+      saveDirty: async () => {
+        throw new DesktopMainError(
+          'DIRTY_DOCUMENT',
+          'Reopen the shared .hdeck before joining so local unsaved edits are not discarded.',
+        );
+      },
+      missingTarget: () => {
+        throw new DesktopMainError(
+          'COLLABORATION_REQUIRES_SAVED_FILE',
+          "Open the host's shared .hdeck before joining.",
+        );
+      },
+      transition: async ({ source, targetPath }) => {
+        const transition = await collaboration.join({ ...input, targetPath });
+        await assignSession(event, transition.snapshot, {
+          sessionId: transition.previousSessionId,
+          closeOptions: { expectedRevision: source.revision },
+        });
+        return transition.status;
+      },
+    });
+    if (result === undefined)
+      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+    return result;
   });
   handle(DESKTOP_IPC.collaborationLeave, sessionInputSchema, async (event, input) => {
     assertSessionAccess(event, input.sessionId);
@@ -2080,20 +2139,13 @@ const configureIpc = (): void => {
     if (ended.mode === 'host' && !ended.preserveDetached) {
       const previousSnapshot = runtime.getSnapshot(input.sessionId);
       const reopened = await runtime.openMainOnly({ targetPath: ended.targetPath });
-      await assignSession(
-        event,
-        reopened,
-        {
-          sessionId: input.sessionId,
-          closeOptions: { expectedRevision: previousSnapshot.revision },
-        },
-        { targetPath: ended.targetPath },
-      );
-    } else {
-      // Keep the converged guest snapshot open as an unsaved local copy. Reopening the shared
-      // target here could regress to the host's last explicit save.
-      sessionTargetPaths.delete(input.sessionId);
+      await assignSession(event, reopened, {
+        sessionId: input.sessionId,
+        closeOptions: { expectedRevision: previousSnapshot.revision },
+      });
     }
+    // Every other transition keeps the converged detached copy open. Reopening the shared target
+    // here could regress to the host's last explicit save.
     return collaboration.status(windowSessions.get(event.sender.id) ?? input.sessionId);
   });
 

@@ -119,6 +119,7 @@ export interface PresentationInput {
 export interface CollaborationStatus {
   readonly mode: 'offline' | 'host' | 'guest';
   readonly connectedPeers: number;
+  readonly availableHostAddresses?: readonly CollaborationHostAddress[] | undefined;
   readonly sessionCode?: string | undefined;
   readonly hostFingerprint?: string | undefined;
   readonly endpoint?: string | undefined;
@@ -126,6 +127,11 @@ export interface CollaborationStatus {
   readonly participants: readonly CollaborationParticipant[];
   readonly pendingJoins: readonly CollaborationPendingJoin[];
   readonly note: string;
+}
+
+export interface CollaborationHostAddress {
+  readonly address: string;
+  readonly name: string;
 }
 
 export interface CollaborationParticipant {
@@ -149,6 +155,7 @@ export interface CollaborationHostInput {
   readonly sessionId: string;
   readonly displayName: string;
   readonly enableDiscovery: boolean;
+  readonly hostAddress: string;
 }
 
 export interface CollaborationJoinInput {

@@ -122,6 +122,7 @@ const paths = {
   evidenceStaging: path.join(worktreeRoot, 'artifacts', 'release-evidence'),
 };
 paths.candidateManifest = path.join(paths.evidenceStaging, 'release-candidate-v1.json');
+paths.dependencySbom = path.join(paths.evidenceStaging, 'dependency-sbom.cdx.json');
 const promotionParent = path.dirname(repositoryRoot);
 const finalArtifactRoot = path.join(repositoryRoot, 'apps', 'desktop', 'out');
 const finalEvidenceRoot = path.join(repositoryRoot, 'artifacts', 'release-evidence');
@@ -168,6 +169,17 @@ if (configuredSigningKeys.length > 0) {
 
 assertSafeWorktree(worktreeRoot);
 const validateCandidatePair = async ({ requireReady }) => {
+  if (requireReady) {
+    await runProcess(
+      process.execPath,
+      [
+        'scripts/verify-dependency-sbom.mjs',
+        '--sbom',
+        path.join(finalEvidenceRoot, 'dependency-sbom.cdx.json'),
+      ],
+      repositoryRoot,
+    );
+  }
   await runProcess(
     process.execPath,
     [

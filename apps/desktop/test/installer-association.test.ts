@@ -42,11 +42,12 @@ describe('Windows installer association cleanup', () => {
     ) as {
       build?: {
         fileAssociations?: Array<{ name?: string }>;
-        nsis?: { include?: string };
+        nsis?: { include?: string; packElevateHelper?: boolean };
       };
     };
 
     expect(packageJson.build?.nsis?.include).toBe('scripts/installer-association.nsh');
+    expect(packageJson.build?.nsis?.packElevateHelper).toBe(false);
     expect(packageJson.build?.fileAssociations?.[0]?.name).toBe(productProgId);
   });
 

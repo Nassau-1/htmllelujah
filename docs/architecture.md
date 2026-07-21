@@ -1,6 +1,6 @@
 # Architecture
 
-Status: V1 release-candidate implementation baseline, 2026-07-16.
+Status: V1 release-candidate implementation baseline, 2026-07-20.
 
 ## System objective
 
@@ -98,10 +98,24 @@ rows, columns, cells, and style data. Images reference embedded content-addresse
 assets. The model never stores arbitrary HTML, JavaScript, active remote URLs,
 unrestricted CSS, or shell instructions.
 
+Validation also enforces the byte size of the complete canonical document before a
+transaction commits. Component limits for text, tables, commands, assets, and other
+collections remain narrower where their processing cost requires it. This makes one
+representability contract apply to editing, recovery, MCP, collaboration, archive
+encoding, and export rather than allowing a document that one surface accepts and
+another cannot safely process.
+
 Human image import validates a bounded header before pixel decode, verifies decoded
 dimensions, then registers the content-addressed bytes and inserts or replaces the
 image in one runtime transaction. The document revision, recovery journal, asset
 reference, and undo history therefore advance together or not at all.
+
+The runtime derives one opaque validation proof from the private immutable bytes of
+each asset. Later transactions, undo, redo, and save preparation can reuse that proof
+without rehashing every retained image. Import is content-identity aware: identical
+bytes reuse the existing canonical asset identifier and dependent `assetId` fields are
+remapped inside the same queued transaction. An identifier alias or a hash match with
+different bytes fails before journaling.
 
 ## Shared rendering
 
@@ -160,6 +174,24 @@ rename against an arbitrary non-cooperating writer; users must not bypass a repo
 conflict. A recovered state opens as an independent candidate and requires explicit
 Save or Save As.
 
+Save, Save As, and the complete transition into hosting or joining are serialized in
+the owning document session. The session's current target is authoritative; a queued
+write or collaboration handoff must still match the exact reserved target at commit
+time. A one-link sidecar coordinates cooperating standalone writers. A one-link
+mutation-lock file is created exclusively and bound to an open-handle identity plus a
+random owner token, serializing sidecar creation, replacement, and deletion across
+processes. Persisted replacement never intentionally removes the active pathname,
+cleanup compares exact bytes or file identity, and release is retryable. Mutation-lock
+recovery is never clock-automatic: it occurs only after explicit expired-writer
+confirmation and a full stable-observation window. A mutation lock whose writer
+sidecar is missing is treated as the same explicit-recovery condition rather than as
+proof that no writer exists.
+
+Archive persistence rechecks both the destination fingerprint and the exact one-link
+temporary-file identity after asynchronous commit guards and before replacement. These
+controls and their remaining platform limit are recorded in
+[`ADR-011`](decisions/ADR-011-bounded-representability-and-save-authority.md).
+
 ## LAN collaboration and synchronized folders
 
 V1 uses an authoritative host rather than a CRDT. A synchronized folder carries the
@@ -176,8 +208,22 @@ claim to prevent a second independent host on another replica.
 
 Transport uses WSS with an ephemeral session certificate, displayed fingerprint,
 document-scoped session credential, HMAC-authenticated frames, bounded messages, and
-private-address validation. Optional discovery advertises only ephemeral protocol
-information, not titles, filenames, paths, slide text, assets, or reusable secrets.
+private-address validation. Hosting requires the user to choose a named private-
+network adapter. The listener binds to that exact address and discovery authenticates
+the same address in its signed hint, so another adapter advertised by the operating
+system cannot silently redirect a guest. If the selected adapter disappears, hosting
+requires a new explicit selection. Optional discovery advertises only ephemeral
+protocol information, not titles, filenames, paths, slide text, assets, or reusable
+secrets.
+
+The listener is bound to one validated private address. Admission, bootstrap,
+idempotency, and retained-history budgets are reserved before asynchronous work.
+Joining peers receive a lossless authoritative snapshot, and indirect master or layout
+changes participate in the same edit-lease rules as direct element changes. The host
+rechecks its writer authority at the shared-file commit boundary. Leaving first closes
+command admission, drains every already admitted submission, persists the resulting
+host snapshot, and only then closes transport and releases writer authority. A failed
+join destroys its detached clone before returning control to the standalone session.
 
 Guests maintain a detached local session and recovery record. Independent objects
 may be edited concurrently through host ordering. A soft lock prevents concurrent
@@ -227,6 +273,11 @@ release. ADR-008 records the decision.
 The Windows x64 build is packaged as an ASAR application and a per-user NSIS
 installer with `.hdeck` association. Installation and normal use do not require
 elevation. User decks and recovery data are not deleted automatically by uninstall.
+
+V1 does not include the packager's optional installed elevation helper: the product
+has no automatic updater or per-machine installation path, and NSIS performs its own
+installer UAC flow. Reintroducing automatic updates or per-machine installation must
+revisit this packaging decision and the executable attestation set.
 
 Release packaging must preserve the project source notice, binary terms,
 third-party notices, Electron and Chromium license files, exact artifact checksums,

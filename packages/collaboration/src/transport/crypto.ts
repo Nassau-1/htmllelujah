@@ -92,6 +92,7 @@ export const createDiscoveryHint = (
   input: {
     readonly sessionId: string;
     readonly certificateFingerprint: string;
+    readonly host: string;
     readonly port: number;
     readonly expiresAtMs: number;
   },

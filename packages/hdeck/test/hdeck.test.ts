@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import {
+  canonicalDocumentBytes,
   createNeutralDemoDeck,
   type DeckDocument,
   type TransactionMetadata,
@@ -11,8 +12,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   appendJournalRecord,
+  assertDisjointZipMemberRanges,
+  assertHdeckRepresentable,
+  assertHdeckRepresentableWithValidatedAssets,
   canonicalJson,
   createHdeckArchive,
+  createHdeckArchiveWithValidatedAssets,
   createJournalBytes,
   createJournalRecord,
   encodeStoredZip,
@@ -26,6 +31,7 @@ import {
   replayJournal,
   saveHdeckAtomic,
   sha256,
+  validateHdeckAsset,
   type HdeckManifestV1,
   type JournalHeader,
 } from '../src/index.js';
@@ -290,7 +296,179 @@ describe('bounded image header parser', () => {
   });
 });
 
+describe('bounded ZIP member ownership', () => {
+  it('rejects overlap independent of descriptor order and accepts exact adjacency', () => {
+    expect(() =>
+      assertDisjointZipMemberRanges([
+        { memberStart: 48, memberEnd: 96 },
+        { memberStart: 0, memberEnd: 64 },
+      ]),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_INVALID' }));
+    expect(() =>
+      assertDisjointZipMemberRanges([
+        { memberStart: 20, memberEnd: 40 },
+        { memberStart: 20, memberEnd: 40 },
+      ]),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_INVALID' }));
+    expect(() =>
+      assertDisjointZipMemberRanges([
+        { memberStart: 10, memberEnd: 90 },
+        { memberStart: 30, memberEnd: 40 },
+      ]),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_INVALID' }));
+    expect(() =>
+      assertDisjointZipMemberRanges([
+        { memberStart: 48, memberEnd: 96 },
+        { memberStart: 0, memberEnd: 48 },
+      ]),
+    ).not.toThrow();
+  });
+});
+
 describe('.hdeck archive', () => {
+  it('uses the shared canonical UTF-8 document boundary exactly', () => {
+    const document = createNeutralDemoDeck();
+    const byteLength = canonicalDocumentBytes(document).byteLength;
+    expect(() =>
+      assertHdeckRepresentable({ document }, { maxDocumentBytes: byteLength }),
+    ).not.toThrow();
+    expect(() =>
+      assertHdeckRepresentable({ document }, { maxDocumentBytes: byteLength - 1 }),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_LIMIT_EXCEEDED' }));
+  });
+
+  it('preflights expanded bytes and exact stored-ZIP overhead before archive allocation', () => {
+    const input = {
+      document: createNeutralDemoDeck(),
+      createdAt: '2026-07-20T12:00:00.000Z',
+      modifiedAt: '2026-07-20T12:00:00.000Z',
+    };
+    const archive = createHdeckArchive(input);
+    const zipOverhead =
+      22 +
+      76 +
+      Buffer.byteLength('manifest.json', 'utf8') * 2 +
+      76 +
+      Buffer.byteLength('document.json', 'utf8') * 2;
+    const expandedBytes = archive.byteLength - zipOverhead;
+
+    expect(() =>
+      assertHdeckRepresentable(input, {
+        maxArchiveBytes: archive.byteLength,
+        maxTotalBytes: expandedBytes,
+        maxEntries: 2,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertHdeckRepresentable(input, { maxArchiveBytes: archive.byteLength - 1 }),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_LIMIT_EXCEEDED' }));
+    expect(() =>
+      assertHdeckRepresentable(input, { maxTotalBytes: expandedBytes - 1 }),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_LIMIT_EXCEEDED' }));
+    expect(() => assertHdeckRepresentable(input, { maxEntries: 1 })).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_LIMIT_EXCEEDED' }),
+    );
+  });
+
+  it('shares one byte-derived asset compatibility policy with precommit callers', () => {
+    const bytes = pngHeader(1, 1);
+    const hash = sha256(bytes);
+    const firstId = '40000000-0000-4000-8000-000000000011';
+    const secondId = '40000000-0000-4000-8000-000000000012';
+    const reference = (id: string) => ({
+      id,
+      kind: 'image' as const,
+      hash,
+      mediaType: 'image/png',
+      fileName: 'tiny.png',
+      byteLength: bytes.byteLength,
+      widthPx: 1,
+      heightPx: 1,
+    });
+    const input = (id: string, widthPx = 1) => ({
+      id,
+      bytes,
+      mediaType: 'image/png' as const,
+      widthPx,
+      heightPx: 1,
+    });
+    const document = { ...createNeutralDemoDeck(), assets: [reference(firstId)] };
+
+    expect(() => assertHdeckRepresentable({ document, assets: [input(firstId)] })).not.toThrow();
+    expect(() => assertHdeckRepresentable({ document, assets: [input(firstId, 2)] })).toThrowError(
+      expect.objectContaining({ code: 'ARCHIVE_INVALID' }),
+    );
+    expect(() =>
+      assertHdeckRepresentable({
+        document: { ...document, assets: [reference(firstId), reference(secondId)] },
+        assets: [input(firstId), input(secondId)],
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_INVALID' }));
+  });
+
+  it('accepts only authoritative immutable-asset proofs for incremental checks', () => {
+    const bytes = pngHeader(1, 1);
+    const id = '40000000-0000-4000-8000-000000000013';
+    const validated = validateHdeckAsset({
+      id,
+      bytes,
+      mediaType: 'image/png',
+      widthPx: 1,
+      heightPx: 1,
+    });
+    const document = {
+      ...createNeutralDemoDeck(),
+      assets: [
+        {
+          id,
+          kind: 'image' as const,
+          hash: sha256(bytes),
+          mediaType: 'image/png',
+          fileName: 'proof.png',
+          byteLength: bytes.byteLength,
+          widthPx: 1,
+          heightPx: 1,
+        },
+      ],
+    };
+
+    expect(Object.isFrozen(validated)).toBe(true);
+    expect(() =>
+      assertHdeckRepresentableWithValidatedAssets({ document, assets: [validated] }),
+    ).not.toThrow();
+    const timestamps = {
+      createdAt: '2026-07-15T12:00:00.000Z',
+      modifiedAt: '2026-07-15T12:00:00.000Z',
+    };
+    expect(
+      createHdeckArchiveWithValidatedAssets({
+        document,
+        assets: [validated],
+        ...timestamps,
+      }),
+    ).toEqual(
+      createHdeckArchive({
+        document,
+        assets: [
+          {
+            id,
+            bytes,
+            mediaType: 'image/png',
+            widthPx: 1,
+            heightPx: 1,
+          },
+        ],
+        ...timestamps,
+      }),
+    );
+    expect(() =>
+      assertHdeckRepresentableWithValidatedAssets({
+        document,
+        assets: [{ ...validated }],
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'ARCHIVE_INVALID' }));
+  });
+
   it('round-trips a canonical deck deterministically', () => {
     const document = createNeutralDemoDeck();
     const input = {

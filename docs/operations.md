@@ -151,6 +151,34 @@ runtime, and pnpm version. A failed rerun removes any prior functional success. 
 run this command as a child of `make:win`, because the build intentionally owns the
 same cross-process lock until promotion is complete.
 
+After that matrix and the exact candidate commit's CodeQL run are green, collect and
+recheck the final security gate:
+
+```powershell
+pnpm security:evidence
+pnpm security:verify
+```
+
+The collector runs both production-only and full `corepack pnpm audit` queries,
+binds the successful CodeQL push run, analyze job, analysis, and exhaustive zero-open-
+alert query to the candidate commit, and records current Microsoft Defender engine,
+platform, and signature versions. The scanner itself must carry a valid Microsoft
+Authenticode signature, and its bytes, version, signature, protection state, engine,
+platform, and definitions must remain unchanged across both scans. Defender scans the
+exact installer and complete `win-unpacked` directory with remediation disabled; raw
+scanner output remains in ignored private release evidence while the public canonical
+JSON records only its hash and size. Both the installer and
+`win-unpacked/HTMLlelujah.exe` must be exactly `NotSigned` with no signer or
+timestamper for the unsigned V1 policy. The final release-evidence verifier runs again
+after the scans. Security evidence and scans dated in the future, older than 24 hours,
+or out of order block finalization. Defender signature definitions must predate the
+scans by no more than seven days.
+
+This is an explicit signed-Microsoft **on-demand** policy. Antivirus, antispyware, the
+antimalware service, fresh definitions, and two clean exact scans are mandatory.
+Real-time protection and the optional network-inspection engine are recorded for
+transparency but are not treated as participants in these two on-demand scans.
+
 Promotion is crash-recoverable; two independent directory renames are not presented
 as one filesystem primitive. Every journal publication, backup, candidate move,
 rollback, commit, and cleanup-tombstone rename is followed by a metadata flush of both
@@ -180,11 +208,13 @@ file-protocol privileges. `RunAsNode` is enabled only to support the console std
 launcher; the accepted tradeoff is documented in
 [`ADR-008`](decisions/ADR-008-local-stdio-mcp.md).
 
-When no Authenticode certificate is configured, the filename and release notes must
-say **unsigned** and explain that Windows may display a reputation warning. Do not
-disable sandboxing, fuses, archive checks, or antivirus scanning to avoid that prompt.
-When a certificate is configured, sign and timestamp the installer, application, and
-uninstaller as applicable, then verify each signature on the candidate machine.
+The official no-charge public V1 pipeline is deliberately **unsigned**: it refuses
+signing credentials, requires unsigned filenames and notes, and verifies that the
+installer and application executable are exactly `NotSigned`. Windows may display a
+reputation warning. Do not disable sandboxing, fuses, archive checks, or antivirus
+scanning to avoid that prompt. A future signed or commercial distribution requires a
+separately reviewed candidate and release gate; it cannot reuse this unsigned V1
+security record.
 
 ## Opened-application smoke tests
 
@@ -289,7 +319,9 @@ journal is the recovery autosave; it does not silently replace the user-selected
 Image import reads at most 25 MiB, parses a bounded PNG/JPEG/WebP header before pixel
 decode, and requires decoded dimensions to match. Asset registration plus insertion
 or replacement is one durable command transaction and one undo step; failed imports
-do not leave an orphaned document reference.
+do not leave an orphaned document reference. Importing identical bytes reuses the
+existing content-addressed asset; this is expected and does not duplicate the image
+payload in the deck.
 
 Do not ask a user to delete recovery data as the first troubleshooting step. Preserve
 the original `.hdeck`, list recovery candidates in the app, open the candidate, verify
@@ -297,9 +329,13 @@ its content, and use Save As. Delete or archive private recovery state only afte
 user has confirmed a good independent file.
 
 Explicit Save checks the target fingerprint, writes and validates a temporary sibling,
-and atomically replaces the file. If a synchronized-folder service changed the target,
+revalidates that same one-link temporary file after the writer-authority check, and
+atomically replaces the target. If a synchronized-folder service changed either path,
 do not bypass the conflict. Reload the changed file, save the current state as an
-independent copy, or cancel and reconcile deliberately.
+independent copy, or cancel and reconcile deliberately. If an expired writer
+reservation is reported, recover it only after confirming that the prior app or device
+is closed; the app then observes both reservation and target for a full lease window
+before taking over and removing any abandoned sidecar-mutation lock file.
 
 ## LAN collaboration operations
 
@@ -316,9 +352,15 @@ can acquire a lease before the synchronization service propagates either sidecar
   channel; treat all three as sensitive session data.
 - Verify the fingerprint before joining. Do not accept a changed fingerprint without
   restarting and reconfirming the session.
+- Select the named private-network adapter that participants actually share. If that
+  adapter disconnects, stop and select again; the app deliberately does not fall over
+  to a VPN, virtual adapter, or another private interface without confirmation.
 - Enable discovery only on a private network. Discovery is convenience, not
   authentication.
 - Guests must not use folder-sync conflict resolution to overwrite the host file.
+- Let the Leave action finish before closing the host. It stops new submissions,
+  drains accepted edits, saves the final host snapshot, and then releases the writer
+  reservation.
 - If a guest falls outside the retained command window or the host disappears, leave
   and rejoin. Do not attempt an offline merge in V1.
 - To fork intentionally, leave the session and use Save As for an independent file.
@@ -372,7 +414,9 @@ separate unmodified FFmpeg binary has its own narrow review in
 [`docs/legal/electron-runtime-license-review.md`](legal/electron-runtime-license-review.md).
 That document is an engineering compliance record, not legal advice. Qualified legal
 approval of the corresponding-source mechanism remains pending and is required before
-commercial distribution.
+commercial distribution. The V1 publication procedure is scoped to an official
+no-charge public build governed by `EULA.txt`; it does not clear that separate
+commercial-distribution gate.
 
 The installer and installed directory must contain `EULA.txt`, the project source
 notice, `THIRD_PARTY_NOTICES.md`, `LICENSE.electron.txt`, and
@@ -386,10 +430,31 @@ Generate the locked production npm SBOM:
 pnpm sbom:generate
 ```
 
+The detached Windows build writes the same validated graph as
+`artifacts/release-evidence/dependency-sbom.cdx.json`, binds it to the exact
+`pnpm-lock.yaml` SHA-256 and package-manager version, and publishes it separately.
 That graph does not by itself enumerate Electron's Chromium and FFmpeg binaries, the
 NSIS runtime, or every packaged file. The release record must also inventory the
-exact installer and installed directory, identify Electron/Chromium/FFmpeg and NSIS,
-and scan the final artifact for vulnerabilities and licenses.
+exact installer and installed directory and identify Electron, Chromium, FFmpeg, and
+NSIS. The pnpm audits cover known vulnerabilities in the locked JavaScript dependency
+graphs; the native supplement is an identity and hash inventory, and Defender is an
+antimalware scan. Neither is represented as a native CVE scan.
+
+The build-runtime supplement treats the exact packaged `HTMLlelujah.exe` as the
+runtime authority. It runs that executable only in Electron's packaged Node mode,
+requires its Electron version to equal both the exact desktop dependency and lockfile
+declarations, reads the fuse wire from that same executable, and requires the complete
+known V1 fuse set: `RunAsNode`, cookie encryption, embedded ASAR integrity, ASAR-only
+loading, and WebAssembly trap handlers enabled; `NODE_OPTIONS`, Node CLI inspection,
+browser-specific V8 snapshot loading, and extra `file:` privileges disabled. An
+unknown, missing, inherited, or contrary fuse fails closed before the executable is
+run. Chromium and embedded Node.js versions are bound to the same executable hash.
+FFmpeg is identified as the binary shipped by that exact Electron distribution and
+retains its own inventory hash. The NSIS version comes from identity text embedded in
+the exact installer, not from a potentially unrelated local builder cache. A
+release-ready record requires exactly one of each of these five components with valid
+versions, fuse evidence, and binding hashes. Non-ready diagnostic evidence may record
+an explicitly incomplete runtime inventory, but it can never satisfy `--require-ready`.
 
 Generate SHA-256 values only after the artifact is final:
 
@@ -425,8 +490,8 @@ installer after it is built; source and lockfile scans alone are insufficient.
 3. Build the unpacked directory and NSIS installer. Run `pnpm validate:candidate` to
    execute and record the opened-app, export, MCP, accessibility, performance, LAN,
    and installer checks against that exact promoted candidate.
-4. Review packaged contents, notices, asset provenance, runtime licenses, SBOM, and
-   vulnerability results.
+4. Review packaged contents, notices, asset provenance, runtime licenses, both SBOMs,
+   JavaScript dependency-audit results, native inventory, and malware-scan results.
 5. Verify version, application identity, `.hdeck` association, signature state,
    checksums, and unsigned labelling when applicable.
 6. Update `CHANGELOG.md`, `TODO.md`, release notes, and the release evidence with only
@@ -460,7 +525,8 @@ peeled annotated local tag, and the already-pushed peeled remote tag all equal
 `candidateManifest.source.commit`. The direct local and remote annotated tag object
 IDs must also be identical. The promoted candidate then passes the complete
 release-evidence verifier again. The finalizer also requires the canonical functional
-JSON and ZIP above, reconstructs every bundled proof, independently recalculates the
+JSON and ZIP and fresh canonical security JSON above, publishes both SBOMs and the
+security JSON, reconstructs every bundled proof, independently recalculates the
 Windows platform/architecture/build, Node runtime, pnpm version, source tree,
 lockfile, and full artifact inventory, and enforces the 30-minute LAN minimum. It
 repeats that exact state check before and after record creation and around every remote
@@ -474,7 +540,15 @@ SHA-256 to stdout. `artifacts/` is ignored, so the record is a release asset, no
 tracked-source edit. It references the immutable candidate/evidence hashes but is not
 included in its own hash set; this avoids a generated-commit or self-hash loop. Record
 creation is write-once and mode-independent: a draft-to-public rerun reuses only the
-byte-identical record and never clobbers it.
+byte-identical record and never clobbers it. That record also freezes the exact
+security-evidence JSON. Its 24-hour validity cannot be renewed in place: any
+publication rerun with an existing record fails before a remote release mutation if
+the bound evidence has expired, is future-dated, or has been replaced by a recollected
+file. The finalizer leaves every existing GitHub draft and its assets unchanged and
+never deletes a release. Preserve the refused draft for audit, then create a new
+versioned candidate from a clean commit, collect fresh evidence, create and push its
+new annotated version tag, and publish a new GitHub release. Do not overwrite the old
+record or reuse its tag.
 
 Electron Builder always remains on `--publish never`, and release child processes do
 not inherit token environment variables or `GH_HOST`. Before `--publish-draft` or

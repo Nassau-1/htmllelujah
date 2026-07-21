@@ -61,6 +61,7 @@ export interface AuthoritativeSessionHostOptions {
   readonly idFactory?: () => string;
   readonly tailLimit?: number;
   readonly idempotencyLimit?: number;
+  readonly maxIdempotencyBytes?: number;
   readonly maxCommandsPerBatch?: number;
   readonly maxCommandPayloadBytes?: number;
   readonly maxPresencePayloadBytes?: number;
@@ -73,6 +74,7 @@ export interface AuthoritativeSessionHostOptions {
 interface IdempotencyEntry {
   readonly fingerprint: string;
   readonly transaction: CommittedTransaction;
+  readonly accountedBytes: number;
 }
 
 interface PreparedSubmission {
@@ -83,12 +85,14 @@ interface PreparedSubmission {
   readonly rebased: boolean;
   readonly beforeRevision: string;
   readonly transactionId: string;
+  readonly idempotencyReservationBytes: number;
   readonly options: TransactionOptions;
 }
 
 const DEFAULT_TAIL_LIMIT = 256;
 const DEFAULT_MAX_TAIL_RESYNC_BYTES = 24 * 1024 * 1024;
 const DEFAULT_IDEMPOTENCY_LIMIT = 10_000;
+const DEFAULT_MAX_IDEMPOTENCY_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_PARTICIPANTS = 32;
 
 const isPositiveSafeInteger = (value: number): boolean => Number.isSafeInteger(value) && value > 0;
@@ -162,6 +166,7 @@ export class AuthoritativeSessionHost {
   private readonly idFactory: () => string;
   private readonly tailLimit: number;
   private readonly idempotencyLimit: number;
+  private readonly maxIdempotencyBytes: number;
   private readonly maxCommandsPerBatch: number;
   private readonly maxCommandPayloadBytes: number;
   private readonly maxPresencePayloadBytes: number;
@@ -171,6 +176,7 @@ export class AuthoritativeSessionHost {
   private readonly presenceTtlMs: number;
   private readonly tail: CommittedTransaction[] = [];
   private readonly idempotency = new Map<string, IdempotencyEntry>();
+  private idempotencyBytes = 0;
   private readonly lastModifiedSeq = new Map<string, number>();
   private readonly textLeases = new Map<string, TextLease>();
   private readonly presence = new Map<string, PresenceRecord>();
@@ -190,6 +196,7 @@ export class AuthoritativeSessionHost {
     this.tailLimit = options.tailLimit ?? DEFAULT_TAIL_LIMIT;
     this.idempotencyLimit =
       options.idempotencyLimit === undefined ? DEFAULT_IDEMPOTENCY_LIMIT : options.idempotencyLimit;
+    this.maxIdempotencyBytes = options.maxIdempotencyBytes ?? DEFAULT_MAX_IDEMPOTENCY_BYTES;
     this.maxCommandsPerBatch = options.maxCommandsPerBatch ?? 100;
     this.maxCommandPayloadBytes =
       options.maxCommandPayloadBytes ?? DEFAULT_MAX_COMMAND_PAYLOAD_BYTES;
@@ -204,6 +211,7 @@ export class AuthoritativeSessionHost {
       ![
         this.tailLimit,
         this.idempotencyLimit,
+        this.maxIdempotencyBytes,
         this.maxCommandsPerBatch,
         this.maxCommandPayloadBytes,
         this.maxPresencePayloadBytes,
@@ -316,6 +324,40 @@ export class AuthoritativeSessionHost {
     const beforeRevision = this.currentRevision;
     const timestampMs = this.clock();
     const transactionId = this.idFactory();
+    const options: TransactionOptions = {
+      expectedRevision: beforeRevision,
+      metadata: {
+        transactionId,
+        actorId: request.clientId,
+        origin: request.metadata.origin,
+        label: request.metadata.label,
+        timestamp: new Date(timestampMs).toISOString(),
+      },
+    };
+    const idempotencyReservationBytes =
+      new TextEncoder().encode(fingerprint).byteLength +
+      measureJsonBytes({
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        sessionId: this.sessionId,
+        documentId: this.documentId,
+        sessionSeq: this.sessionSequence + 1,
+        transactionId,
+        clientId: request.clientId,
+        clientRequestId: request.clientRequestId,
+        beforeRevision,
+        afterRevision: 'x'.repeat(160),
+        ...(rebased ? { rebasedFromRevision: request.baseRevision } : {}),
+        commands: request.commands,
+        metadata: options.metadata,
+        access,
+      });
+    if (idempotencyReservationBytes > this.maxIdempotencyBytes) {
+      throw new CollaborationError(
+        'IDEMPOTENCY_CAPACITY',
+        'The committed request is too large for the bounded idempotency window.',
+        { idempotencyReservationBytes, maxIdempotencyBytes: this.maxIdempotencyBytes },
+      );
+    }
     return {
       request,
       fingerprint,
@@ -324,16 +366,8 @@ export class AuthoritativeSessionHost {
       rebased,
       beforeRevision,
       transactionId,
-      options: {
-        expectedRevision: beforeRevision,
-        metadata: {
-          transactionId,
-          actorId: request.clientId,
-          origin: request.metadata.origin,
-          label: request.metadata.label,
-          timestamp: new Date(timestampMs).toISOString(),
-        },
-      },
+      idempotencyReservationBytes,
+      options,
     };
   }
 
@@ -341,8 +375,16 @@ export class AuthoritativeSessionHost {
     prepared: PreparedSubmission,
     result: TransactionResult,
   ): CommittedTransaction {
-    const { request, fingerprint, idempotencyKey, access, rebased, beforeRevision, transactionId } =
-      prepared;
+    const {
+      request,
+      fingerprint,
+      idempotencyKey,
+      access,
+      rebased,
+      beforeRevision,
+      transactionId,
+      idempotencyReservationBytes,
+    } = prepared;
     const nextSeq = this.sessionSequence + 1;
     const transaction = committedTransactionSchema.parse({
       protocolVersion: COLLABORATION_PROTOCOL_VERSION,
@@ -365,23 +407,47 @@ export class AuthoritativeSessionHost {
     access.writeSet.forEach((key) => this.lastModifiedSeq.set(key, nextSeq));
     this.tail.push(transaction);
     if (this.tail.length > this.tailLimit) this.tail.shift();
-    this.rememberIdempotentResult(idempotencyKey, { fingerprint, transaction });
+    this.pruneHistoricalWriteKeys();
+    this.rememberIdempotentResult(idempotencyKey, {
+      fingerprint,
+      transaction,
+      accountedBytes: idempotencyReservationBytes,
+    });
     this.removeInvalidTextLeases(result.document);
 
     return clone(transaction);
   }
 
   private rememberIdempotentResult(key: string, entry: IdempotencyEntry): void {
+    const replaced = this.idempotency.get(key);
+    if (replaced !== undefined) this.idempotencyBytes -= replaced.accountedBytes;
     this.idempotency.set(key, entry);
+    this.idempotencyBytes += entry.accountedBytes;
 
     // Map iteration follows insertion order. Keeping retries at their original position gives us
     // a deterministic window of the most recently committed requests and prevents an old retry
     // from pinning itself indefinitely. Eviction happens only after a successful transaction.
-    while (this.idempotency.size > this.idempotencyLimit) {
+    while (
+      this.idempotency.size > this.idempotencyLimit ||
+      this.idempotencyBytes > this.maxIdempotencyBytes
+    ) {
       const oldest = this.idempotency.keys().next();
       if (oldest.done) return;
+      const evicted = this.idempotency.get(oldest.value);
       this.idempotency.delete(oldest.value);
+      if (evicted !== undefined) this.idempotencyBytes -= evicted.accountedBytes;
     }
+  }
+
+  private get minimumAcceptedBaseSeq(): number {
+    return (this.tail[0]?.sessionSeq ?? this.sessionSequence + 1) - 1;
+  }
+
+  private pruneHistoricalWriteKeys(): void {
+    const minimumAcceptedBaseSeq = this.minimumAcceptedBaseSeq;
+    this.lastModifiedSeq.forEach((lastSeq, key) => {
+      if (lastSeq <= minimumAcceptedBaseSeq) this.lastModifiedSeq.delete(key);
+    });
   }
 
   public getResync(rawRequest: unknown): ResyncResponse {
@@ -587,6 +653,20 @@ export class AuthoritativeSessionHost {
         );
       }
       return false;
+    }
+
+    const minimumBaseSeq = this.minimumAcceptedBaseSeq;
+    if (request.baseSeq < minimumBaseSeq) {
+      throw new CollaborationError(
+        'REVISION_CONFLICT',
+        'The request base sequence predates the retained conflict history.',
+        {
+          baseSeq: request.baseSeq,
+          minimumBaseSeq,
+          currentSeq: this.sessionSequence,
+          currentRevision: this.currentRevision,
+        },
+      );
     }
 
     const touchedKeys = new Set([...access.readSet, ...access.writeSet]);

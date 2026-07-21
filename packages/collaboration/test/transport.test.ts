@@ -187,6 +187,8 @@ const connectRaw = async (
   closed: Promise<[number, Buffer]>;
 }> => {
   const socket = new WebSocket(rawUrl(invitation), {
+    // lgtm[js/disabling-certificate-validation] Test-only raw peer for the server's ephemeral
+    // self-signed certificate; production pin verification is exercised by createClient().
     rejectUnauthorized: false,
     perMessageDeflate: false,
     maxPayload: 1024 * 1024,
@@ -1291,6 +1293,8 @@ describe('WSS collaboration transport', () => {
       const partialTls = connectTls({
         host: invitation.host,
         port: invitation.port,
+        // lgtm[js/disabling-certificate-validation] Test-only incomplete TLS handshake against
+        // the local ephemeral self-signed server; no application data is accepted or sent.
         rejectUnauthorized: false,
       });
       sockets.push(partialTls);

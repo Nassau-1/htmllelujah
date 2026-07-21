@@ -13,6 +13,12 @@ import {
   trackedSourceIdentity,
 } from './release-source-state.mjs';
 import { assertCandidateManifest } from './release-candidate-manifest.mjs';
+import {
+  assertNativeRuntimeSbom,
+  incompleteNativeRuntimeQuality,
+  inspectNativeRuntimeEvidence,
+  nativeRuntimeQuality,
+} from './native-runtime-evidence-support.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
@@ -169,8 +175,10 @@ async function main() {
   const manifestPath = path.join(options.evidenceDir, 'release-manifest.json');
   const inventoryPath = path.join(options.evidenceDir, 'content-inventory.json');
   const checksumsPath = path.join(options.evidenceDir, 'checksums-sha256.txt');
+  const sbomPath = path.join(options.evidenceDir, 'build-sbom.cdx.json');
   const manifest = await readJson(manifestPath);
   const inventory = await readJson(inventoryPath);
+  const sbom = await readJson(sbomPath);
   const artifactDir = options.artifactDir ?? path.resolve(REPO_ROOT, manifest.artifact.root);
 
   const errors = [];
@@ -276,6 +284,57 @@ async function main() {
     }
   }
 
+  if (manifest.quality?.nativeRuntime?.passed === true) {
+    if (errors.length > 0) {
+      errors.push('Native runtime execution was refused because artifact integrity failed');
+    } else {
+      try {
+        const desktopPackage = await readJson(
+          path.join(REPO_ROOT, 'apps', 'desktop', 'package.json'),
+        );
+        const nativeRuntimeEvidence = await inspectNativeRuntimeEvidence({
+          artifactDir,
+          desktopPackage,
+          installers: actualEntries.filter(isInstaller),
+          inventory: actualEntries,
+          lockfile: await readFile(path.join(REPO_ROOT, 'pnpm-lock.yaml'), 'utf8'),
+        });
+        assertNativeRuntimeSbom(sbom, nativeRuntimeEvidence);
+        const expectedQuality = nativeRuntimeQuality(nativeRuntimeEvidence);
+        if (JSON.stringify(manifest.quality.nativeRuntime) !== JSON.stringify(expectedQuality)) {
+          errors.push('Manifest native runtime quality evidence is missing or inconsistent');
+        }
+        const runtimeStatus = sbom?.metadata?.component?.properties?.find(
+          (entry) => entry?.name === 'app.htmllelujah.release:native-runtime-inventory',
+        )?.value;
+        if (runtimeStatus !== 'complete') {
+          errors.push('Build SBOM does not explicitly record a complete native runtime inventory');
+        }
+      } catch (error) {
+        errors.push(`Native runtime evidence failed: ${error.message}`);
+      }
+    }
+  } else {
+    if (
+      JSON.stringify(manifest.quality?.nativeRuntime) !==
+      JSON.stringify(incompleteNativeRuntimeQuality())
+    ) {
+      errors.push('Manifest incomplete native runtime quality evidence is malformed');
+    }
+    if (!Array.isArray(sbom?.components) || sbom.components.length !== 0) {
+      errors.push('An incomplete native runtime SBOM must not claim runtime components');
+    }
+    const runtimeStatus = sbom?.metadata?.component?.properties?.find(
+      (entry) => entry?.name === 'app.htmllelujah.release:native-runtime-inventory',
+    )?.value;
+    if (runtimeStatus !== 'incomplete') {
+      errors.push('Build SBOM does not explicitly record an incomplete native runtime inventory');
+    }
+    if (manifest.quality?.releaseReady === true && !options.requireReady) {
+      errors.push('releaseReady contradicts the incomplete native runtime inventory');
+    }
+  }
+
   if (errors.length > 0) {
     for (const error of errors) console.error(`FAIL: ${error}`);
     throw new Error(`${errors.length} release evidence verification error(s)`);
@@ -291,6 +350,9 @@ async function main() {
     const currentVersion = desktopPackage.version;
     if (manifest.quality.releaseReady !== true) {
       readinessErrors.push('the recorded manifest is not release-ready');
+    }
+    if (manifest.quality.nativeRuntime?.passed !== true) {
+      readinessErrors.push('the required native runtime inventory is incomplete');
     }
     if (manifest.quality.candidatePolicy?.passed !== true) {
       readinessErrors.push('the manifest lacks a passing current candidate policy');

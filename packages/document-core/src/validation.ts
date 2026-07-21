@@ -44,11 +44,45 @@ export type ValidationResult =
       readonly issues: readonly ValidationIssue[];
     };
 
+export const VALIDATION_LIMITS = Object.freeze({
+  maxIssues: 256,
+  maxTableCoordinateVisits: DOCUMENT_LIMITS.maxTableRows * DOCUMENT_LIMITS.maxTableColumns,
+});
+
+export interface ValidationOptions {
+  /** Test-only lowering seam; callers cannot raise production validation work. */
+  readonly maxIssues?: number | undefined;
+  /** Test-only lowering seam; checked before allocating or visiting table occupancy. */
+  readonly maxTableCoordinateVisits?: number | undefined;
+}
+
+interface ResolvedValidationLimits {
+  readonly maxIssues: number;
+  readonly maxTableCoordinateVisits: number;
+}
+
+const resolveValidationLimits = (options: ValidationOptions = {}): ResolvedValidationLimits => {
+  const maxIssues = options.maxIssues ?? VALIDATION_LIMITS.maxIssues;
+  const maxTableCoordinateVisits =
+    options.maxTableCoordinateVisits ?? VALIDATION_LIMITS.maxTableCoordinateVisits;
+  if (
+    !Number.isSafeInteger(maxIssues) ||
+    maxIssues < 1 ||
+    maxIssues > VALIDATION_LIMITS.maxIssues ||
+    !Number.isSafeInteger(maxTableCoordinateVisits) ||
+    maxTableCoordinateVisits < 0 ||
+    maxTableCoordinateVisits > VALIDATION_LIMITS.maxTableCoordinateVisits
+  ) {
+    throw new TypeError('Validation limits are invalid.');
+  }
+  return { maxIssues, maxTableCoordinateVisits };
+};
+
 const pathFromZod = (path: readonly PropertyKey[]): string =>
   path.length === 0 ? '$' : `$.${path.map(String).join('.')}`;
 
-const zodIssues = (error: ZodError): readonly ValidationIssue[] =>
-  error.issues.map((issue) => ({
+const zodIssues = (error: ZodError, maximum: number): readonly ValidationIssue[] =>
+  error.issues.slice(0, maximum).map((issue) => ({
     code: 'SCHEMA_INVALID',
     path: pathFromZod(issue.path),
     message: issue.message,
@@ -57,13 +91,18 @@ const zodIssues = (error: ZodError): readonly ValidationIssue[] =>
 interface StructuralValidationContext {
   readonly issues: ValidationIssue[];
   readonly ids: Map<string, string>;
+  readonly limits: ResolvedValidationLimits;
   elementCount: number;
 }
+
+const addIssue = (context: StructuralValidationContext, issue: ValidationIssue): void => {
+  if (context.issues.length < context.limits.maxIssues) context.issues.push(issue);
+};
 
 const registerId = (context: StructuralValidationContext, id: string, path: string): void => {
   const previousPath = context.ids.get(id);
   if (previousPath !== undefined) {
-    context.issues.push({
+    addIssue(context, {
       code: 'DUPLICATE_ID',
       path,
       message: `Identifier ${id} is already used at ${previousPath}.`,
@@ -96,54 +135,98 @@ const validateTable = (
   path: string,
 ): void => {
   if (table.rowHeightsPt.length !== table.rowCount) {
-    context.issues.push({
+    addIssue(context, {
       code: 'TABLE_DIMENSION_MISMATCH',
       path: `${path}.rowHeightsPt`,
       message: 'rowHeightsPt must contain exactly rowCount entries.',
     });
   }
   if (table.columnWidthsPt.length !== table.columnCount) {
-    context.issues.push({
+    addIssue(context, {
       code: 'TABLE_DIMENSION_MISMATCH',
       path: `${path}.columnWidthsPt`,
       message: 'columnWidthsPt must contain exactly columnCount entries.',
     });
   }
 
-  const occupied = new Set<string>();
-  table.cells.forEach((cell, cellIndex) => {
+  const tableArea = table.rowCount * table.columnCount;
+  let declaredArea = 0;
+  let hasOutOfBoundsCell = false;
+  for (let cellIndex = 0; cellIndex < table.cells.length; cellIndex += 1) {
+    const cell = table.cells[cellIndex]!;
     const cellPath = `${path}.cells.${cellIndex}`;
     registerId(context, cell.id, `${cellPath}.id`);
     registerRichTextIds(context, cell.content, `${cellPath}.content`);
 
-    const lastRow = cell.row + cell.rowSpan;
-    const lastColumn = cell.column + cell.columnSpan;
-    if (lastRow > table.rowCount || lastColumn > table.columnCount) {
-      context.issues.push({
+    if (
+      cell.row >= table.rowCount ||
+      cell.column >= table.columnCount ||
+      cell.rowSpan > table.rowCount - cell.row ||
+      cell.columnSpan > table.columnCount - cell.column
+    ) {
+      hasOutOfBoundsCell = true;
+      addIssue(context, {
         code: 'TABLE_CELL_OUT_OF_BOUNDS',
         path: cellPath,
         message: 'Cell span extends beyond the table dimensions.',
       });
+      continue;
+    }
+
+    const cellArea = cell.rowSpan * cell.columnSpan;
+    if (!Number.isSafeInteger(cellArea) || declaredArea > tableArea - cellArea) {
+      addIssue(context, {
+        code: 'TABLE_CELL_OVERLAP',
+        path: `${path}.cells`,
+        message: 'Aggregate cell span area exceeds the table area.',
+      });
       return;
     }
+    declaredArea += cellArea;
+  }
 
+  if (hasOutOfBoundsCell || declaredArea !== tableArea) {
+    addIssue(context, {
+      code: 'TABLE_CELL_MISSING',
+      path: `${path}.cells`,
+      message: 'Cell span area must equal the table area.',
+    });
+    return;
+  }
+
+  if (tableArea > context.limits.maxTableCoordinateVisits) {
+    addIssue(context, {
+      code: 'LIMIT_EXCEEDED',
+      path: `${path}.cells`,
+      message: 'Table validation work exceeds the configured limit.',
+    });
+    return;
+  }
+
+  const occupied = new Uint8Array(tableArea);
+  let occupiedCount = 0;
+  let hasOverlap = false;
+  for (const cell of table.cells) {
+    const lastRow = cell.row + cell.rowSpan;
+    const lastColumn = cell.column + cell.columnSpan;
     for (let row = cell.row; row < lastRow; row += 1) {
       for (let column = cell.column; column < lastColumn; column += 1) {
-        const coordinate = `${row}:${column}`;
-        if (occupied.has(coordinate)) {
-          context.issues.push({
-            code: 'TABLE_CELL_OVERLAP',
-            path: cellPath,
-            message: `Cell overlaps the occupied coordinate ${coordinate}.`,
-          });
-        }
-        occupied.add(coordinate);
+        const coordinate = row * table.columnCount + column;
+        if (occupied[coordinate] === 0) occupiedCount += 1;
+        else hasOverlap = true;
+        occupied[coordinate] = 1;
       }
     }
-  });
-
-  if (occupied.size !== table.rowCount * table.columnCount) {
-    context.issues.push({
+  }
+  if (hasOverlap) {
+    addIssue(context, {
+      code: 'TABLE_CELL_OVERLAP',
+      path: `${path}.cells`,
+      message: 'Table cells overlap.',
+    });
+  }
+  if (occupiedCount !== tableArea) {
+    addIssue(context, {
       code: 'TABLE_CELL_MISSING',
       path: `${path}.cells`,
       message: 'Cells must cover every table coordinate exactly once.',
@@ -161,14 +244,14 @@ const registerElements = (
   const visit = (element: Element, elementPath: string, depth: number): void => {
     context.elementCount += 1;
     if (context.elementCount === DOCUMENT_LIMITS.maxElements + 1) {
-      context.issues.push({
+      addIssue(context, {
         code: 'LIMIT_EXCEEDED',
         path: elementPath,
         message: `Document contains more than ${DOCUMENT_LIMITS.maxElements} elements.`,
       });
     }
     if (depth > DOCUMENT_LIMITS.maxGroupDepth) {
-      context.issues.push({
+      addIssue(context, {
         code: 'LIMIT_EXCEEDED',
         path: elementPath,
         message: `Group nesting exceeds ${DOCUMENT_LIMITS.maxGroupDepth}.`,
@@ -218,7 +301,7 @@ const validateConnectorReferences = (
       endpoints.forEach(([key, endpoint]) => {
         const reference = endpoint.binding.elementId;
         if (reference !== undefined && !elementIds.has(reference)) {
-          context.issues.push({
+          addIssue(context, {
             code: 'REFERENCE_MISSING',
             path: `${elementPath}.${key}.binding.elementId`,
             message: `Connector target ${reference} does not exist in this element collection.`,
@@ -245,7 +328,7 @@ const validateImageReferences = (
 ): void => {
   const visit = (element: Element, elementPath: string): void => {
     if (element.type === 'image' && !imageAssetIds.has(element.assetId)) {
-      context.issues.push({
+      addIssue(context, {
         code: 'REFERENCE_MISSING',
         path: `${elementPath}.assetId`,
         message: `Image asset ${element.assetId} does not exist or is not an image.`,
@@ -268,7 +351,7 @@ const validateBackgroundReference = (
   path: string,
 ): void => {
   if (background?.type === 'image' && !imageAssetIds.has(background.assetId)) {
-    context.issues.push({
+    addIssue(context, {
       code: 'REFERENCE_MISSING',
       path: `${path}.assetId`,
       message: `Background image asset ${background.assetId} does not exist or is not an image.`,
@@ -299,7 +382,7 @@ const validatePlaceholderBindings = (
     if (binding !== undefined) {
       const placeholder = placeholders.get(binding.placeholderId);
       if (placeholder === undefined) {
-        context.issues.push({
+        addIssue(context, {
           code: 'PLACEHOLDER_BINDING_INVALID',
           path: `${elementPath}.placeholderBinding.placeholderId`,
           message: `Placeholder ${binding.placeholderId} is unavailable for this slide.`,
@@ -310,14 +393,14 @@ const validatePlaceholderBindings = (
         element.type === 'placeholder' ||
         !placeholder.accepts.includes(element.type)
       ) {
-        context.issues.push({
+        addIssue(context, {
           code: 'PLACEHOLDER_BINDING_INVALID',
           path: `${elementPath}.placeholderBinding.placeholderId`,
           message: `Placeholder ${binding.placeholderId} does not accept ${element.type}.`,
         });
       }
       if (bound.has(binding.placeholderId)) {
-        context.issues.push({
+        addIssue(context, {
           code: 'PLACEHOLDER_BINDING_INVALID',
           path: `${elementPath}.placeholderBinding.placeholderId`,
           message: `Placeholder ${binding.placeholderId} is bound more than once on this slide.`,
@@ -332,8 +415,16 @@ const validatePlaceholderBindings = (
   elements.forEach((element, index) => visit(element, `${path}.${index}`));
 };
 
-const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] => {
-  const context: StructuralValidationContext = { issues: [], ids: new Map(), elementCount: 0 };
+const structuralIssues = (
+  document: DeckDocument,
+  limits: ResolvedValidationLimits,
+): readonly ValidationIssue[] => {
+  const context: StructuralValidationContext = {
+    issues: [],
+    ids: new Map(),
+    limits,
+    elementCount: 0,
+  };
   registerId(context, document.id, '$.id');
 
   const imageAssetIds = new Set<string>();
@@ -344,14 +435,14 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
       imageAssetIds.add(asset.id);
       const dimensionsArePaired = (asset.widthPx === undefined) === (asset.heightPx === undefined);
       if (!dimensionsArePaired) {
-        context.issues.push({
+        addIssue(context, {
           code: 'ASSET_DIMENSION_INVALID',
           path: assetPath,
           message: 'Image widthPx and heightPx must either both be present or both be omitted.',
         });
       }
     } else if (asset.widthPx !== undefined || asset.heightPx !== undefined) {
-      context.issues.push({
+      addIssue(context, {
         code: 'ASSET_DIMENSION_INVALID',
         path: assetPath,
         message: 'Only image assets may declare pixel dimensions.',
@@ -374,7 +465,7 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
     theme.textStyles.forEach((style, styleIndex) => {
       registerId(context, style.id, `${themePath}.textStyles.${styleIndex}.id`);
       if (roles.has(style.role)) {
-        context.issues.push({
+        addIssue(context, {
           code: 'DUPLICATE_STYLE_ROLE',
           path: `${themePath}.textStyles.${styleIndex}.role`,
           message: `Theme contains more than one ${style.role} style.`,
@@ -390,7 +481,7 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
     registerId(context, master.id, `${masterPath}.id`);
     masterIds.add(master.id);
     if (!themeIds.has(master.themeId)) {
-      context.issues.push({
+      addIssue(context, {
         code: 'REFERENCE_MISSING',
         path: `${masterPath}.themeId`,
         message: `Theme ${master.themeId} does not exist.`,
@@ -416,7 +507,7 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
     registerId(context, layout.id, `${layoutPath}.id`);
     layoutIds.add(layout.id);
     if (!masterIds.has(layout.masterId)) {
-      context.issues.push({
+      addIssue(context, {
         code: 'REFERENCE_MISSING',
         path: `${layoutPath}.masterId`,
         message: `Master ${layout.masterId} does not exist.`,
@@ -440,7 +531,7 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
     const slidePath = `$.slides.${slideIndex}`;
     registerId(context, slide.id, `${slidePath}.id`);
     if (!layoutIds.has(slide.layoutId)) {
-      context.issues.push({
+      addIssue(context, {
         code: 'REFERENCE_MISSING',
         path: `${slidePath}.layoutId`,
         message: `Layout ${slide.layoutId} does not exist.`,
@@ -471,7 +562,8 @@ const structuralIssues = (document: DeckDocument): readonly ValidationIssue[] =>
   return context.issues;
 };
 
-export const validateDeck = (input: unknown): ValidationResult => {
+export const validateDeck = (input: unknown, options: ValidationOptions = {}): ValidationResult => {
+  const limits = resolveValidationLimits(options);
   const parsedV2 = deckDocumentSchema.safeParse(input);
   let document: DeckDocument;
   if (parsedV2.success) document = parsedV2.data;
@@ -484,7 +576,7 @@ export const validateDeck = (input: unknown): ValidationResult => {
           : false;
       return {
         success: false,
-        issues: zodIssues(legacyCandidate ? parsedV1.error : parsedV2.error),
+        issues: zodIssues(legacyCandidate ? parsedV1.error : parsedV2.error, limits.maxIssues),
       };
     }
     document = migrateParsedDeckToCurrent(parsedV1.data).document;
@@ -492,7 +584,7 @@ export const validateDeck = (input: unknown): ValidationResult => {
 
   document = canonicalizeDeckConnectorGeometry(document);
 
-  const issues = structuralIssues(document);
+  const issues = structuralIssues(document, limits);
   if (issues.length > 0) return { success: false, issues };
   return { success: true, document, issues: [] };
 };

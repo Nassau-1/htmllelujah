@@ -40,6 +40,8 @@ const COMMIT = '1'.repeat(40);
 const TREE_SHA = '2'.repeat(64);
 const LOCK_SHA = '3'.repeat(64);
 const BUILD_ID = '10000000-0000-4000-8000-000000000001';
+const FIXTURE_CLOCK_START = '2024-01-01T00:01:00.000Z';
+const FIXTURE_CLOCK_START_MS = Date.parse(FIXTURE_CLOCK_START);
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
@@ -54,7 +56,6 @@ const exists = async (filePath) =>
     });
 
 const jsonBytes = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
-const nowIso = () => new Date().toISOString();
 
 const allTrue = {
   first: true,
@@ -93,9 +94,9 @@ const uiLaunchSample = (role, ordinal, interactiveReadyMs = 100) => ({
   },
 });
 
-const uiReport = () => ({
+const uiReport = (testedAt = FIXTURE_CLOCK_START) => ({
   passed: true,
-  testedAt: nowIso(),
+  testedAt,
   launchMode: 'packaged-executable',
   performance: {
     interactiveReadyMs: 100,
@@ -117,9 +118,9 @@ const uiReport = () => ({
   checks: Array.from({ length: 12 }, (_, index) => `UI check ${index + 1}`),
 });
 
-const mcpReport = (target) => ({
+const mcpReport = (target, generatedAt = FIXTURE_CLOCK_START) => ({
   schemaVersion: 1,
-  generatedAt: nowIso(),
+  generatedAt,
   product: 'HTMLlelujah',
   version: '1.0.0',
   target: {
@@ -141,12 +142,18 @@ const mcpReport = (target) => ({
   limitations: [],
 });
 
-const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
-  if (descriptor.role === 'installed-ui-report') return uiReport();
-  if (descriptor.role === 'installed-mcp-report') return mcpReport(target);
+const reportForOutput = ({
+  gate,
+  descriptor,
+  target,
+  lanDurationMs,
+  reportTimestamp = FIXTURE_CLOCK_START,
+}) => {
+  if (descriptor.role === 'installed-ui-report') return uiReport(reportTimestamp);
+  if (descriptor.role === 'installed-mcp-report') return mcpReport(target, reportTimestamp);
   switch (gate.id) {
     case 'ui-packaged':
-      return uiReport();
+      return uiReport(reportTimestamp);
     case 'exports-widescreen':
     case 'exports-standard':
     case 'exports-a4-landscape':
@@ -156,7 +163,7 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
       return {
         schemaVersion: 2,
         passed: true,
-        testedAt: nowIso(),
+        testedAt: reportTimestamp,
         launchMode: 'packaged-executable',
         fixture: { pagePreset: preset },
         run: {
@@ -174,12 +181,12 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
       };
     }
     case 'mcp-packaged':
-      return mcpReport(target);
+      return mcpReport(target, reportTimestamp);
     case 'accessibility-scaling':
       return {
         schemaVersion: 1,
         passed: true,
-        testedAt: nowIso(),
+        testedAt: reportTimestamp,
         launchMode: 'packaged-executable',
         requestedScaleFactors: [1, 1.25, 1.5, 2],
         completedScaleFactors: [1, 1.25, 1.5, 2],
@@ -189,7 +196,7 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
     case 'text-lock-two-process':
       return {
         passed: true,
-        testedAt: nowIso(),
+        testedAt: reportTimestamp,
         launchMode: 'packaged-executable',
         checks: {
           syntheticDeckOpenedByTwoIsolatedProfiles: true,
@@ -210,7 +217,7 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
       return {
         schemaVersion: 1,
         passed: true,
-        testedAt: nowIso(),
+        testedAt: reportTimestamp,
         artifactFinality: 'final-release-candidate',
         freshForRelease: true,
         installer: { sha256: target.installer.sha256 },
@@ -229,8 +236,8 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
       return {
         schemaVersion: 4,
         passed: true,
-        startedAt: nowIso(),
-        completedAt: nowIso(),
+        startedAt: reportTimestamp,
+        completedAt: reportTimestamp,
         sourceCommit: COMMIT,
         sourceTree: { sha256: TREE_SHA, fileCount: 5, bytes: 100 },
         lockfileSha256: LOCK_SHA,
@@ -266,7 +273,7 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
     case 'benchmark-core':
       return {
         schemaVersion: 1,
-        generatedAt: nowIso(),
+        generatedAt: reportTimestamp,
         validation: { slides: 500 },
         exports: { mixedExports: 50 },
         gesture: { p95Ms: 1, thresholdMs: 16.7, passed: true },
@@ -279,7 +286,7 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
     case 'benchmark-capacity-presentation':
       return {
         schemaVersion: 1,
-        generatedAt: nowIso(),
+        generatedAt: reportTimestamp,
         fixture: { slides: 500, elements: 10_000 },
         capacity: { passed: true },
         presentationNavigation: { p95Ms: 1, thresholdMs: 100, passed: true },
@@ -288,7 +295,7 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
       return {
         schemaVersion: 1,
         passed: true,
-        testedAt: nowIso(),
+        testedAt: reportTimestamp,
         fixture: { expandedAssetMiB: 500 },
         measurements: { saveMs: 20_000, reopenMs: 15_000, peakRssMiB: 3_100 },
         checks: allTrue,
@@ -298,8 +305,8 @@ const reportForOutput = ({ gate, descriptor, target, lanDurationMs }) => {
       return {
         schemaVersion: 1,
         status: 'passed',
-        startedAt: nowIso(),
-        endedAt: nowIso(),
+        startedAt: reportTimestamp,
+        endedAt: reportTimestamp,
         configuredDurationMs: lanDurationMs,
         steadyStateDurationMs: lanDurationMs,
         topology: { hosts: 1, guests: 2 },
@@ -388,7 +395,7 @@ const createCandidateFixture = async () => {
     productName: 'HTMLlelujah',
     version: '1.0.0',
     buildId: BUILD_ID,
-    createdAt: new Date(Date.now() - 60_000).toISOString(),
+    createdAt: new Date(FIXTURE_CLOCK_START_MS - 60_000).toISOString(),
     source: {
       commit: COMMIT,
       dirty: false,
@@ -429,7 +436,7 @@ const createCandidateFixture = async () => {
 };
 
 const injectedDependencies = (fixture, runCommand, { lanElapsedMs = 100 } = {}) => {
-  let clock = Date.now();
+  let clock = FIXTURE_CLOCK_START_MS;
   let monotonicClock = 0;
   return {
     platform: 'win32',
@@ -453,7 +460,7 @@ const injectedDependencies = (fixture, runCommand, { lanElapsedMs = 100 } = {}) 
     operatingSystemRelease: () => '10.0.26200',
     operatingSystemVersion: () => 'Windows 11 Enterprise',
     runCommand: async (command) => {
-      await runCommand(command);
+      await runCommand(command, { reportTimestamp: new Date(clock).toISOString() });
       if (command.gate.id === 'lan-loopback-soak') {
         clock += lanElapsedMs;
         monotonicClock += lanElapsedMs;
@@ -479,7 +486,7 @@ const createFinalizationPairFixture = async () => {
     ),
     candidateManifestSha256: sha256Bytes(candidateManifestBytes),
   };
-  const runCommand = async ({ gate }) => {
+  const runCommand = async ({ gate }, { reportTimestamp }) => {
     for (const descriptor of gate.outputs) {
       await mkdir(path.dirname(descriptor.sourcePath), { recursive: true });
       const bytes = descriptor.role.includes('screenshot')
@@ -490,6 +497,7 @@ const createFinalizationPairFixture = async () => {
               descriptor,
               target,
               lanDurationMs: DEFAULT_LAN_DURATION_MS,
+              reportTimestamp,
             }),
           );
       await writeFile(descriptor.sourcePath, bytes);
@@ -982,8 +990,8 @@ test('public ZIP is deterministic, sorted, and rejects traversal', () => {
 });
 
 test('packaged UI gate recomputes the median and requires clean recovery-free closes', () => {
-  const startedAt = new Date(Date.now() - 1_000).toISOString();
-  const completedAt = new Date(Date.now() + 1_000).toISOString();
+  const startedAt = new Date(FIXTURE_CLOCK_START_MS - 1_000).toISOString();
+  const completedAt = new Date(FIXTURE_CLOCK_START_MS + 1_000).toISOString();
   const gate = { id: 'ui-packaged', startedAt, completedAt, durationMs: 2_000 };
   const errorsFor = (report) =>
     gateReportErrors({
@@ -1024,8 +1032,8 @@ test('packaged UI gate recomputes the median and requires clean recovery-free cl
 });
 
 test('LAN and expanded-limit performance caps are exclusive at their boundaries', () => {
-  const startedAt = new Date(Date.now() - 1_000).toISOString();
-  const completedAt = new Date(Date.now() + 1_000).toISOString();
+  const startedAt = new Date(FIXTURE_CLOCK_START_MS - 1_000).toISOString();
+  const completedAt = new Date(FIXTURE_CLOCK_START_MS + 1_000).toISOString();
   const gate = (id, durationMs = 2_000) => ({ id, startedAt, completedAt, durationMs });
   const evidence = (id, report) => [
     {
@@ -1156,7 +1164,7 @@ test('injected runner deletes stale outputs, binds the exact target, and fails c
   };
   const lanDurationMs = 100;
   let staleWasDeleted = false;
-  const runCommand = async ({ gate }) => {
+  const runCommand = async ({ gate }, { reportTimestamp }) => {
     for (const descriptor of gate.outputs) {
       assert.equal(await exists(descriptor.sourcePath), false, `${gate.id} output was not deleted`);
       if (gate.id === 'ui-packaged' && descriptor.originalName === 'v1-editor-electron.json') {
@@ -1165,7 +1173,7 @@ test('injected runner deletes stale outputs, binds the exact target, and fails c
       await mkdir(path.dirname(descriptor.sourcePath), { recursive: true });
       const bytes = descriptor.role.includes('screenshot')
         ? PNG
-        : jsonBytes(reportForOutput({ gate, descriptor, target, lanDurationMs }));
+        : jsonBytes(reportForOutput({ gate, descriptor, target, lanDurationMs, reportTimestamp }));
       await writeFile(descriptor.sourcePath, bytes);
     }
   };

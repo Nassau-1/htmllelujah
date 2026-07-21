@@ -586,10 +586,15 @@ const runSaveOperation = async ({ editor, menuPrefix, dialogTitle, targetPath, s
     30_000,
     `${menuPrefix} output`,
   );
-  await editor.waitForRenderer(
-    `[...document.querySelectorAll('.toast')].some((toast) => toast.textContent?.includes(${JSON.stringify(successText)}))`,
-    `${menuPrefix} completion toast`,
+  await waitFor(
+    async () => {
+      const toastTexts = await editor.evaluate(
+        `([...document.querySelectorAll('.toast')].map((toast) => toast.textContent?.trim() ?? ''))`,
+      );
+      return toastTexts.some((text) => text.includes(successText)) ? true : undefined;
+    },
     30_000,
+    `${menuPrefix} completion toast`,
   );
 };
 

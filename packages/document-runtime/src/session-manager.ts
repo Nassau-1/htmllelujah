@@ -6,6 +6,7 @@ import {
   createDefaultDeck,
   createRevisionToken,
   DocumentCommandError,
+  MAX_CANONICAL_DOCUMENT_BYTES,
   parseDeck,
   validateDeck,
   type AssetRef,
@@ -15,17 +16,20 @@ import {
   type TransactionMetadata,
 } from '@htmllelujah/document-core';
 import {
+  assertHdeckRepresentableWithValidatedAssets,
   createHdeckArchive,
+  createHdeckArchiveWithValidatedAssets,
   createJournalRecord,
   HdeckError,
   parseHdeckArchive,
   PersistenceError,
   sha256,
+  validateHdeckAsset,
   type ApprovedMediaType,
-  type HdeckAssetInput,
   type JournalHeader,
   type JournalRecord,
   type ParsedHdeck,
+  type ValidatedHdeckAsset,
 } from '@htmllelujah/hdeck';
 
 import { DocumentRuntimeError } from './errors.js';
@@ -46,8 +50,11 @@ import type {
   DocumentSessionSnapshot,
   ExecuteRequest,
   HistoryRequest,
+  ImportAssetTransactionRequest,
+  ImportAssetTransactionResult,
   JournalDurabilityCapability,
   OpenSessionInput,
+  PersistedDocumentSource,
   ProposalRequest,
   ProposalSummary,
   RecoveryBlobGcResult,
@@ -58,6 +65,7 @@ import type {
   RuntimeAssetBytes,
   SafeDocumentDiff,
   SaveAsOptions,
+  SaveCommitOptions,
   SessionDurability,
   StoreAssetRequest,
   StoreAssetTransactionRequest,
@@ -74,6 +82,7 @@ const MAX_RECOVERY_BLOBS_DELETED_PER_PASS = 256;
 interface InternalAsset {
   readonly id: string;
   readonly bytes: Uint8Array;
+  readonly validation: ValidatedHdeckAsset;
   readonly mediaType: ApprovedMediaType;
   readonly fileName: string;
   readonly widthPx?: number | undefined;
@@ -171,6 +180,29 @@ const deepFreeze = <T>(value: T): T => {
 
 const immutableClone = <T>(value: T): T => deepFreeze(structuredClone(value));
 
+const bytesEqual = (left: Uint8Array, right: Uint8Array): boolean =>
+  left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
+
+const remapImportedAssetIdValue = (value: unknown, from: string, to: string): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((item) => remapImportedAssetIdValue(item, from, to));
+  }
+  if (typeof value !== 'object' || value === null || ArrayBuffer.isView(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      key === 'assetId' && item === from ? to : remapImportedAssetIdValue(item, from, to),
+    ]),
+  );
+};
+
+const remapImportedAssetId = (
+  commands: readonly DocumentCommand[],
+  from: string,
+  to: string,
+): readonly DocumentCommand[] =>
+  commands.map((command) => remapImportedAssetIdValue(command, from, to) as DocumentCommand);
+
 const countElements = (elements: readonly Element[]): number =>
   elements.reduce(
     (total, element) =>
@@ -216,7 +248,10 @@ const runtimeErrorFromPersistence = (error: unknown): DocumentRuntimeError => {
   return new DocumentRuntimeError('SAVE_FAILED', 'The document could not be saved.', true);
 };
 
-const internalAssetsFromParsed = (parsed: ParsedHdeck): Map<string, InternalAsset> => {
+const internalAssetsFromParsed = (
+  parsed: ParsedHdeck,
+  onAssetValidated?: ((assetId: string) => void) | undefined,
+): Map<string, InternalAsset> => {
   const result = new Map<string, InternalAsset>();
   for (const asset of parsed.document.assets) {
     const bytes = parsed.assets.get(asset.id);
@@ -224,9 +259,24 @@ const internalAssetsFromParsed = (parsed: ParsedHdeck): Map<string, InternalAsse
     if (bytes === undefined || manifest === undefined || !approvedMediaType(manifest.mediaType)) {
       throw new DocumentRuntimeError('RECOVERY_INVALID', 'Archive asset data is incomplete.');
     }
+    const ownedBytes = Uint8Array.from(bytes);
+    const validation = validateHdeckAsset({
+      id: asset.id,
+      bytes: ownedBytes,
+      mediaType: manifest.mediaType,
+      originalName: asset.fileName,
+      ...(manifest.widthPx === undefined ? {} : { widthPx: manifest.widthPx }),
+      ...(manifest.heightPx === undefined ? {} : { heightPx: manifest.heightPx }),
+    });
+    try {
+      onAssetValidated?.(asset.id);
+    } catch {
+      // Test instrumentation cannot affect document authority.
+    }
     result.set(asset.id, {
       id: asset.id,
-      bytes: Uint8Array.from(bytes),
+      bytes: ownedBytes,
+      validation,
       mediaType: manifest.mediaType,
       fileName: asset.fileName,
       ...(manifest.widthPx === undefined ? {} : { widthPx: manifest.widthPx }),
@@ -248,6 +298,8 @@ export class DocumentSessionManager implements DocumentRuntimeService {
   readonly #now: () => string;
   readonly #autosaveDelayMs: number;
   readonly #maxHistoryEntries: number;
+  readonly #maxCanonicalDocumentBytes: number;
+  readonly #onAssetValidated: ((assetId: string) => void) | undefined;
   readonly #defaultProposalTtlMs: number;
   readonly #recoveryBlobGcMinAgeMs: number;
   readonly #stagedBlobHashes = new Map<string, number>();
@@ -260,6 +312,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#autosaveDelayMs = options.autosaveDelayMs ?? 1_000;
     this.#maxHistoryEntries = options.maxHistoryEntries ?? 100;
+    this.#maxCanonicalDocumentBytes =
+      options.maxCanonicalDocumentBytes ?? MAX_CANONICAL_DOCUMENT_BYTES;
+    this.#onAssetValidated = options.onAssetValidated;
     this.#defaultProposalTtlMs = options.defaultProposalTtlMs ?? 60_000;
     this.#recoveryBlobGcMinAgeMs =
       options.recoveryBlobGcMinAgeMs ?? DEFAULT_RECOVERY_BLOB_GC_MIN_AGE_MS;
@@ -268,6 +323,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       this.#autosaveDelayMs < 0 ||
       !Number.isSafeInteger(this.#maxHistoryEntries) ||
       this.#maxHistoryEntries < 1 ||
+      !Number.isSafeInteger(this.#maxCanonicalDocumentBytes) ||
+      this.#maxCanonicalDocumentBytes < 1 ||
+      this.#maxCanonicalDocumentBytes > MAX_CANONICAL_DOCUMENT_BYTES ||
       !Number.isSafeInteger(this.#defaultProposalTtlMs) ||
       this.#defaultProposalTtlMs < MIN_PROPOSAL_TTL_MS ||
       this.#defaultProposalTtlMs > MAX_PROPOSAL_TTL_MS ||
@@ -351,6 +409,56 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     });
   }
 
+  /** Returns the authoritative save target after all earlier session operations complete. */
+  public getSaveTargetMainOnly(sessionId: string): Promise<string | undefined> {
+    const state = this.#requireSession(sessionId);
+    return this.#enqueue(state, async () => state.targetPath);
+  }
+
+  /** Captures one clean persisted generation under the session's authority queue. */
+  public capturePersistedSourceMainOnly(sessionId: string): Promise<PersistedDocumentSource> {
+    const state = this.#requireSession(sessionId);
+    return this.#enqueue(state, async () => {
+      if (
+        !state.persisted ||
+        this.#dirty(state) ||
+        state.durability !== 'clean' ||
+        state.targetPath === undefined ||
+        state.targetFingerprint === null
+      ) {
+        throw new DocumentRuntimeError(
+          'INVALID_REQUEST',
+          'A clean persisted document source is required.',
+        );
+      }
+      const assets: RuntimeAssetBytes[] = [];
+      for (const reference of state.document.assets) {
+        const asset = state.assets.get(reference.id);
+        if (asset === undefined) {
+          throw new DocumentRuntimeError(
+            'ASSET_BYTES_MISSING',
+            'Persisted document asset bytes are unavailable.',
+          );
+        }
+        assets.push({
+          id: asset.id,
+          hash: reference.hash,
+          bytes: Uint8Array.from(asset.bytes),
+          mediaType: asset.mediaType,
+          fileName: asset.fileName,
+          ...(asset.widthPx === undefined ? {} : { widthPx: asset.widthPx }),
+          ...(asset.heightPx === undefined ? {} : { heightPx: asset.heightPx }),
+        });
+      }
+      return immutableClone({
+        snapshot: this.#snapshot(state),
+        assets,
+        targetPath: state.targetPath,
+        targetFingerprint: state.targetFingerprint,
+      });
+    });
+  }
+
   #enqueue<T>(state: SessionState, operation: () => Promise<T>): Promise<T> {
     const result = state.queue.then(() => {
       if (this.#sessions.get(state.sessionId) !== state) {
@@ -377,24 +485,98 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     }
   }
 
+  #createInternalAsset(input: {
+    readonly id: string;
+    readonly bytes: Uint8Array;
+    readonly mediaType: ApprovedMediaType;
+    readonly fileName: string;
+    readonly widthPx?: number | undefined;
+    readonly heightPx?: number | undefined;
+  }): InternalAsset {
+    const bytes = Uint8Array.from(input.bytes);
+    let validation: ValidatedHdeckAsset;
+    try {
+      validation = validateHdeckAsset({
+        id: input.id,
+        bytes,
+        mediaType: input.mediaType,
+        originalName: input.fileName,
+        ...(input.widthPx === undefined ? {} : { widthPx: input.widthPx }),
+        ...(input.heightPx === undefined ? {} : { heightPx: input.heightPx }),
+      });
+    } catch (error) {
+      if (error instanceof HdeckError) {
+        throw new DocumentRuntimeError('INVALID_REQUEST', 'Asset bytes or metadata are invalid.');
+      }
+      throw error;
+    }
+    try {
+      this.#onAssetValidated?.(input.id);
+    } catch {
+      // Test instrumentation cannot affect document authority.
+    }
+    return {
+      id: input.id,
+      bytes,
+      validation,
+      mediaType: input.mediaType,
+      fileName: input.fileName,
+      ...(input.widthPx === undefined ? {} : { widthPx: input.widthPx }),
+      ...(input.heightPx === undefined ? {} : { heightPx: input.heightPx }),
+    };
+  }
+
+  #assertRepresentable(document: DeckDocument, assets: ReadonlyMap<string, InternalAsset>): void {
+    const validatedAssets: ValidatedHdeckAsset[] = [];
+    for (const reference of document.assets) {
+      const asset = assets.get(reference.id);
+      if (asset === undefined) {
+        throw new DocumentRuntimeError(
+          'ASSET_BYTES_MISSING',
+          'Candidate document asset bytes are unavailable.',
+        );
+      }
+      validatedAssets.push(asset.validation);
+    }
+    try {
+      assertHdeckRepresentableWithValidatedAssets(
+        {
+          document,
+          assets: validatedAssets,
+          createdAt: document.metadata.createdAt,
+          modifiedAt: document.metadata.modifiedAt,
+        },
+        { maxDocumentBytes: this.#maxCanonicalDocumentBytes },
+      );
+    } catch (error) {
+      if (error instanceof HdeckError) {
+        throw new DocumentRuntimeError(
+          'INVALID_REQUEST',
+          'The candidate document cannot be represented by the supported file format.',
+        );
+      }
+      throw error;
+    }
+  }
+
   async #archiveFor(
     document: DeckDocument,
     assets: ReadonlyMap<string, InternalAsset>,
   ): Promise<Uint8Array> {
-    const inputs: HdeckAssetInput[] = [];
+    const validatedAssets: ValidatedHdeckAsset[] = [];
     for (const reference of document.assets) {
       let asset = assets.get(reference.id);
       if (asset === undefined) {
         const bytes = await this.#recovery.readBlob(reference.hash);
         if (bytes !== undefined && approvedMediaType(reference.mediaType)) {
-          asset = {
+          asset = this.#createInternalAsset({
             id: reference.id,
             bytes,
             mediaType: reference.mediaType,
             fileName: reference.fileName,
             ...(reference.widthPx === undefined ? {} : { widthPx: reference.widthPx }),
             ...(reference.heightPx === undefined ? {} : { heightPx: reference.heightPx }),
-          };
+          });
         }
       }
       if (asset === undefined) {
@@ -403,18 +585,11 @@ export class DocumentSessionManager implements DocumentRuntimeService {
           `Asset bytes are unavailable for asset ${reference.id}.`,
         );
       }
-      inputs.push({
-        id: asset.id,
-        bytes: asset.bytes,
-        mediaType: asset.mediaType,
-        originalName: asset.fileName,
-        ...(asset.widthPx === undefined ? {} : { widthPx: asset.widthPx }),
-        ...(asset.heightPx === undefined ? {} : { heightPx: asset.heightPx }),
-      });
+      validatedAssets.push(asset.validation);
     }
-    return createHdeckArchive({
+    return createHdeckArchiveWithValidatedAssets({
       document,
-      assets: inputs,
+      assets: validatedAssets,
       createdAt: document.metadata.createdAt,
       modifiedAt: document.metadata.modifiedAt,
     });
@@ -520,9 +695,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       modifiedAt: document.metadata.modifiedAt,
     });
     const parsed = parseHdeckArchive(archive);
-    const assets = internalAssetsFromParsed(parsed);
+    const assets = internalAssetsFromParsed(parsed, this.#onAssetValidated);
     for (const asset of assets.values())
-      await this.#recovery.putBlob(sha256(asset.bytes), asset.bytes);
+      await this.#recovery.putBlob(asset.validation.sha256, asset.bytes);
     const state = this.#newState({
       sessionId,
       document: parsed.document,
@@ -557,9 +732,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         'Generated session identifier already exists.',
       );
     }
-    const assets = internalAssetsFromParsed(opened.parsed);
+    const assets = internalAssetsFromParsed(opened.parsed, this.#onAssetValidated);
     for (const asset of assets.values())
-      await this.#recovery.putBlob(sha256(asset.bytes), asset.bytes);
+      await this.#recovery.putBlob(asset.validation.sha256, asset.bytes);
     const state = this.#newState({
       sessionId,
       document: opened.parsed.document,
@@ -596,14 +771,17 @@ export class DocumentSessionManager implements DocumentRuntimeService {
           `Asset bytes are unavailable for asset ${command.asset.id}.`,
         );
       }
-      additions.set(command.asset.id, {
-        id: command.asset.id,
-        bytes,
-        mediaType: command.asset.mediaType,
-        fileName: command.asset.fileName,
-        ...(command.asset.widthPx === undefined ? {} : { widthPx: command.asset.widthPx }),
-        ...(command.asset.heightPx === undefined ? {} : { heightPx: command.asset.heightPx }),
-      });
+      additions.set(
+        command.asset.id,
+        this.#createInternalAsset({
+          id: command.asset.id,
+          bytes,
+          mediaType: command.asset.mediaType,
+          fileName: command.asset.fileName,
+          ...(command.asset.widthPx === undefined ? {} : { widthPx: command.asset.widthPx }),
+          ...(command.asset.heightPx === undefined ? {} : { heightPx: command.asset.heightPx }),
+        }),
+      );
     }
     return additions;
   }
@@ -711,11 +889,12 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       }
       nextAssets.set(reference.id, asset);
     }
+    this.#assertRepresentable(transaction.document, nextAssets);
     // Validate the whole transaction before creating blobs, then make every newly referenced
     // byte payload durable before acknowledging its journal record.
     for (const [assetId, asset] of stagedAssets) {
       if (additions.get(assetId) === asset) {
-        await this.#recovery.putBlob(sha256(asset.bytes), asset.bytes);
+        await this.#recovery.putBlob(asset.validation.sha256, asset.bytes);
       }
     }
     await this.#appendRecord(
@@ -762,54 +941,138 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     return this.storeAssetAndExecute(sessionId, { ...request, commands: [] });
   }
 
+  #executeStagedAssetLocked(
+    state: SessionState,
+    request: StoreAssetTransactionRequest,
+    asset: InternalAsset,
+    commands: readonly DocumentCommand[],
+  ): Promise<DocumentSessionSnapshot> {
+    const kind: AssetRef['kind'] = asset.mediaType === 'font/woff2' ? 'font' : 'image';
+    return this.#executeLocked(
+      state,
+      {
+        expectedRevision: request.expectedRevision,
+        metadata: request.metadata,
+        commands: [
+          {
+            type: 'asset.register',
+            asset: {
+              id: asset.id,
+              kind,
+              hash: asset.validation.sha256,
+              mediaType: asset.mediaType,
+              fileName: asset.fileName,
+              byteLength: asset.validation.byteLength,
+              ...(asset.widthPx === undefined ? {} : { widthPx: asset.widthPx }),
+              ...(asset.heightPx === undefined ? {} : { heightPx: asset.heightPx }),
+            },
+          },
+          ...commands,
+        ],
+        ...(request.historyGroupId === undefined ? {} : { historyGroupId: request.historyGroupId }),
+      },
+      new Map([[asset.id, asset]]),
+    );
+  }
+
   /** Registers asset bytes and applies dependent commands as one undoable transaction. */
   public async storeAssetAndExecute(
     sessionId: string,
     request: StoreAssetTransactionRequest,
   ): Promise<DocumentSessionSnapshot> {
     const state = this.#requireSession(sessionId);
-    const bytes = Uint8Array.from(request.bytes);
-    const hash = sha256(bytes);
-    const kind: AssetRef['kind'] = request.mediaType === 'font/woff2' ? 'font' : 'image';
-    const asset: InternalAsset = {
+    const asset = this.#createInternalAsset({
       id: request.id,
-      bytes,
+      bytes: request.bytes,
       mediaType: request.mediaType,
       fileName: request.fileName,
       ...(request.widthPx === undefined ? {} : { widthPx: request.widthPx }),
       ...(request.heightPx === undefined ? {} : { heightPx: request.heightPx }),
-    };
+    });
+    const hash = asset.validation.sha256;
     this.#stagedBlobHashes.set(hash, (this.#stagedBlobHashes.get(hash) ?? 0) + 1);
     try {
       return await this.#enqueue(state, () =>
-        this.#executeLocked(
-          state,
-          {
-            expectedRevision: request.expectedRevision,
-            metadata: request.metadata,
-            commands: [
-              {
-                type: 'asset.register',
-                asset: {
-                  id: request.id,
-                  kind,
-                  hash,
-                  mediaType: request.mediaType,
-                  fileName: request.fileName,
-                  byteLength: bytes.byteLength,
-                  ...(request.widthPx === undefined ? {} : { widthPx: request.widthPx }),
-                  ...(request.heightPx === undefined ? {} : { heightPx: request.heightPx }),
-                },
-              },
-              ...request.commands,
-            ],
-            ...(request.historyGroupId === undefined
-              ? {}
-              : { historyGroupId: request.historyGroupId }),
-          },
-          new Map([[request.id, asset]]),
-        ),
+        this.#executeStagedAssetLocked(state, request, asset, request.commands),
       );
+    } finally {
+      const retained = (this.#stagedBlobHashes.get(hash) ?? 1) - 1;
+      if (retained <= 0) this.#stagedBlobHashes.delete(hash);
+      else this.#stagedBlobHashes.set(hash, retained);
+    }
+  }
+
+  /**
+   * Imports by content identity. A matching immutable asset is reused atomically and only
+   * dependent `assetId` fields are remapped; low-level asset mutation commands remain forbidden.
+   */
+  public async importAssetAndExecute(
+    sessionId: string,
+    request: ImportAssetTransactionRequest,
+  ): Promise<ImportAssetTransactionResult> {
+    const state = this.#requireSession(sessionId);
+    if (request.commands.some((command) => command.type.startsWith('asset.'))) {
+      throw new DocumentRuntimeError(
+        'INVALID_REQUEST',
+        'Import-dependent commands cannot register or remove assets directly.',
+      );
+    }
+    const asset = this.#createInternalAsset({
+      id: request.id,
+      bytes: request.bytes,
+      mediaType: request.mediaType,
+      fileName: request.fileName,
+      ...(request.widthPx === undefined ? {} : { widthPx: request.widthPx }),
+      ...(request.heightPx === undefined ? {} : { heightPx: request.heightPx }),
+    });
+    const hash = asset.validation.sha256;
+    this.#stagedBlobHashes.set(hash, (this.#stagedBlobHashes.get(hash) ?? 0) + 1);
+    try {
+      return await this.#enqueue(state, async () => {
+        if (request.expectedRevision !== state.revision) {
+          throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
+        }
+        const proposedIdOwner = state.document.assets.find(
+          (candidate) => candidate.id === request.id,
+        );
+        if (proposedIdOwner !== undefined && proposedIdOwner.hash !== hash) {
+          throw new DocumentRuntimeError(
+            'INVALID_REQUEST',
+            'Proposed asset identifier already belongs to different content.',
+          );
+        }
+        const existingReference = state.document.assets.find(
+          (candidate) => candidate.hash === hash,
+        );
+        if (existingReference !== undefined) {
+          const existing = state.assets.get(existingReference.id);
+          if (existing === undefined) {
+            throw new DocumentRuntimeError(
+              'ASSET_BYTES_MISSING',
+              'Matching document asset bytes are unavailable.',
+            );
+          }
+          if (!bytesEqual(existing.bytes, asset.bytes)) {
+            throw new DocumentRuntimeError(
+              'INVALID_REQUEST',
+              'Asset content identity could not be confirmed.',
+            );
+          }
+          const commands = remapImportedAssetId(request.commands, request.id, existingReference.id);
+          const snapshot =
+            commands.length === 0
+              ? this.#snapshot(state)
+              : await this.#executeLocked(state, { ...request, commands });
+          return Object.freeze({ snapshot, assetId: existingReference.id, reused: true });
+        }
+        const snapshot = await this.#executeStagedAssetLocked(
+          state,
+          request,
+          asset,
+          request.commands,
+        );
+        return Object.freeze({ snapshot, assetId: asset.id, reused: false });
+      });
     } finally {
       const retained = (this.#stagedBlobHashes.get(hash) ?? 1) - 1;
       if (retained <= 0) this.#stagedBlobHashes.delete(hash);
@@ -830,6 +1093,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     const parsed = parseDeck(target);
     const revision = createRevisionToken(parsed);
     const assets = await this.#assetsForRecoveredDocument(parsed, state.assets);
+    this.#assertRepresentable(parsed, assets);
     await this.#appendRecord(
       state,
       state.revision,
@@ -920,6 +1184,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       readonly expectedFingerprint: string | null | undefined;
       readonly allowOverwrite?: boolean;
       readonly attachTarget?: boolean;
+      readonly beforeCommit?: (() => Promise<void>) | undefined;
     },
   ): Promise<DocumentSessionSnapshot> {
     const archive = await this.#archiveFor(state.document, state.assets);
@@ -928,6 +1193,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       const result = await this.#archive.save(targetPath, archive, {
         expectedFingerprint: options.expectedFingerprint,
         ...(options.allowOverwrite === undefined ? {} : { allowOverwrite: options.allowOverwrite }),
+        ...(options.beforeCommit === undefined ? {} : { beforeCommit: options.beforeCommit }),
       });
       if (options.attachTarget !== false) {
         state.targetPath = targetPath;
@@ -986,7 +1252,13 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     }
   }
 
-  public save(sessionId: string): Promise<DocumentSessionSnapshot> {
+  public save(
+    sessionId: string,
+    options: SaveCommitOptions = {},
+  ): Promise<DocumentSessionSnapshot> {
+    if (options.expectedTargetPath !== undefined) {
+      this.#assertMainOnlyPath(options.expectedTargetPath);
+    }
     const state = this.#requireSession(sessionId);
     return this.#enqueue(state, async () => {
       if (state.autosaveTimer !== undefined) {
@@ -996,9 +1268,19 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       if (state.targetPath === undefined) {
         throw new DocumentRuntimeError('NO_SAVE_TARGET', 'Document has no save target.');
       }
+      if (
+        options.expectedTargetPath !== undefined &&
+        state.targetPath !== options.expectedTargetPath
+      ) {
+        throw new DocumentRuntimeError(
+          'TARGET_CHANGED',
+          'The reserved save target no longer matches this document session.',
+        );
+      }
       if (!this.#dirty(state)) return this.#snapshot(state);
       return this.#saveLocked(state, state.targetPath, {
         expectedFingerprint: state.targetFingerprint,
+        ...(options.beforeCommit === undefined ? {} : { beforeCommit: options.beforeCommit }),
       });
     });
   }
@@ -1018,6 +1300,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       return this.#saveLocked(state, options.targetPath, {
         expectedFingerprint: options.expectedFingerprint,
         ...(options.allowOverwrite === undefined ? {} : { allowOverwrite: options.allowOverwrite }),
+        ...(options.beforeCommit === undefined ? {} : { beforeCommit: options.beforeCommit }),
       });
     });
   }
@@ -1041,6 +1324,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       return this.#saveLocked(state, options.targetPath, {
         expectedFingerprint: options.expectedFingerprint,
         ...(options.allowOverwrite === undefined ? {} : { allowOverwrite: options.allowOverwrite }),
+        ...(options.beforeCommit === undefined ? {} : { beforeCommit: options.beforeCommit }),
         attachTarget: false,
       });
     });
@@ -1281,7 +1565,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     const result = new Map<string, InternalAsset>();
     for (const reference of document.assets) {
       const available = existing.get(reference.id);
-      if (available !== undefined && sha256(available.bytes) === reference.hash) {
+      if (available !== undefined && available.validation.sha256 === reference.hash) {
         result.set(reference.id, available);
         continue;
       }
@@ -1292,14 +1576,17 @@ export class DocumentSessionManager implements DocumentRuntimeService {
           'Recovery asset bytes are unavailable.',
         );
       }
-      result.set(reference.id, {
-        id: reference.id,
-        bytes,
-        mediaType: reference.mediaType,
-        fileName: reference.fileName,
-        ...(reference.widthPx === undefined ? {} : { widthPx: reference.widthPx }),
-        ...(reference.heightPx === undefined ? {} : { heightPx: reference.heightPx }),
-      });
+      result.set(
+        reference.id,
+        this.#createInternalAsset({
+          id: reference.id,
+          bytes,
+          mediaType: reference.mediaType,
+          fileName: reference.fileName,
+          ...(reference.widthPx === undefined ? {} : { widthPx: reference.widthPx }),
+          ...(reference.heightPx === undefined ? {} : { heightPx: reference.heightPx }),
+        }),
+      );
     }
     return result;
   }
@@ -1440,7 +1727,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         );
       }
     }
-    let assets = internalAssetsFromParsed(parsed);
+    let assets = internalAssetsFromParsed(parsed, this.#onAssetValidated);
     assets = await this.#assetsForRecoveredDocument(document, assets);
     const state = this.#newState({
       sessionId: candidateId,

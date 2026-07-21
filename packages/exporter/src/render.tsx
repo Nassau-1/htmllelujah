@@ -1,9 +1,8 @@
 import {
   parseDeck,
-  resolveSlide,
+  resolveSlideFromValidatedDocument,
   type DeckDocument,
   type DeckDocumentInput,
-  type Element,
   type ResolvedSlide,
   type Slide,
 } from '@htmllelujah/document-core';
@@ -11,7 +10,9 @@ import { RENDERER_CSS, SlideSurface, formatNumber, formatPoint } from '@htmllelu
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { createDataAssetResolver } from './assets.js';
-import { buildHtmlDocument, escapeHtmlAttribute, escapeHtmlText } from './html.js';
+import { BoundedUtf8Builder, buildHtmlDocument, escapeHtmlAttribute } from './html.js';
+import { resolveExportLimits, type ExportLimitOverrides, type ExportLimits } from './limits.js';
+import { preflightProjectionBudget } from './projection-budget.js';
 import { PRINT_READINESS_SCRIPT, STANDALONE_VIEWER_SCRIPT } from './scripts.js';
 import type {
   BaseHtmlExportOptions,
@@ -91,40 +92,35 @@ const parseDocument = (input: DeckDocumentInput): DeckDocument => {
 const eligibleSlides = (document: DeckDocument, policy: HiddenSlidePolicy): readonly Slide[] =>
   policy === 'include' ? document.slides : document.slides.filter((slide) => !slide.hidden);
 
-const collectElementAssetIds = (element: Element, output: Set<string>): void => {
-  if (element.type === 'image') output.add(element.assetId);
-  if (element.type === 'group') {
-    for (const child of element.children) collectElementAssetIds(child, output);
-  }
-};
-
-const collectProjectionAssetIds = (projection: ResolvedSlide, output: Set<string>): void => {
-  if (projection.background.type === 'image') output.add(projection.background.assetId);
-  for (const resolved of projection.elements) collectElementAssetIds(resolved.element, output);
-};
-
-const prepareProjections = (
+const prepareExport = (
   input: DeckDocumentInput,
   assets: ExportAssets,
   policyInput: unknown,
+  limitOverrides: ExportLimitOverrides | undefined,
 ): Readonly<{
   document: DeckDocument;
-  projections: readonly ResolvedSlide[];
+  slides: readonly Slide[];
   resolveAsset: (assetId: string) => string | null;
+  limits: ExportLimits;
 }> => {
   const document = parseDocument(input);
   const policy = hiddenPolicy(document, policyInput);
   const slides = eligibleSlides(document, policy);
-  let projections: readonly ResolvedSlide[];
+  const limits = resolveExportLimits(limitOverrides);
+  const budget = preflightProjectionBudget(document, slides, limits);
+  const resolveAsset = createDataAssetResolver(document, assets, budget.requiredAssetIds, {
+    occurrenceCounts: budget.assetOccurrences,
+    maxProjectedAssetBytes: limits.maxProjectedAssetBytes,
+  });
+  return { document, slides, resolveAsset, limits };
+};
+
+const resolveProjection = (document: DeckDocument, slide: Slide): ResolvedSlide => {
   try {
-    projections = slides.map((slide) => resolveSlide(document, slide.id));
+    return resolveSlideFromValidatedDocument(document, slide.id);
   } catch {
     throw new ExporterError('INVALID_REQUEST', 'A slide could not be resolved for export.');
   }
-  const requiredAssets = new Set<string>();
-  for (const projection of projections) collectProjectionAssetIds(projection, requiredAssets);
-  const resolveAsset = createDataAssetResolver(document, assets, requiredAssets);
-  return { document, projections, resolveAsset };
 };
 
 const renderProjection = (
@@ -145,6 +141,7 @@ export const createStandaloneHtml = (
   deck: DeckDocumentInput,
   assets: ExportAssets,
   options: StandaloneHtmlOptions = {},
+  limitOverrides?: ExportLimitOverrides,
 ): string => {
   assertOptions(options, ['hiddenSlides', 'title', 'startSlideId', 'clickNavigation']);
   if (options.clickNavigation !== undefined && typeof options.clickNavigation !== 'boolean') {
@@ -153,48 +150,58 @@ export const createStandaloneHtml = (
   if (options.startSlideId !== undefined && typeof options.startSlideId !== 'string') {
     throw new ExporterError('INVALID_REQUEST', 'The starting slide is invalid.');
   }
-  const prepared = prepareProjections(deck, assets, options.hiddenSlides);
+  const prepared = prepareExport(deck, assets, options.hiddenSlides, limitOverrides);
   const title = exportTitle(prepared.document, options.title);
   const startIndex =
     options.startSlideId === undefined
       ? 0
-      : prepared.projections.findIndex(
-          (projection) => projection.slide.id === options.startSlideId,
-        );
+      : prepared.slides.findIndex((slide) => slide.id === options.startSlideId);
   if (options.startSlideId !== undefined && startIndex < 0) {
     throw new ExporterError('NOT_FOUND', 'The requested starting slide is not exportable.');
   }
-  const slides = prepared.projections
-    .map((projection, index) => {
+  const count = prepared.slides.length;
+  const body = new BoundedUtf8Builder(prepared.limits.maxOutputUtf8Bytes);
+  body.append(`<main class="hl-export-viewer" data-htmllelujah-viewer="true" data-testid="presentation-root" data-start-index="${Math.max(0, startIndex)}" data-click-navigation="${options.clickNavigation === false ? 'false' : 'true'}" aria-label="${escapeHtmlAttribute(title)}">
+  <div class="hl-export-stage" data-export-stage="true">`);
+  if (count === 0) {
+    body.append('<p class="hl-export-empty">No slides to present.</p>');
+  } else {
+    for (const [index, slide] of prepared.slides.entries()) {
       const active = index === startIndex;
+      const projection = resolveProjection(prepared.document, slide);
       const markup = renderProjection(projection, 'html', prepared.resolveAsset);
-      return `<section class="hl-export-slide" data-export-slide="${index}" data-testid="export-slide" aria-hidden="${active ? 'false' : 'true'}"${active ? '' : ' hidden'}>${markup}</section>`;
-    })
-    .join('\n');
-  const count = prepared.projections.length;
-  const body = `<main class="hl-export-viewer" data-htmllelujah-viewer="true" data-testid="presentation-root" data-start-index="${Math.max(0, startIndex)}" data-click-navigation="${options.clickNavigation === false ? 'false' : 'true'}" aria-label="${escapeHtmlAttribute(title)}">
-  <div class="hl-export-stage" data-export-stage="true">${slides || '<p class="hl-export-empty">No slides to present.</p>'}</div>
+      if (index > 0) body.append('\n');
+      body.append(
+        `<section class="hl-export-slide" data-export-slide="${index}" data-testid="export-slide" aria-hidden="${active ? 'false' : 'true'}"${active ? '' : ' hidden'}>${markup}</section>`,
+      );
+    }
+  }
+  body.append(`</div>
   <nav class="hl-export-controls" aria-label="Presentation controls">
     <button type="button" data-action="previous" aria-label="Previous slide"${count === 0 || startIndex === 0 ? ' disabled' : ''}>‹</button>
     <output class="hl-export-counter" data-slide-counter="true" aria-live="polite">${count === 0 ? '0 / 0' : `${startIndex + 1} / ${count}`}</output>
     <button type="button" data-action="next" aria-label="Next slide"${count === 0 || startIndex === count - 1 ? ' disabled' : ''}>›</button>
     <button type="button" data-action="fullscreen" aria-label="Toggle fullscreen">⛶</button>
   </nav>
-</main>`;
-  return buildHtmlDocument({
-    kind: 'standalone',
-    locale: prepared.document.metadata.locale,
-    title,
-    css: STANDALONE_CSS,
-    script: STANDALONE_VIEWER_SCRIPT,
-    body,
-  });
+</main>`);
+  return buildHtmlDocument(
+    {
+      kind: 'standalone',
+      locale: prepared.document.metadata.locale,
+      title,
+      css: STANDALONE_CSS,
+      script: STANDALONE_VIEWER_SCRIPT,
+      body: body.toString(),
+    },
+    prepared.limits.maxOutputUtf8Bytes,
+  );
 };
 
 export const createPrintHtml = (
   deck: DeckDocumentInput,
   assets: ExportAssets,
   options: PrintHtmlOptions = {},
+  limitOverrides?: ExportLimitOverrides,
 ): string => {
   assertOptions(options, ['hiddenSlides', 'title', 'readinessDeadlineMs']);
   const requestedDeadline: unknown = options.readinessDeadlineMs;
@@ -207,35 +214,42 @@ export const createPrintHtml = (
   ) {
     throw new ExporterError('INVALID_REQUEST', 'The readiness deadline is invalid.');
   }
-  const prepared = prepareProjections(deck, assets, options.hiddenSlides);
-  if (prepared.projections.length === 0) {
+  const prepared = prepareExport(deck, assets, options.hiddenSlides, limitOverrides);
+  if (prepared.slides.length === 0) {
     throw new ExporterError(
       'INVALID_REQUEST',
       'Print export requires at least one eligible slide.',
     );
   }
   const title = exportTitle(prepared.document, options.title);
-  const pages = prepared.projections
-    .map((projection, index) => {
-      const markup = renderProjection(projection, 'pdf', prepared.resolveAsset);
-      return `<section class="hl-print-page" data-print-page="${index}" data-testid="page-root">${markup}</section>`;
-    })
-    .join('\n');
-  const body = `<main class="hl-print-root" data-print-root="true" data-testid="print-root">${pages}</main>`;
-  return buildHtmlDocument({
-    kind: 'print',
-    locale: prepared.document.metadata.locale,
-    title,
-    css: printCss(prepared.document),
-    script: PRINT_READINESS_SCRIPT,
-    body,
-    htmlDataAttributes: {
-      'render-ready': 'pending',
-      'readiness-deadline-ms': String(deadline),
-      'page-count': String(prepared.projections.length),
-      'page-width-pt': formatNumber(prepared.document.page.widthPt),
-      'page-height-pt': formatNumber(prepared.document.page.heightPt),
-      testid: 'render-ready-state',
+  const body = new BoundedUtf8Builder(prepared.limits.maxOutputUtf8Bytes);
+  body.append('<main class="hl-print-root" data-print-root="true" data-testid="print-root">');
+  for (const [index, slide] of prepared.slides.entries()) {
+    const projection = resolveProjection(prepared.document, slide);
+    const markup = renderProjection(projection, 'pdf', prepared.resolveAsset);
+    if (index > 0) body.append('\n');
+    body.append(
+      `<section class="hl-print-page" data-print-page="${index}" data-testid="page-root">${markup}</section>`,
+    );
+  }
+  body.append('</main>');
+  return buildHtmlDocument(
+    {
+      kind: 'print',
+      locale: prepared.document.metadata.locale,
+      title,
+      css: printCss(prepared.document),
+      script: PRINT_READINESS_SCRIPT,
+      body: body.toString(),
+      htmlDataAttributes: {
+        'render-ready': 'pending',
+        'readiness-deadline-ms': String(deadline),
+        'page-count': String(prepared.slides.length),
+        'page-width-pt': formatNumber(prepared.document.page.widthPt),
+        'page-height-pt': formatNumber(prepared.document.page.heightPt),
+        testid: 'render-ready-state',
+      },
     },
-  });
+    prepared.limits.maxOutputUtf8Bytes,
+  );
 };

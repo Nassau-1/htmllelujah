@@ -1,11 +1,20 @@
 import { createHash } from 'node:crypto';
 
-import { resolveSlide, STANDARD_PAGE_SIZES } from '@htmllelujah/document-core';
+import * as documentCore from '@htmllelujah/document-core';
+import {
+  resolveSlide,
+  STANDARD_PAGE_SIZES,
+  type DeckDocument,
+  type ImageElement,
+  type TextElement,
+} from '@htmllelujah/document-core';
 import { RENDERER_CSS, SlideSurface } from '@htmllelujah/renderer';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
+  BoundedUtf8Builder,
+  EXPORT_LIMITS,
   ExporterError,
   PRINT_READINESS_SCRIPT,
   STANDALONE_VIEWER_SCRIPT,
@@ -17,7 +26,7 @@ import {
 import { createExportFixture } from './fixtures.js';
 
 const scriptText = (html: string): string => {
-  const matches = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  const matches = [...html.matchAll(/<script>([\s\S]*?)<\/script>/giu)];
   expect(matches).toHaveLength(1);
   return matches[0]?.[1] ?? '';
 };
@@ -39,6 +48,101 @@ const normalizeModeMarkup = (html: string): string =>
     .replace(/hl-mode-(?:editor|html|pdf)/g, 'hl-mode-COMMON')
     .replace(/data-render-mode="(?:editor|html|pdf)"/g, 'data-render-mode="COMMON"')
     .replace(/ data-locked="true"/g, '');
+
+const inheritedProjectionFixture = (): DeckDocument => {
+  const fixture = createExportFixture();
+  const master = fixture.deck.masters[0];
+  const layout = fixture.deck.layouts.find((candidate) => candidate.masterId === master?.id);
+  const sourceText = fixture.deck.slides
+    .flatMap((slide) => slide.elements)
+    .find((element): element is TextElement => element.type === 'text');
+  if (master === undefined || layout === undefined || sourceText === undefined) {
+    throw new Error('Projection fixture is incomplete.');
+  }
+  const firstBlock = sourceText.content.blocks[0];
+  const inheritedMarks =
+    firstBlock?.type === 'list' ? firstBlock.items[0]?.runs[0]?.marks : firstBlock?.runs[0]?.marks;
+  const { placeholderBinding: _placeholderBinding, ...unboundText } = sourceText;
+  const inheritedText: TextElement = {
+    ...unboundText,
+    content: {
+      blocks: [
+        {
+          id: '42000000-0000-4000-8000-000000000001',
+          type: 'paragraph',
+          alignment: 'left',
+          runs: [
+            {
+              text: 'x',
+              marks: inheritedMarks ?? {
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+              },
+            },
+          ],
+        },
+      ],
+    },
+  };
+  return {
+    ...fixture.deck,
+    masters: fixture.deck.masters.map((candidate) =>
+      candidate.id === master.id ? { ...candidate, elements: [inheritedText] } : candidate,
+    ),
+    layouts: fixture.deck.layouts.map((candidate) =>
+      candidate.id === layout.id ? { ...candidate, elements: [] } : candidate,
+    ),
+    slides: fixture.deck.slides.map((slide, index) => ({
+      ...slide,
+      layoutId: layout.id,
+      hidden: index === 2,
+      elements: [],
+    })),
+    assets: [],
+  };
+};
+
+const repeatedAssetFixture = (): Readonly<{
+  deck: DeckDocument;
+  assets: ReadonlyMap<string, Uint8Array>;
+  dataUrl: string;
+}> => {
+  const fixture = createExportFixture();
+  const base = inheritedProjectionFixture();
+  const sourceImage = fixture.deck.slides
+    .flatMap((slide) => slide.elements)
+    .find(
+      (element): element is ImageElement =>
+        element.type === 'image' && element.assetId === fixture.visibleAssetId,
+    );
+  const reference = fixture.deck.assets.find((asset) => asset.id === fixture.visibleAssetId);
+  if (sourceImage === undefined || reference === undefined) {
+    throw new Error('Asset occurrence fixture is incomplete.');
+  }
+  const slides = base.slides.slice(0, 2).map((slide, index) => ({
+    ...slide,
+    hidden: false,
+    elements: [
+      {
+        ...sourceImage,
+        id: `43000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+      },
+    ],
+  }));
+  const dataUrl = `data:${reference.mediaType};base64,${Buffer.from(fixture.visibleBytes).toString('base64')}`;
+  return {
+    deck: {
+      ...base,
+      masters: base.masters.map((master) => ({ ...master, elements: [] })),
+      slides,
+      assets: [reference],
+    },
+    assets: new Map([[fixture.visibleAssetId, fixture.visibleBytes]]),
+    dataUrl,
+  };
+};
 
 describe('createStandaloneHtml', () => {
   it('is deterministic, single-file, offline and contains working static controls', () => {
@@ -125,7 +229,7 @@ describe('createStandaloneHtml', () => {
     expect(html).toContain('style-src-attr &#39;unsafe-inline&#39;');
     expect(html).toContain('img-src data:');
     expect(html).not.toContain('unsafe-eval');
-    expect(html.match(/<script>/g)).toHaveLength(1);
+    expect(html.match(/<script>/giu)).toHaveLength(1);
   });
 
   it('rejects unknown options and a non-exportable starting slide', () => {
@@ -254,5 +358,128 @@ describe('asset integrity', () => {
     expect(serialized).not.toContain(fixture.visibleAssetId);
     expect(serialized).not.toContain('private-visible.png');
     expect(serialized).not.toContain(Buffer.from(fixture.visibleBytes).toString('base64'));
+  });
+});
+
+describe('bounded export representability', () => {
+  it('parses the document once and resolves every eligible slide from that validation', () => {
+    const fixture = createExportFixture();
+    const parse = vi.spyOn(documentCore, 'parseDeck');
+    try {
+      createStandaloneHtml(fixture.deck, fixture.assets);
+      expect(parse).toHaveBeenCalledTimes(1);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it('counts inherited element and escaped-text occurrences before standalone or print render', () => {
+    const deck = inheritedProjectionFixture();
+
+    expect(() =>
+      createStandaloneHtml(
+        deck,
+        new Map(),
+        {},
+        {
+          maxProjectedElementOccurrences: 2,
+          maxProjectedContentBytes: 2,
+        },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      createPrintHtml(
+        deck,
+        new Map(),
+        {},
+        {
+          maxProjectedElementOccurrences: 2,
+          maxProjectedContentBytes: 2,
+        },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      createStandaloneHtml(
+        deck,
+        new Map(),
+        { hiddenSlides: 'include' },
+        {
+          maxProjectedElementOccurrences: 2,
+        },
+      ),
+    ).toThrowError(expect.objectContaining({ code: 'EXPORT_LIMIT_EXCEEDED' }));
+    expect(() =>
+      createPrintHtml(
+        deck,
+        new Map(),
+        { hiddenSlides: 'include' },
+        {
+          maxProjectedContentBytes: 2,
+        },
+      ),
+    ).toThrowError(expect.objectContaining({ code: 'EXPORT_LIMIT_EXCEEDED' }));
+    expect(() =>
+      createStandaloneHtml(
+        deck,
+        new Map(),
+        { hiddenSlides: 'include' },
+        {
+          maxProjectedElementOccurrences: 3,
+          maxProjectedContentBytes: 3,
+        },
+      ),
+    ).not.toThrow();
+  });
+
+  it('charges each emitted data-URL occurrence before base64 rendering', () => {
+    const fixture = repeatedAssetFixture();
+    const exactProjectedBytes = Buffer.byteLength(fixture.dataUrl, 'utf8') * 2;
+    const standalone = createStandaloneHtml(
+      fixture.deck,
+      fixture.assets,
+      {},
+      {
+        maxProjectedAssetBytes: exactProjectedBytes,
+      },
+    );
+    expect(standalone.split(fixture.dataUrl)).toHaveLength(3);
+    expect(() =>
+      createPrintHtml(
+        fixture.deck,
+        fixture.assets,
+        {},
+        {
+          maxProjectedAssetBytes: exactProjectedBytes,
+        },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      createStandaloneHtml(
+        fixture.deck,
+        fixture.assets,
+        {},
+        {
+          maxProjectedAssetBytes: exactProjectedBytes - 1,
+        },
+      ),
+    ).toThrowError(expect.objectContaining({ code: 'EXPORT_LIMIT_EXCEEDED' }));
+  });
+
+  it('bounds UTF-8 accumulation exactly and rejects raised test ceilings', () => {
+    const output = new BoundedUtf8Builder(7);
+    output.append('é').append('&amp;');
+    expect(output.byteLength).toBe(7);
+    expect(output.toString()).toBe('é&amp;');
+    expect(() => output.append('x')).toThrowError(
+      expect.objectContaining({ code: 'EXPORT_LIMIT_EXCEEDED' }),
+    );
+    expect(() => new BoundedUtf8Builder(EXPORT_LIMITS.maxOutputUtf8Bytes + 1)).toThrowError(
+      expect.objectContaining({ code: 'INVALID_REQUEST' }),
+    );
+  });
+
+  it('keeps print image readiness work at four concurrent decoders', () => {
+    expect(PRINT_READINESS_SCRIPT).toContain('Math.min(4, images.length)');
+    expect(PRINT_READINESS_SCRIPT).not.toContain('Promise.all(Array.from(document.images).map');
   });
 });

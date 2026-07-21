@@ -2,10 +2,17 @@ import { createHash } from 'node:crypto';
 
 import { DOCUMENT_LIMITS, type AssetRef, type DeckDocument } from '@htmllelujah/document-core';
 
+import { EXPORT_LIMITS, MAX_TOTAL_ASSET_BYTES } from './limits.js';
 import { ExporterError, type ExportAssets } from './types.js';
 
 const SUPPORTED_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
-const MAX_TOTAL_ASSET_BYTES = 200 * 1024 * 1024;
+
+export interface DataAssetResolverOptions {
+  /** Number of times each required asset URL is projected into the final markup. */
+  readonly occurrenceCounts?: ReadonlyMap<string, number> | undefined;
+  /** Testable lowering-only override for the production projection ceiling. */
+  readonly maxProjectedAssetBytes?: number | undefined;
+}
 
 export const sha256Hex = (bytes: Uint8Array): string =>
   createHash('sha256').update(bytes).digest('hex');
@@ -80,11 +87,24 @@ export const createDataAssetResolver = (
   document: DeckDocument,
   assets: ExportAssets,
   requiredAssetIds: ReadonlySet<string> = new Set(document.assets.map((asset) => asset.id)),
+  options: DataAssetResolverOptions = {},
 ): ((assetId: string) => string | null) => {
+  const projectedLimit = options.maxProjectedAssetBytes ?? EXPORT_LIMITS.maxProjectedAssetBytes;
+  if (
+    !Number.isSafeInteger(projectedLimit) ||
+    projectedLimit < 0 ||
+    projectedLimit > EXPORT_LIMITS.maxProjectedAssetBytes
+  ) {
+    throw new ExporterError(
+      'INVALID_REQUEST',
+      'The projected asset limit must only lower the production ceiling.',
+    );
+  }
   const supplied = asAssetMap(assets);
   const declared = new Map(document.assets.map((asset) => [asset.id, asset]));
   let totalBytes = 0;
-  const dataUrls = new Map<string, string>();
+  let projectedBytes = 0;
+  const validated = new Map<string, Readonly<{ reference: AssetRef; bytes: Uint8Array }>>();
   for (const assetId of requiredAssetIds) {
     const reference = declared.get(assetId);
     const bytes = supplied.get(assetId);
@@ -96,16 +116,37 @@ export const createDataAssetResolver = (
     if (totalBytes > MAX_TOTAL_ASSET_BYTES) {
       throw new ExporterError('ASSET_LIMIT_EXCEEDED', 'Export assets exceed the total size limit.');
     }
-    const base64 = Buffer.from(bytes).toString('base64');
-    if (!/^[a-z0-9+/]+={0,2}$/i.test(base64)) {
-      throw new ExporterError('ASSET_INVALID', 'An export asset could not be encoded safely.');
+    const occurrences = options.occurrenceCounts?.get(assetId) ?? 1;
+    if (!Number.isSafeInteger(occurrences) || occurrences < 0) {
+      throw new ExporterError('INVALID_REQUEST', 'Projected asset occurrences are invalid.');
     }
-    dataUrls.set(assetId, `data:${reference.mediaType};base64,${base64}`);
+    const prefixBytes = Buffer.byteLength(`data:${reference.mediaType};base64,`, 'utf8');
+    const dataUrlBytes = prefixBytes + Math.ceil(bytes.byteLength / 3) * 4;
+    if (
+      !Number.isSafeInteger(dataUrlBytes) ||
+      occurrences > Math.floor((projectedLimit - projectedBytes) / dataUrlBytes)
+    ) {
+      throw new ExporterError(
+        'EXPORT_LIMIT_EXCEEDED',
+        'Projected export assets exceed the representability limit.',
+      );
+    }
+    projectedBytes += dataUrlBytes * occurrences;
+    validated.set(assetId, { reference, bytes });
   }
   for (const assetId of supplied.keys()) {
     if (!declared.has(assetId)) {
       throw new ExporterError('ASSET_INVALID', 'An undeclared export asset was supplied.');
     }
+  }
+
+  const dataUrls = new Map<string, string>();
+  for (const [assetId, { reference, bytes }] of validated) {
+    const base64 = Buffer.from(bytes).toString('base64');
+    if (!/^[a-z0-9+/]+={0,2}$/i.test(base64)) {
+      throw new ExporterError('ASSET_INVALID', 'An export asset could not be encoded safely.');
+    }
+    dataUrls.set(assetId, `data:${reference.mediaType};base64,${base64}`);
   }
   return (assetId: string): string | null => dataUrls.get(assetId) ?? null;
 };

@@ -8,12 +8,33 @@ import {
 
 import { boundedTextRuns } from './canonical-factories';
 
-export const RICH_CLIPBOARD_LIMITS = Object.freeze({
+export interface RichClipboardLimits {
+  readonly maxHtmlLength: number;
+  readonly maxTextLength: number;
+  readonly maxBlocks: number;
+  readonly maxRunsPerBlock: number;
+  readonly maxRecognizedTags: number;
+  readonly maxInlineMarkDepth: number;
+  readonly maxListDepth: number;
+  readonly maxSuppressedDepth: number;
+}
+
+export type RichClipboardLimitOverrides = Partial<RichClipboardLimits>;
+
+export const RICH_CLIPBOARD_LIMITS: Readonly<RichClipboardLimits> = Object.freeze({
   maxHtmlLength: 1_000_000,
   maxTextLength: 500_000,
   maxBlocks: Math.min(1_000, DOCUMENT_LIMITS.maxRichTextBlocks),
   maxRunsPerBlock: DOCUMENT_LIMITS.maxTextRunsPerBlock,
+  maxRecognizedTags: 50_000,
+  maxInlineMarkDepth: 64,
+  maxListDepth: DOCUMENT_LIMITS.maxListLevel + 1,
+  maxSuppressedDepth: 64,
 });
+
+const RICH_CLIPBOARD_LIMIT_KEYS = Object.freeze(
+  Object.keys(RICH_CLIPBOARD_LIMITS) as readonly (keyof RichClipboardLimits)[],
+);
 
 export class RichClipboardError extends Error {
   readonly code = 'CLIPBOARD_LIMIT_EXCEEDED';
@@ -23,6 +44,34 @@ export class RichClipboardError extends Error {
     this.name = 'RichClipboardError';
   }
 }
+
+export const resolveRichClipboardLimits = (
+  overrides: RichClipboardLimitOverrides | undefined,
+): Readonly<RichClipboardLimits> => {
+  if (overrides === undefined) return RICH_CLIPBOARD_LIMITS;
+  if (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides)) {
+    throw new RichClipboardError('Clipboard limits are invalid.');
+  }
+  if (
+    Object.keys(overrides).some(
+      (key) => !RICH_CLIPBOARD_LIMIT_KEYS.includes(key as keyof RichClipboardLimits),
+    )
+  ) {
+    throw new RichClipboardError('Clipboard limits are invalid.');
+  }
+  const resolved = { ...RICH_CLIPBOARD_LIMITS };
+  for (const key of RICH_CLIPBOARD_LIMIT_KEYS) {
+    const value = overrides[key];
+    if (
+      value !== undefined &&
+      (!Number.isSafeInteger(value) || value < 0 || value > RICH_CLIPBOARD_LIMITS[key])
+    ) {
+      throw new RichClipboardError('Clipboard limits must only lower production ceilings.');
+    }
+    if (value !== undefined) resolved[key] = value;
+  }
+  return Object.freeze(resolved);
+};
 
 type ParsedLine =
   | Readonly<{
@@ -168,35 +217,55 @@ const trimRuns = (runs: readonly TextRun[]): readonly TextRun[] => {
   return result.filter((run) => run.text.length > 0);
 };
 
-const toLines = (content: RichTextDocument): readonly ParsedLine[] =>
-  content.blocks.flatMap((block): readonly ParsedLine[] =>
-    block.type === 'list'
-      ? block.items.map((item) => ({
-          kind: 'list' as const,
+const toLines = (content: RichTextDocument, limits: RichClipboardLimits): readonly ParsedLine[] => {
+  const lines: ParsedLine[] = [];
+  const cloneRuns = (runs: readonly TextRun[]): readonly TextRun[] => {
+    if (runs.length > limits.maxRunsPerBlock) {
+      throw new RichClipboardError('Rich text contains too many inline runs.');
+    }
+    return runs.map((run) => ({ text: run.text, marks: cloneMarks(run.marks) }));
+  };
+  const append = (line: ParsedLine): void => {
+    if (lines.length >= limits.maxBlocks) {
+      throw new RichClipboardError('Rich text contains too many blocks.');
+    }
+    lines.push(line);
+  };
+  for (const block of content.blocks) {
+    if (block.type === 'list') {
+      if (block.items.length > DOCUMENT_LIMITS.maxListItems) {
+        throw new RichClipboardError('Rich text contains too many list items.');
+      }
+      for (const item of block.items) {
+        append({
+          kind: 'list',
           ordered: block.ordered,
           level: item.level,
-          runs: item.runs.map((run) => ({ text: run.text, marks: cloneMarks(run.marks) })),
-        }))
-      : [
-          block.type === 'heading'
-            ? {
-                kind: 'heading' as const,
-                level: block.level,
-                alignment: block.alignment,
-                runs: block.runs.map((run) => ({ text: run.text, marks: cloneMarks(run.marks) })),
-              }
-            : {
-                kind: 'paragraph' as const,
-                alignment: block.alignment,
-                runs: block.runs.map((run) => ({ text: run.text, marks: cloneMarks(run.marks) })),
-              },
-        ],
-  );
+          runs: cloneRuns(item.runs),
+        });
+      }
+    } else if (block.type === 'heading') {
+      append({
+        kind: 'heading',
+        level: block.level,
+        alignment: block.alignment,
+        runs: cloneRuns(block.runs),
+      });
+    } else {
+      append({ kind: 'paragraph', alignment: block.alignment, runs: cloneRuns(block.runs) });
+    }
+  }
+  return lines;
+};
 
 const linesToDocument = (
   lines: readonly ParsedLine[],
   fallbackMarks: TextMarks,
+  limits: RichClipboardLimits,
 ): RichTextDocument => {
+  if (lines.length > limits.maxBlocks || (lines.length === 0 && limits.maxBlocks < 1)) {
+    throw new RichClipboardError('Rich text contains too many blocks after insertion.');
+  }
   const blocks: RichTextDocument['blocks'][number][] = [];
   for (const line of lines) {
     const runs =
@@ -246,7 +315,7 @@ const linesToDocument = (
             },
           ],
   };
-  if (document.blocks.length > DOCUMENT_LIMITS.maxRichTextBlocks) {
+  if (document.blocks.length > limits.maxBlocks) {
     throw new RichClipboardError('Rich text contains too many blocks after insertion.');
   }
   for (const block of document.blocks) {
@@ -254,10 +323,10 @@ const linesToDocument = (
       if (block.items.length > DOCUMENT_LIMITS.maxListItems) {
         throw new RichClipboardError('Rich text contains too many list items after insertion.');
       }
-      if (block.items.some((item) => item.runs.length > DOCUMENT_LIMITS.maxTextRunsPerBlock)) {
+      if (block.items.some((item) => item.runs.length > limits.maxRunsPerBlock)) {
         throw new RichClipboardError('Rich text contains too many inline runs after insertion.');
       }
-    } else if (block.runs.length > DOCUMENT_LIMITS.maxTextRunsPerBlock) {
+    } else if (block.runs.length > limits.maxRunsPerBlock) {
       throw new RichClipboardError('Rich text contains too many inline runs after insertion.');
     }
   }
@@ -324,6 +393,21 @@ const locateOffset = (
   return { lineIndex: 0, offsetInLine: 0 };
 };
 
+const pushBounded = <T>(stack: T[], value: T, maximum: number, message: string): void => {
+  if (stack.length >= maximum) throw new RichClipboardError(message);
+  stack.push(value);
+};
+
+type ActiveMarkKind = 'bold' | 'italic' | 'underline' | 'strikethrough';
+
+const markKind = (tag: string): ActiveMarkKind | undefined => {
+  if (tag === 'b' || tag === 'strong') return 'bold';
+  if (tag === 'em' || tag === 'i') return 'italic';
+  if (tag === 'u') return 'underline';
+  if (tag === 'del' || tag === 's' || tag === 'strike') return 'strikethrough';
+  return undefined;
+};
+
 /**
  * Converts clipboard HTML to the closed rich-text model. No attribute is read,
  * no URL is retained, and active/embedded content subtrees are discarded.
@@ -333,9 +417,11 @@ export const sanitizeClipboardHtml = (
   options: Readonly<{
     fallbackMarks: TextMarks;
     alignment?: TextAlignment;
+    limits?: RichClipboardLimitOverrides;
   }>,
 ): RichTextDocument => {
-  if (html.length > RICH_CLIPBOARD_LIMITS.maxHtmlLength) {
+  const limits = resolveRichClipboardLimits(options.limits);
+  if (html.length > limits.maxHtmlLength) {
     throw new RichClipboardError('Clipboard HTML exceeds the supported size.');
   }
 
@@ -343,19 +429,22 @@ export const sanitizeClipboardHtml = (
   const listStack: boolean[] = [];
   const activeMarkTags: string[] = [];
   const suppressedTags: string[] = [];
+  const activeMarks: Record<ActiveMarkKind, number> = {
+    bold: 0,
+    italic: 0,
+    underline: 0,
+    strikethrough: 0,
+  };
   let current: MutableLine | null = null;
   let textLength = 0;
+  let recognizedTags = 0;
 
   const currentMarks = (): TextMarks => ({
     ...options.fallbackMarks,
-    bold:
-      options.fallbackMarks.bold || activeMarkTags.some((tag) => tag === 'b' || tag === 'strong'),
-    italic:
-      options.fallbackMarks.italic || activeMarkTags.some((tag) => tag === 'em' || tag === 'i'),
-    underline: options.fallbackMarks.underline || activeMarkTags.includes('u'),
-    strikethrough:
-      options.fallbackMarks.strikethrough ||
-      activeMarkTags.some((tag) => tag === 'del' || tag === 's' || tag === 'strike'),
+    bold: options.fallbackMarks.bold || activeMarks.bold > 0,
+    italic: options.fallbackMarks.italic || activeMarks.italic > 0,
+    underline: options.fallbackMarks.underline || activeMarks.underline > 0,
+    strikethrough: options.fallbackMarks.strikethrough || activeMarks.strikethrough > 0,
   });
 
   const flush = (): void => {
@@ -363,7 +452,7 @@ export const sanitizeClipboardHtml = (
     const runs = trimRuns(current.runs);
     if (runs.length > 0) lines.push({ ...current, runs } as ParsedLine);
     current = null;
-    if (lines.length > RICH_CLIPBOARD_LIMITS.maxBlocks) {
+    if (lines.length > limits.maxBlocks) {
       throw new RichClipboardError('Clipboard HTML contains too many text blocks.');
     }
   };
@@ -381,7 +470,7 @@ export const sanitizeClipboardHtml = (
     const text = normalizedText(raw);
     if (text === '') return;
     textLength += text.length;
-    if (textLength > RICH_CLIPBOARD_LIMITS.maxTextLength) {
+    if (textLength > limits.maxTextLength) {
       throw new RichClipboardError('Clipboard text exceeds the supported size.');
     }
     const line = ensureLine();
@@ -396,7 +485,7 @@ export const sanitizeClipboardHtml = (
     }
     for (const run of boundedTextRuns(text, marks)) {
       line.runs.push({ text: run.text, marks: cloneMarks(run.marks) });
-      if (line.runs.length > RICH_CLIPBOARD_LIMITS.maxRunsPerBlock) {
+      if (line.runs.length > limits.maxRunsPerBlock) {
         throw new RichClipboardError('Clipboard HTML contains too many inline runs.');
       }
     }
@@ -424,24 +513,46 @@ export const sanitizeClipboardHtml = (
     cursor = tagEnd + 1;
     const match = /^<\s*(\/?)\s*([a-z][a-z0-9:-]*)/i.exec(rawTag);
     if (match === null) continue;
+    recognizedTags += 1;
+    if (recognizedTags > limits.maxRecognizedTags) {
+      throw new RichClipboardError('Clipboard HTML contains too many tags.');
+    }
     const closing = match[1] === '/';
     const tag = match[2]!.toLowerCase();
     const selfClosing = /\/\s*>$/.test(rawTag) || voidTags.has(tag);
 
     if (suppressedTags.length > 0) {
-      if (!closing && blockedContentTags.has(tag) && !selfClosing) suppressedTags.push(tag);
-      else if (closing && suppressedTags.at(-1) === tag) suppressedTags.pop();
+      if (!closing && blockedContentTags.has(tag) && !selfClosing) {
+        pushBounded(
+          suppressedTags,
+          tag,
+          limits.maxSuppressedDepth,
+          'Clipboard HTML contains excessively nested blocked content.',
+        );
+      } else if (closing && suppressedTags.at(-1) === tag) suppressedTags.pop();
       continue;
     }
     if (!closing && blockedContentTags.has(tag)) {
-      if (!selfClosing) suppressedTags.push(tag);
+      if (!selfClosing) {
+        pushBounded(
+          suppressedTags,
+          tag,
+          limits.maxSuppressedDepth,
+          'Clipboard HTML contains excessively nested blocked content.',
+        );
+      }
       continue;
     }
     if (tag === 'img' || tag === 'input' || tag === 'link' || tag === 'meta') continue;
 
     if (!closing && (tag === 'ul' || tag === 'ol')) {
       flush();
-      listStack.push(tag === 'ol');
+      pushBounded(
+        listStack,
+        tag === 'ol',
+        limits.maxListDepth,
+        'Clipboard HTML contains excessively nested lists.',
+      );
     } else if (closing && (tag === 'ul' || tag === 'ol')) {
       flush();
       listStack.pop();
@@ -476,14 +587,25 @@ export const sanitizeClipboardHtml = (
     } else if (['b', 'strong', 'em', 'i', 'u', 'del', 's', 'strike'].includes(tag)) {
       if (closing) {
         const index = activeMarkTags.lastIndexOf(tag);
-        if (index >= 0) activeMarkTags.splice(index, 1);
+        if (index >= 0) {
+          const [removed] = activeMarkTags.splice(index, 1);
+          const kind = removed === undefined ? undefined : markKind(removed);
+          if (kind !== undefined) activeMarks[kind] -= 1;
+        }
       } else if (!selfClosing) {
-        activeMarkTags.push(tag);
+        pushBounded(
+          activeMarkTags,
+          tag,
+          limits.maxInlineMarkDepth,
+          'Clipboard HTML contains excessively nested inline formatting.',
+        );
+        const kind = markKind(tag);
+        if (kind !== undefined) activeMarks[kind] += 1;
       }
     }
   }
   flush();
-  return linesToDocument(lines, options.fallbackMarks);
+  return linesToDocument(lines, options.fallbackMarks, limits);
 };
 
 /**
@@ -497,10 +619,12 @@ export const replaceRichTextRange = (
   endOffset: number,
   pasted: RichTextDocument,
   fallbackMarks: TextMarks,
+  limitOverrides?: RichClipboardLimitOverrides,
 ): RichTextDocument => {
-  const sourceLines = toLines(source);
-  const pastedLines = toLines(pasted);
-  if (sourceLines.length === 0) return linesToDocument(pastedLines, fallbackMarks);
+  const limits = resolveRichClipboardLimits(limitOverrides);
+  const sourceLines = toLines(source, limits);
+  const pastedLines = toLines(pasted, limits);
+  if (sourceLines.length === 0) return linesToDocument(pastedLines, fallbackMarks, limits);
   const sourceLength = sourceLines.reduce(
     (length, line, index) => length + runTextLength(line.runs) + (index === 0 ? 0 : 1),
     0,
@@ -511,10 +635,12 @@ export const replaceRichTextRange = (
     (length, line, index) => length + runTextLength(line.runs) + (index === 0 ? 0 : 1),
     0,
   );
-  if (sourceLength - (end - start) + pastedLength > RICH_CLIPBOARD_LIMITS.maxTextLength) {
+  if (sourceLength - (end - start) + pastedLength > limits.maxTextLength) {
     throw new RichClipboardError('Rich text exceeds the supported size after insertion.');
   }
-  if (start === 0 && end === sourceLength) return linesToDocument(pastedLines, fallbackMarks);
+  if (start === 0 && end === sourceLength) {
+    return linesToDocument(pastedLines, fallbackMarks, limits);
+  }
 
   const startLocation = locateOffset(sourceLines, start);
   const endLocation = locateOffset(sourceLines, end);
@@ -534,6 +660,7 @@ export const replaceRichTextRange = (
         ...after,
       ],
       fallbackMarks,
+      limits,
     );
   }
 
@@ -542,5 +669,5 @@ export const replaceRichTextRange = (
   result.push(...pastedLines);
   if (runTextLength(suffixRuns) > 0) result.push(lineWithRuns(endLine, suffixRuns));
   result.push(...after);
-  return linesToDocument(result, fallbackMarks);
+  return linesToDocument(result, fallbackMarks, limits);
 };

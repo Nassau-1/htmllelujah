@@ -19,6 +19,7 @@ const discoveryTxtSchema = z
     v: z.literal(String(COLLABORATION_PROTOCOL_VERSION)),
     sid: z.string().uuid(),
     fp: certificateFingerprintSchema,
+    addr: z.string().min(3).max(64),
     exp: z.string().regex(/^\d{10,16}$/),
     hint: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
   })
@@ -133,6 +134,12 @@ export const isPrivateLanAddress = (address: string): boolean => {
   return false;
 };
 
+/** Listener addresses must be concrete private/loopback IP literals, never hostnames or wildcards. */
+export const isPrivateLanLiteral = (address: string): boolean => {
+  const normalized = address.toLowerCase().split('%')[0] ?? address.toLowerCase();
+  return isIP(normalized) !== 0 && isPrivateLanAddress(address);
+};
+
 export class LanDiscoveryController {
   private readonly documentSecret: Buffer;
   private readonly clock: () => number;
@@ -165,6 +172,7 @@ export class LanDiscoveryController {
     const hint = createDiscoveryHint(this.documentSecret, {
       sessionId: parsed.sessionId,
       certificateFingerprint: parsed.certificateFingerprint,
+      host: parsed.host,
       port: parsed.port,
       expiresAtMs: parsed.expiresAtMs,
     });
@@ -177,6 +185,7 @@ export class LanDiscoveryController {
         v: String(COLLABORATION_PROTOCOL_VERSION),
         sid: parsed.sessionId,
         fp: parsed.certificateFingerprint,
+        addr: parsed.host,
         exp: String(parsed.expiresAtMs),
         hint,
       },
@@ -197,12 +206,13 @@ export class LanDiscoveryController {
       const expectedHint = createDiscoveryHint(this.documentSecret, {
         sessionId: txt.sid,
         certificateFingerprint: txt.fp,
+        host: txt.addr,
         port: service.port,
         expiresAtMs,
       });
       if (!constantTimeEqual(txt.hint, expectedHint)) return;
-      const host = service.addresses.find(isPrivateLanAddress) ?? service.host;
-      if (!isPrivateLanAddress(host)) return;
+      const host = txt.addr;
+      if (!isPrivateLanLiteral(host) || !service.addresses.includes(host)) return;
       onInvitation(
         manualInvitationSchema.parse({
           protocolVersion: COLLABORATION_PROTOCOL_VERSION,

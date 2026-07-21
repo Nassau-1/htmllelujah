@@ -10,6 +10,12 @@ import { fileURLToPath } from 'node:url';
 
 import { artifactFreshness, sourceProvenance } from './release-source-state.mjs';
 import { assertCandidateManifest } from './release-candidate-manifest.mjs';
+import {
+  buildNativeRuntimeComponents,
+  incompleteNativeRuntimeQuality,
+  inspectNativeRuntimeEvidence,
+  nativeRuntimeQuality,
+} from './native-runtime-evidence-support.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
@@ -411,66 +417,6 @@ function inventoryEntry(inventory, relativePath) {
   return inventory.find((entry) => entry.path.toLowerCase() === relativePath.toLowerCase());
 }
 
-function detectElectronRuntimeVersions(electronPackageDirectory) {
-  const executable =
-    process.platform === 'win32'
-      ? path.join(electronPackageDirectory, 'dist', 'electron.exe')
-      : path.join(electronPackageDirectory, 'dist', 'electron');
-  if (!spawnSync || !executable) return null;
-  const result = spawnSync(
-    executable,
-    ['-e', 'process.stdout.write(JSON.stringify(process.versions))'],
-    {
-      encoding: 'utf8',
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-      timeout: 15_000,
-      windowsHide: true,
-    },
-  );
-  if (result.status !== 0 || !result.stdout) return null;
-  try {
-    return JSON.parse(result.stdout);
-  } catch {
-    return null;
-  }
-}
-
-async function compareElectronPayload(artifactDir, inventory, electronPackageDirectory) {
-  const comparisons = [];
-  for (const name of ['ffmpeg.dll', 'icudtl.dat', 'resources.pak']) {
-    const packaged = inventoryEntry(inventory, `win-unpacked/${name}`);
-    const toolchainPath = path.join(electronPackageDirectory, 'dist', name);
-    if (!packaged || !(await exists(toolchainPath))) continue;
-    comparisons.push({
-      path: `win-unpacked/${name}`,
-      sha256: packaged.sha256,
-      matchesElectronToolchain: packaged.sha256 === (await sha256(toolchainPath)),
-    });
-  }
-  return comparisons;
-}
-
-async function detectNsis(installerEntries) {
-  if (installerEntries.length === 0) return null;
-  const cacheRoot = process.env.LOCALAPPDATA
-    ? path.join(process.env.LOCALAPPDATA, 'electron-builder', 'Cache', 'nsis')
-    : null;
-  let candidates = [];
-  if (cacheRoot && (await exists(cacheRoot))) {
-    candidates = (await readdir(cacheRoot, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() && /^nsis-/i.test(entry.name))
-      .map((entry) => entry.name)
-      .sort((left, right) => left.localeCompare(right, 'en'));
-  }
-  const selected = candidates.at(-1);
-  return {
-    version: selected?.replace(/^nsis-/i, '') ?? null,
-    evidence: selected
-      ? `electron-builder local tool cache ${selected}`
-      : 'installer filename and electron-builder NSIS target; tool version unavailable',
-  };
-}
-
 function inspectAuthenticode(filePath) {
   if (process.platform !== 'win32') {
     return { status: 'NotChecked', reason: 'Authenticode inspection requires Windows.' };
@@ -514,123 +460,12 @@ function signingEvidence(artifactDir, inventory, installers) {
   }));
 }
 
-async function buildSbom({ artifactDir, inventory, installers, repositoryUrl, version }) {
+async function buildSbom({ inventory, installers, nativeRuntimeEvidence, repositoryUrl, version }) {
   const desktopPackagePath = path.join(REPO_ROOT, 'apps', 'desktop', 'package.json');
   const desktopPackage = await readJson(desktopPackagePath);
-  const electronPackageDirectory = path.join(
-    REPO_ROOT,
-    'apps',
-    'desktop',
-    'node_modules',
-    'electron',
-  );
-  const electronPackagePath = path.join(electronPackageDirectory, 'package.json');
-  const electronPackage = (await exists(electronPackagePath))
-    ? await readJson(electronPackagePath)
-    : null;
-  const runtimeVersions = electronPackage
-    ? detectElectronRuntimeVersions(electronPackageDirectory)
-    : null;
-  const payloadComparisons = electronPackage
-    ? await compareElectronPayload(artifactDir, inventory, electronPackageDirectory)
-    : [];
-  const payloadBinding = payloadComparisons.some((item) => item.matchesElectronToolchain);
   const mainExecutable = inventoryEntry(inventory, 'win-unpacked/HTMLlelujah.exe');
-  const ffmpeg = inventoryEntry(inventory, 'win-unpacked/ffmpeg.dll');
-  const chromiumNotice = inventoryEntry(inventory, 'win-unpacked/LICENSES.chromium.html');
-  const nsis = await detectNsis(installers);
-  const components = [];
-
-  if (electronPackage && mainExecutable) {
-    const electronReference = payloadBinding
-      ? `pkg:npm/electron@${electronPackage.version}`
-      : `htmllelujah:embedded:electron:${mainExecutable.sha256}`;
-    components.push({
-      type: 'framework',
-      'bom-ref': electronReference,
-      group: 'Electron',
-      name: 'Electron',
-      ...(payloadBinding ? { version: electronPackage.version } : {}),
-      ...(payloadBinding ? { purl: `pkg:npm/electron@${electronPackage.version}` } : {}),
-      licenses: [{ license: { id: 'MIT' } }],
-      properties: [
-        componentProperty('evidence', 'packaged Electron executable and LICENSE.electron.txt'),
-        componentProperty(
-          'toolchain-payload-binding',
-          payloadBinding ? 'at least one embedded payload hash matched' : 'not established',
-        ),
-        ...payloadComparisons.map((item) =>
-          componentProperty(`payload.${item.path}.matches`, item.matchesElectronToolchain),
-        ),
-      ],
-    });
-  }
-
-  if (payloadBinding && runtimeVersions?.chrome && chromiumNotice) {
-    components.push({
-      type: 'framework',
-      'bom-ref': `pkg:generic/chromium@${runtimeVersions.chrome}`,
-      group: 'Chromium',
-      name: 'Chromium',
-      version: runtimeVersions.chrome,
-      purl: `pkg:generic/chromium@${runtimeVersions.chrome}`,
-      properties: [
-        componentProperty('evidence', 'Electron toolchain process.versions.chrome'),
-        componentProperty('license-notice-path', 'win-unpacked/LICENSES.chromium.html'),
-      ],
-    });
-  }
-
-  if (payloadBinding && runtimeVersions?.node && mainExecutable) {
-    components.push({
-      type: 'framework',
-      'bom-ref': `pkg:generic/node.js@${runtimeVersions.node}`,
-      name: 'Node.js embedded in Electron',
-      version: runtimeVersions.node,
-      purl: `pkg:generic/node.js@${runtimeVersions.node}`,
-      properties: [componentProperty('evidence', 'Electron toolchain process.versions.node')],
-    });
-  }
-
-  if (ffmpeg) {
-    components.push({
-      type: 'library',
-      'bom-ref': `htmllelujah:embedded:ffmpeg:${ffmpeg.sha256}`,
-      group: 'FFmpeg',
-      name: 'FFmpeg (Electron Chromium build)',
-      hashes: componentHashes(ffmpeg),
-      licenses: [{ expression: 'LGPL-2.1-or-later' }],
-      properties: [
-        componentProperty('evidence-path', 'win-unpacked/ffmpeg.dll'),
-        componentProperty(
-          'version-status',
-          'not exposed by the packaged DLL; governed by the matching Electron build',
-        ),
-        componentProperty(
-          'license-evidence',
-          'FFmpeg entry in packaged LICENSES.chromium.html; build options must be reviewed separately',
-        ),
-      ],
-    });
-  }
-
-  if (nsis) {
-    const refVersion = nsis.version ?? 'undetected';
-    components.push({
-      type: 'application',
-      'bom-ref': `pkg:generic/nsis@${refVersion}`,
-      name: 'Nullsoft Scriptable Install System',
-      ...(nsis.version ? { version: nsis.version } : {}),
-      ...(nsis.version ? { purl: `pkg:generic/nsis@${nsis.version}` } : {}),
-      licenses: [{ license: { id: 'Zlib' } }],
-      properties: [
-        componentProperty('evidence', nsis.evidence),
-        componentProperty('installer-count', installers.length),
-      ],
-    });
-  }
-
-  components.sort((left, right) => left['bom-ref'].localeCompare(right['bom-ref'], 'en'));
+  const components =
+    nativeRuntimeEvidence === null ? [] : buildNativeRuntimeComponents(nativeRuntimeEvidence);
   const appHashes =
     installers.length > 0
       ? installers.map((entry) => hashObject('SHA-256', entry.sha256))
@@ -666,6 +501,10 @@ async function buildSbom({ artifactDir, inventory, installers, repositoryUrl, ve
             installers.length > 0
               ? 'NSIS installer and unpacked application'
               : 'unpacked application only',
+          ),
+          componentProperty(
+            'native-runtime-inventory',
+            nativeRuntimeEvidence === null ? 'incomplete' : 'complete',
           ),
         ],
       },
@@ -757,10 +596,25 @@ async function main() {
     files,
   };
   const checksums = files.map((entry) => `${entry.sha256}  ${entry.path}`).join('\n') + '\n';
+  let nativeRuntimeEvidence = null;
+  let nativeRuntime = incompleteNativeRuntimeQuality();
+  try {
+    nativeRuntimeEvidence = await inspectNativeRuntimeEvidence({
+      artifactDir: options.artifactDir,
+      desktopPackage,
+      installers: grouped.installers,
+      inventory: files,
+      lockfile: await readFile(path.join(REPO_ROOT, 'pnpm-lock.yaml'), 'utf8'),
+    });
+    nativeRuntime = nativeRuntimeQuality(nativeRuntimeEvidence);
+  } catch {
+    // Non-ready diagnostic evidence is still useful. Promotion remains fail-closed:
+    // --require-ready requires the complete five-component inventory and all bindings.
+  }
   const sbom = await buildSbom({
-    artifactDir: options.artifactDir,
     installers: grouped.installers,
     inventory: files,
+    nativeRuntimeEvidence,
     repositoryUrl: options.repositoryUrl,
     version,
   });
@@ -819,10 +673,12 @@ async function main() {
       stale: freshness.stale,
       cleanSource: source.dirty === false,
       candidateManifestPresent: candidateManifest !== null,
+      nativeRuntime,
       releaseReady:
         installerPresent &&
         unpackedApplicationPresent &&
         candidateManifest !== null &&
+        nativeRuntime.passed &&
         candidatePolicy.passed &&
         !freshness.stale &&
         source.dirty === false,
@@ -843,6 +699,9 @@ async function main() {
         ...(candidateManifest !== null
           ? []
           : ['No validated pre-promotion release candidate manifest was supplied.']),
+        ...(nativeRuntime.passed
+          ? []
+          : ['The required native runtime inventory or one of its bindings is incomplete.']),
       ],
     },
   };

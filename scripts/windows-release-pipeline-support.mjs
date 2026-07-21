@@ -286,6 +286,11 @@ export const buildCommandPlan = ({ packageNames, paths, offline = true }) => [
     command: 'corepack',
     args: ['pnpm', 'install', '--frozen-lockfile', ...(offline ? ['--offline'] : [])],
   },
+  {
+    name: 'generate-locked-production-sbom',
+    command: process.execPath,
+    args: ['scripts/generate-sbom.mjs', '--output', paths.dependencySbom],
+  },
   ...packageNames.map((name) => ({
     name: `build-workspace-package:${name}`,
     command: 'corepack',
@@ -364,6 +369,11 @@ export const buildCommandPlan = ({ packageNames, paths, offline = true }) => [
       '--require-candidate-manifest',
       '--require-fresh',
     ],
+  },
+  {
+    name: 'verify-locked-production-sbom',
+    command: process.execPath,
+    args: ['scripts/verify-dependency-sbom.mjs', '--sbom', paths.dependencySbom],
   },
   {
     name: 'verify-release-evidence',

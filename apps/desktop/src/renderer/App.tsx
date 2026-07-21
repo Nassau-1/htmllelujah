@@ -101,6 +101,7 @@ import type {
   McpStatus,
   SessionView,
 } from '../shared/desktop-api';
+import { reconcileHostAddressSelection } from './collaboration-host-address';
 import { EditorButton } from './components/EditorButton';
 import { CanonicalSlideCanvas, sameCanvasSelection } from './components/CanonicalSlideCanvas';
 import { CollaborationParticipants } from './components/CollaborationParticipants';
@@ -590,11 +591,24 @@ function EditorApp() {
   const [toast, setToast] = useState<Toast | null>(null);
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
+  const [hostAddress, setHostAddress] = useState('');
+  const hostAddressNeedsConfirmationRef = useRef(false);
   const [shareStatus, setShareStatus] = useState<CollaborationStatus | null>(null);
   const acceptShareStatus = useCallback((next: CollaborationStatus): void => {
     setShareStatus((current) =>
       current !== null && JSON.stringify(current) === JSON.stringify(next) ? current : next,
     );
+    if (next.mode === 'offline' && next.availableHostAddresses !== undefined) {
+      setHostAddress((current) => {
+        const reconciled = reconcileHostAddressSelection(
+          current,
+          next.availableHostAddresses ?? [],
+          hostAddressNeedsConfirmationRef.current,
+        );
+        hostAddressNeedsConfirmationRef.current = reconciled.requiresConfirmation;
+        return reconciled.address;
+      });
+    }
   }, []);
   const [decidingJoinId, setDecidingJoinId] = useState<string | null>(null);
   const [collaborationDecisionError, setCollaborationDecisionError] = useState<string | null>(null);
@@ -2512,6 +2526,7 @@ function EditorApp() {
         sessionId: current.snapshot.sessionId,
         displayName,
         enableDiscovery: discovery,
+        hostAddress,
       });
       if (!result.ok) {
         showFailure(result);
@@ -2525,7 +2540,7 @@ function EditorApp() {
       startingCollaborationRef.current = false;
       setStartingCollaboration(false);
     }
-  }, [acceptSession, acceptShareStatus, discovery, displayName, showFailure]);
+  }, [acceptSession, acceptShareStatus, discovery, displayName, hostAddress, showFailure]);
 
   const joinCollaboration = useCallback(async (): Promise<void> => {
     if (!(await canLeaveInlineTextEditorRef.current())) return;
@@ -6328,6 +6343,38 @@ function EditorApp() {
             <div className="share-columns">
               <div>
                 <h3>Host</h3>
+                <label className="stacked-field">
+                  <span>Network address</span>
+                  <select
+                    value={hostAddress}
+                    disabled={startingCollaboration || joiningCollaboration}
+                    onChange={(event) => {
+                      hostAddressNeedsConfirmationRef.current = false;
+                      setHostAddress(event.currentTarget.value);
+                    }}
+                  >
+                    {(shareStatus?.availableHostAddresses ?? []).length === 0 ? (
+                      <option value="">No private network detected</option>
+                    ) : (
+                      <>
+                        <option value="" disabled>
+                          Choose a network...
+                        </option>
+                        {(shareStatus?.availableHostAddresses ?? []).map((adapter) => (
+                          <option key={adapter.address} value={adapter.address}>
+                            {adapter.name} - {adapter.address}
+                          </option>
+                        ))}
+                      </>
+                    )}
+                  </select>
+                  <small>
+                    {shareStatus?.availableHostAddresses !== undefined &&
+                    shareStatus.availableHostAddresses.length > 1
+                      ? 'Choose the network your collaborators are using.'
+                      : 'HTMLlelujah binds only to this private address.'}
+                  </small>
+                </label>
                 <label className="toggle-row">
                   <input
                     type="checkbox"
@@ -6340,7 +6387,10 @@ function EditorApp() {
                   type="button"
                   className="primary-inspector-action"
                   disabled={
-                    shareStatus?.mode !== 'offline' || startingCollaboration || joiningCollaboration
+                    shareStatus?.mode !== 'offline' ||
+                    hostAddress === '' ||
+                    startingCollaboration ||
+                    joiningCollaboration
                   }
                   onClick={() => void hostCollaboration()}
                 >

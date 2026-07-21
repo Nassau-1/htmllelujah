@@ -1,6 +1,8 @@
 import {
+  createDefaultDeck,
   createNeutralDemoDeck,
   InMemoryDocumentAdapter,
+  type DeckDocument,
   type DocumentCommand,
   type Element,
   type Frame,
@@ -13,6 +15,8 @@ import {
   AuthoritativeSessionHost,
   CollaborationError,
   COLLABORATION_PROTOCOL_VERSION,
+  deckNameKey,
+  deckPageKey,
   deckSlideOrderKey,
   elementCollectionKey,
   elementEntityKey,
@@ -385,6 +389,93 @@ describe('authoritative collaboration host', () => {
     expect(host.sessionSeq).toBe(1);
   });
 
+  it('rejects an idempotency entry that cannot fit before committing the document', () => {
+    const { host, adapter } = createHost({ maxIdempotencyBytes: 1 });
+    const before = adapter.getSnapshot();
+    const element = before.document.slides[0]!.elements[0]!;
+
+    expectCollaborationError(
+      () =>
+        host.submit(
+          createRequest(host, {
+            clientId: CLIENT_A,
+            clientRequestId: requestId(2_101),
+            commands: [transformCommand(element.id, { ...element.frame, xPt: 321 })],
+          }),
+        ),
+      'IDEMPOTENCY_CAPACITY',
+    );
+    expect(host.sessionSeq).toBe(0);
+    expect(adapter.getSnapshot()).toEqual(before);
+  });
+
+  it('evicts idempotency results by aggregate retained bytes before the count limit', () => {
+    const probe = createHost({ idempotencyLimit: 10 });
+    const probeElement = probe.host.getSnapshot().document.slides[0]!.elements[0]!;
+    probe.host.submit(
+      createRequest(probe.host, {
+        clientId: CLIENT_A,
+        clientRequestId: requestId(2_111),
+        commands: [transformCommand(probeElement.id, { ...probeElement.frame, xPt: 111 })],
+      }),
+    );
+    const probeState = probe.host as unknown as {
+      idempotency: Map<string, { accountedBytes: number }>;
+    };
+    const singleEntryBudget = [...probeState.idempotency.values()][0]!.accountedBytes;
+
+    const { host } = createHost({ idempotencyLimit: 3, maxIdempotencyBytes: singleEntryBudget });
+    const element = host.getSnapshot().document.slides[0]!.elements[0]!;
+    const initialRevision = host.revision;
+    host.submit(
+      createRequest(host, {
+        clientId: CLIENT_A,
+        clientRequestId: requestId(2_111),
+        commands: [transformCommand(element.id, { ...element.frame, xPt: 111 })],
+      }),
+    );
+    const state = host as unknown as {
+      idempotency: Map<string, { accountedBytes: number }>;
+      idempotencyBytes: number;
+    };
+    expect([...state.idempotency.keys()]).toEqual([`${CLIENT_A}\0${requestId(2_111)}`]);
+    expect(state.idempotencyBytes).toBeLessThanOrEqual(singleEntryBudget);
+    const secondRequest = createRequest(host, {
+      clientId: CLIENT_A,
+      clientRequestId: requestId(2_112),
+      commands: [transformCommand(element.id, { ...element.frame, xPt: 112 })],
+    });
+    const second = host.submit(secondRequest);
+
+    expect(state.idempotency.size).toBe(1);
+    expect([...state.idempotency.keys()]).toEqual([`${CLIENT_A}\0${requestId(2_112)}`]);
+    expect(state.idempotencyBytes).toBeLessThanOrEqual(singleEntryBudget);
+    expect(host.submit(structuredClone(secondRequest))).toEqual(second);
+    expect(host.sessionSeq).toBe(2);
+
+    const beforeFailure = {
+      keys: [...state.idempotency.keys()],
+      bytes: state.idempotencyBytes,
+    };
+    expectCollaborationError(
+      () =>
+        host.submit(
+          createRequest(host, {
+            clientId: CLIENT_B,
+            clientRequestId: requestId(2_113),
+            baseRevision: initialRevision,
+            baseSeq: 0,
+            commands: [transformCommand(element.id, { ...element.frame, xPt: 113 })],
+          }),
+        ),
+      'REVISION_CONFLICT',
+    );
+    expect({
+      keys: [...state.idempotency.keys()],
+      bytes: state.idempotencyBytes,
+    }).toEqual(beforeFailure);
+  });
+
   it.each([
     0,
     -1,
@@ -400,6 +491,152 @@ describe('authoritative collaboration host', () => {
       'INVALID_REQUEST',
     );
   });
+
+  it('rejects invalid idempotency byte limits', () => {
+    expectCollaborationError(() => createHost({ maxIdempotencyBytes: 0 }), 'INVALID_REQUEST');
+  });
+
+  it('bounds stale rebase history to the retained transaction floor', () => {
+    const { host } = createHost({ tailLimit: 2 });
+    const initialRevision = host.revision;
+    host.submit(
+      createRequest(host, {
+        clientId: CLIENT_A,
+        clientRequestId: requestId(2_201),
+        commands: [{ type: 'deck.rename', name: 'History one' }],
+      }),
+    );
+    const revisionAfterOne = host.revision;
+    const page = host.getSnapshot().document.page;
+    host.submit(
+      createRequest(host, {
+        clientId: CLIENT_A,
+        clientRequestId: requestId(2_202),
+        commands: [{ type: 'deck.set-page', page: { ...page, widthPt: page.widthPt + 1 } }],
+      }),
+    );
+    const slide = host.getSnapshot().document.slides[0]!;
+    host.submit(
+      createRequest(host, {
+        clientId: CLIENT_A,
+        clientRequestId: requestId(2_203),
+        commands: [{ type: 'slide.set-hidden', slideId: slide.id, hidden: true }],
+      }),
+    );
+
+    const state = host as unknown as { lastModifiedSeq: Map<string, number> };
+    expect(state.lastModifiedSeq.has(deckNameKey)).toBe(false);
+    expect(state.lastModifiedSeq.get(deckPageKey)).toBe(2);
+
+    const tooOld = expectCollaborationError(
+      () =>
+        host.submit(
+          createRequest(host, {
+            clientId: CLIENT_B,
+            clientRequestId: requestId(2_204),
+            baseRevision: initialRevision,
+            baseSeq: 0,
+            commands: [{ type: 'deck.set-export-options', includeHiddenSlidesInExport: true }],
+          }),
+        ),
+      'REVISION_CONFLICT',
+    );
+    expect(tooOld.details?.minimumBaseSeq).toBe(1);
+
+    const retainedConflict = expectCollaborationError(
+      () =>
+        host.submit(
+          createRequest(host, {
+            clientId: CLIENT_B,
+            clientRequestId: requestId(2_205),
+            baseRevision: revisionAfterOne,
+            baseSeq: 1,
+            commands: [{ type: 'deck.set-page', page }],
+          }),
+        ),
+      'REVISION_CONFLICT',
+    );
+    expect(retainedConflict.details?.conflictKeys).toContain(deckPageKey);
+  });
+
+  it.each(['master.update', 'master.delete', 'layout.update'] as const)(
+    'requires the bound text lease for indirect %s remapping',
+    (commandType) => {
+      const ids = deterministicIdFactory();
+      const base = createDefaultDeck({ idFactory: ids });
+      const originalMaster = base.masters[0]!;
+      const replacementMaster = {
+        ...originalMaster,
+        id: '93000000-0000-4000-8000-000000000001',
+        name: 'Replacement master',
+      };
+      const deck: DeckDocument =
+        commandType === 'master.delete'
+          ? { ...base, masters: [...base.masters, replacementMaster] }
+          : base;
+      const adapter = new InMemoryDocumentAdapter(deck);
+      const host = new AuthoritativeSessionHost(adapter, {
+        sessionId: SESSION_ID,
+        idFactory: deterministicIdFactory(),
+      });
+      const slide = host.getSnapshot().document.slides[0]!;
+      const text = slide.elements[0]!;
+      const master = deck.masters[0]!;
+      const layout = deck.layouts[0]!;
+      const command: DocumentCommand =
+        commandType === 'master.update'
+          ? {
+              type: 'master.update',
+              masterId: master.id,
+              replacement: { ...master, name: 'Updated master' },
+            }
+          : commandType === 'master.delete'
+            ? {
+                type: 'master.delete',
+                masterId: master.id,
+                replacementMasterId: replacementMaster.id,
+              }
+            : {
+                type: 'layout.update',
+                layoutId: layout.id,
+                replacement: { ...layout, name: 'Updated layout' },
+              };
+      const lease = host.acquireTextLease({
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        sessionId: host.sessionId,
+        documentId: host.documentId,
+        clientId: CLIENT_A,
+        slideId: slide.id,
+        elementId: text.id,
+      });
+      const originalBinding = structuredClone(text.placeholderBinding);
+
+      expectCollaborationError(
+        () =>
+          host.submit(
+            createRequest(host, {
+              clientId: CLIENT_B,
+              clientRequestId: requestId(2_301),
+              commands: [command],
+            }),
+          ),
+        'TEXT_LEASE_HELD',
+      );
+      expect(host.getSnapshot().document.slides[0]!.elements[0]!.placeholderBinding).toEqual(
+        originalBinding,
+      );
+      expect(
+        host.submit(
+          createRequest(host, {
+            clientId: CLIENT_A,
+            clientRequestId: requestId(2_302),
+            commands: [command],
+            lockTokens: { [text.id]: lease.token },
+          }),
+        ).sessionSeq,
+      ).toBe(1);
+    },
+  );
 
   it('enforces, renews, releases, and expires 15-second text leases', () => {
     let now = 1_000;

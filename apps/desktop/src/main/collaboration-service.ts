@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
+import path from 'node:path';
 
 import {
   applyCommittedTransaction,
@@ -13,10 +14,12 @@ import {
   fingerprintSharedTargetBytes,
   isPrivateLanAddress,
   LanDiscoveryController,
+  measureJsonBytes,
   RemoteTransportError,
   WriterLeaseStore,
   type CommandBatchRequest,
   type CommittedTransaction,
+  type CollaborationTransportClientOptions,
   type DurableCollaborationDocumentAdapter,
   type ManualInvitation,
   type PendingJoinRequest,
@@ -35,9 +38,14 @@ import {
   DocumentRuntimeError,
   DocumentSessionManager,
   type DocumentSessionSnapshot,
+  type PersistedDocumentSource,
 } from '@htmllelujah/document-runtime';
 
-import type { CollaborationParticipant, CollaborationStatus } from '../shared/desktop-api.js';
+import type {
+  CollaborationHostAddress,
+  CollaborationParticipant,
+  CollaborationStatus,
+} from '../shared/desktop-api.js';
 
 export interface CollaborationTransition {
   readonly previousSessionId: string;
@@ -60,6 +68,11 @@ export interface DesktopCollaborationCoordinatorOptions {
   readonly presenceHeartbeatIntervalMs?: number | undefined;
   readonly joinApprovalTimeoutMs?: number | undefined;
   readonly reconnectGrantTtlMs?: number | undefined;
+  readonly maxJoinBufferedTransactions?: number | undefined;
+  readonly maxJoinBufferedBytes?: number | undefined;
+  readonly lanAddressEntries?: (() => readonly LanAddressEntry[]) | undefined;
+  readonly transportClientFactory?:
+    ((options: CollaborationTransportClientOptions) => CollaborationTransportClient) | undefined;
 }
 
 export type DesktopTextLeaseStatus =
@@ -209,20 +222,86 @@ const heldTextLeaseFromError = (
   };
 };
 
-const advertisedLanAddress = (): string => {
-  const candidates = Object.values(networkInterfaces())
-    .flatMap((entries) => entries ?? [])
-    .filter(
-      (entry) => entry.family === 'IPv4' && !entry.internal && isPrivateLanAddress(entry.address),
-    )
-    .sort((left, right) => left.address.localeCompare(right.address));
-  return candidates[0]?.address ?? '127.0.0.1';
+export type LanAddressEntry = {
+  readonly name?: string | undefined;
+  readonly address: string;
+  readonly family: string | number;
+  readonly internal: boolean;
+};
+
+export const listPrivateLanAdapters = (
+  entries: readonly LanAddressEntry[],
+): readonly CollaborationHostAddress[] => {
+  const byAddress = new Map<string, CollaborationHostAddress>();
+  for (const entry of entries) {
+    if (
+      (entry.family !== 'IPv4' && entry.family !== 4) ||
+      entry.internal ||
+      !isPrivateLanAddress(entry.address)
+    ) {
+      continue;
+    }
+    const name = entry.name?.trim() || 'Private network';
+    if (!byAddress.has(entry.address)) {
+      byAddress.set(entry.address, { address: entry.address, name });
+    }
+  }
+  return [...byAddress.values()].sort((left, right) =>
+    left.address === right.address
+      ? left.name.localeCompare(right.name)
+      : left.address.localeCompare(right.address),
+  );
+};
+
+export const listPrivateLanAddresses = (entries: readonly LanAddressEntry[]): readonly string[] =>
+  listPrivateLanAdapters(entries).map((entry) => entry.address);
+
+export const selectPrivateLanAddress = (entries: readonly LanAddressEntry[]): string | undefined =>
+  listPrivateLanAddresses(entries)[0];
+
+export const selectRequestedPrivateLanAddress = (
+  entries: readonly LanAddressEntry[],
+  requested?: string | undefined,
+): string | undefined => {
+  const candidates = listPrivateLanAddresses(entries);
+  if (requested === undefined || requested === '') {
+    if (candidates.length <= 1) return candidates[0];
+    throw new CollaborationError(
+      'INVALID_REQUEST',
+      'Choose which private network collaborators are using before hosting.',
+    );
+  }
+  if (!candidates.includes(requested)) {
+    throw new CollaborationError(
+      'INVALID_REQUEST',
+      'The selected private-network address is no longer available on this computer.',
+    );
+  }
+  return requested;
+};
+
+const systemLanAddressEntries = (): readonly LanAddressEntry[] =>
+  Object.entries(networkInterfaces()).flatMap(([name, entries]) =>
+    (entries ?? []).map((entry) => ({ ...entry, name })),
+  );
+
+export const persistedTargetFingerprintToWriterLeaseFingerprint = (fingerprint: string): string => {
+  if (!/^[0-9a-f]{64}$/u.test(fingerprint)) {
+    throw new CollaborationError('TARGET_CHANGED', 'Persisted target fingerprint is invalid.');
+  }
+  const digest = Buffer.from(fingerprint, 'hex');
+  if (digest.byteLength !== 32 || digest.toString('hex') !== fingerprint) {
+    throw new CollaborationError('TARGET_CHANGED', 'Persisted target fingerprint is invalid.');
+  }
+  return `sha256-${digest.toString('base64url')}`;
 };
 
 const invitationEndpoint = (invitation: ManualInvitation): string =>
   `wss://${invitation.host.includes(':') ? `[${invitation.host}]` : invitation.host}:${invitation.port}`;
 
 const MAX_SESSION_CODE_LENGTH = 128;
+const DEFAULT_MAX_JOIN_BUFFERED_TRANSACTIONS = 256;
+const DEFAULT_MAX_JOIN_BUFFERED_BYTES = 24 * 1024 * 1024;
 
 const encodeSessionCode = (invitation: ManualInvitation, secret: Uint8Array): string =>
   `${invitation.sessionId}.${invitation.expiresAtMs.toString(36)}.${Buffer.from(secret).toString('base64url')}`;
@@ -355,6 +434,8 @@ export class DesktopCollaborationCoordinator {
   readonly #options: DesktopCollaborationCoordinatorOptions;
   readonly #clock: () => number;
   readonly #presenceHeartbeatIntervalMs: number;
+  readonly #maxJoinBufferedTransactions: number;
+  readonly #maxJoinBufferedBytes: number;
   readonly #states = new Map<string, CollaborationState>();
 
   public constructor(
@@ -367,6 +448,9 @@ export class DesktopCollaborationCoordinator {
     const presenceTtlMs = options.presenceTtlMs ?? DEFAULT_PRESENCE_TTL_MS;
     this.#presenceHeartbeatIntervalMs =
       options.presenceHeartbeatIntervalMs ?? Math.min(8_000, Math.floor(presenceTtlMs / 2));
+    this.#maxJoinBufferedTransactions =
+      options.maxJoinBufferedTransactions ?? DEFAULT_MAX_JOIN_BUFFERED_TRANSACTIONS;
+    this.#maxJoinBufferedBytes = options.maxJoinBufferedBytes ?? DEFAULT_MAX_JOIN_BUFFERED_BYTES;
     if (
       !Number.isSafeInteger(presenceTtlMs) ||
       presenceTtlMs < 2 ||
@@ -379,6 +463,17 @@ export class DesktopCollaborationCoordinator {
         'Presence heartbeat must be at least 25 ms and shorter than the presence TTL.',
       );
     }
+    if (
+      !Number.isSafeInteger(this.#maxJoinBufferedTransactions) ||
+      this.#maxJoinBufferedTransactions < 1 ||
+      !Number.isSafeInteger(this.#maxJoinBufferedBytes) ||
+      this.#maxJoinBufferedBytes < 1
+    ) {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'Join bootstrap buffer limits must be positive safe integers.',
+      );
+    }
   }
 
   public mode(sessionId: string): CollaborationState['mode'] | 'offline' {
@@ -388,9 +483,14 @@ export class DesktopCollaborationCoordinator {
   public status(sessionId: string): CollaborationStatus {
     const state = this.#states.get(sessionId);
     if (state === undefined) {
+      const availableHostAddresses: readonly CollaborationHostAddress[] =
+        this.#options.bindHost === undefined
+          ? listPrivateLanAdapters(this.#options.lanAddressEntries?.() ?? systemLanAddressEntries())
+          : [{ address: this.#options.bindHost, name: 'Configured network' }];
       return {
         mode: 'offline',
         connectedPeers: 0,
+        availableHostAddresses,
         discoveryEnabled: false,
         participants: [],
         pendingJoins: [],
@@ -759,6 +859,20 @@ export class DesktopCollaborationCoordinator {
     return this.#runtime.createMainOnly({ document: targetDocument, assets });
   }
 
+  async #clonePersistedSource(source: PersistedDocumentSource): Promise<DocumentSessionSnapshot> {
+    return this.#runtime.createMainOnly({
+      document: source.snapshot.document,
+      assets: source.assets.map((asset) => ({
+        id: asset.id,
+        bytes: asset.bytes,
+        mediaType: asset.mediaType,
+        originalName: asset.fileName,
+        ...(asset.widthPx === undefined ? {} : { widthPx: asset.widthPx }),
+        ...(asset.heightPx === undefined ? {} : { heightPx: asset.heightPx }),
+      })),
+    });
+  }
+
   #runtimeAdapter(
     sessionId: string,
     safety: CollaborationSafetyLatch,
@@ -802,6 +916,7 @@ export class DesktopCollaborationCoordinator {
     readonly targetPath: string;
     readonly displayName: string;
     readonly enableDiscovery: boolean;
+    readonly hostAddress?: string | undefined;
     readonly allowExpiredTakeover?: boolean;
   }): Promise<CollaborationTransition> {
     if (this.#states.has(input.sessionId)) {
@@ -810,8 +925,18 @@ export class DesktopCollaborationCoordinator {
         'This presentation is already collaborating.',
       );
     }
+    const captured = await this.#runtime.capturePersistedSourceMainOnly(input.sessionId);
+    if (path.resolve(input.targetPath) !== path.resolve(captured.targetPath)) {
+      throw new CollaborationError(
+        'TARGET_CHANGED',
+        'The requested collaboration target does not match the persisted source.',
+      );
+    }
+    const expectedTargetFingerprint = persistedTargetFingerprintToWriterLeaseFingerprint(
+      captured.targetFingerprint,
+    );
     const secret = randomBytes(32);
-    const detached = await this.#cloneDetached(input.sessionId);
+    const detached = await this.#clonePersistedSource(captured);
     const clientId = `host-${randomUUID()}`;
     const safety: CollaborationSafetyLatch = {};
     const engine = new AuthoritativeSessionHost(this.#runtimeAdapter(detached.sessionId, safety), {
@@ -833,7 +958,7 @@ export class DesktopCollaborationCoordinator {
       selectedElementIds: [],
     });
     const writerLease = new WriterLeaseStore({
-      targetPath: input.targetPath,
+      targetPath: captured.targetPath,
       documentId: detached.documentId,
       sessionId: engine.sessionId,
       writerInstanceId: clientId,
@@ -848,13 +973,29 @@ export class DesktopCollaborationCoordinator {
     let stopHeartbeat: (() => void) | undefined;
     let stopPresenceHeartbeat: (() => void) | undefined;
     try {
-      await writerLease.claim({ allowExpiredTakeover: input.allowExpiredTakeover === true });
+      const bindHost =
+        this.#options.bindHost ??
+        selectRequestedPrivateLanAddress(
+          this.#options.lanAddressEntries?.() ?? systemLanAddressEntries(),
+          input.hostAddress,
+        );
+      if (bindHost === undefined) {
+        throw new CollaborationError(
+          'INVALID_REQUEST',
+          'Collaboration hosting requires a specific private or loopback address.',
+        );
+      }
+      await writerLease.claim({
+        expectedTargetFingerprint,
+        allowExpiredTakeover: input.allowExpiredTakeover === true,
+      });
+      await writerLease.preflightTarget(expectedTargetFingerprint);
       server = new CollaborationTransportServer({
         engine,
         documentSecret: secret,
         hostClientId: clientId,
-        bindHost: this.#options.bindHost ?? '0.0.0.0',
-        advertisedHost: this.#options.advertisedHost ?? advertisedLanAddress(),
+        bindHost,
+        advertisedHost: this.#options.advertisedHost ?? bindHost,
         ...(this.#options.port === undefined ? {} : { port: this.#options.port }),
         maxPeers: 8,
         clock: this.#clock,
@@ -876,7 +1017,7 @@ export class DesktopCollaborationCoordinator {
       const state: HostState = {
         mode: 'host',
         sessionId: detached.sessionId,
-        targetPath: input.targetPath,
+        targetPath: captured.targetPath,
         clientId,
         displayName: input.displayName,
         secret: cloneSecret(secret),
@@ -903,7 +1044,7 @@ export class DesktopCollaborationCoordinator {
       return {
         previousSessionId: input.sessionId,
         snapshot: detached,
-        targetPath: input.targetPath,
+        targetPath: captured.targetPath,
         status: this.status(detached.sessionId),
       };
     } catch (error) {
@@ -939,7 +1080,7 @@ export class DesktopCollaborationCoordinator {
     const source = this.#runtime.getSnapshot(input.sessionId);
     const decoded = invitationFromJoin(input, this.#clock);
     const clientId = `guest-${randomUUID()}`;
-    const client = new CollaborationTransportClient({
+    const clientOptions: CollaborationTransportClientOptions = {
       invitation: decoded.invitation,
       documentId: source.documentId,
       clientId,
@@ -949,11 +1090,77 @@ export class DesktopCollaborationCoordinator {
       ...(this.#options.joinApprovalTimeoutMs === undefined
         ? {}
         : { joinApprovalTimeoutMs: this.#options.joinApprovalTimeoutMs + 1_000 }),
-    });
+    };
+    let client: CollaborationTransportClient;
+    try {
+      client = (
+        this.#options.transportClientFactory ??
+        ((options) => new CollaborationTransportClient(options))
+      )(clientOptions);
+    } catch (error) {
+      decoded.secret.fill(0);
+      throw error;
+    }
     let detached: DocumentSessionSnapshot | undefined;
     let state: GuestState | undefined;
+    let activeGuest: GuestState | undefined;
+    let joinFailure: Error | undefined;
+    let bufferedBytes = 0;
+    let bufferedTransactions: CommittedTransaction[] = [];
+    const failBootstrap = (error: Error): void => {
+      if (joinFailure !== undefined) return;
+      joinFailure = error;
+      void client.close().catch(() => undefined);
+    };
+    const assertBootstrapHealthy = (): void => {
+      if (joinFailure !== undefined) throw joinFailure;
+    };
+    const stopTransactionListener = client.onTransaction((transaction) => {
+      const guest = activeGuest;
+      if (guest !== undefined) {
+        // The queue records a fatal replica failure and disconnects before this rejection is
+        // consumed at the event boundary, so a divergence can never remain silent/editable.
+        void this.#queueGuestTransaction(guest, transaction).catch(() => undefined);
+        return;
+      }
+      if (joinFailure !== undefined) return;
+      let transactionBytes: number;
+      try {
+        transactionBytes = measureJsonBytes(transaction);
+      } catch (error) {
+        failBootstrap(
+          error instanceof Error ? error : new Error('Join transaction buffering failed.'),
+        );
+        return;
+      }
+      if (
+        bufferedTransactions.length >= this.#maxJoinBufferedTransactions ||
+        bufferedBytes + transactionBytes > this.#maxJoinBufferedBytes
+      ) {
+        failBootstrap(
+          new CollaborationError(
+            'PAYLOAD_TOO_LARGE',
+            'The bounded join transaction buffer was exceeded.',
+          ),
+        );
+        return;
+      }
+      bufferedTransactions.push(structuredClone(transaction));
+      bufferedBytes += transactionBytes;
+    });
+    const stopDisconnectListener = client.onDisconnect((error) => {
+      const guest = activeGuest;
+      if (guest === undefined) {
+        failBootstrap(error);
+        return;
+      }
+      if (this.#states.get(guest.sessionId) !== guest || guest.failure !== undefined) return;
+      guest.textLeases.clear();
+      void this.#reconnectGuest(guest).catch(() => undefined);
+    });
     try {
       await client.connect();
+      assertBootstrapHealthy();
       const initial = await client.getResync({
         protocolVersion: COLLABORATION_PROTOCOL_VERSION,
         sessionId: decoded.invitation.sessionId,
@@ -961,6 +1168,7 @@ export class DesktopCollaborationCoordinator {
         afterSeq: 0,
         knownRevision: source.revision,
       });
+      assertBootstrapHealthy();
       let synchronized: DocumentSnapshot;
       let lastSeq: number;
       if (initial.kind === 'snapshot') {
@@ -975,6 +1183,7 @@ export class DesktopCollaborationCoordinator {
       }
       const detachedSnapshot = await this.#cloneDetached(input.sessionId, synchronized);
       detached = detachedSnapshot;
+      assertBootstrapHealthy();
       const guestState: GuestState = {
         mode: 'guest',
         sessionId: detachedSnapshot.sessionId,
@@ -992,40 +1201,47 @@ export class DesktopCollaborationCoordinator {
         presence: { selectedElementIds: [] },
         stopPresenceHeartbeat: () => undefined,
         textLeases: new Map(),
-        stopTransactionListener: () => undefined,
-        stopDisconnectListener: () => undefined,
+        stopTransactionListener,
+        stopDisconnectListener,
       };
       state = guestState;
-      guestState.stopTransactionListener = client.onTransaction((transaction) => {
-        // The queue records a fatal replica failure and disconnects before this rejection is
-        // consumed at the event boundary, so a divergence can never remain silent/editable.
-        void this.#queueGuestTransaction(guestState, transaction).catch(() => undefined);
-      });
       this.#states.set(detachedSnapshot.sessionId, guestState);
-      guestState.stopDisconnectListener = client.onDisconnect(() => {
-        if (
-          this.#states.get(guestState.sessionId) !== guestState ||
-          guestState.failure !== undefined
-        )
-          return;
-        guestState.textLeases.clear();
-        void this.#reconnectGuest(guestState).catch(() => undefined);
-      });
+
+      // No callback can interleave with this synchronous handoff. Every bootstrap broadcast is
+      // sorted and queued before future broadcasts can append to the same serialized apply tail.
+      activeGuest = guestState;
+      const handoff = bufferedTransactions
+        .sort((left, right) => left.sessionSeq - right.sessionSeq)
+        .map((transaction) => this.#queueGuestTransaction(guestState, transaction));
+      bufferedTransactions = [];
+      bufferedBytes = 0;
+      await Promise.all(handoff);
+      assertBootstrapHealthy();
+      this.#assertHealthy(guestState);
+      await this.#queueGuestResyncFence(guestState);
+      await guestState.applyQueue;
+      assertBootstrapHealthy();
+      this.#assertHealthy(guestState);
+
       guestState.stopPresenceHeartbeat = this.#startPresenceHeartbeat(guestState);
       // Authentication creates sequence 0 on the host, but cloning a large local replica can
       // outlive the presence TTL before the heartbeat exists. Refresh once before join resolves
       // so an authenticated guest is represented when the caller first observes the session.
       await this.#enqueuePresence(guestState);
+      await guestState.applyQueue;
+      assertBootstrapHealthy();
+      this.#assertHealthy(guestState);
+      const joinedSnapshot = this.#runtime.getSnapshot(detachedSnapshot.sessionId);
       return {
         previousSessionId: input.sessionId,
-        snapshot: detachedSnapshot,
+        snapshot: joinedSnapshot,
         targetPath: input.targetPath,
-        status: this.status(detachedSnapshot.sessionId),
+        status: this.status(joinedSnapshot.sessionId),
       };
     } catch (error) {
+      stopTransactionListener();
+      stopDisconnectListener();
       if (state !== undefined) {
-        state.stopTransactionListener();
-        state.stopDisconnectListener();
         state.stopPresenceHeartbeat();
         if (this.#states.get(state.sessionId) === state) this.#states.delete(state.sessionId);
         await client.close().catch(() => undefined);
@@ -1046,6 +1262,19 @@ export class DesktopCollaborationCoordinator {
     } finally {
       decoded.secret.fill(0);
     }
+  }
+
+  #queueGuestResyncFence(state: GuestState): Promise<void> {
+    const operation = state.applyQueue.then(() => this.#resyncGuest(state));
+    const guarded = operation.catch(async (error: unknown) => {
+      await this.#failGuest(
+        state,
+        error instanceof Error ? error : new Error('Guest replica resynchronization failed.'),
+      );
+      throw error;
+    });
+    state.applyQueue = guarded.catch(() => undefined);
+    return guarded;
   }
 
   #queueGuestTransaction(state: GuestState, transaction: CommittedTransaction): Promise<void> {
@@ -1335,19 +1564,22 @@ export class DesktopCollaborationCoordinator {
             this.#options.saveLeaseReservationMs ?? 120_000,
           ),
         );
-        const encoded = previousFingerprint.slice('sha256-'.length);
-        const expectedBytes = Buffer.from(encoded, 'base64url');
         if (
+          typeof previousFingerprint !== 'string' ||
           !/^sha256-[A-Za-z0-9_-]{43}$/u.test(previousFingerprint) ||
-          expectedBytes.byteLength !== 32
+          Buffer.from(previousFingerprint.slice('sha256-'.length), 'base64url').byteLength !== 32
         ) {
           throw new CollaborationError('TARGET_CHANGED', 'Shared target fingerprint is invalid.');
         }
+        const expectedBytes = Buffer.from(previousFingerprint.slice('sha256-'.length), 'base64url');
         state.saveUnconfirmed = true;
         const snapshot = await this.#runtime.saveDetachedMainOnly(sessionId, {
           targetPath: state.targetPath,
           // The hdeck persistence CAS uses the same SHA-256 bytes encoded as lowercase hex.
           expectedFingerprint: expectedBytes.toString('hex'),
+          beforeCommit: async () => {
+            await state.writerLease.preflightTarget(previousFingerprint);
+          },
         });
         const nextFingerprint = fingerprintSharedTargetBytes(await readFile(state.targetPath));
         await state.writerLease.recordSnapshot(previousFingerprint, nextFingerprint);
@@ -1377,12 +1609,15 @@ export class DesktopCollaborationCoordinator {
   > {
     const state = this.#states.get(sessionId);
     if (state === undefined) return undefined;
-    if (
-      state.mode === 'host' &&
-      state.safety.failure === undefined &&
-      this.#runtime.getSnapshot(sessionId).dirty
-    ) {
-      await this.saveHost(sessionId);
+    if (state.mode === 'host') {
+      // Close document-command admission synchronously, then let every command already admitted
+      // reach the durable authoritative replica before choosing the exact snapshot to save.
+      state.stopHeartbeat();
+      state.discovery?.destroy();
+      await state.server.closeSubmissionAdmissionAndDrain();
+      if (state.safety.failure === undefined && this.#runtime.getSnapshot(sessionId).dirty) {
+        await this.saveHost(sessionId);
+      }
     }
     const snapshot = this.#runtime.getSnapshot(sessionId);
     const preserveDetached =
@@ -1396,8 +1631,6 @@ export class DesktopCollaborationCoordinator {
       await state.presenceQueue;
       await this.#releaseOwnedTextLeases(state).catch(() => undefined);
       this.#states.delete(sessionId);
-      state.stopHeartbeat();
-      state.discovery?.destroy();
       await state.leaseQueue;
       await state.safeTransition;
       await state.server.close();

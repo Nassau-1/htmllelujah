@@ -29,9 +29,14 @@ import {
   remoteTagCommitFromLsRemote,
 } from './release-candidate-manifest.mjs';
 import {
+  assertExistingFinalRecordSecurityReceipt,
   assertTrackedReleaseNotes,
   buildFinalReleaseRecord,
 } from './release-finalization-support.mjs';
+import {
+  SECURITY_EVIDENCE_FILE_NAME,
+  SECURITY_EVIDENCE_MAX_AGE_MS,
+} from './security-release-evidence-support.mjs';
 import {
   FUNCTIONAL_VALIDATION_BUNDLE_NAME,
   FUNCTIONAL_VALIDATION_FILE_NAME,
@@ -135,6 +140,7 @@ test('command plan rebuilds every package sequentially before desktop and packag
     artifactStaging: 'isolated/out',
     evidenceStaging: 'isolated/evidence',
     candidateManifest: 'isolated/evidence/release-candidate-v1.json',
+    dependencySbom: 'isolated/evidence/dependency-sbom.cdx.json',
   };
   const plan = buildCommandPlan({ packageNames, paths, offline: true });
   const packageSteps = plan.filter((entry) => entry.name.startsWith('build-workspace-package:'));
@@ -145,6 +151,21 @@ test('command plan rebuilds every package sequentially before desktop and packag
   assert.ok(
     plan.find((entry) => entry.name === 'install-exact-lockfile').args.includes('--offline'),
   );
+  const dependencySbomStep = plan.find((entry) => entry.name === 'generate-locked-production-sbom');
+  assert.deepEqual(dependencySbomStep.args, [
+    'scripts/generate-sbom.mjs',
+    '--output',
+    'isolated/evidence/dependency-sbom.cdx.json',
+  ]);
+  assert.ok(
+    plan.findIndex((entry) => entry.name === 'generate-locked-production-sbom') >
+      plan.findIndex((entry) => entry.name === 'install-exact-lockfile'),
+  );
+  assert.deepEqual(plan.find((entry) => entry.name === 'verify-locked-production-sbom').args, [
+    'scripts/verify-dependency-sbom.mjs',
+    '--sbom',
+    'isolated/evidence/dependency-sbom.cdx.json',
+  ]);
   assert.ok(
     plan.findIndex((entry) => entry.name === 'build-desktop-vite') >
       plan.findIndex((entry) => entry.name === packageSteps.at(-1).name),
@@ -169,6 +190,7 @@ test('finalizer CLI loads the mandatory functional evidence contract', () => {
   });
   assert.equal(result.status, 0, String(result.stderr ?? ''));
   assert.match(String(result.stdout ?? ''), /functional evidence pair/iu);
+  assert.match(String(result.stdout ?? ''), /security evidence/iu);
 });
 
 test('release children cannot inherit publication credentials or renderer overrides', () => {
@@ -1634,6 +1656,60 @@ const publicationAssets = [
   },
 ];
 
+test('existing final record accepts only its still-fresh immutable security receipt', () => {
+  const generatedAt = '2026-07-20T10:00:00.000Z';
+  const originalBytes = Buffer.from(`${JSON.stringify({ generatedAt, releaseReady: true })}\n`);
+  const securityAsset = {
+    role: 'security-evidence',
+    name: SECURITY_EVIDENCE_FILE_NAME,
+    size: originalBytes.length,
+    sha256: createHash('sha256').update(originalBytes).digest('hex'),
+  };
+  const finalRecord = { publication: { assets: [securityAsset] } };
+  const expiry = Date.parse(generatedAt) + SECURITY_EVIDENCE_MAX_AGE_MS;
+
+  assert.deepEqual(
+    assertExistingFinalRecordSecurityReceipt({
+      finalRecord,
+      securityEvidenceBytes: originalBytes,
+      now: expiry,
+    }),
+    {
+      generatedAt,
+      expiresAt: new Date(expiry).toISOString(),
+      size: originalBytes.length,
+      sha256: securityAsset.sha256,
+    },
+  );
+  assert.throws(
+    () =>
+      assertExistingFinalRecordSecurityReceipt({
+        finalRecord,
+        securityEvidenceBytes: originalBytes,
+        now: expiry + 1,
+      }),
+    (error) => {
+      assert.match(error.message, /expired/iu);
+      assert.match(error.message, /Leave any existing GitHub draft unchanged/iu);
+      assert.match(error.message, /new versioned candidate and annotated tag/iu);
+      return true;
+    },
+  );
+
+  const recollectedBytes = Buffer.from(
+    `${JSON.stringify({ generatedAt: '2026-07-20T11:00:00.000Z', releaseReady: true })}\n`,
+  );
+  assert.throws(
+    () =>
+      assertExistingFinalRecordSecurityReceipt({
+        finalRecord,
+        securityEvidenceBytes: recollectedBytes,
+        now: Date.parse('2026-07-20T11:00:00.000Z'),
+      }),
+    /immutable .* identity differs.*Leave any existing GitHub draft unchanged/iu,
+  );
+});
+
 const githubReleaseFixture = ({ draft = true, assets = publicationAssets } = {}) => ({
   id: 42,
   url: `https://api.github.com/repos/${publicationRepository}/releases/42`,
@@ -1812,11 +1888,13 @@ test('executable publication verifies a draft before publishing and re-verifies 
     const edit = harness.commands.find(
       (command) => command[2] === 'edit' && command.includes('--draft=false'),
     );
-    assert.ok(create.includes('github.com/Nassau-1/htmllelujah'));
+    const repositoryIndex = create.indexOf('--repo');
+    assert.ok(repositoryIndex >= 0);
+    assert.equal(create[repositoryIndex + 1], 'github.com/Nassau-1/htmllelujah');
     assert.ok(edit);
-    assert.ok(
-      harness.commands[0].includes('--hostname') && harness.commands[0].includes('github.com'),
-    );
+    const hostnameIndex = harness.commands[0].indexOf('--hostname');
+    assert.ok(hostnameIndex >= 0);
+    assert.equal(harness.commands[0][hostnameIndex + 1], 'github.com');
     assert.ok(
       harness.bindings.indexOf('after-draft-download') <
         harness.bindings.indexOf('immediately-before-public-edit'),
@@ -1850,6 +1928,40 @@ test('publication resumes only an exact existing draft or public release', async
     assert.deepEqual(publicHarness.stages, ['resumed-public']);
     assert.equal(
       publicHarness.commands.some((command) => command[2] === 'edit' || command[2] === 'create'),
+      false,
+    );
+  });
+});
+
+test('publication refuses a replaced immutable draft receipt without remote mutation', async () => {
+  await withPublicationFixture(async (notesFile) => {
+    const securityAsset = {
+      role: 'security-evidence',
+      name: SECURITY_EVIDENCE_FILE_NAME,
+      size: 303,
+      sha256: 'c'.repeat(64),
+      filePath: `C:\\release\\${SECURITY_EVIDENCE_FILE_NAME}`,
+    };
+    const expectedAssets = [publicationAssets[0], securityAsset, publicationAssets[1]];
+    const oldSecurityAsset = { ...securityAsset, sha256: 'd'.repeat(64) };
+    const harness = publicationHarness({
+      notesFile,
+      initialRelease: githubReleaseFixture({
+        draft: true,
+        assets: [publicationAssets[0], oldSecurityAsset, publicationAssets[1]],
+      }),
+    });
+    harness.options.assets = expectedAssets;
+
+    await assert.rejects(publishGithubRelease(harness.options), (error) => {
+      assert.match(error.message, /immutable publication receipt differs/iu);
+      assert.match(error.message, /Leave any existing GitHub draft unchanged/iu);
+      assert.match(error.message, /new versioned candidate and annotated tag/iu);
+      return true;
+    });
+    assert.equal(harness.release.draft, true);
+    assert.equal(
+      harness.commands.some((command) => command[1] === 'release'),
       false,
     );
   });
@@ -2156,12 +2268,11 @@ test('exported record and publication wiring carries the functional pair through
     assert.ok(createCall.args.includes(functionalBundlePath));
     assert.ok(createCall.args.includes(recordPath));
     assert.ok(
-      state.calls.some(
-        (call) =>
-          call.args[0] === 'api' &&
-          call.args.includes('--hostname') &&
-          call.args.includes('github.com'),
-      ),
+      state.calls.some((call) => {
+        if (call.args[0] !== 'api') return false;
+        const hostnameIndex = call.args.indexOf('--hostname');
+        return hostnameIndex >= 0 && call.args[hostnameIndex + 1] === 'github.com';
+      }),
     );
 
     const second = await runGithubReleasePublication(options);

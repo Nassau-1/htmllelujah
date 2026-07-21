@@ -5,7 +5,40 @@ and releases use semantic versions.
 
 ## [Unreleased]
 
-No user-facing change is queued after the V1 release candidate.
+### Fixed
+
+- Refused publication from an existing write-once release record after its bound
+  security receipt expires or is recollected, while preserving any GitHub draft and
+  directing operators to a new versioned candidate, tag, and release.
+- Serialized Save and Save As within each document session, made the runtime's target
+  path authoritative at commit time, serialized complete host/join handoffs against
+  retargeting, rechecked destination and temporary-file identity immediately before
+  replacement, and required explicit confirmation before taking over an expired writer
+  reservation.
+- Serialized writer-sidecar mutation across processes without an intentionally
+  absent-path window, made partial creation and release cleanup identity/exact-byte
+  safe and retryable, treated an orphaned mutation lock as an explicit-recovery
+  condition, and limited abandoned mutation-lock recovery to the stable
+  expired-writer takeover flow.
+- Made LAN admission reserve bounded capacity before asynchronous work, bound listeners
+  to an explicitly selected named private-network adapter, authenticated that exact
+  address in discovery, retained lossless join state, bounded idempotency and history
+  storage, drained admitted host submissions before the final save, cleaned up failed
+  join clones, and fenced shared-file commits with current host writer authority.
+- Reused identical imported image bytes under one canonical content-addressed asset,
+  remapped dependent insert and replacement commands atomically, and cached an opaque
+  immutable validation proof so ordinary edits, undo, redo, and autosave do not
+  repeatedly hash every existing asset.
+- Enforced complete canonical-document, archive, export-projection, asset-decoding, and
+  rich-clipboard budgets before mutation or expensive work.
+- Excluded the packager's unused installed elevation helper from V1; the per-user
+  installer retains its independent NSIS UAC flow.
+
+### Security
+
+- Hardened the release gate around the actual pnpm 11 audit format, signed on-demand
+  Microsoft Defender scans, stable scanner/platform identity, zero-open-alert CodeQL
+  evidence, and stable one-link evidence reads.
 
 ## [1.0.0] - 2026-07-17
 
@@ -52,9 +85,20 @@ No user-facing change is queued after the V1 release candidate.
 - Made the Windows warm-start release gate close every probe through the real native
   close handshake, reject residual recovery state, retain three phase-level samples,
   and enforce the unchanged three-second budget against their deterministic median.
+- Made release evidence inventory exactly five native runtime components
+  (Electron, Chromium, embedded Node.js, FFmpeg, and NSIS), bind their versions and
+  hashes to the packaged executable or installer, attest every packaged Electron
+  fuse against the V1 policy, and fail readiness when any component, version, hash,
+  fuse, or binding is absent, unknown, or malformed.
 
 ### Security
 
+- Added a fresh fail-closed V1 publication gate that binds the exact candidate to
+  zero-vulnerability production and full pnpm audits, its successful CodeQL analysis
+  and zero open alerts, clean no-remediation scans by an Authenticode-validated
+  Microsoft Defender scanner whose engine and definitions remain stable during both
+  scans, the unsigned installer and application executable, and a lockfile-bound
+  production dependency SBOM.
 - Made image registration plus insertion or replacement one durable, undoable transaction;
   bounded image headers are inspected before pixel decoding.
 - Retained the editor session and recovery journal after failed close/save operations, and
@@ -111,8 +155,9 @@ No user-facing change is queued after the V1 release candidate.
 
 ### Known V1 boundaries
 
-- Authenticode is applied only when a release certificate is configured; otherwise
-  artifacts are explicitly labelled unsigned.
+- The official no-charge public V1 pipeline deliberately produces and verifies
+  exactly unsigned artifacts and refuses signing credentials. Any later signed or
+  commercial distribution requires a separately reviewed candidate and release gate.
 - MCP mutations are paused during a live LAN session; read tools remain available.
 - Collaboration has no internet relay, automatic writer election, disconnected edit
   merge, or simultaneous editing of one text element.

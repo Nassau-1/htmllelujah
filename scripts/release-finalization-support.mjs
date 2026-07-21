@@ -4,8 +4,95 @@ import {
   FUNCTIONAL_VALIDATION_BUNDLE_NAME,
   FUNCTIONAL_VALIDATION_FILE_NAME,
 } from './windows-candidate-validation-support.mjs';
+import {
+  SECURITY_EVIDENCE_FILE_NAME,
+  SECURITY_EVIDENCE_MAX_AGE_MS,
+  sha256Bytes,
+} from './security-release-evidence-support.mjs';
 
 const SHA256 = /^[0-9a-f]{64}$/u;
+const SECURITY_RECEIPT_RECOVERY =
+  'Leave any existing GitHub draft unchanged; do not delete or overwrite its assets. Create a new versioned candidate and annotated tag, collect fresh security evidence, and publish a new GitHub release.';
+
+const securityReceiptRefusal = (reason) => {
+  throw new Error(
+    `Publication from the existing final release record is refused because ${reason} ${SECURITY_RECEIPT_RECOVERY}`,
+  );
+};
+
+export const assertExistingFinalRecordSecurityReceipt = ({
+  finalRecord,
+  securityEvidenceBytes,
+  now = Date.now(),
+  maxAgeMs = SECURITY_EVIDENCE_MAX_AGE_MS,
+}) => {
+  if (!Number.isFinite(now) || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
+    throw new Error('Security receipt freshness bounds are invalid.');
+  }
+  const assets = finalRecord?.publication?.assets;
+  const matches = Array.isArray(assets)
+    ? assets.filter(
+        (asset) =>
+          asset?.role === 'security-evidence' || asset?.name === SECURITY_EVIDENCE_FILE_NAME,
+      )
+    : [];
+  if (
+    matches.length !== 1 ||
+    matches[0]?.role !== 'security-evidence' ||
+    matches[0]?.name !== SECURITY_EVIDENCE_FILE_NAME ||
+    !Number.isSafeInteger(matches[0]?.size) ||
+    matches[0].size < 1 ||
+    !SHA256.test(matches[0]?.sha256 ?? '')
+  ) {
+    securityReceiptRefusal(
+      `its immutable ${SECURITY_EVIDENCE_FILE_NAME} identity is missing or malformed.`,
+    );
+  }
+
+  const bytes = Buffer.isBuffer(securityEvidenceBytes)
+    ? securityEvidenceBytes
+    : Buffer.from(securityEvidenceBytes ?? '');
+  if (bytes.length !== matches[0].size || sha256Bytes(bytes) !== matches[0].sha256) {
+    securityReceiptRefusal(
+      `its immutable ${SECURITY_EVIDENCE_FILE_NAME} identity differs from the current security evidence.`,
+    );
+  }
+
+  let securityEvidence;
+  try {
+    securityEvidence = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    securityReceiptRefusal(`the bound ${SECURITY_EVIDENCE_FILE_NAME} is not valid JSON.`);
+  }
+  const generatedAt = securityEvidence?.generatedAt;
+  const generatedTime = Date.parse(generatedAt ?? '');
+  if (
+    typeof generatedAt !== 'string' ||
+    !Number.isFinite(generatedTime) ||
+    new Date(generatedTime).toISOString() !== generatedAt
+  ) {
+    securityReceiptRefusal(
+      `the bound ${SECURITY_EVIDENCE_FILE_NAME} has no exact generation timestamp.`,
+    );
+  }
+  if (generatedTime > now) {
+    securityReceiptRefusal(
+      `the bound ${SECURITY_EVIDENCE_FILE_NAME} is dated in the future and is not currently valid.`,
+    );
+  }
+  const expiresAt = generatedTime + maxAgeMs;
+  if (now > expiresAt) {
+    securityReceiptRefusal(
+      `the bound ${SECURITY_EVIDENCE_FILE_NAME} expired at ${new Date(expiresAt).toISOString()}.`,
+    );
+  }
+  return {
+    generatedAt,
+    expiresAt: new Date(expiresAt).toISOString(),
+    size: bytes.length,
+    sha256: matches[0].sha256,
+  };
+};
 
 const exactFunctionalValidationAsset = ({ assets, name, role, size, sha256 }) => {
   if (!Array.isArray(assets)) {

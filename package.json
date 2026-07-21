@@ -19,14 +19,17 @@
     "make:win": "node scripts/build-windows-release.mjs",
     "package:win": "node scripts/build-windows-release.mjs",
     "sbom:generate": "node scripts/generate-sbom.mjs",
+    "security:evidence": "node scripts/generate-security-release-evidence.mjs",
+    "security:verify": "node scripts/verify-security-release-evidence.mjs",
     "test": "pnpm build:packages && pnpm --workspace-concurrency=1 -r --if-present test --pool=threads --maxWorkers=1",
     "test:candidate-validation": "node --test --test-isolation=none scripts/windows-candidate-validation.test.mjs",
-    "test:release-evidence": "node scripts/test-release-evidence.mjs",
+    "test:release-evidence": "node --test scripts/native-runtime-evidence-support.test.mjs && node scripts/test-release-evidence.mjs",
     "test:release-pipeline": "node --test --test-isolation=none scripts/windows-release-pipeline.test.mjs",
     "test:sbom-generate": "node --test scripts/generate-sbom.test.mjs",
+    "test:security-release": "node --test --test-isolation=none scripts/security-release-evidence.test.mjs",
     "typecheck": "pnpm build:packages && pnpm --workspace-concurrency=1 -r --if-present typecheck",
     "validate:candidate": "node scripts/run-windows-candidate-validation.mjs",
-    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:candidate-validation && pnpm test:release-evidence && pnpm test:release-pipeline && pnpm test:sbom-generate && pnpm build && pnpm licenses:check"
+    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:candidate-validation && pnpm test:release-evidence && pnpm test:release-pipeline && pnpm test:sbom-generate && pnpm test:security-release && pnpm build && pnpm licenses:check"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

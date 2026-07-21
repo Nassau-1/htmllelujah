@@ -65,7 +65,14 @@ export interface CloseSessionOptions {
   readonly preserveRecovery?: boolean | undefined;
 }
 
-export interface SaveAsOptions {
+export interface SaveCommitOptions {
+  /** Main-process reservation target. Save rejects if the queued session now points elsewhere. */
+  readonly expectedTargetPath?: string | undefined;
+  /** Main-process authority check forwarded to the atomic persistence commit boundary. */
+  readonly beforeCommit?: (() => Promise<void>) | undefined;
+}
+
+export interface SaveAsOptions extends SaveCommitOptions {
   /** Main-process only. */
   readonly targetPath: string;
   readonly expectedFingerprint?: string | null | undefined;
@@ -91,6 +98,14 @@ export interface RuntimeAssetBytes {
   readonly heightPx?: number | undefined;
 }
 
+/** One queued, main-process-only persisted generation suitable for authoritative cloning. */
+export interface PersistedDocumentSource {
+  readonly snapshot: DocumentSessionSnapshot;
+  readonly assets: readonly RuntimeAssetBytes[];
+  readonly targetPath: string;
+  readonly targetFingerprint: string;
+}
+
 export interface StoreAssetRequest extends AssetBytesInput {
   readonly expectedRevision: string;
   readonly metadata: TransactionMetadata;
@@ -100,6 +115,15 @@ export interface StoreAssetRequest extends AssetBytesInput {
 export interface StoreAssetTransactionRequest extends StoreAssetRequest {
   readonly commands: readonly DocumentCommand[];
   readonly historyGroupId?: string | undefined;
+}
+
+/** Content-addressed import request; dependent assetId fields may use the proposed `id`. */
+export type ImportAssetTransactionRequest = StoreAssetTransactionRequest;
+
+export interface ImportAssetTransactionResult {
+  readonly snapshot: DocumentSessionSnapshot;
+  readonly assetId: string;
+  readonly reused: boolean;
 }
 
 export interface RecoveryBlobGcResult {
@@ -201,6 +225,10 @@ export interface DocumentRuntimeOptions {
   readonly now?: (() => string) | undefined;
   readonly autosaveDelayMs?: number | undefined;
   readonly maxHistoryEntries?: number | undefined;
+  /** Main-process test seam. May only lower the shared `.hdeck` document-byte capacity. */
+  readonly maxCanonicalDocumentBytes?: number | undefined;
+  /** Main-process test observer for deterministic validation-count assertions. */
+  readonly onAssetValidated?: ((assetId: string) => void) | undefined;
   readonly defaultProposalTtlMs?: number | undefined;
   /** Keep freshly staged blobs during crash/restart races. Production defaults to one hour. */
   readonly recoveryBlobGcMinAgeMs?: number | undefined;

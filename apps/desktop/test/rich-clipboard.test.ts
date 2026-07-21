@@ -4,11 +4,12 @@ import {
   RICH_CLIPBOARD_LIMITS,
   RichClipboardError,
   sanitizeClipboardHtml,
+  type RichClipboardLimitOverrides,
 } from '../src/renderer/editor/rich-clipboard.js';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-const sanitize = (html: string) =>
-  sanitizeClipboardHtml(html, { fallbackMarks: emptyMarks(), alignment: 'left' });
+const sanitize = (html: string, limits?: RichClipboardLimitOverrides) =>
+  sanitizeClipboardHtml(html, { fallbackMarks: emptyMarks(), alignment: 'left', limits });
 
 describe('allowlisted rich clipboard normalization', () => {
   it('preserves H1 through H6, nested lists, and semantic inline marks', () => {
@@ -52,9 +53,7 @@ describe('allowlisted rich clipboard normalization', () => {
   });
 
   it('rejects oversized clipboard payloads before parsing', () => {
-    expect(() => sanitize('x'.repeat(RICH_CLIPBOARD_LIMITS.maxHtmlLength + 1))).toThrowError(
-      RichClipboardError,
-    );
+    expect(() => sanitize('123456789', { maxHtmlLength: 8 })).toThrowError(RichClipboardError);
   });
 
   it('inserts inline marks without flattening the surrounding block', () => {
@@ -79,35 +78,74 @@ describe('allowlisted rich clipboard normalization', () => {
   });
 
   it('rejects a bounded paste when the combined editor text would exceed the V1 limit', () => {
-    const source = sanitize(`<p>${'a'.repeat(RICH_CLIPBOARD_LIMITS.maxTextLength - 2)}</p>`);
+    const source = sanitize('<p>aaa</p>');
     const pasted = sanitize('<strong>four</strong>');
     expect(() =>
-      replaceRichTextRange(
-        source,
-        RICH_CLIPBOARD_LIMITS.maxTextLength - 2,
-        RICH_CLIPBOARD_LIMITS.maxTextLength - 2,
-        pasted,
-        emptyMarks(),
-      ),
+      replaceRichTextRange(source, 3, 3, pasted, emptyMarks(), { maxTextLength: 6 }),
     ).toThrowError(RichClipboardError);
   });
 
   it('rejects a merge that would exceed canonical block limits', () => {
     const paragraph = sanitize('<p>a</p>').blocks[0]!;
     const source = {
-      blocks: Array.from({ length: 1_500 }, (_, index) => ({
+      blocks: Array.from({ length: 3 }, (_, index) => ({
         ...paragraph,
         id: `f3000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
       })),
     };
     const pasted = {
-      blocks: Array.from({ length: 600 }, (_, index) => ({
+      blocks: Array.from({ length: 2 }, (_, index) => ({
         ...paragraph,
         id: `f4000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
       })),
     };
-    expect(() => replaceRichTextRange(source, 0, 0, pasted, emptyMarks())).toThrowError(
+    expect(() =>
+      replaceRichTextRange(source, 0, 0, pasted, emptyMarks(), { maxBlocks: 4 }),
+    ).toThrowError(RichClipboardError);
+  });
+
+  it('charges recognized tags at the exact lowered boundary', () => {
+    expect(contentToPlainText(sanitize('<p>x</p>', { maxRecognizedTags: 2 }))).toBe('x');
+    expect(() => sanitize('<p>x</p>', { maxRecognizedTags: 1 })).toThrowError(RichClipboardError);
+  });
+
+  it('bounds inline, list, and blocked-subtree nesting independently', () => {
+    expect(() => sanitize('<b><i>x</i></b>', { maxInlineMarkDepth: 2 })).not.toThrow();
+    expect(() => sanitize('<b><i>x</i></b>', { maxInlineMarkDepth: 1 })).toThrowError(
       RichClipboardError,
     );
+
+    const nestedList = '<ul><li>a<ul><li>b</li></ul></li></ul>';
+    expect(() => sanitize(nestedList, { maxListDepth: 2 })).not.toThrow();
+    expect(() => sanitize(nestedList, { maxListDepth: 1 })).toThrowError(RichClipboardError);
+
+    const nestedBlocked = '<script><style>x</style></script>';
+    expect(() => sanitize(nestedBlocked, { maxSuppressedDepth: 2 })).not.toThrow();
+    expect(() => sanitize(nestedBlocked, { maxSuppressedDepth: 1 })).toThrowError(
+      RichClipboardError,
+    );
+  });
+
+  it('retains mark semantics with constant-time active counters', () => {
+    const content = sanitize('<p><b>one<strong> two</b> three</strong> four</p>');
+    const block = content.blocks[0];
+    expect(block?.type).toBe('paragraph');
+    if (block?.type !== 'paragraph') throw new Error('Expected paragraph content.');
+    expect(block.runs.map((run) => [run.text, run.marks.bold])).toEqual([
+      ['one two three', true],
+      [' four', false],
+    ]);
+  });
+
+  it('rejects raised limits before a caller can commit normalized content', () => {
+    const commit = vi.fn();
+    const normalizeThenCommit = (): void => {
+      const content = sanitize('<p>x</p>', {
+        maxRecognizedTags: RICH_CLIPBOARD_LIMITS.maxRecognizedTags + 1,
+      });
+      commit(content);
+    };
+    expect(normalizeThenCommit).toThrowError(RichClipboardError);
+    expect(commit).not.toHaveBeenCalled();
   });
 });

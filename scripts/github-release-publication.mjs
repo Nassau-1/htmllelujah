@@ -3,6 +3,16 @@ import { readFile } from 'node:fs/promises';
 const GITHUB_HOST = 'github.com';
 const GITHUB_API_ORIGIN = 'https://api.github.com';
 const GITHUB_WEB_ORIGIN = 'https://github.com';
+const IMMUTABLE_RECEIPT_ROLES = new Set(['security-evidence', 'final-release-record']);
+
+const assetMismatch = (expectedAsset, name) => {
+  if (IMMUTABLE_RECEIPT_ROLES.has(expectedAsset?.role)) {
+    throw new Error(
+      `GitHub release immutable publication receipt differs: ${name}. Publication is refused. Leave any existing GitHub draft unchanged; do not delete or overwrite its assets. Create a new versioned candidate and annotated tag, collect fresh security evidence, and publish a new GitHub release.`,
+    );
+  }
+  throw new Error(`GitHub release asset is unexpected or changed: ${name}.`);
+};
 
 const assertSafeExpectedAssets = (assets) => {
   if (!Array.isArray(assets) || assets.length === 0) {
@@ -113,11 +123,12 @@ const assertGithubRelease = ({
       !Number.isSafeInteger(asset?.id) ||
       asset.id < 1
     ) {
-      throw new Error(
-        `GitHub release asset is unexpected or changed: ${asset?.name ?? 'unknown'}.`,
-      );
+      assetMismatch(expectedAsset, asset?.name ?? 'unknown');
     }
     if (asset.digest !== `sha256:${expectedAsset.sha256}`) {
+      if (IMMUTABLE_RECEIPT_ROLES.has(expectedAsset.role)) {
+        assetMismatch(expectedAsset, asset.name);
+      }
       throw new Error(`GitHub release asset digest mismatch: ${asset.name}.`);
     }
     exactUrl(

@@ -74,6 +74,7 @@ describe('opt-in LAN discovery', () => {
     controller.advertise(invitation);
     expect(backend.advertisement?.type).toBe('htmllelujah');
     expect(Object.keys(backend.advertisement?.txt ?? {}).sort()).toEqual([
+      'addr',
       'exp',
       'fp',
       'hint',
@@ -88,7 +89,7 @@ describe('opt-in LAN discovery', () => {
     backend.listener?.({
       host: 'htmllelujah.local',
       port: invitation.port,
-      addresses: [invitation.host],
+      addresses: ['10.0.0.8', invitation.host],
       txt: backend.advertisement!.txt,
     });
     expect(discovered).toEqual([invitation]);
@@ -118,6 +119,12 @@ describe('opt-in LAN discovery', () => {
       port: invitation.port,
       addresses: [invitation.host],
       txt: { ...backend.advertisement!.txt, hint: 'AAAAAAAAAAAAAAAAAAAAAA' },
+    });
+    backend.listener?.({
+      host: invitation.host,
+      port: invitation.port,
+      addresses: [invitation.host, '10.0.0.8'],
+      txt: { ...backend.advertisement!.txt, addr: '10.0.0.8' },
     });
     expect(discovered).toBe(0);
     controller.destroy();

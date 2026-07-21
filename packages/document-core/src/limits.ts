@@ -30,3 +30,6 @@ export const DOCUMENT_LIMITS = Object.freeze({
 } as const);
 
 export type DocumentLimits = typeof DOCUMENT_LIMITS;
+
+/** Canonical UTF-8 capacity shared by document sessions and the V1 `.hdeck` format. */
+export const MAX_CANONICAL_DOCUMENT_BYTES = 32 * 1024 * 1024;

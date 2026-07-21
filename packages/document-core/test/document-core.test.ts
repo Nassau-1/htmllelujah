@@ -115,6 +115,81 @@ describe('model, schema, and revisions', () => {
     if (result.success) throw new Error('Expected validation to fail.');
     expect(result.issues.some((issue) => issue.code === 'TABLE_CELL_MISSING')).toBe(true);
   });
+
+  it('preflights aggregate table span area and bounds numeric occupancy diagnostics', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides.find((candidate) =>
+      candidate.elements.some((element) => element.type === 'table'),
+    );
+    const table = slide?.elements.find((element) => element.type === 'table');
+    if (slide === undefined || table?.type !== 'table' || table.cells.length < 2) {
+      throw new Error('Missing table fixture.');
+    }
+    const withTable = (replacement: typeof table): DeckDocument => ({
+      ...source,
+      slides: source.slides.map((candidate) =>
+        candidate.id === slide.id
+          ? {
+              ...candidate,
+              elements: candidate.elements.map((element) =>
+                element.id === table.id ? replacement : element,
+              ),
+            }
+          : candidate,
+      ),
+    });
+    const base = {
+      ...table,
+      rowCount: 2,
+      columnCount: 2,
+      rowHeightsPt: table.rowHeightsPt.slice(0, 2),
+      columnWidthsPt: table.columnWidthsPt.slice(0, 2),
+    };
+    const full = { ...table.cells[0]!, row: 0, column: 0, rowSpan: 2, columnSpan: 2 };
+    const duplicate = { ...table.cells[1]!, row: 0, column: 0, rowSpan: 1, columnSpan: 1 };
+    const overAreaTable = { ...base, cells: [full, duplicate] };
+    const overArea = withTable(overAreaTable);
+    const overAreaResult = validateDeck(overArea, {
+      maxIssues: 4,
+      maxTableCoordinateVisits: 0,
+    });
+    expect(overAreaResult.success).toBe(false);
+    if (overAreaResult.success) throw new Error('Expected aggregate table rejection.');
+    expect(overAreaResult.issues).toEqual([
+      expect.objectContaining({ code: 'TABLE_CELL_OVERLAP' }),
+    ]);
+
+    const valid = withTable({ ...base, cells: [full] });
+    expect(validateDeck(valid, { maxTableCoordinateVisits: 4 })).toMatchObject({ success: true });
+
+    const horizontal = { ...table.cells[0]!, row: 0, column: 0, rowSpan: 1, columnSpan: 2 };
+    const vertical = { ...table.cells[1]!, row: 0, column: 0, rowSpan: 2, columnSpan: 1 };
+    const equalAreaOverlap = validateDeck(withTable({ ...base, cells: [horizontal, vertical] }), {
+      maxIssues: 2,
+      maxTableCoordinateVisits: 4,
+    });
+    expect(equalAreaOverlap.success).toBe(false);
+    if (equalAreaOverlap.success) throw new Error('Expected bounded overlap rejection.');
+    expect(equalAreaOverlap.issues.map((issue) => issue.code)).toEqual([
+      'TABLE_CELL_OVERLAP',
+      'TABLE_CELL_MISSING',
+    ]);
+
+    const sourceBefore = canonicalSerialize(source);
+    expect(() =>
+      applyCommand(
+        source,
+        {
+          type: 'element.update',
+          slideId: slide.id,
+          elementId: table.id,
+          replacement: overAreaTable,
+        },
+        metadata(),
+      ),
+    ).toThrow(DocumentValidationError);
+    expect(canonicalSerialize(source)).toBe(sourceBefore);
+  });
 });
 
 describe('slide commands and transaction guarantees', () => {

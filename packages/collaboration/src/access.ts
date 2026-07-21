@@ -125,6 +125,12 @@ const addElementTreeWrites = (element: Element, slideId: string, writes: Set<str
   element.children.forEach((child) => addElementTreeWrites(child, slideId, writes));
 };
 
+const addSlideTreeWrites = (slide: Slide, writes: Set<string>): void => {
+  writes.add(slideEntityKey(slide.id));
+  writes.add(elementCollectionKey(slide.id));
+  slide.elements.forEach((element) => addElementTreeWrites(element, slide.id, writes));
+};
+
 const addElementTreeEntityWrites = (element: Element, writes: Set<string>): void => {
   writes.add(elementEntityKey(element.id));
   if (element.type === 'group') {
@@ -273,7 +279,7 @@ export const analyzeCommandAccess = (
         command.master.elements.forEach((element) => addElementTreeEntityWrites(element, writes));
         break;
 
-      case 'master.update':
+      case 'master.update': {
         reads.add(masterEntityKey(command.masterId));
         reads.add(themeEntityKey(command.replacement.themeId));
         addAssetReferenceReads(command.replacement.elements, command.replacement.background, reads);
@@ -284,7 +290,18 @@ export const analyzeCommandAccess = (
         command.replacement.elements.forEach((element) =>
           addElementTreeEntityWrites(element, writes),
         );
+        if (document !== undefined) {
+          const affectedLayoutIds = new Set(
+            document.layouts
+              .filter((layout) => layout.masterId === command.masterId)
+              .map((layout) => layout.id),
+          );
+          document.slides
+            .filter((slide) => affectedLayoutIds.has(slide.layoutId))
+            .forEach((slide) => addSlideTreeWrites(slide, writes));
+        }
         break;
+      }
 
       case 'master.delete': {
         reads.add(masterCollectionKey);
@@ -300,7 +317,13 @@ export const analyzeCommandAccess = (
         }
         const affected = document?.layouts.filter((layout) => layout.masterId === command.masterId);
         if (affected === undefined) writes.add(layoutCollectionKey);
-        else affected.forEach((layout) => writes.add(layoutEntityKey(layout.id)));
+        else {
+          const affectedLayoutIds = new Set(affected.map((layout) => layout.id));
+          affected.forEach((layout) => writes.add(layoutEntityKey(layout.id)));
+          document?.slides
+            .filter((slide) => affectedLayoutIds.has(slide.layoutId))
+            .forEach((slide) => addSlideTreeWrites(slide, writes));
+        }
         break;
       }
 
@@ -315,7 +338,7 @@ export const analyzeCommandAccess = (
         command.layout.elements.forEach((element) => addElementTreeEntityWrites(element, writes));
         break;
 
-      case 'layout.update':
+      case 'layout.update': {
         reads.add(layoutEntityKey(command.layoutId));
         reads.add(masterEntityKey(command.replacement.masterId));
         addAssetReferenceReads(command.replacement.elements, command.replacement.background, reads);
@@ -326,7 +349,11 @@ export const analyzeCommandAccess = (
         command.replacement.elements.forEach((element) =>
           addElementTreeEntityWrites(element, writes),
         );
+        document?.slides
+          .filter((slide) => slide.layoutId === command.layoutId)
+          .forEach((slide) => addSlideTreeWrites(slide, writes));
         break;
+      }
 
       case 'layout.delete': {
         reads.add(layoutCollectionKey);

@@ -79,10 +79,19 @@ export const PRINT_READINESS_SCRIPT = `(() => {
   const requested = Number(root.dataset.readinessDeadlineMs);
   const deadline = Number.isFinite(requested) ? Math.min(60000, Math.max(100, requested)) : 10000;
   const frame = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
-  const decodeImages = () => Promise.all(Array.from(document.images).map((image) => {
-    if (typeof image.decode === "function") return image.decode();
-    return image.complete ? Promise.resolve() : Promise.reject(new Error("decode"));
-  }));
+  const decodeImages = async () => {
+    const images = Array.from(document.images);
+    let nextIndex = 0;
+    const worker = async () => {
+      while (nextIndex < images.length) {
+        const image = images[nextIndex++];
+        if (typeof image.decode === "function") await image.decode();
+        else if (!image.complete) throw new Error("decode");
+      }
+    };
+    const workers = Array.from({ length: Math.min(4, images.length) }, () => worker());
+    await Promise.all(workers);
+  };
   const geometryIsExact = () => Array.from(document.querySelectorAll(".hl-slide-surface")).every((surface) => {
     if (!(surface instanceof HTMLElement)) return false;
     const widthPt = Number(surface.dataset.pageWidthPt);

@@ -18,6 +18,7 @@ import {
 } from './release-candidate-manifest.mjs';
 import { captureSourceSnapshot, gitSourceState } from './release-source-state.mjs';
 import {
+  assertExistingFinalRecordSecurityReceipt,
   assertTrackedReleaseNotes,
   buildFinalReleaseRecord,
 } from './release-finalization-support.mjs';
@@ -35,6 +36,10 @@ import {
   FUNCTIONAL_VALIDATION_FILE_NAME,
   verifyFunctionalValidationPair,
 } from './windows-candidate-validation-support.mjs';
+import {
+  DEPENDENCY_SBOM_FILE_NAME,
+  SECURITY_EVIDENCE_FILE_NAME,
+} from './security-release-evidence-support.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
@@ -44,7 +49,7 @@ const EXPECTED_GITHUB_REPOSITORY = 'Nassau-1/htmllelujah';
 
 const usage = () => `Usage: node scripts/finalize-windows-release.mjs [options]
 
-Verifies the promoted candidate, functional evidence pair, and local/remote tag, then writes an ignored public asset record.
+Verifies the promoted candidate, functional evidence pair, security evidence, and local/remote tag, then writes an ignored public asset record.
 
 Options:
   --tag <tag>          exact version tag (default: v<desktop version>)
@@ -326,6 +331,7 @@ try {
   const contentInventoryPath = path.join(options.evidenceDir, 'content-inventory.json');
   const functionalManifestPath = path.join(options.evidenceDir, FUNCTIONAL_VALIDATION_FILE_NAME);
   const functionalBundlePath = path.join(options.evidenceDir, FUNCTIONAL_VALIDATION_BUNDLE_NAME);
+  const securityEvidencePath = path.join(options.evidenceDir, SECURITY_EVIDENCE_FILE_NAME);
   const candidateManifestBytes = await readRegularFileStable(
     candidatePath,
     'Release candidate manifest',
@@ -363,6 +369,35 @@ try {
     );
   }
   await assertSafeReleaseDirectoryPath({ directory: path.dirname(outputPath), allowMissing: true });
+
+  if (options.publishMode !== 'none') {
+    let existingRecordBytes = null;
+    try {
+      existingRecordBytes = await readRegularFileStable(
+        outputPath,
+        'Existing final release record',
+      );
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+    }
+    if (existingRecordBytes !== null) {
+      let existingRecord;
+      try {
+        existingRecord = JSON.parse(existingRecordBytes.toString('utf8'));
+      } catch {
+        throw new Error(
+          'Existing final release record is not valid JSON; publication is refused and any GitHub draft must be left unchanged.',
+        );
+      }
+      assertExistingFinalRecordSecurityReceipt({
+        finalRecord: existingRecord,
+        securityEvidenceBytes: await readRegularFileStable(
+          securityEvidencePath,
+          'Security evidence',
+        ),
+      });
+    }
+  }
 
   const readPublicationBinding = () => {
     const currentSource = gitSourceState(repositoryRoot);
@@ -501,6 +536,19 @@ try {
     };
   };
 
+  const verifySecurityGate = () =>
+    run(
+      process.execPath,
+      [
+        'scripts/verify-security-release-evidence.mjs',
+        '--artifact-dir',
+        options.artifactDir,
+        '--evidence-dir',
+        options.evidenceDir,
+      ],
+      { timeoutMs: 600_000 },
+    );
+
   run(
     process.execPath,
     [
@@ -513,6 +561,7 @@ try {
     ],
     { timeoutMs: 600_000 },
   );
+  verifySecurityGate();
 
   const initialFunctionalState = await verifyExactFunctionalState();
   if (
@@ -544,11 +593,13 @@ try {
     for (const [role, name] of [
       ['checksums', 'checksums-sha256.txt'],
       ['cyclonedx-sbom', 'build-sbom.cdx.json'],
+      ['dependency-sbom', DEPENDENCY_SBOM_FILE_NAME],
       ['content-inventory', 'content-inventory.json'],
       ['candidate-manifest', 'release-candidate-v1.json'],
       ['release-evidence', 'release-manifest.json'],
       ['functional-validation', FUNCTIONAL_VALIDATION_FILE_NAME],
       ['functional-validation-evidence', FUNCTIONAL_VALIDATION_BUNDLE_NAME],
+      ['security-evidence', SECURITY_EVIDENCE_FILE_NAME],
     ]) {
       result.push(await assetEntry({ role, filePath: path.join(options.evidenceDir, name) }));
     }
@@ -572,6 +623,7 @@ try {
     ],
     { timeoutMs: 600_000 },
   );
+  verifySecurityGate();
   const finalBinding = readPublicationBinding();
   const finalFunctionalState = await verifyExactFunctionalState();
   const finalEvidenceManifest = await readJson(evidenceManifestPath);
@@ -608,6 +660,7 @@ try {
   const confirmation = await readJson(outputPath);
   const postWriteAssets = await collectPublicationAssets();
   const postWriteFunctionalState = await verifyExactFunctionalState();
+  verifySecurityGate();
   const postWriteBinding = readPublicationBinding();
   await assertNoPendingReleasePromotions({ transactionParent: promotionParent, releaseLock });
   if (
@@ -634,6 +687,7 @@ try {
   }
 
   const revalidateBinding = async (stage) => {
+    verifySecurityGate();
     const currentBinding = readPublicationBinding();
     const currentFunctionalState = await verifyExactFunctionalState();
     const currentAssets = await collectPublicationAssets();

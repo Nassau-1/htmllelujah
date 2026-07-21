@@ -29,6 +29,7 @@ export type ExporterErrorCode =
   | 'NOT_FOUND'
   | 'ASSET_INVALID'
   | 'ASSET_LIMIT_EXCEEDED'
+  | 'EXPORT_LIMIT_EXCEEDED'
   | 'RENDER_NOT_READY'
   | 'EXPORT_FAILED';
 

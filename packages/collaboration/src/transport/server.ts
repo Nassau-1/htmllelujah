@@ -22,6 +22,7 @@ import {
   generateEphemeralCertificate,
   normalizeDocumentSecret,
 } from './crypto.js';
+import { isPrivateLanAddress, isPrivateLanLiteral } from './discovery.js';
 import {
   BoundedSender,
   ChunkReassembler,
@@ -136,6 +137,7 @@ const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
 const DEFAULT_JOIN_APPROVAL_TIMEOUT_MS = 60_000;
 const DEFAULT_RECONNECT_GRANT_TTL_MS = 2 * 60_000;
 const DEFAULT_INVITATION_TTL_MS = 12 * 60 * 60 * 1_000;
+const EARLY_REJECTION_TERMINATION_MS = 100;
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -180,6 +182,8 @@ export class CollaborationTransportServer {
   private startPromise: Promise<ManualInvitation> | undefined;
   private closing: Promise<void> | undefined;
   private closed = false;
+  private acceptingSubmissions = true;
+  private readonly activeSubmissions = new Set<Promise<CommittedTransaction>>();
 
   public constructor(options: CollaborationTransportServerOptions) {
     this.engine = options.engine;
@@ -214,6 +218,12 @@ export class CollaborationTransportServer {
     this.clock = options.clock ?? (() => Date.now());
     this.idFactory = options.idFactory ?? (() => globalThis.crypto.randomUUID());
     this.nonceFactory = options.nonceFactory ?? createNonce;
+    if (!isPrivateLanLiteral(this.bindHost) || !isPrivateLanAddress(this.advertisedHost)) {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'Collaboration listeners and invitations must use private LAN or loopback addresses.',
+      );
+    }
     if (
       ![
         this.maxPayloadBytes,
@@ -263,7 +273,7 @@ export class CollaborationTransportServer {
   }
 
   public get pendingHandshakeCount(): number {
-    return [...this.preUpgradeConnections.values()].filter((state) => !state.upgraded).length;
+    return this.preUpgradeConnections.size;
   }
 
   public onPendingJoin(listener: (request: PendingJoinRequest) => void): () => void {
@@ -372,9 +382,9 @@ export class CollaborationTransportServer {
       perMessageDeflate: false,
     });
     webSocketServer.on('connection', (socket, request) => {
-      if (!this.markConnectionUpgraded(request.socket as Socket)) {
-        socket.close(1013, 'Pending limit');
-        socket.terminate();
+      const admissionState = this.markConnectionUpgraded(request.socket as Socket);
+      if (admissionState === undefined) {
+        this.closeUntrackedPeer(socket, 1013, 'Pending limit');
         return;
       }
       this.acceptConnection(
@@ -382,6 +392,7 @@ export class CollaborationTransportServer {
         request.url ?? '',
         certificate.fingerprint,
         request.socket.remoteAddress ?? 'unknown',
+        admissionState,
       );
     });
     webSocketServer.on('error', () => undefined);
@@ -417,24 +428,49 @@ export class CollaborationTransportServer {
 
   public close(): Promise<void> {
     if (this.closing !== undefined) return this.closing;
+    this.acceptingSubmissions = false;
     this.closed = true;
     this.closing = this.closeInternal();
     return this.closing;
   }
 
+  /**
+   * Prevents any later document command from entering the authoritative queue and waits for every
+   * command already admitted to finish. The transport remains connected so callers can durably
+   * save the resulting authoritative snapshot before closing peers and releasing writer authority.
+   */
+  public async closeSubmissionAdmissionAndDrain(): Promise<void> {
+    this.acceptingSubmissions = false;
+    await this.drainActiveSubmissions();
+  }
+
   /** Commits a trusted host-side command and publishes it to every authenticated replica. */
   public async submitAndBroadcast(request: CommandBatchRequest): Promise<CommittedTransaction> {
-    const transaction = await this.engine.submitAsync(request);
-    this.broadcast({
-      type: 'transaction.committed',
-      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
-      payload: transaction,
+    if (!this.acceptingSubmissions) {
+      throw new CollaborationError(
+        'INVALID_REQUEST',
+        'The collaboration host is ending and no longer accepts edits.',
+      );
+    }
+    const operation = this.engine.submitAsync(request).then((transaction) => {
+      this.broadcast({
+        type: 'transaction.committed',
+        protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+        payload: transaction,
+      });
+      return transaction;
     });
-    return transaction;
+    this.activeSubmissions.add(operation);
+    try {
+      return await operation;
+    } finally {
+      this.activeSubmissions.delete(operation);
+    }
   }
 
   private async closeInternal(): Promise<void> {
     await this.startPromise?.catch(() => undefined);
+    await this.drainActiveSubmissions();
     const webSocketServer = this.webSocketServer;
     const httpsServer = this.httpsServer;
     this.webSocketServer = undefined;
@@ -473,15 +509,22 @@ export class CollaborationTransportServer {
     this.documentSecret.fill(0);
   }
 
+  private async drainActiveSubmissions(): Promise<void> {
+    while (this.activeSubmissions.size > 0) {
+      await Promise.allSettled([...this.activeSubmissions]);
+    }
+  }
+
   private acceptConnection(
     socket: WebSocket,
     requestUrl: string,
     fingerprint: string,
     remoteAddress: string,
+    admissionState: PreUpgradeConnectionState,
   ): void {
     const expectedPath = `/v1/session/${this.engine.sessionId}`;
     if (requestUrl !== expectedPath) {
-      socket.close(1008, 'Invalid session path');
+      this.closeUntrackedPeer(socket, 1008, 'Invalid session path');
       return;
     }
     if (this.invitation === undefined || this.invitation.expiresAtMs <= this.clock()) {
@@ -493,12 +536,12 @@ export class CollaborationTransportServer {
           message: 'The collaboration invitation expired.',
         }),
       );
-      socket.close(1008, 'Invitation expired');
+      this.closeUntrackedPeer(socket, 1008, 'Invitation expired');
       return;
     }
     const pending = [...this.connections.values()].filter((state) => !state.authenticated);
     const pendingPreUpgrade = [...this.preUpgradeConnections.values()].filter(
-      (state) => !state.upgraded,
+      (state) => state !== admissionState,
     );
     if (
       pending.length + pendingPreUpgrade.length >= this.maxPendingConnections ||
@@ -514,7 +557,7 @@ export class CollaborationTransportServer {
           message: 'The collaboration authentication queue is full.',
         }),
       );
-      socket.close(1013, 'Pending limit');
+      this.closeUntrackedPeer(socket, 1013, 'Pending limit');
       return;
     }
 
@@ -579,13 +622,22 @@ export class CollaborationTransportServer {
     socket.on('message', (data, isBinary) => this.receive(state, data, isBinary));
     socket.on('close', () => this.removeConnection(state));
     socket.on('error', () => this.removeConnection(state));
+    this.transferConnectionAdmission(admissionState);
     void sender.sendRaw(json(challenge)).catch(() => this.removeConnection(state));
+  }
+
+  private closeUntrackedPeer(socket: WebSocket, code: number, reason: string): void {
+    if (socket.readyState === WebSocket.OPEN) socket.close(code, reason.slice(0, 123));
+    const timer = setTimeout(() => {
+      if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+    }, EARLY_REJECTION_TERMINATION_MS);
+    timer.unref?.();
   }
 
   private acceptPreUpgradeConnection(socket: Socket): void {
     const remoteAddress = socket.remoteAddress ?? 'unknown';
     const key = this.connectionKey(socket);
-    const pending = [...this.preUpgradeConnections.values()].filter((state) => !state.upgraded);
+    const pending = [...this.preUpgradeConnections.values()];
     const pendingWebSockets = [...this.connections.values()].filter(
       (state) => !state.authenticated,
     );
@@ -607,7 +659,7 @@ export class CollaborationTransportServer {
       upgraded: false,
     };
     state.timer = setTimeout(() => {
-      if (!state.upgraded) socket.destroy();
+      if (this.preUpgradeConnections.get(key) === state) socket.destroy();
     }, this.authTimeoutMs);
     state.timer.unref?.();
     this.preUpgradeConnections.set(key, state);
@@ -622,13 +674,18 @@ export class CollaborationTransportServer {
     socket.once('error', remove);
   }
 
-  private markConnectionUpgraded(socket: Socket): boolean {
+  private markConnectionUpgraded(socket: Socket): PreUpgradeConnectionState | undefined {
     const state = this.preUpgradeConnections.get(this.connectionKey(socket));
-    if (state === undefined || state.upgraded) return false;
+    if (state === undefined || state.upgraded) return undefined;
     state.upgraded = true;
+    return state;
+  }
+
+  private transferConnectionAdmission(state: PreUpgradeConnectionState): void {
+    if (this.preUpgradeConnections.get(state.key) !== state) return;
     if (state.timer !== undefined) clearTimeout(state.timer);
     state.timer = undefined;
-    return true;
+    this.preUpgradeConnections.delete(state.key);
   }
 
   private connectionKey(socket: Socket): string {

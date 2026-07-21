@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import assert from 'node:assert/strict';
 import { appendFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
@@ -72,7 +73,10 @@ async function main() {
       await writeFile(path.join(unpackedDir, name), content);
     }
     const installerPath = path.join(artifactDir, 'HTMLlelujah-1.0.0-test-x64-unsigned-Setup.exe');
-    await writeFile(installerPath, 'synthetic NSIS installer fixture\n');
+    await writeFile(
+      installerPath,
+      'synthetic NSIS installer fixture: Nullsoft Install System v3.04\n',
+    );
     await writeFile(`${installerPath}.blockmap`, '{"synthetic":true}\n');
 
     const baseArguments = [
@@ -84,6 +88,16 @@ async function main() {
       '1.0.0-test',
     ];
     run(GENERATOR, baseArguments, 0, 'Installer detected: yes');
+    const diagnosticManifest = JSON.parse(
+      await readFile(path.join(evidenceDir, 'release-manifest.json'), 'utf8'),
+    );
+    const diagnosticSbom = JSON.parse(
+      await readFile(path.join(evidenceDir, 'build-sbom.cdx.json'), 'utf8'),
+    );
+    assert.equal(diagnosticManifest.quality.releaseReady, false);
+    assert.equal(diagnosticManifest.quality.nativeRuntime.passed, false);
+    assert.equal(diagnosticManifest.quality.nativeRuntime.componentCount, 0);
+    assert.deepEqual(diagnosticSbom.components, []);
     const inventory = JSON.parse(
       await readFile(path.join(evidenceDir, 'content-inventory.json'), 'utf8'),
     );
@@ -166,17 +180,25 @@ async function main() {
       '--require-candidate-manifest',
     ];
     run(GENERATOR, sharedArguments, 0, 'Installer detected: yes');
-    run(
-      VERIFIER,
-      ['--artifact-dir', artifactDir, '--evidence-dir', evidenceDir],
-      0,
-      'Verified 10 artifact files.',
+    const candidateDiagnosticManifest = JSON.parse(
+      await readFile(path.join(evidenceDir, 'release-manifest.json'), 'utf8'),
     );
+    assert.equal(candidateDiagnosticManifest.quality.candidateManifestPresent, true);
+    assert.equal(candidateDiagnosticManifest.quality.nativeRuntime.passed, false);
+    assert.equal(candidateDiagnosticManifest.quality.releaseReady, false);
+    run(VERIFIER, ['--artifact-dir', artifactDir, '--evidence-dir', evidenceDir], 0, 'Verified ');
 
     const manifestPath = path.join(evidenceDir, 'release-manifest.json');
     const mismatchedManifest = JSON.parse(await readFile(manifestPath, 'utf8'));
     mismatchedManifest.quality.releaseReady = true;
     mismatchedManifest.quality.candidatePolicy.passed = true;
+    await writeFile(manifestPath, `${JSON.stringify(mismatchedManifest, null, 2)}\n`, 'utf8');
+    run(
+      VERIFIER,
+      ['--artifact-dir', artifactDir, '--evidence-dir', evidenceDir],
+      1,
+      'releaseReady contradicts the incomplete native runtime inventory',
+    );
     mismatchedManifest.release.source.commit = '0000000000000000000000000000000000000000';
     await writeFile(manifestPath, `${JSON.stringify(mismatchedManifest, null, 2)}\n`, 'utf8');
     run(
