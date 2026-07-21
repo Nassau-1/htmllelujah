@@ -189,7 +189,7 @@ const connectRaw = async (
   const socket = new WebSocket(rawUrl(invitation), {
     // Test-only raw peer for the server's ephemeral self-signed certificate; production pin
     // verification is exercised by createClient().
-    // codeql[js/disabling-certificate-validation]
+    // CodeQL triage: used in tests.
     rejectUnauthorized: false,
     perMessageDeflate: false,
     maxPayload: 1024 * 1024,
@@ -1298,7 +1298,7 @@ describe('WSS collaboration transport', () => {
         port: invitation.port,
         // Test-only incomplete TLS handshake against the local ephemeral self-signed server; no
         // application data is accepted or sent.
-        // codeql[js/disabling-certificate-validation]
+        // CodeQL triage: used in tests.
         rejectUnauthorized: false,
       });
       sockets.push(partialTls);

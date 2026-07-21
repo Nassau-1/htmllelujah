@@ -234,7 +234,7 @@ export class CollaborationTransportClient {
       // pin is checked in constant time on the upgrade event below. Authentication refuses to
       // answer the challenge until that pin is verified, so no secret-derived proof or application
       // frame is sent to an unpinned peer.
-      // codeql[js/disabling-certificate-validation]
+      // CodeQL triage: false positive; alternative certificate authentication is enforced above.
       rejectUnauthorized: false,
       perMessageDeflate: false,
       maxPayload: this.maxPayloadBytes,
