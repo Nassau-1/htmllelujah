@@ -315,6 +315,9 @@ const registryState = (installDirectory) => {
       "$productClass = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(('Software\\Classes\\{0}' -f $productProgId))",
       '$productClassRegistered = $null -ne $productClass',
       'if ($null -ne $productClass) { $productClass.Dispose() }',
+      "$iconKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(('Software\\Classes\\{0}\\DefaultIcon' -f $productProgId))",
+      "$productIcon = if ($null -eq $iconKey) { $null } else { [string]$iconKey.GetValue('') }",
+      'if ($null -ne $iconKey) { $iconKey.Dispose() }',
       "$commandKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(('Software\\Classes\\{0}\\shell\\open\\command' -f $productProgId))",
       "$productCommand = if ($null -eq $commandKey) { $null } else { [string]$commandKey.GetValue('') }",
       'if ($null -ne $commandKey) { $commandKey.Dispose() }',
@@ -364,6 +367,7 @@ const registryState = (installDirectory) => {
       '  extensionDefault = $extensionDefault',
       '  openWithProgIds = @($openWithProgIds)',
       '  productClassRegistered = $productClassRegistered',
+      '  productIcon = $productIcon',
       '  productCommand = $productCommand',
       '  installRecords = @($installRecords)',
       '  uninstallRecords = @($uninstallRecords)',
@@ -393,8 +397,16 @@ const shortcutState = (installedExecutable) => {
       ')',
       '$items = foreach ($item in $paths) {',
       '  $present = Test-Path -LiteralPath $item.path -PathType Leaf',
-      '  $target = if ($present) { $shell.CreateShortcut($item.path).TargetPath } else { $null }',
-      '  [pscustomobject]@{ kind = $item.kind; present = $present; exactTarget = $present -and [string]::Equals($target, $env:HTMLLELUJAH_EXECUTABLE, [StringComparison]::OrdinalIgnoreCase) }',
+      '  $shortcut = if ($present) { $shell.CreateShortcut($item.path) } else { $null }',
+      '  $target = if ($present) { [string]$shortcut.TargetPath } else { $null }',
+      '  $iconLocation = if ($present) { [string]$shortcut.IconLocation } else { $null }',
+      '  $iconTarget = if ([string]::IsNullOrWhiteSpace($iconLocation)) { $null } else {',
+      '    $candidate = $iconLocation.Trim().Trim([char]34)',
+      "    if ($candidate.EndsWith(',0', [StringComparison]::Ordinal)) { $candidate = $candidate.Substring(0, $candidate.Length - 2).Trim().Trim([char]34) }",
+      '    $candidate',
+      '  }',
+      '  $iconLocationValid = -not $present -or [string]::IsNullOrWhiteSpace($iconLocation) -or [string]::Equals($iconTarget, $env:HTMLLELUJAH_EXECUTABLE, [StringComparison]::OrdinalIgnoreCase)',
+      '  [pscustomobject]@{ kind = $item.kind; present = $present; exactTarget = $present -and [string]::Equals($target, $env:HTMLLELUJAH_EXECUTABLE, [StringComparison]::OrdinalIgnoreCase); iconLocation = $iconLocation; iconLocationValid = $iconLocationValid }',
       '}',
       '@($items) | ConvertTo-Json -Compress',
     ].join('\n'),
@@ -617,6 +629,20 @@ const assertInstalledFiles = async (installDirectory) => {
   }
 };
 
+const registeredIconExecutable = (value) => {
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+  let candidate = value.trim();
+  for (let iteration = 0; iteration < 2; iteration += 1) {
+    if (candidate.startsWith('"') && candidate.endsWith('"')) {
+      candidate = candidate.slice(1, -1).trim();
+    }
+    if (candidate.endsWith(',0')) {
+      candidate = candidate.slice(0, -2).trim();
+    }
+  }
+  return candidate;
+};
+
 const assertInstalledWindowsState = (state, baseline, installedExecutable) => {
   if (
     !state.productClassRegistered ||
@@ -640,6 +666,16 @@ const assertInstalledWindowsState = (state, baseline, installedExecutable) => {
   ) {
     throw new Error('The installed .hdeck command does not target the exact installed executable.');
   }
+  const productIconExecutable = registeredIconExecutable(state.productIcon);
+  if (
+    productIconExecutable === undefined ||
+    productIconExecutable.localeCompare(installedExecutable, undefined, {
+      sensitivity: 'accent',
+    }) !== 0
+  ) {
+    throw new Error('The installed .hdeck icon does not target the exact installed executable.');
+  }
+
   const currentUserInstall = state.installRecords.filter((entry) => entry.hive === 'HKCU');
   const localMachineInstall = state.installRecords.filter((entry) => entry.hive === 'HKLM');
   const currentUserUninstall = state.uninstallRecords.filter(
@@ -661,7 +697,9 @@ const assertInstalledWindowsState = (state, baseline, installedExecutable) => {
 const assertInstalledShortcuts = (shortcuts) => {
   if (
     shortcuts.length !== 2 ||
-    shortcuts.some((shortcut) => !shortcut.present || !shortcut.exactTarget)
+    shortcuts.some(
+      (shortcut) => !shortcut.present || !shortcut.exactTarget || !shortcut.iconLocationValid,
+    )
   ) {
     throw new Error('The expected per-user desktop and Start Menu shortcuts are invalid.');
   }

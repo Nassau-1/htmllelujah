@@ -1,6 +1,6 @@
 # Bundled Asset Provenance
 
-Last reviewed: 2026-07-15.
+Last reviewed: 2026-07-22.
 
 This ledger covers every visual asset file bundled from this repository. User-imported
 presentation assets are not part of the application distribution and remain the
@@ -8,21 +8,22 @@ user's responsibility.
 
 ## Application icon
 
-| File                           | SHA-256                                                            | Provenance                                                                           |
-| ------------------------------ | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
-| `apps/desktop/assets/icon.png` | `78128f922eff1e8d27fa3e7ec682a100153f295af413091cba4af3d3493786a1` | Generated specifically for HTMLlelujah under project direction, then cleaned locally |
-| `apps/desktop/assets/icon.ico` | `6e2b7acb9bc8a7f6e37f98895fd03724755364bb111f7d574afe9cb0e58c6242` | Derived locally from the reviewed PNG for Windows packaging                          |
+| File                                           | SHA-256                                                            | Provenance                                                           |
+| ---------------------------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `apps/desktop/assets/icon.png`                 | `2c0fc4e9872807d366dee86245cd7e03f53a2e8feae0b4c97b2a5b2708e2d4d2` | Exact `icon.png` entry from the owner-provided HTMLlelujah logo pack |
+| `apps/desktop/assets/icon.ico`                 | `7554b438632c7e1767b2d5397f1c1e5afc148bf2e9e87a868e324f9219c602e1` | Exact `icon.ico` entry from the owner-provided HTMLlelujah logo pack |
+| `apps/desktop/assets/htmllelujah-app-icon.svg` | `3a89de7aeaf9a693cbc47d08a5402fdf21f10751d006ddb692f50b264994fa92` | Exact vector app-icon entry from the same owner-provided logo pack   |
 
-The generation brief requested a professional application icon combining a
-presentation page, code brackets, and a structured grid in midnight navy, violet,
-and ivory, with no text and a chroma-green background. The chroma background was
-removed locally. The brief named no artist, living or historical, and imported no
-third-party logo or source image. The resulting icon is treated as original project
-material under [`LICENSE`](../../LICENSE), subject to any mandatory terms of the
-generation service.
+The repository owner supplied `htmllelujah-logo-pack.zip` on 2026-07-22 for use as
+HTMLlelujah's official identity. The received archive has SHA-256
+`e6ead9675b2d3d0aa5bb877477ccd55afd7ddaf56b612ebe58f18fcad2eabf09`.
+The three bundled files above are exact archive entries; no third-party source asset
+or open-source logo dependency was declared in the handoff. The ICO contains native
+16, 24, 32, 48, 64, 128, and 256 pixel variants, and the PNG is a transparent
+1024-by-1024 source.
 
-Any regeneration or visual replacement requires a new source record, prompt or brief,
-license basis, and final-file hash before packaging.
+Any regeneration or visual replacement requires a new owner source record, license
+basis, final-file hash, and packaging review.
 
 ## Interface icons
 
@@ -50,8 +51,8 @@ Windows emoji font.
 
 No font, stock photograph, illustration, or demo media file is bundled in the
 repository as of this review. The editor uses CSS font stacks and fonts available on
-the user's system. The only tracked PNG or ICO files are the two application-icon
-files listed above.
+the user's system. The only tracked product-identity media are the three application
+icon files listed above.
 
 ## Release gate
 

@@ -537,6 +537,9 @@ describe('Windows installer lifecycle smoke support', () => {
     expect(source).toContain("entry.hive === 'HKLM'");
     expect(source).toContain('assertNoProductRegistry(');
     expect(source).toContain('assertNoShortcuts(shortcutState(installedExecutable))');
+    expect(source).toContain('productIcon = $productIcon');
+    expect(source).toContain('registeredIconExecutable(state.productIcon)');
+    expect(source).toContain('shortcut.iconLocationValid');
     expect(source).toContain('productProcesses(installedExecutable).length > 0');
     expect(source).toContain('namedProductProcesses().length > 0');
     expect(source).not.toContain('CommandLine.IndexOf($directory');

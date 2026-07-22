@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" fill="none"/>
+  <rect x="48" y="48" width="928" height="928" rx="224" fill="#2F6FEB"/>
+
+  <!-- HTML chevrons -->
+  <path d="M350 304 L196 512 L350 720"
+        fill="none" stroke="#FFFFFF" stroke-width="76"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M674 304 L828 512 L674 720"
+        fill="none" stroke="#FFFFFF" stroke-width="76"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Offset slide: a deck rather than a single screen -->
+  <rect x="402" y="374" width="282" height="180" rx="38"
+        fill="#FFFFFF" opacity="0.24"/>
+
+  <!-- Primary slide / H crossbar -->
+  <rect x="370" y="420" width="284" height="184" rx="40" fill="#171C24"/>
+  <rect x="430" y="468" width="164" height="22" rx="11" fill="#FFFFFF"/>
+  <rect x="430" y="520" width="108" height="18" rx="9" fill="#FFFFFF" opacity="0.72"/>
+</svg>

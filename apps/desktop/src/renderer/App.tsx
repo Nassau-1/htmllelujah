@@ -101,6 +101,7 @@ import type {
   McpStatus,
   SessionView,
 } from '../shared/desktop-api';
+import htmllelujahAppIcon from '../../assets/htmllelujah-app-icon.svg';
 import { reconcileHostAddressSelection } from './collaboration-host-address';
 import { EditorButton } from './components/EditorButton';
 import { CanonicalSlideCanvas, sameCanvasSelection } from './components/CanonicalSlideCanvas';
@@ -366,9 +367,13 @@ const safeErrorMessage = <T,>(result: DesktopResult<T>): string | undefined =>
 function LoadingScreen({ message }: { readonly message: string }) {
   return (
     <main className="loading-screen" aria-live="polite">
-      <span className="brand-mark loading-mark" aria-hidden="true">
-        H
-      </span>
+      <img
+        className="brand-mark loading-mark"
+        src={htmllelujahAppIcon}
+        alt=""
+        aria-hidden="true"
+        draggable={false}
+      />
       <strong>HTMLlelujah</strong>
       <span>{message}</span>
     </main>
@@ -2970,9 +2975,13 @@ function EditorApp() {
       <header className="app-header">
         <div className="title-row">
           <div className="brand-lockup" aria-label="HTMLlelujah">
-            <span className="brand-mark" aria-hidden="true">
-              H
-            </span>
+            <img
+              className="brand-mark"
+              src={htmllelujahAppIcon}
+              alt=""
+              aria-hidden="true"
+              draggable={false}
+            />
             <span className="brand-name">HTMLlelujah</span>
           </div>
           <button

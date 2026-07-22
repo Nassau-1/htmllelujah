@@ -45,16 +45,11 @@
 }
 
 .brand-mark {
-  display: grid;
+  display: block;
+  flex: 0 0 auto;
   width: 24px;
   height: 24px;
-  place-items: center;
-  border-radius: var(--primitive-radius-6);
-  background: var(--color-accent);
-  color: var(--color-text-inverse);
-  font-size: var(--primitive-font-13);
-  font-weight: 700;
-  letter-spacing: -0.04em;
+  object-fit: contain;
 }
 
 .brand-name {
@@ -2219,7 +2214,6 @@
 .loading-mark {
   width: 42px;
   height: 42px;
-  font-size: 18px;
 }
 
 .modal-backdrop {

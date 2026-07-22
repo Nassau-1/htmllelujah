@@ -84,8 +84,7 @@
         "ext": "hdeck",
         "name": "HTMLlelujah presentation",
         "description": "HTMLlelujah presentation",
-        "role": "Editor",
-        "icon": "assets/icon.ico"
+        "role": "Editor"
       }
     ],
     "afterPack": "scripts/apply-fuses.mjs",

@@ -5,6 +5,13 @@ and releases use semantic versions.
 
 ## [Unreleased]
 
+### Changed
+
+- Adopted the owner-provided HTMLlelujah identity across the Windows executable,
+  installer, file association, browser metadata, editor header, and loading screen,
+  with exact source hashes and multi-resolution icon coverage recorded in the asset
+  provenance ledger.
+
 ### Fixed
 
 - Gave the complete Windows source-verification gate a measured one-hour ceiling,

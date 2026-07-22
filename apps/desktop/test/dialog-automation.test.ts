@@ -47,6 +47,8 @@ describe('native file-dialog editor selection', () => {
     );
     expect(source).toContain('::ReadControlText(');
     expect(source).toContain('function Test-NativeMessageTimeoutException');
+    expect(source).toContain('$lastInputTimeout = $_.Exception.GetBaseException().Message');
+    expect(source).toContain('attempts=$attempts,lastInputTimeout=$lastInputTimeout');
     expect(source).toContain('$current = $current.InnerException');
     expect(source).toContain('function Read-ExactNativeEditorText');
     expect(source).toContain('while ([DateTime]::UtcNow -lt $Deadline)');

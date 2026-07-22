@@ -890,6 +890,7 @@ function Set-StableNativeEditorValue {
   $maximumTextLength = [Math]::Min([Math]::Max($Value.Length + 16, 260), 32768)
   $attempts = 0
   $observedValue = ''
+  $lastInputTimeout = 'none'
   $stable = $false
   while ([DateTime]::UtcNow -lt $Deadline -and -not $stable) {
     if (-not (Test-NativeDialogIdentity -DialogIdentity $DialogIdentity)) {
@@ -911,6 +912,7 @@ function Set-StableNativeEditorValue {
     }
 
     $attempts += 1
+    try {
     [HtmllelujahNativeDialog]::TypeControlText(
       $DialogIdentity.Handle,
       $EditorIdentity.Handle,
@@ -923,6 +925,17 @@ function Set-StableNativeEditorValue {
       $EditorIdentity.ClassName,
       $EditorIdentity.ControlId
     )
+    }
+    catch {
+      if (-not (Test-NativeMessageTimeoutException -Exception $_.Exception)) {
+        throw
+      }
+      $lastInputTimeout = $_.Exception.GetBaseException().Message
+      if ([DateTime]::UtcNow -lt $Deadline) {
+        Start-Sleep -Milliseconds 100
+      }
+      continue
+    }
     if (-not (Test-NativeDialogIdentity -DialogIdentity $DialogIdentity)) {
       throw 'The exact native save dialog changed immediately after bounded input.'
     }
@@ -964,7 +977,7 @@ function Set-StableNativeEditorValue {
     )
   }
   if (-not $stable) {
-    throw "The exact native file-name editor did not retain a stable requested value before the global deadline (hwnd=$($EditorIdentity.HandleValue),actualLength=$($observedValue.Length),expectedLength=$($Value.Length),attempts=$attempts)."
+    throw "The exact native file-name editor did not retain a stable requested value before the global deadline (hwnd=$($EditorIdentity.HandleValue),actualLength=$($observedValue.Length),expectedLength=$($Value.Length),attempts=$attempts,lastInputTimeout=$lastInputTimeout)."
   }
   return [pscustomobject]@{
     Value = $observedValue

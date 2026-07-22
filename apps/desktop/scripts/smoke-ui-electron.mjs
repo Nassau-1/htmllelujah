@@ -670,6 +670,11 @@ const runCleanLaunchProbe = async ({
     const applicationShellReadyAt = performance.now();
     await evaluateCdp(launchCdp, `document.fonts.ready.then(() => true)`);
     const fontsReadyAt = performance.now();
+    await waitForDecodedImages(
+      launchCdp,
+      '.brand-lockup img.brand-mark',
+      `${label} decoded official HTMLlelujah identity`,
+    );
     const initialized = await evaluateCdp(
       launchCdp,
       `(async () => {
@@ -996,6 +1001,11 @@ try {
   const applicationShellReadyAt = performance.now();
   await evaluate(`document.fonts.ready.then(() => true)`);
   const fontsReadyAt = performance.now();
+  await waitForDecodedImages(
+    cdp,
+    '.brand-lockup img.brand-mark',
+    'Decoded official HTMLlelujah identity at interactive readiness',
+  );
   const measuredInitialization = await evaluate(`(async () => {
     const result = await window.htmllelujah.initialize();
     if (!result.ok) return { ok: false, errorCode: result.error.code };
@@ -1353,6 +1363,13 @@ try {
     `document.querySelector('.canonical-slide-surface')?.textContent?.includes('Alpha') === true`,
     'Redo TSV paste result',
   );
+  const contentSlideIndex = await evaluate(
+    `[...document.querySelectorAll('.canonical-thumbnail')].findIndex((thumbnail) => thumbnail.classList.contains('is-selected'))`,
+  );
+  if (!Number.isInteger(contentSlideIndex) || contentSlideIndex < 0) {
+    throw new Error('The native-content slide index is unavailable.');
+  }
+
   await click('[aria-label="Add icon"]', 'Add icon');
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 4}`,
@@ -1928,6 +1945,24 @@ try {
     `document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() === 'Properties'`,
     'Properties tab after rejected close commit',
   );
+  const contentSlideSelected = await evaluate(`(() => {
+    const thumbnails = [...document.querySelectorAll('.canonical-thumbnail')];
+    const element = thumbnails[${contentSlideIndex}];
+    if (!(element instanceof HTMLButtonElement)) return false;
+    element.click();
+    return true;
+  })()`);
+  if (!contentSlideSelected) {
+    throw new Error('The original native-content slide could not be restored.');
+  }
+  await waitForRenderer(
+    `document.querySelector('.canonical-slide-surface')?.textContent?.includes('Alpha') === true &&
+      [...document.querySelectorAll('.canonical-hitbox')].some(
+        (candidate) => candidate.getAttribute('aria-label')?.includes(', table'),
+      )`,
+    'Original native-content slide restored before close handshake',
+  );
+
   const closeCellSelected = await evaluate(`(() => {
     const element = [...document.querySelectorAll('.canonical-hitbox')].find(
       (candidate) => candidate.getAttribute('aria-label')?.includes(', table'),
@@ -2133,6 +2168,11 @@ try {
 
   await waitForDecodedImages(
     cdp,
+    '.brand-lockup img.brand-mark',
+    'Decoded official HTMLlelujah identity before editor evidence capture',
+  );
+  await waitForDecodedImages(
+    cdp,
     '.canonical-canvas-scaled .canonical-slide-surface img[alt="Presentation image"]',
     'Decoded imported image before editor evidence capture',
   );
@@ -2193,6 +2233,7 @@ try {
       'Alt+F4-equivalent close flushed an immediate inline draft before the native save prompt',
       'stale Discard consent could not discard a concurrent agent mutation',
       'Design and Properties inspector tabs switched',
+      'official HTMLlelujah identity decoded in the real editor window',
       'stable PNG screenshot captured from the real window',
       'stable PNG screenshot captured after the real presentation window decoded its image',
     ],

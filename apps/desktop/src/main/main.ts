@@ -277,6 +277,8 @@ const mimeForAppPath = (filePath: string): string => {
       return 'text/css; charset=utf-8';
     case '.png':
       return 'image/png';
+    case '.svg':
+      return 'image/svg+xml';
     case '.ico':
       return 'image/x-icon';
     case '.woff2':
@@ -1816,6 +1818,7 @@ const createPresentationWindow = async (
     fullscreen: true,
     backgroundColor: '#000000',
     autoHideMenuBar: true,
+    icon: path.join(app.getAppPath(), 'assets', 'icon.png'),
     title: `${source.document.name} — Presentation`,
     webPreferences: {
       preload: path.join(currentDirectory, 'preload.mjs'),
