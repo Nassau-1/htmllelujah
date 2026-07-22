@@ -569,17 +569,32 @@ const closeLaunchGracefully = async ({
 }) => {
   if (child.pid === undefined) throw new Error(`${label} process ID is unavailable.`);
   const discard = expectUnsavedPrompt
-    ? automateMessageBox(child.pid, 'Unsaved changes', 'Discard')
+    ? automateMessageBox(child.pid, 'Unsaved changes', 'Discard', 150)
     : undefined;
+  const closeFailure = automateMessageBox(child.pid, 'Presentation remains open', 'OK');
   let nativeClose;
   void discard?.catch(() => undefined);
   try {
+    void closeFailure.catch(() => undefined);
     nativeClose = await requestNativeWindowClose(child.pid);
     if (discard !== undefined) {
       if (!(await discard.ready)) await discard;
       await discard;
     }
-    if (!(await waitForExit(child, 30_000))) {
+    const closeOutcome = await Promise.race([
+      waitForExit(child, 30_000).then((exited) => ({ kind: 'exit', exited })),
+      closeFailure.ready.then((ready) =>
+        ready ? { kind: 'retained' } : { kind: 'failure-automation-ended' },
+      ),
+    ]);
+    if (closeOutcome.kind === 'retained') {
+      await closeFailure;
+      throw new Error(
+        `${label} was retained after its native close request.` +
+          ` Close-failure diagnostics: ${closeFailure.diagnostics()}`,
+      );
+    }
+    if (closeOutcome.kind !== 'exit' || !closeOutcome.exited) {
       const automationDiagnostics = discard?.diagnostics() ?? '';
       throw new Error(
         `${label} did not exit after its native close request.` +
@@ -599,6 +614,7 @@ const closeLaunchGracefully = async ({
     await waitForProcessTreeExit(nativeClose.processIds, label);
   } finally {
     if (discard !== undefined) await discard.cancel();
+    await closeFailure.cancel();
   }
   await assertRecoveryArtifactsRemoved(userData, sessionId, label);
   return {
@@ -1882,6 +1898,16 @@ try {
   if (typeof originalThemeName !== 'string' || originalThemeName === '') {
     throw new Error('The theme name field was unavailable for the rejected close-commit test.');
   }
+  await evaluate(`(() => {
+    for (const dismiss of document.querySelectorAll('.toast button[aria-label="Dismiss"]')) {
+      if (dismiss instanceof HTMLButtonElement) dismiss.click();
+    }
+    return true;
+  })()`);
+  await waitForRenderer(
+    `document.querySelector('.toast-error') === null`,
+    'No stale error toast before rejected close commit',
+  );
   const invalidThemeName = 'x'.repeat(300);
   await setInputValue(
     '.theme-card input[maxlength="120"]',
@@ -1889,6 +1915,20 @@ try {
     'Invalid focused theme name',
     false,
     true,
+  );
+  const invalidThemeBlurredBeforeClose = await evaluate(`(() => {
+    const element = document.querySelector('.theme-card input[maxlength="120"]');
+    if (!(element instanceof HTMLInputElement) || document.activeElement !== element) return false;
+    element.blur();
+    return document.activeElement !== element;
+  })()`);
+  if (!invalidThemeBlurredBeforeClose) {
+    throw new Error('The invalid theme field could not be blurred before native close.');
+  }
+  await waitForRenderer(
+    `document.querySelector('.toast-error') !== null &&
+      document.querySelector('.theme-card input[maxlength="120"]')?.value === ${JSON.stringify(invalidThemeName)}`,
+    'Rejected theme blur retained before native close',
   );
   const acknowledgeInvalidFieldFailure = automateMessageBox(
     application.pid,
@@ -1963,6 +2003,110 @@ try {
     'Original native-content slide restored before close handshake',
   );
 
+  const detachedTsvDraft = 'Unapplied TSV draft survives a detached editor';
+  const detachedTsvTableSelected = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].find(
+      (candidate) => candidate.getAttribute('aria-label')?.includes(', table'),
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+    return true;
+  })()`);
+  if (!detachedTsvTableSelected) {
+    throw new Error('The table was unavailable for the detached TSV close test.');
+  }
+  await waitForRenderer(
+    `document.querySelector('[aria-label="Table cells (tab-separated values)"]') !== null`,
+    'Table TSV editor before detach',
+  );
+  await setInputValue(
+    '[aria-label="Table cells (tab-separated values)"]',
+    detachedTsvDraft,
+    'Unapplied detached TSV draft',
+  );
+  await waitForRenderer(
+    `document.querySelector('[aria-label="Table cells (tab-separated values)"]')?.value === ${JSON.stringify(detachedTsvDraft)}`,
+    'Unapplied TSV draft before detach',
+  );
+  const detachedTsvSelectionChanged = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].find(
+      (candidate) => candidate.getAttribute('aria-label')?.includes(', shape'),
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+    return true;
+  })()`);
+  if (!detachedTsvSelectionChanged) {
+    throw new Error('A non-table object was unavailable to detach the TSV editor.');
+  }
+  await waitForRenderer(
+    `document.querySelector('[aria-label="Table cells (tab-separated values)"]') === null`,
+    'TSV editor detached after selection change',
+  );
+  const acknowledgeDetachedTsvFailure = automateMessageBox(
+    application.pid,
+    'Presentation remains open',
+    'OK',
+  );
+  void acknowledgeDetachedTsvFailure.catch(() => undefined);
+  let detachedTsvExitListener;
+  const unexpectedDetachedTsvExit = new Promise((resolve) => {
+    detachedTsvExitListener = () => resolve('closed');
+    application.once('exit', detachedTsvExitListener);
+  });
+  try {
+    await requestNativeWindowClose(application.pid);
+    const detachedTsvCloseResult = await Promise.race([
+      acknowledgeDetachedTsvFailure.ready.then((visible) =>
+        visible ? 'failure' : new Promise(() => undefined),
+      ),
+      unexpectedDetachedTsvExit,
+      sleep(12_000).then(() => 'timeout'),
+    ]);
+    if (detachedTsvCloseResult !== 'failure') {
+      throw new Error(
+        detachedTsvCloseResult === 'closed'
+          ? 'A detached TSV draft was allowed to close the presentation.'
+          : 'A detached TSV draft did not produce a bounded close failure.',
+      );
+    }
+    await acknowledgeDetachedTsvFailure;
+  } finally {
+    if (detachedTsvExitListener !== undefined) {
+      application.off('exit', detachedTsvExitListener);
+    }
+    await acknowledgeDetachedTsvFailure.cancel();
+  }
+  const detachedTsvTableReselected = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].find(
+      (candidate) => candidate.getAttribute('aria-label')?.includes(', table'),
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+    return true;
+  })()`);
+  if (!detachedTsvTableReselected) {
+    throw new Error('The table could not be reselected after the detached TSV close test.');
+  }
+  await waitForRenderer(
+    `document.querySelector('[aria-label="Table cells (tab-separated values)"]')?.value === ${JSON.stringify(detachedTsvDraft)}`,
+    'Detached TSV draft retained after blocked close',
+  );
+  await setInputValue(
+    '[aria-label="Table cells (tab-separated values)"]',
+    '',
+    'Clear detached TSV draft',
+    true,
+    true,
+  );
+  await waitForRenderer(
+    `document.querySelector('[aria-label="Table cells (tab-separated values)"]')?.value === ''`,
+    'Detached TSV draft cleared explicitly',
+  );
+
   const closeCellSelected = await evaluate(`(() => {
     const element = [...document.querySelectorAll('.canonical-hitbox')].find(
       (candidate) => candidate.getAttribute('aria-label')?.includes(', table'),
@@ -1985,12 +2129,25 @@ try {
     false,
     true,
   );
+  const closeReleaseProbeInstalled = await evaluate(`(() => {
+    if (typeof window.__htmllelujahCloseReleaseProbeDispose === 'function') {
+      window.__htmllelujahCloseReleaseProbeDispose();
+    }
+    window.__htmllelujahCloseReleaseProbe = [];
+    window.__htmllelujahCloseReleaseProbeDispose =
+      window.htmllelujah.onWindowCloseReleased((release) => {
+        window.__htmllelujahCloseReleaseProbe.push(release.requestId);
+      });
+    return true;
+  })()`);
+  if (!closeReleaseProbeInstalled) throw new Error('The close-release IPC probe was unavailable.');
   const cancelFocusedCellDialog = automateMessageBox(application.pid, 'Unsaved changes', 'Cancel');
   const acknowledgeFocusedCellFailure = automateMessageBox(
     application.pid,
     'Presentation remains open',
     'OK',
   );
+  let retryFocusedCellDialog;
   void cancelFocusedCellDialog.catch(() => undefined);
   void acknowledgeFocusedCellFailure.catch(() => undefined);
   try {
@@ -2012,8 +2169,87 @@ try {
       );
     }
     await cancelFocusedCellDialog;
+    await waitForRenderer(
+      `Array.isArray(window.__htmllelujahCloseReleaseProbe) &&
+        window.__htmllelujahCloseReleaseProbe.length === 1 &&
+        typeof window.__htmllelujahCloseReleaseProbe[0] === 'string'`,
+      'Exact correlated close release after Cancel',
+      3_000,
+    );
+    const releaseProbeElementCount = await evaluate(
+      `document.querySelectorAll('[data-canvas-element-id]').length`,
+    );
+    const releaseProbeStarted = await evaluate(`(() => {
+      const button = document.querySelector('button[aria-label="Add shape"]');
+      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+      button.click();
+      return true;
+    })()`);
+    if (!releaseProbeStarted) {
+      throw new Error('The post-Cancel close-release probe could not start a reversible edit.');
+    }
+    await waitForRenderer(
+      `document.querySelectorAll('[data-canvas-element-id]').length === ${releaseProbeElementCount + 1}`,
+      'Post-Cancel edit admitted before the old close watchdog',
+      3_000,
+    );
+    const releaseProbeUndone = await evaluate(`(() => {
+      const button = document.querySelector('button[aria-label="Undo"]');
+      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+      button.click();
+      return true;
+    })()`);
+    if (!releaseProbeUndone) throw new Error('The close-release probe could not be undone.');
+    await waitForRenderer(
+      `document.querySelectorAll('[data-canvas-element-id]').length === ${releaseProbeElementCount}`,
+      'Post-Cancel close-release probe undone',
+    );
+
+    const closeReleaseProbeDisposed = await evaluate(`(() => {
+      if (typeof window.__htmllelujahCloseReleaseProbeDispose !== 'function') return false;
+      window.__htmllelujahCloseReleaseProbeDispose();
+      delete window.__htmllelujahCloseReleaseProbeDispose;
+      return window.__htmllelujahCloseReleaseProbe.length === 1;
+    })()`);
+    if (!closeReleaseProbeDisposed) {
+      throw new Error('The close-release IPC probe observed an unexpected release count.');
+    }
+    retryFocusedCellDialog = automateMessageBox(application.pid, 'Unsaved changes', 'Cancel');
+    void retryFocusedCellDialog.catch(() => undefined);
+    await requestNativeWindowClose(application.pid);
+    const retryCloseDialog = await Promise.race([
+      retryFocusedCellDialog.ready.then((visible) =>
+        visible ? 'unsaved' : new Promise(() => undefined),
+      ),
+      acknowledgeFocusedCellFailure.ready.then((visible) =>
+        visible ? 'failure' : new Promise(() => undefined),
+      ),
+      sleep(12_000).then(() => 'timeout'),
+    ]);
+    if (retryCloseDialog !== 'unsaved') {
+      throw new Error(
+        retryCloseDialog === 'failure'
+          ? 'An immediate close retry after Cancel was rejected by a stale renderer seal.'
+          : 'A close retry after the release probe did not reach the unsaved prompt.',
+      );
+    }
+    await retryFocusedCellDialog;
   } finally {
-    await Promise.all([cancelFocusedCellDialog.cancel(), acknowledgeFocusedCellFailure.cancel()]);
+    await Promise.allSettled([
+      evaluate(`(() => {
+        if (typeof window.__htmllelujahCloseReleaseProbeDispose === 'function') {
+          window.__htmllelujahCloseReleaseProbeDispose();
+        }
+        delete window.__htmllelujahCloseReleaseProbeDispose;
+        delete window.__htmllelujahCloseReleaseProbe;
+        return true;
+      })()`),
+    ]);
+    await Promise.all([
+      cancelFocusedCellDialog.cancel(),
+      retryFocusedCellDialog?.cancel(),
+      acknowledgeFocusedCellFailure.cancel(),
+    ]);
   }
   await waitForRenderer(
     `document.querySelector('.app-shell') !== null &&
@@ -2229,7 +2465,9 @@ try {
       'layout placeholder resize, undo, and selection retention stayed inside the layout',
       'new slide instantiated title/body frames from the active layout exactly',
       'a rejected focused onBlur commit kept the clean presentation open',
+      'an unapplied TSV draft remained close-blocking after its editor was detached',
       'Alt+F4-equivalent close committed a focused onBlur table cell before the native save prompt',
+      'post-Cancel renderer received its exact release IPC, admitted a reversible edit, and reached the retry prompt',
       'Alt+F4-equivalent close flushed an immediate inline draft before the native save prompt',
       'stale Discard consent could not discard a concurrent agent mutation',
       'Design and Properties inspector tabs switched',

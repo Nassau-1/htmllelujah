@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  isWindowCloseRelease,
   isWindowCloseRequest,
   isWindowCloseResponse,
   type WindowCloseDecision,
+  type WindowCloseRelease,
   type WindowCloseRequest,
 } from '../shared/desktop-api.js';
 
@@ -45,6 +47,40 @@ export const retainWindowOnFailure = async (
   }
 };
 
+/** Releases a renderer close seal only while the prepared window is still retained. */
+export const releaseRendererCloseSealIfRetained = (
+  window: DestroyableWindow,
+  requestId: string,
+  release: (value: WindowCloseRelease) => void,
+): boolean => {
+  const value = { requestId };
+  if (window.isDestroyed() || !isWindowCloseRelease(value)) return false;
+  try {
+    release(Object.freeze(value));
+    return true;
+  } catch {
+    // The renderer watchdog remains the bounded fallback if WebContents disappears mid-send.
+    return false;
+  }
+};
+
+/**
+ * Completes a close attempt that already consumed a renderer `ready` response. Cancelled dialogs,
+ * failed saves, and collaboration errors all retain the window and therefore release that exact
+ * renderer generation. A successfully destroyed window never receives a release.
+ */
+export const retainWindowAfterRendererClosePreparation = async (
+  window: DestroyableWindow,
+  requestId: string,
+  operation: () => Promise<void>,
+  report: () => Promise<void>,
+  release: (value: WindowCloseRelease) => void,
+): Promise<boolean> => {
+  const completed = await retainWindowOnFailure(window, operation, report);
+  releaseRendererCloseSealIfRetained(window, requestId, release);
+  return completed;
+};
+
 /**
  * Cleans a replacement session only while it remains detached from every native window.
  * Ownership is checked both before asynchronous preparation and immediately before close so a
@@ -67,15 +103,19 @@ export const cleanupSessionIfUnowned = async (
  * may consume it during dispatch; every throw or no-event return revokes it before a later retry.
  */
 export const runAuthorizedWindowClose = (
-  preparedCloses: Set<number>,
+  preparedCloses: Map<number, string>,
   webContentsId: number,
+  requestId: string,
   close: () => void,
-): void => {
-  preparedCloses.add(webContentsId);
+): boolean => {
+  preparedCloses.set(webContentsId, requestId);
   try {
     close();
+    return !preparedCloses.has(webContentsId);
   } finally {
-    preparedCloses.delete(webContentsId);
+    if (preparedCloses.get(webContentsId) === requestId) {
+      preparedCloses.delete(webContentsId);
+    }
   }
 };
 

@@ -31,6 +31,7 @@ import {
 } from 'electron';
 import { z } from 'zod';
 
+import { BoundedShutdownAdmission, settleShutdownTasks } from './bounded-shutdown.js';
 import { DesktopCollaborationCoordinator } from './collaboration-service.js';
 import {
   assertDecodedDimensions,
@@ -55,7 +56,8 @@ import {
   cleanupSessionIfUnowned,
   initializeWindowSafely,
   RendererCloseHandshakeBroker,
-  retainWindowOnFailure,
+  releaseRendererCloseSealIfRetained,
+  retainWindowAfterRendererClosePreparation,
   runAuthorizedWindowClose,
 } from './window-lifecycle.js';
 import {
@@ -68,6 +70,7 @@ import {
   type ExportResult,
   type InitializeResult,
   type McpStatus,
+  type WindowCloseRelease,
   type SessionView,
 } from '../shared/desktop-api.js';
 
@@ -121,7 +124,7 @@ const assetTokens = new Map<
 const tokensByWebContents = new Map<number, Set<string>>();
 const closingWindows = new Set<number>();
 const closingDecisions = new Set<number>();
-const rendererPreparedCloses = new Set<number>();
+const rendererPreparedCloses = new Map<number, string>();
 const rendererCloseHandshake = new RendererCloseHandshakeBroker();
 let pendingOpenPath: string | undefined;
 
@@ -1500,7 +1503,8 @@ const mcpBridge = new DesktopMcpBridge({
 });
 
 let mcpRpcServer: LocalRpcServerHandle | undefined;
-let gracefulShutdownStarted = false;
+const gracefulShutdownAdmission = new BoundedShutdownAdmission();
+const FINAL_SHUTDOWN_TIMEOUT_MS = 15_000;
 
 const reportCloseFailure = async (window: BrowserWindow): Promise<void> => {
   await dialog.showMessageBox(window, {
@@ -1562,16 +1566,25 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
         rendererCloseHandshake.cancel(webContentsId);
       });
       window.once('ready-to-show', () => window.show());
+      const sendRendererCloseRelease = (release: WindowCloseRelease): void => {
+        if (window.isDestroyed() || window.webContents.isDestroyed()) {
+          throw new Error('The editor window closed before its close seal could be released.');
+        }
+        window.webContents.send(DESKTOP_IPC.windowCloseReleased, release);
+      };
+
       window.on('close', (event) => {
         const webContentsId = window.webContents.id;
         if (closingWindows.has(webContentsId)) return;
-        const rendererPrepared = rendererPreparedCloses.delete(webContentsId);
-        if (!rendererPrepared) {
+        const rendererPreparedRequestId = rendererPreparedCloses.get(webContentsId);
+        if (rendererPreparedRequestId !== undefined) rendererPreparedCloses.delete(webContentsId);
+        if (rendererPreparedRequestId === undefined) {
           event.preventDefault();
           if (closingDecisions.has(webContentsId)) return;
           closingDecisions.add(webContentsId);
           void (async (): Promise<void> => {
             let handedOff = false;
+            let readyRequestId: string | undefined;
             try {
               const result = await rendererCloseHandshake.request(webContentsId, (request) => {
                 if (window.isDestroyed() || window.webContents.isDestroyed()) {
@@ -1579,36 +1592,83 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
                 }
                 window.webContents.send(DESKTOP_IPC.windowCloseRequested, request);
               });
-              if (result.decision !== 'ready') {
+              if (result.decision !== 'ready' || result.requestId === undefined) {
+                if (result.requestId !== undefined) {
+                  releaseRendererCloseSealIfRetained(
+                    window,
+                    result.requestId,
+                    sendRendererCloseRelease,
+                  );
+                }
                 if (!window.isDestroyed()) {
                   await reportCloseFailure(window).catch(() => undefined);
                 }
                 return;
               }
               if (window.isDestroyed()) return;
+              readyRequestId = result.requestId;
               closingDecisions.delete(webContentsId);
-              handedOff = true;
-              runAuthorizedWindowClose(rendererPreparedCloses, webContentsId, () => window.close());
+              handedOff = runAuthorizedWindowClose(
+                rendererPreparedCloses,
+                webContentsId,
+                readyRequestId,
+                () => window.close(),
+              );
             } catch {
               if (!window.isDestroyed()) await reportCloseFailure(window).catch(() => undefined);
             } finally {
-              if (!handedOff) closingDecisions.delete(webContentsId);
+              if (!handedOff) {
+                closingDecisions.delete(webContentsId);
+                if (readyRequestId !== undefined) {
+                  releaseRendererCloseSealIfRetained(
+                    window,
+                    readyRequestId,
+                    sendRendererCloseRelease,
+                  );
+                }
+              }
             }
           })();
           return;
         }
+        event.preventDefault();
         if (closingDecisions.has(webContentsId)) {
           event.preventDefault();
+          releaseRendererCloseSealIfRetained(
+            window,
+            rendererPreparedRequestId,
+            sendRendererCloseRelease,
+          );
           return;
         }
         const sessionId = windowSessions.get(webContentsId);
-        if (sessionId === undefined) return;
-        const collaborationMode = collaboration.mode(sessionId);
+        if (sessionId === undefined) {
+          releaseRendererCloseSealIfRetained(
+            window,
+            rendererPreparedRequestId,
+            sendRendererCloseRelease,
+          );
+          void reportCloseFailure(window).catch(() => undefined);
+          return;
+        }
+        let collaborationMode: 'offline' | 'host' | 'guest';
+        try {
+          collaborationMode = collaboration.mode(sessionId);
+        } catch {
+          releaseRendererCloseSealIfRetained(
+            window,
+            rendererPreparedRequestId,
+            sendRendererCloseRelease,
+          );
+          void reportCloseFailure(window).catch(() => undefined);
+          return;
+        }
         if (collaborationMode !== 'offline') {
           event.preventDefault();
           closingDecisions.add(webContentsId);
-          void retainWindowOnFailure(
+          void retainWindowAfterRendererClosePreparation(
             window,
+            rendererPreparedRequestId,
             async () => {
               let discardDetachedChanges = false;
               let closeRevision: string | undefined;
@@ -1670,15 +1730,28 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
               window.destroy();
             },
             () => reportCloseFailure(window),
+            sendRendererCloseRelease,
           ).finally(() => closingDecisions.delete(webContentsId));
           return;
         }
-        const snapshot = runtime.getSnapshot(sessionId);
+        let snapshot: DocumentSessionSnapshot;
+        try {
+          snapshot = runtime.getSnapshot(sessionId);
+        } catch {
+          releaseRendererCloseSealIfRetained(
+            window,
+            rendererPreparedRequestId,
+            sendRendererCloseRelease,
+          );
+          void reportCloseFailure(window).catch(() => undefined);
+          return;
+        }
         if (!snapshot.dirty) {
           event.preventDefault();
           closingDecisions.add(webContentsId);
-          void retainWindowOnFailure(
+          void retainWindowAfterRendererClosePreparation(
             window,
+            rendererPreparedRequestId,
             async () => {
               await collaboration.shutdown(sessionId);
               await runtime.close(sessionId, { expectedRevision: snapshot.revision });
@@ -1690,13 +1763,15 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
               window.destroy();
             },
             () => reportCloseFailure(window),
+            sendRendererCloseRelease,
           ).finally(() => closingDecisions.delete(webContentsId));
           return;
         }
         event.preventDefault();
         closingDecisions.add(webContentsId);
-        void retainWindowOnFailure(
+        void retainWindowAfterRendererClosePreparation(
           window,
+          rendererPreparedRequestId,
           async () => {
             const choice = await dialog.showMessageBox(window, {
               type: 'warning',
@@ -1729,6 +1804,7 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
             window.destroy();
           },
           () => reportCloseFailure(window),
+          sendRendererCloseRelease,
         ).finally(() => closingDecisions.delete(webContentsId));
       });
 
@@ -2325,13 +2401,28 @@ else {
   });
 
   app.on('will-quit', (event) => {
-    if (gracefulShutdownStarted) return;
-    gracefulShutdownStarted = true;
-    event.preventDefault();
+    if (!gracefulShutdownAdmission.intercept(event)) return;
     rendererCloseHandshake.dispose();
     mcpBridge.revokeApprovals();
-    void Promise.allSettled([collaboration.shutdownAll(), mcpRpcServer?.close()]).finally(() => {
-      app.exit(0);
-    });
+    void settleShutdownTasks(
+      [
+        { name: 'collaboration', run: () => collaboration.shutdownAll() },
+        { name: 'mcp', run: () => mcpRpcServer?.close() },
+      ],
+      FINAL_SHUTDOWN_TIMEOUT_MS,
+    ).then(
+      (report) => {
+        for (const result of report.tasks) {
+          if (result.status !== 'fulfilled') {
+            console.error(`[shutdown] ${result.name} shutdown ${result.status}.`);
+          }
+        }
+        app.exit(report.ok ? 0 : 1);
+      },
+      () => {
+        console.error('[shutdown] Final shutdown coordination failed.');
+        app.exit(1);
+      },
+    );
   });
 }

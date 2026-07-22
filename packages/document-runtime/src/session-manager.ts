@@ -303,6 +303,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
   readonly #defaultProposalTtlMs: number;
   readonly #recoveryBlobGcMinAgeMs: number;
   readonly #stagedBlobHashes = new Map<string, number>();
+  #recoveryBlobGcInFlight: Promise<RecoveryBlobGcResult> | undefined;
 
   public constructor(options: DocumentRuntimeOptions) {
     this.#recovery = new RuntimeRecoveryStore(options.recoveryDirectory);
@@ -471,6 +472,10 @@ export class DocumentSessionManager implements DocumentRuntimeService {
       () => undefined,
     );
     return result;
+  }
+
+  #scheduleRecoveryGarbageCollection(): void {
+    void this.collectRecoveryGarbageMainOnly().catch(() => undefined);
   }
 
   #assertMainOnlyPath(targetPath: string): void {
@@ -1237,7 +1242,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         revision: state.revision,
         dirty: false,
       });
-      await this.collectRecoveryGarbageMainOnly().catch(() => undefined);
+      this.#scheduleRecoveryGarbageCollection();
       return this.#snapshot(state);
     } catch (error) {
       if (error instanceof DocumentRuntimeError && error.code === 'JOURNAL_FAILED') throw error;
@@ -1408,7 +1413,7 @@ export class DocumentSessionManager implements DocumentRuntimeService {
         dirtyDiscarded: dirty && options.preserveRecovery !== true,
       });
       if (options.preserveRecovery !== true) {
-        await this.collectRecoveryGarbageMainOnly().catch(() => undefined);
+        this.#scheduleRecoveryGarbageCollection();
       }
     });
   }
@@ -1623,7 +1628,22 @@ export class DocumentSessionManager implements DocumentRuntimeService {
   }
 
   /** Main-process-only, bounded mark-and-sweep over the private content-addressed blob store. */
-  public async collectRecoveryGarbageMainOnly(): Promise<RecoveryBlobGcResult> {
+  public collectRecoveryGarbageMainOnly(): Promise<RecoveryBlobGcResult> {
+    if (this.#recoveryBlobGcInFlight !== undefined) return this.#recoveryBlobGcInFlight;
+    const collection = this.#collectRecoveryGarbagePassMainOnly();
+    this.#recoveryBlobGcInFlight = collection;
+    void collection.then(
+      () => {
+        if (this.#recoveryBlobGcInFlight === collection) this.#recoveryBlobGcInFlight = undefined;
+      },
+      () => {
+        if (this.#recoveryBlobGcInFlight === collection) this.#recoveryBlobGcInFlight = undefined;
+      },
+    );
+    return collection;
+  }
+
+  async #collectRecoveryGarbagePassMainOnly(): Promise<RecoveryBlobGcResult> {
     const referenced = new Set<string>(this.#stagedBlobHashes.keys());
     for (const state of this.#sessions.values()) {
       markDocumentAssetHashes(state.document, referenced);

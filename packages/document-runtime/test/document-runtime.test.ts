@@ -8,7 +8,7 @@ import {
   createDefaultDeck,
   type TransactionMetadata,
 } from '@htmllelujah/document-core';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   defaultJournalDurability,
@@ -997,10 +997,83 @@ describe('save, reopen, assets, and conflicts', () => {
     expect(await readFile(path.join(directory, 'blobs', assetHash))).toEqual(bytes);
 
     await manager.close(session.sessionId, { discardUnsaved: true });
+    await manager.collectRecoveryGarbageMainOnly();
     await expect(readFile(path.join(directory, 'blobs', assetHash))).rejects.toMatchObject({
       code: 'ENOENT',
     });
     expect(removed.document.assets).toHaveLength(0);
+  });
+
+  it('keeps best-effort recovery garbage collection off the critical close path', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory, { recoveryBlobGcMinAgeMs: 0 });
+    const session = await manager.createMainOnly();
+    let finishCollection: () => void = () => undefined;
+    const collection = vi.spyOn(manager, 'collectRecoveryGarbageMainOnly').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishCollection = () =>
+            resolve({
+              scanned: 0,
+              deleted: 0,
+              retained: 0,
+              truncated: false,
+            });
+        }),
+    );
+
+    await expect(
+      manager.close(session.sessionId, {
+        discardUnsaved: true,
+        expectedRevision: session.revision,
+      }),
+    ).resolves.toBeUndefined();
+    await Promise.resolve();
+    expect(collection).toHaveBeenCalledOnce();
+    expect(manager.listSessions()).toEqual([]);
+    finishCollection();
+  });
+
+  it('keeps rejected recovery garbage collection off the durable save path', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(path.join(directory, 'recovery'), {
+      recoveryBlobGcMinAgeMs: 0,
+    });
+    const session = await manager.createMainOnly();
+    let rejectCollection: (reason: unknown) => void = () => undefined;
+    const collection = vi.spyOn(manager, 'collectRecoveryGarbageMainOnly').mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectCollection = reject;
+        }),
+    );
+
+    await expect(
+      manager.saveAsMainOnly(session.sessionId, {
+        targetPath: path.join(directory, 'saved.hdeck'),
+        expectedFingerprint: null,
+      }),
+    ).resolves.toMatchObject({ dirty: false, hasSaveTarget: true });
+    await Promise.resolve();
+    expect(collection).toHaveBeenCalledOnce();
+
+    rejectCollection(new Error('best-effort collection failed'));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  it('coalesces concurrent recovery garbage collection passes', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory, { recoveryBlobGcMinAgeMs: 0 });
+
+    const first = manager.collectRecoveryGarbageMainOnly();
+    const concurrent = manager.collectRecoveryGarbageMainOnly();
+    expect(concurrent).toBe(first);
+    await expect(first).resolves.toMatchObject({ deleted: 0 });
+
+    const later = manager.collectRecoveryGarbageMainOnly();
+    expect(later).not.toBe(first);
+    await expect(later).resolves.toMatchObject({ deleted: 0 });
   });
 
   it('autosaves a bound target and flush observes the durable result', async () => {

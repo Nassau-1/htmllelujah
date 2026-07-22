@@ -14,6 +14,24 @@ and releases use semantic versions.
 
 ### Fixed
 
+- Made every editable inspector and canvas field register its exact blur commit before
+  native window closure, retain rejected or failed values visibly, drain superseded and
+  concurrent commits to a bounded deadline, and keep the presentation open whenever the
+  last human edit cannot be applied safely.
+- Kept an unapplied table TSV draft close-blocking even after its textarea is unmounted by
+  a selection change, so a hidden draft cannot be silently discarded during native close.
+- Correlated renderer close preparation with a one-time main-process release nonce so a
+  cancelled or retained native close immediately permits a clean retry without reopening
+  the mutation race; stale releases cannot unlock a newer close generation and the
+  deadline remains a fail-safe watchdog.
+- Diagnosed retained-window failures separately from invisible process hangs in the real
+  Electron smoke, required the exact correlated release event after Cancel, exercised an
+  immediate close retry, and bounded final collaboration and MCP shutdown so an
+  already-closed presentation cannot leave a background Electron process alive
+  indefinitely; reentrant quit requests remain intercepted until that drain completes.
+- Moved best-effort recovery-blob garbage collection behind the durable save and session
+  close boundaries, so filesystem maintenance cannot retain an already-approved native
+  close while still observing every late collection failure.
 - Gave the complete Windows source-verification gate a measured one-hour ceiling,
   preserved the timeout diagnosis across process termination, and failed closed when
   its validation process tree cannot be drained.

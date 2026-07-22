@@ -29,8 +29,12 @@ import {
 import {
   activeElementNeedsBlurCommit,
   adjacentSlideIndex,
+  BlurCommitBarrier,
   canAutoCommitInlineText,
   claimInlineTextCommit,
+  closeExecutionMayStart,
+  CorrelatedCloseSeal,
+  CloseExecutionBarrier,
   consumeInlineTextBlurSuppression,
   inlineTextCanCloseWithoutApply,
   inlineTextEditorKeyAction,
@@ -59,6 +63,195 @@ describe('accessible editor interactions', () => {
     expect(activeElementNeedsBlurCommit('DIV', true)).toBe(true);
     expect(activeElementNeedsBlurCommit('button', false)).toBe(false);
     expect(activeElementNeedsBlurCommit('body', false)).toBe(false);
+  });
+  it('seals close-time execution admission before the final drain', () => {
+    expect(closeExecutionMayStart(false, false, false, false)).toBe(true);
+    expect(closeExecutionMayStart(true, true, false, false)).toBe(true);
+    expect(closeExecutionMayStart(true, false, true, false)).toBe(true);
+    expect(closeExecutionMayStart(true, false, false, false)).toBe(false);
+    expect(closeExecutionMayStart(true, true, false, true)).toBe(false);
+    expect(closeExecutionMayStart(true, false, true, true)).toBe(false);
+  });
+
+  it('releases only the exact close generation and ignores a stale release', () => {
+    const seal = new CorrelatedCloseSeal();
+    expect(seal.seal('')).toBe(false);
+    expect(seal.seal('request-1')).toBe(true);
+    expect(seal.activeRequestId).toBe('request-1');
+    expect(seal.release('request-2')).toBe(false);
+    expect(seal.activeRequestId).toBe('request-1');
+    expect(seal.release('request-1')).toBe(true);
+    expect(seal.activeRequestId).toBeNull();
+    expect(seal.seal('request-2')).toBe(true);
+    expect(seal.release('request-1')).toBe(false);
+    expect(seal.activeRequestId).toBe('request-2');
+    expect(seal.release('request-2')).toBe(true);
+  });
+
+  it('retains rejected blur commits per control until that control explicitly succeeds', async () => {
+    const barrier = new BlurCommitBarrier<object>();
+    const firstField = {};
+    const secondField = {};
+
+    await expect(barrier.attempt(firstField, () => false)).resolves.toBe(false);
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(false);
+
+    await expect(barrier.attempt(secondField, () => true)).resolves.toBe(true);
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(false);
+
+    await expect(barrier.attempt(firstField, () => Promise.resolve(true))).resolves.toBe(true);
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(true);
+
+    await expect(
+      barrier.attempt(firstField, () => Promise.reject(new Error('commit rejected'))),
+    ).resolves.toBe(false);
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(false);
+
+    await expect(
+      barrier.attempt(firstField, () => {
+        throw new Error('commit threw');
+      }),
+    ).resolves.toBe(false);
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(false);
+
+    barrier.prune((key) => key !== firstField);
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(true);
+  });
+
+  it('retains a logical draft while pruning a detached control attempt', async () => {
+    const barrier = new BlurCommitBarrier<object>();
+    const logicalDraft = {};
+    const detachedControl = {};
+
+    await expect(barrier.attempt(logicalDraft, () => false)).resolves.toBe(false);
+    await expect(barrier.attempt(detachedControl, () => false)).resolves.toBe(false);
+    await expect(barrier.settle(Date.now() + 500, (key) => key === logicalDraft)).resolves.toBe(
+      false,
+    );
+
+    await expect(barrier.attempt(logicalDraft, () => true)).resolves.toBe(true);
+    await expect(barrier.settle(Date.now() + 500, (key) => key === logicalDraft)).resolves.toBe(
+      true,
+    );
+  });
+
+  it('lets a newer successful attempt supersede an older stuck attempt immediately', async () => {
+    const barrier = new BlurCommitBarrier<object>();
+    const field = {};
+    let releaseOld: (applied: boolean) => void = () => undefined;
+    void barrier.attempt(
+      field,
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseOld = resolve;
+        }),
+    );
+
+    const settling = barrier.settle(Date.now() + 500);
+    await Promise.resolve();
+    await expect(barrier.attempt(field, () => true)).resolves.toBe(true);
+    await expect(settling).resolves.toBe(true);
+    releaseOld(false);
+  });
+
+  it('does not let an older late success erase the newest rejected attempt', async () => {
+    const barrier = new BlurCommitBarrier<object>();
+    const field = {};
+    let releaseOld: (applied: boolean) => void = () => undefined;
+    void barrier.attempt(
+      field,
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseOld = resolve;
+        }),
+    );
+
+    await expect(barrier.attempt(field, () => false)).resolves.toBe(false);
+    releaseOld(true);
+    await Promise.resolve();
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(false);
+
+    await expect(barrier.attempt(field, () => true)).resolves.toBe(true);
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(true);
+  });
+
+  it('bounds a pending blur attempt by the close deadline', async () => {
+    const barrier = new BlurCommitBarrier<object>();
+    const field = {};
+    void barrier.attempt(field, () => new Promise<boolean>(() => undefined));
+    const startedAt = Date.now();
+    await expect(barrier.settle(Date.now() + 25)).resolves.toBe(false);
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    barrier.prune(() => false);
+    await expect(barrier.settle(Date.now() + 500)).resolves.toBe(true);
+  });
+
+  it('drains commands pending or added during close and reaches a microtask-stable result', async () => {
+    const barrier = new CloseExecutionBarrier();
+    let releaseFirst: (applied: boolean) => void = () => undefined;
+    barrier.track(
+      new Promise<boolean>((resolve) => {
+        releaseFirst = resolve;
+      }),
+    );
+    const drain = barrier.begin();
+    const settled = drain.settle(Date.now() + 500);
+    barrier.track(Promise.resolve(false));
+    releaseFirst(true);
+
+    await expect(settled).resolves.toBe(false);
+    drain.end();
+
+    const microtaskDrain = barrier.begin();
+    const microtaskSettled = microtaskDrain.settle(Date.now() + 500);
+    queueMicrotask(() => barrier.track(Promise.resolve(false)));
+    await expect(microtaskSettled).resolves.toBe(false);
+    microtaskDrain.end();
+
+    const rejectedDrain = barrier.begin();
+    barrier.track(Promise.reject(new Error('execute failed')));
+    await expect(rejectedDrain.settle(Date.now() + 500)).resolves.toBe(false);
+    rejectedDrain.end();
+
+    const successfulDrain = barrier.begin();
+    barrier.track(Promise.resolve(true));
+    await expect(successfulDrain.settle(Date.now() + 500)).resolves.toBe(true);
+    successfulDrain.end();
+  });
+
+  it('bounds a stuck close command and rejects admission after the final seal', async () => {
+    const stuckBarrier = new CloseExecutionBarrier();
+    stuckBarrier.track(new Promise<boolean>(() => undefined));
+    const stuckDrain = stuckBarrier.begin();
+    const startedAt = Date.now();
+    await expect(stuckDrain.settle(Date.now() + 25)).resolves.toBe(false);
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    stuckDrain.end();
+    const retryDrain = stuckBarrier.begin();
+    retryDrain.end();
+
+    const sealedBarrier = new CloseExecutionBarrier();
+    let release: (applied: boolean) => void = () => undefined;
+    sealedBarrier.track(
+      new Promise<boolean>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const sealedDrain = sealedBarrier.begin();
+    const sealed = sealedDrain.sealAndSettle(Date.now() + 500);
+    queueMicrotask(() => sealedBarrier.track(Promise.resolve(true)));
+    release(true);
+    await expect(sealed).resolves.toBe(false);
+    sealedDrain.end();
+
+    const nestedBarrier = new CloseExecutionBarrier();
+    const nestedDrain = nestedBarrier.begin();
+    const nestedSettled = nestedDrain.sealAndSettle(Date.now() + 500);
+    queueMicrotask(() => queueMicrotask(() => nestedBarrier.track(Promise.resolve(false))));
+    await expect(nestedSettled).resolves.toBe(true);
+    expect(nestedDrain.isSealedStable()).toBe(false);
+    await expect(nestedDrain.sealAndSettle(Date.now() + 500)).resolves.toBe(false);
+    nestedDrain.end();
   });
 
   it('authorizes only an exact stable canvas selection', () => {

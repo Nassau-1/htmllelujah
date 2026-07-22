@@ -32,6 +32,7 @@ export const DESKTOP_IPC = Object.freeze({
   mcpCreateApproval: 'htmllelujah:v1:mcp-create-approval',
   windowCloseRequested: 'htmllelujah:v1:event-window-close-requested',
   windowCloseResponse: 'htmllelujah:v1:window-close-response',
+  windowCloseReleased: 'htmllelujah:v1:event-window-close-released',
   documentChanged: 'htmllelujah:v1:event-document-changed',
   presentationChanged: 'htmllelujah:v1:event-presentation-changed',
 } as const);
@@ -250,12 +251,16 @@ export interface WindowCloseResponse {
   readonly requestId: string;
   readonly decision: WindowCloseDecision;
 }
+export interface WindowCloseRelease {
+  readonly requestId: string;
+}
 
 export type WindowCloseRequestListener = (
   request: WindowCloseRequest,
 ) => WindowCloseDecision | Promise<WindowCloseDecision>;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+export type WindowCloseReleaseListener = (release: WindowCloseRelease) => void;
 
 const isStrictRecord = (
   value: unknown,
@@ -280,6 +285,10 @@ export const isWindowCloseResponse = (value: unknown): value is WindowCloseRespo
   typeof value.requestId === 'string' &&
   UUID_PATTERN.test(value.requestId) &&
   (value.decision === 'ready' || value.decision === 'blocked');
+export const isWindowCloseRelease = (value: unknown): value is WindowCloseRelease =>
+  isStrictRecord(value, ['requestId']) &&
+  typeof value.requestId === 'string' &&
+  UUID_PATTERN.test(value.requestId);
 
 /** A native close is safe only when every registered renderer participant explicitly agrees. */
 export const settleWindowCloseListeners = async (
@@ -352,6 +361,7 @@ export interface HtmllelujahDesktopApi {
   mcpCreateApproval(input: McpApprovalInput): Promise<DesktopResult<McpApproval>>;
   onWindowCloseRequested(listener: WindowCloseRequestListener): () => void;
   onDocumentChanged(listener: (event: SafeDocumentChangedEvent) => void): () => void;
+  onWindowCloseReleased(listener: WindowCloseReleaseListener): () => void;
   onPresentationChanged(listener: (event: PresentationChangedEvent) => void): () => void;
 }
 

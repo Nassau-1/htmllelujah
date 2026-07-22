@@ -8,11 +8,17 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   cleanupSessionIfUnowned,
   RendererCloseHandshakeBroker,
+  releaseRendererCloseSealIfRetained,
   initializeWindowSafely,
   retainWindowOnFailure,
+  retainWindowAfterRendererClosePreparation,
   runAuthorizedWindowClose,
 } from '../src/main/window-lifecycle.js';
-import { settleWindowCloseListeners, type WindowCloseRequest } from '../src/shared/desktop-api.js';
+import {
+  isWindowCloseRelease,
+  settleWindowCloseListeners,
+  type WindowCloseRequest,
+} from '../src/shared/desktop-api.js';
 
 const FIRST_REQUEST_ID = '11111111-1111-4111-8111-111111111111';
 const SECOND_REQUEST_ID = '22222222-2222-4222-8222-222222222222';
@@ -106,6 +112,61 @@ describe('native window lifecycle guards', () => {
     expect(window.destroy).not.toHaveBeenCalled();
   });
 
+  it('releases the exact renderer generation after every retained close outcome', async () => {
+    const cancelled = fakeWindow();
+    const cancelRelease = vi.fn();
+    await expect(
+      retainWindowAfterRendererClosePreparation(
+        cancelled,
+        FIRST_REQUEST_ID,
+        async () => undefined,
+        async () => undefined,
+        cancelRelease,
+      ),
+    ).resolves.toBe(true);
+    expect(cancelRelease).toHaveBeenCalledWith({ requestId: FIRST_REQUEST_ID });
+    expect(Object.isFrozen(cancelRelease.mock.calls[0]?.[0])).toBe(true);
+
+    const failed = fakeWindow();
+    const failureRelease = vi.fn();
+    const report = vi.fn(async () => undefined);
+    await expect(
+      retainWindowAfterRendererClosePreparation(
+        failed,
+        FIRST_REQUEST_ID,
+        async () => Promise.reject(new Error('save failed')),
+        report,
+        failureRelease,
+      ),
+    ).resolves.toBe(false);
+    expect(report).toHaveBeenCalledOnce();
+    expect(failureRelease).toHaveBeenCalledWith({ requestId: FIRST_REQUEST_ID });
+
+    const destroyed = fakeWindow();
+    const destroyRelease = vi.fn();
+    await expect(
+      retainWindowAfterRendererClosePreparation(
+        destroyed,
+        FIRST_REQUEST_ID,
+        async () => destroyed.destroy(),
+        async () => undefined,
+        destroyRelease,
+      ),
+    ).resolves.toBe(true);
+    expect(destroyRelease).not.toHaveBeenCalled();
+
+    const sendFailure = vi.fn(() => {
+      throw new Error('webContents disappeared');
+    });
+    expect(releaseRendererCloseSealIfRetained(fakeWindow(), FIRST_REQUEST_ID, sendFailure)).toBe(
+      false,
+    );
+    expect(sendFailure).toHaveBeenCalledOnce();
+    expect(isWindowCloseRelease({ requestId: FIRST_REQUEST_ID })).toBe(true);
+    expect(isWindowCloseRelease({ requestId: FIRST_REQUEST_ID, extra: true })).toBe(false);
+    expect(isWindowCloseRelease({ requestId: 'not-a-request-id' })).toBe(false);
+  });
+
   it('never closes a cleanup candidate that already has or gains a window owner', async () => {
     let owned = true;
     const prepare = vi.fn(async () => undefined);
@@ -130,19 +191,31 @@ describe('native window lifecycle guards', () => {
   });
 
   it('revokes a one-shot native close authorization after success, no event, or failure', () => {
-    const prepared = new Set<number>();
+    const prepared = new Map<number, string>();
     const webContentsId = 41;
 
-    runAuthorizedWindowClose(prepared, webContentsId, () => {
-      expect(prepared.delete(webContentsId)).toBe(true);
-    });
+    expect(
+      runAuthorizedWindowClose(prepared, webContentsId, FIRST_REQUEST_ID, () => {
+        expect(prepared.delete(webContentsId)).toBe(true);
+      }),
+    ).toBe(true);
     expect(prepared.has(webContentsId)).toBe(false);
 
-    runAuthorizedWindowClose(prepared, webContentsId, () => undefined);
+    expect(
+      runAuthorizedWindowClose(prepared, webContentsId, FIRST_REQUEST_ID, () => undefined),
+    ).toBe(false);
     expect(prepared.has(webContentsId)).toBe(false);
+
+    expect(
+      runAuthorizedWindowClose(prepared, webContentsId, FIRST_REQUEST_ID, () => {
+        prepared.set(webContentsId, SECOND_REQUEST_ID);
+      }),
+    ).toBe(false);
+    expect(prepared.get(webContentsId)).toBe(SECOND_REQUEST_ID);
+    prepared.delete(webContentsId);
 
     expect(() =>
-      runAuthorizedWindowClose(prepared, webContentsId, () => {
+      runAuthorizedWindowClose(prepared, webContentsId, FIRST_REQUEST_ID, () => {
         throw new Error('native close failed');
       }),
     ).toThrow('native close failed');

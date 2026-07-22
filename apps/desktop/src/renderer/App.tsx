@@ -141,11 +141,16 @@ import {
 import {
   activeElementNeedsBlurCommit,
   adjacentSlideIndex,
+  BlurCommitBarrier,
   canAutoCommitInlineText,
+  closeExecutionMayStart,
+  CorrelatedCloseSeal,
+  CloseExecutionBarrier,
   consumeInlineTextBlurSuppression,
   inlineTextCanCloseWithoutApply,
   retainInlineTextEditingTarget,
   runInlineTextCommitOnce,
+  settleBooleanBeforeDeadline,
   shouldPreserveDetachedTextDraft,
   textDraftAutosaveMayAttempt,
   textDraftTargetHasChanged,
@@ -670,7 +675,11 @@ function EditorApp() {
   const canLeaveInlineTextEditorRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
   const closePreparationInFlightRef = useRef(false);
   const allowExecuteDuringCloseBlurRef = useRef(false);
-  const closeBlurExecutionResultsRef = useRef<Promise<boolean>[] | null>(null);
+  const closeExecutionAdmissionSealedRef = useRef(false);
+  const correlatedCloseSealRef = useRef(new CorrelatedCloseSeal());
+  const blurCommitBarrierRef = useRef(new BlurCommitBarrier<object>());
+  const closeExecutionBarrierRef = useRef(new CloseExecutionBarrier());
+  const tableTsvDraftCommitKeyRef = useRef({ kind: 'table-tsv-draft' as const });
 
   const acceptSession = useCallback((next: SessionView): void => {
     sessionRef.current = next;
@@ -686,6 +695,25 @@ function EditorApp() {
   const notify = useCallback((message: string, kind: Toast['kind'] = 'info'): void => {
     setToast({ message, kind });
   }, []);
+
+  const commitOnBlur = useCallback(
+    (target: object, action: () => boolean | Promise<boolean>): Promise<boolean> =>
+      blurCommitBarrierRef.current.attempt(target, action),
+    [],
+  );
+
+  const restoreBlurValue = useCallback(
+    (
+      target: HTMLInputElement | HTMLTextAreaElement,
+      persistedValue: string | number,
+      message?: string,
+    ): boolean => {
+      target.value = String(persistedValue);
+      if (message !== undefined) notify(message, 'error');
+      return true;
+    },
+    [notify],
+  );
 
   const updateTextDraftDirty = useCallback((dirty: boolean): void => {
     textDraftDirtyRef.current = dirty;
@@ -1127,15 +1155,14 @@ function EditorApp() {
         readonly preserveInlineTextDraft?: boolean;
       } = {},
     ): Promise<boolean> => {
-      const closeBlurResults =
-        closePreparationInFlightRef.current && allowExecuteDuringCloseBlurRef.current
-          ? closeBlurExecutionResultsRef.current
-          : null;
       const operation = (async (): Promise<boolean> => {
         if (
-          closePreparationInFlightRef.current &&
-          !allowExecuteDuringCloseBlurRef.current &&
-          options.preserveInlineTextDraft !== true
+          !closeExecutionMayStart(
+            closePreparationInFlightRef.current,
+            allowExecuteDuringCloseBlurRef.current,
+            options.preserveInlineTextDraft === true,
+            closeExecutionAdmissionSealedRef.current,
+          )
         )
           return false;
         if (
@@ -1189,12 +1216,7 @@ function EditorApp() {
         );
         return queued;
       })();
-      if (closeBlurResults === null) return operation;
-      const tracked = operation.then(
-        (applied) => applied,
-        () => false,
-      );
-      closeBlurResults.push(tracked);
+      const tracked = closeExecutionBarrierRef.current.track(operation);
       return tracked;
     },
     [acceptSession, busy, notify, showFailure],
@@ -1525,14 +1547,14 @@ function EditorApp() {
   );
 
   const patchElement = useCallback(
-    (replacement: Element, label = 'Update object'): void => {
-      if (designSurface !== 'slide' || activeSlide === undefined) return;
+    (replacement: Element, label = 'Update object'): Promise<boolean> => {
+      if (designSurface !== 'slide' || activeSlide === undefined) return Promise.resolve(false);
       const slideId = activeSlide.id;
       const baseline = sessionRef.current?.snapshot.document.slides
         .find((slide) => slide.id === slideId)
         ?.elements.find((element) => element.id === replacement.id);
-      if (baseline === undefined) return;
-      void execute(label, (latestDocument) => {
+      if (baseline === undefined) return Promise.resolve(false);
+      return execute(label, (latestDocument) => {
         const latest = latestDocument.slides
           .find((slide) => slide.id === slideId)
           ?.elements.find((element) => element.id === replacement.id);
@@ -1981,15 +2003,35 @@ function EditorApp() {
   useLayoutEffect(() => {
     canLeaveInlineTextEditorRef.current = canLeaveInlineTextEditor;
   }, [canLeaveInlineTextEditor]);
+  const releaseClosePreparation = useCallback((requestId: string): boolean => {
+    if (!correlatedCloseSealRef.current.release(requestId)) return false;
+    closeExecutionAdmissionSealedRef.current = false;
+    closePreparationInFlightRef.current = false;
+    return true;
+  }, []);
+  useEffect(
+    () =>
+      window.htmllelujah.onWindowCloseReleased((release) => {
+        releaseClosePreparation(release.requestId);
+      }),
+    [releaseClosePreparation],
+  );
   useEffect(
     () =>
       window.htmllelujah.onWindowCloseRequested(async (request) => {
-        if (Date.now() >= request.deadlineAtMs || closePreparationInFlightRef.current)
+        const settleDeadlineAtMs = request.deadlineAtMs - 50;
+        if (
+          Date.now() >= settleDeadlineAtMs ||
+          closePreparationInFlightRef.current ||
+          correlatedCloseSealRef.current.activeRequestId !== null
+        )
           return 'blocked';
         closePreparationInFlightRef.current = true;
+        closeExecutionAdmissionSealedRef.current = false;
+        let closeExecutions: ReturnType<CloseExecutionBarrier['begin']> | null = null;
+        let keepAdmissionSealed = false;
         try {
-          const closeBlurResults: Promise<boolean>[] = [];
-          closeBlurExecutionResultsRef.current = closeBlurResults;
+          closeExecutions = closeExecutionBarrierRef.current.begin();
           allowExecuteDuringCloseBlurRef.current = true;
           try {
             const activeElement = window.document.activeElement;
@@ -2002,25 +2044,64 @@ function EditorApp() {
             await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
           } finally {
             allowExecuteDuringCloseBlurRef.current = false;
-            closeBlurExecutionResultsRef.current = null;
           }
-          if (!(await Promise.all(closeBlurResults)).every((applied) => applied)) return 'blocked';
-          if (!(await canLeaveInlineTextEditorRef.current())) return 'blocked';
+          if (
+            !(await blurCommitBarrierRef.current.settle(
+              settleDeadlineAtMs,
+              (target) =>
+                target === tableTsvDraftCommitKeyRef.current ||
+                (target instanceof HTMLElement && target.isConnected),
+            ))
+          )
+            return 'blocked';
+          if (!(await closeExecutions.settle(settleDeadlineAtMs))) return 'blocked';
+          if (
+            !(await settleBooleanBeforeDeadline(
+              canLeaveInlineTextEditorRef.current(),
+              settleDeadlineAtMs,
+            ))
+          )
+            return 'blocked';
+          if (!(await closeExecutions.settle(settleDeadlineAtMs))) return 'blocked';
           for (;;) {
             const queued = executeQueueRef.current;
-            await queued;
+            if (
+              !(await settleBooleanBeforeDeadline(
+                queued.then(
+                  () => true,
+                  () => false,
+                ),
+                settleDeadlineAtMs,
+              ))
+            )
+              return 'blocked';
             if (queued === executeQueueRef.current && pendingExecuteCountRef.current === 0) break;
           }
-          return Date.now() < request.deadlineAtMs ? 'ready' : 'blocked';
+          closeExecutionAdmissionSealedRef.current = true;
+          if (!(await closeExecutions.sealAndSettle(settleDeadlineAtMs))) return 'blocked';
+          if (!closeExecutions.isSealedStable()) {
+            if (!(await closeExecutions.sealAndSettle(settleDeadlineAtMs))) return 'blocked';
+            if (!closeExecutions.isSealedStable()) return 'blocked';
+          }
+          if (Date.now() >= settleDeadlineAtMs) return 'blocked';
+          if (!correlatedCloseSealRef.current.seal(request.requestId)) return 'blocked';
+          keepAdmissionSealed = true;
+          return 'ready';
         } catch {
           return 'blocked';
         } finally {
+          closeExecutions?.end();
           allowExecuteDuringCloseBlurRef.current = false;
-          closeBlurExecutionResultsRef.current = null;
-          closePreparationInFlightRef.current = false;
+          if (keepAdmissionSealed) {
+            const remainingMs = Math.max(0, request.deadlineAtMs - Date.now());
+            window.setTimeout(() => releaseClosePreparation(request.requestId), remainingMs);
+          } else {
+            closeExecutionAdmissionSealedRef.current = false;
+            closePreparationInFlightRef.current = false;
+          }
         }
       }),
-    [],
+    [releaseClosePreparation],
   );
   useEffect(() => {
     if (inlineTextElementId === null || primaryText?.id !== inlineTextElementId) return;
@@ -2168,15 +2249,17 @@ function EditorApp() {
           tsv: tableTsv,
         },
       ])
-    )
+    ) {
       setTableTsv('');
-  }, [activeSlide, execute, primaryTable, tableTsv]);
+      void commitOnBlur(tableTsvDraftCommitKeyRef.current, () => true);
+    }
+  }, [activeSlide, commitOnBlur, execute, primaryTable, tableTsv]);
 
   const updateImageCrop = useCallback(
-    (side: keyof ImageElement['crop'], raw: string): void => {
-      if (primaryImage === undefined) return;
+    (side: keyof ImageElement['crop'], raw: string): Promise<boolean> => {
+      if (primaryImage === undefined) return Promise.resolve(false);
       const requested = Number(raw);
-      if (!Number.isFinite(requested)) return;
+      if (!Number.isFinite(requested)) return Promise.resolve(false);
       const opposite =
         side === 'left'
           ? primaryImage.crop.right
@@ -2185,7 +2268,7 @@ function EditorApp() {
             : side === 'top'
               ? primaryImage.crop.bottom
               : primaryImage.crop.top;
-      patchElement(
+      return patchElement(
         {
           ...primaryImage,
           crop: {
@@ -2204,9 +2287,9 @@ function EditorApp() {
       connector: ConnectorElement,
       endpoint: 'start' | 'end',
       value: ConnectorElement['start'],
-    ): void => {
-      if (activeSlide === undefined) return;
-      void execute('Update connector endpoint', [
+    ): Promise<boolean> => {
+      if (activeSlide === undefined) return Promise.resolve(false);
+      return execute('Update connector endpoint', [
         {
           type: 'connector.update-endpoint',
           slideId: activeSlide.id,
@@ -2220,8 +2303,12 @@ function EditorApp() {
   );
 
   const updateTheme = useCallback(
-    (themeId: string, updater: (theme: Theme) => Theme, label = 'Update theme'): void => {
-      void execute(label, (latestDocument) => {
+    (
+      themeId: string,
+      updater: (theme: Theme) => Theme,
+      label = 'Update theme',
+    ): Promise<boolean> => {
+      return execute(label, (latestDocument) => {
         const latest = latestDocument.themes.find((theme) => theme.id === themeId);
         if (latest === undefined) return [];
         return [{ type: 'theme.update', themeId, replacement: updater(latest) }];
@@ -2257,9 +2344,9 @@ function EditorApp() {
   }, [designTheme, document, execute]);
 
   const updateThemeTextStyle = useCallback(
-    (role: TextStyleRole, patch: Partial<Omit<TextStyle, 'id' | 'role'>>): void => {
-      if (designTheme === undefined) return;
-      updateTheme(
+    (role: TextStyleRole, patch: Partial<Omit<TextStyle, 'id' | 'role'>>): Promise<boolean> => {
+      if (designTheme === undefined) return Promise.resolve(false);
+      return updateTheme(
         designTheme.id,
         (theme) => updateThemeRoleStyle(theme, role, patch),
         `Update ${role} style`,
@@ -2269,12 +2356,12 @@ function EditorApp() {
   );
 
   const updateMaster = useCallback(
-    (replacement: Master, label = 'Update master'): void => {
+    (replacement: Master, label = 'Update master'): Promise<boolean> => {
       const baseline = sessionRef.current?.snapshot.document.masters.find(
         (master) => master.id === replacement.id,
       );
-      if (baseline === undefined) return;
-      void execute(label, (latestDocument) => {
+      if (baseline === undefined) return Promise.resolve(false);
+      return execute(label, (latestDocument) => {
         const latest = latestDocument.masters.find((master) => master.id === replacement.id);
         if (latest === undefined) return [];
         return [
@@ -2290,12 +2377,12 @@ function EditorApp() {
   );
 
   const updateLayout = useCallback(
-    (replacement: Layout, label = 'Update layout'): void => {
+    (replacement: Layout, label = 'Update layout'): Promise<boolean> => {
       const baseline = sessionRef.current?.snapshot.document.layouts.find(
         (layout) => layout.id === replacement.id,
       );
-      if (baseline === undefined) return;
-      void execute(label, (latestDocument) => {
+      if (baseline === undefined) return Promise.resolve(false);
+      return execute(label, (latestDocument) => {
         const latest = latestDocument.layouts.find((layout) => layout.id === replacement.id);
         if (latest === undefined) return [];
         return [
@@ -3350,16 +3437,19 @@ function EditorApp() {
               });
             }}
             onInlineTextPaste={pasteRichText}
-            onInlineTextCommit={(confirmConflict, relatedTarget) => {
+            onInlineTextCommit={(target, confirmConflict, relatedTarget) => {
               if (!confirmConflict) {
-                if (consumeInlineTextBlurSuppression(suppressNextInlineBlurRef)) return;
+                if (consumeInlineTextBlurSuppression(suppressNextInlineBlurRef)) {
+                  void commitOnBlur(target, () => true);
+                  return;
+                }
                 if (
                   relatedTarget instanceof HTMLElement &&
                   relatedTarget.closest('.text-editor-section') !== null
                 )
                   return;
               }
-              void commitInlineText({ confirmConflict });
+              void commitOnBlur(target, () => commitInlineText({ confirmConflict }));
             }}
             onInlineTextCancel={revertTextDraft}
             onInlineTextFocus={() => {
@@ -3493,13 +3583,24 @@ function EditorApp() {
                         defaultValue={designTheme.name}
                         maxLength={120}
                         onBlur={(event) => {
-                          const name = event.currentTarget.value.trim();
-                          if (name !== '' && name !== designTheme.name)
-                            updateTheme(
+                          const target = event.currentTarget;
+                          void commitOnBlur(target, () => {
+                            const name = target.value.trim();
+                            if (name === designTheme.name)
+                              return restoreBlurValue(target, designTheme.name);
+                            if (name === '')
+                              return restoreBlurValue(
+                                target,
+                                designTheme.name,
+                                'A theme name cannot be empty.',
+                              );
+                            target.value = name;
+                            return updateTheme(
                               designTheme.id,
                               (theme) => ({ ...theme, name }),
                               'Rename theme',
                             );
+                          });
                         }}
                       />
                     </label>
@@ -3600,11 +3701,25 @@ function EditorApp() {
                               max="240"
                               key={`${style.id}-size`}
                               defaultValue={style.fontSizePt}
-                              onBlur={(event) =>
-                                updateThemeTextStyle(role, {
-                                  fontSizePt: clamp(Number(event.currentTarget.value), 6, 240),
-                                })
-                              }
+                              onBlur={(event) => {
+                                const target = event.currentTarget;
+                                void commitOnBlur(target, () => {
+                                  if (
+                                    target.value.trim() === '' ||
+                                    !Number.isFinite(target.valueAsNumber)
+                                  )
+                                    return restoreBlurValue(
+                                      target,
+                                      style.fontSizePt,
+                                      'Enter a valid font size.',
+                                    );
+                                  const fontSizePt = clamp(target.valueAsNumber, 6, 240);
+                                  if (fontSizePt === style.fontSizePt)
+                                    return restoreBlurValue(target, style.fontSizePt);
+                                  target.value = String(fontSizePt);
+                                  return updateThemeTextStyle(role, { fontSizePt });
+                                });
+                              }}
                             />
                           </label>
                           <label className="stacked-field">
@@ -3616,14 +3731,26 @@ function EditorApp() {
                               step="100"
                               key={`${style.id}-weight`}
                               defaultValue={style.fontWeight}
-                              onBlur={(event) =>
-                                updateThemeTextStyle(role, {
-                                  fontWeight:
-                                    Math.round(
-                                      clamp(Number(event.currentTarget.value), 100, 900) / 100,
-                                    ) * 100,
-                                })
-                              }
+                              onBlur={(event) => {
+                                const target = event.currentTarget;
+                                void commitOnBlur(target, () => {
+                                  if (
+                                    target.value.trim() === '' ||
+                                    !Number.isFinite(target.valueAsNumber)
+                                  )
+                                    return restoreBlurValue(
+                                      target,
+                                      style.fontWeight,
+                                      'Enter a valid font weight.',
+                                    );
+                                  const fontWeight =
+                                    Math.round(clamp(target.valueAsNumber, 100, 900) / 100) * 100;
+                                  if (fontWeight === style.fontWeight)
+                                    return restoreBlurValue(target, style.fontWeight);
+                                  target.value = String(fontWeight);
+                                  return updateThemeTextStyle(role, { fontWeight });
+                                });
+                              }}
                             />
                           </label>
                           <label className="toggle-row">
@@ -3645,11 +3772,25 @@ function EditorApp() {
                               step="0.05"
                               key={`${style.id}-line-height`}
                               defaultValue={style.lineHeight}
-                              onBlur={(event) =>
-                                updateThemeTextStyle(role, {
-                                  lineHeight: clamp(Number(event.currentTarget.value), 0.5, 4),
-                                })
-                              }
+                              onBlur={(event) => {
+                                const target = event.currentTarget;
+                                void commitOnBlur(target, () => {
+                                  if (
+                                    target.value.trim() === '' ||
+                                    !Number.isFinite(target.valueAsNumber)
+                                  )
+                                    return restoreBlurValue(
+                                      target,
+                                      style.lineHeight,
+                                      'Enter a valid line height.',
+                                    );
+                                  const lineHeight = clamp(target.valueAsNumber, 0.5, 4);
+                                  if (lineHeight === style.lineHeight)
+                                    return restoreBlurValue(target, style.lineHeight);
+                                  target.value = String(lineHeight);
+                                  return updateThemeTextStyle(role, { lineHeight });
+                                });
+                              }}
                             />
                           </label>
                           <label className="stacked-field">
@@ -3821,9 +3962,20 @@ function EditorApp() {
                         defaultValue={designLayout.name}
                         maxLength={120}
                         onBlur={(event) => {
-                          const name = event.currentTarget.value.trim();
-                          if (name !== '' && name !== designLayout.name)
-                            updateLayout({ ...designLayout, name }, 'Rename layout');
+                          const target = event.currentTarget;
+                          void commitOnBlur(target, () => {
+                            const name = target.value.trim();
+                            if (name === designLayout.name)
+                              return restoreBlurValue(target, designLayout.name);
+                            if (name === '')
+                              return restoreBlurValue(
+                                target,
+                                designLayout.name,
+                                'A layout name cannot be empty.',
+                              );
+                            target.value = name;
+                            return updateLayout({ ...designLayout, name }, 'Rename layout');
+                          });
                         }}
                       />
                     </label>
@@ -3915,19 +4067,22 @@ function EditorApp() {
                               key={`${placeholder.id}-prompt`}
                               defaultValue={placeholder.prompt}
                               onBlur={(event) => {
-                                const prompt = event.currentTarget.value;
-                                if (prompt === placeholder.prompt) return;
-                                updateLayout(
-                                  {
-                                    ...designLayout,
-                                    elements: designLayout.elements.map((element) =>
-                                      element.id === placeholder.id
-                                        ? { ...placeholder, prompt }
-                                        : element,
-                                    ),
-                                  },
-                                  'Edit placeholder prompt',
-                                );
+                                const target = event.currentTarget;
+                                void commitOnBlur(target, () => {
+                                  const prompt = target.value;
+                                  if (prompt === placeholder.prompt) return true;
+                                  return updateLayout(
+                                    {
+                                      ...designLayout,
+                                      elements: designLayout.elements.map((element) =>
+                                        element.id === placeholder.id
+                                          ? { ...placeholder, prompt }
+                                          : element,
+                                      ),
+                                    },
+                                    'Edit placeholder prompt',
+                                  );
+                                });
                               }}
                             />
                           </label>
@@ -3954,30 +4109,44 @@ function EditorApp() {
                                   step="1"
                                   defaultValue={Math.round(placeholder.frame[property])}
                                   onBlur={(event) => {
-                                    const value = Number(event.currentTarget.value);
-                                    if (!Number.isFinite(value)) return;
-                                    const maximum =
-                                      property === 'xPt' || property === 'widthPt'
-                                        ? document.page.widthPt
-                                        : document.page.heightPt;
-                                    const minimum =
-                                      property === 'widthPt' || property === 'heightPt' ? 12 : 0;
-                                    const replacement = {
-                                      ...placeholder,
-                                      frame: {
-                                        ...placeholder.frame,
-                                        [property]: clamp(value, minimum, maximum),
-                                      },
-                                    };
-                                    updateLayout(
-                                      {
-                                        ...designLayout,
-                                        elements: designLayout.elements.map((element) =>
-                                          element.id === placeholder.id ? replacement : element,
-                                        ),
-                                      },
-                                      'Resize layout placeholder',
-                                    );
+                                    const target = event.currentTarget;
+                                    void commitOnBlur(target, () => {
+                                      const persistedValue = Math.round(
+                                        placeholder.frame[property],
+                                      );
+                                      if (
+                                        target.value.trim() === '' ||
+                                        !Number.isFinite(target.valueAsNumber)
+                                      )
+                                        return restoreBlurValue(
+                                          target,
+                                          persistedValue,
+                                          'Enter a valid placeholder position or size.',
+                                        );
+                                      if (target.valueAsNumber === persistedValue)
+                                        return restoreBlurValue(target, persistedValue);
+                                      const maximum =
+                                        property === 'xPt' || property === 'widthPt'
+                                          ? document.page.widthPt
+                                          : document.page.heightPt;
+                                      const minimum =
+                                        property === 'widthPt' || property === 'heightPt' ? 12 : 0;
+                                      const value = clamp(target.valueAsNumber, minimum, maximum);
+                                      target.value = String(value);
+                                      const replacement = {
+                                        ...placeholder,
+                                        frame: { ...placeholder.frame, [property]: value },
+                                      };
+                                      return updateLayout(
+                                        {
+                                          ...designLayout,
+                                          elements: designLayout.elements.map((element) =>
+                                            element.id === placeholder.id ? replacement : element,
+                                          ),
+                                        },
+                                        'Resize layout placeholder',
+                                      );
+                                    });
                                   }}
                                 />
                               </label>
@@ -4040,19 +4209,32 @@ function EditorApp() {
                           aria-label="Guide position in points"
                           defaultValue={guide.positionPt}
                           onBlur={(event) => {
-                            const positionPt = Number(event.currentTarget.value);
-                            if (!Number.isFinite(positionPt)) return;
-                            updateLayout(
-                              {
-                                ...designLayout,
-                                guides: designLayout.guides.map((candidate) =>
-                                  candidate.id === guide.id
-                                    ? { ...candidate, positionPt }
-                                    : candidate,
-                                ),
-                              },
-                              'Move layout guide',
-                            );
+                            const target = event.currentTarget;
+                            void commitOnBlur(target, () => {
+                              if (
+                                target.value.trim() === '' ||
+                                !Number.isFinite(target.valueAsNumber)
+                              )
+                                return restoreBlurValue(
+                                  target,
+                                  guide.positionPt,
+                                  'Enter a valid guide position.',
+                                );
+                              const positionPt = target.valueAsNumber;
+                              if (positionPt === guide.positionPt)
+                                return restoreBlurValue(target, guide.positionPt);
+                              return updateLayout(
+                                {
+                                  ...designLayout,
+                                  guides: designLayout.guides.map((candidate) =>
+                                    candidate.id === guide.id
+                                      ? { ...candidate, positionPt }
+                                      : candidate,
+                                  ),
+                                },
+                                'Move layout guide',
+                              );
+                            });
                           }}
                         />
                         <button
@@ -4138,9 +4320,20 @@ function EditorApp() {
                         defaultValue={designMaster.name}
                         maxLength={120}
                         onBlur={(event) => {
-                          const name = event.currentTarget.value.trim();
-                          if (name !== '' && name !== designMaster.name)
-                            updateMaster({ ...designMaster, name }, 'Rename master');
+                          const target = event.currentTarget;
+                          void commitOnBlur(target, () => {
+                            const name = target.value.trim();
+                            if (name === designMaster.name)
+                              return restoreBlurValue(target, designMaster.name);
+                            if (name === '')
+                              return restoreBlurValue(
+                                target,
+                                designMaster.name,
+                                'A master name cannot be empty.',
+                              );
+                            target.value = name;
+                            return updateMaster({ ...designMaster, name }, 'Rename master');
+                          });
                         }}
                       />
                     </label>
@@ -4248,19 +4441,30 @@ function EditorApp() {
                             defaultValue={designSelectedElement.name}
                             maxLength={120}
                             onBlur={(event) => {
-                              const name = event.currentTarget.value.trim();
-                              if (name === '' || name === designSelectedElement.name) return;
-                              updateMaster(
-                                {
-                                  ...designMaster,
-                                  elements: designMaster.elements.map((element) =>
-                                    element.id === designSelectedElement.id
-                                      ? { ...element, name }
-                                      : element,
-                                  ),
-                                },
-                                'Rename master object',
-                              );
+                              const target = event.currentTarget;
+                              void commitOnBlur(target, () => {
+                                const name = target.value.trim();
+                                if (name === designSelectedElement.name)
+                                  return restoreBlurValue(target, designSelectedElement.name);
+                                if (name === '')
+                                  return restoreBlurValue(
+                                    target,
+                                    designSelectedElement.name,
+                                    'An object name cannot be empty.',
+                                  );
+                                target.value = name;
+                                return updateMaster(
+                                  {
+                                    ...designMaster,
+                                    elements: designMaster.elements.map((element) =>
+                                      element.id === designSelectedElement.id
+                                        ? { ...element, name }
+                                        : element,
+                                    ),
+                                  },
+                                  'Rename master object',
+                                );
+                              });
                             }}
                           />
                         </label>
@@ -4281,31 +4485,44 @@ function EditorApp() {
                                 type="number"
                                 defaultValue={Math.round(designSelectedElement.frame[property])}
                                 onBlur={(event) => {
-                                  const raw = Number(event.currentTarget.value);
-                                  if (!Number.isFinite(raw)) return;
-                                  const value =
-                                    property === 'rotationDeg'
-                                      ? clamp(raw, -180, 180)
-                                      : property === 'widthPt' || property === 'heightPt'
-                                        ? clamp(raw, 12, 20_000)
-                                        : clamp(raw, -20_000, 20_000);
-                                  updateMaster(
-                                    {
-                                      ...designMaster,
-                                      elements: designMaster.elements.map((element) =>
-                                        element.id === designSelectedElement.id
-                                          ? {
-                                              ...element,
-                                              frame: {
-                                                ...element.frame,
-                                                [property]: value,
-                                              },
-                                            }
-                                          : element,
-                                      ),
-                                    },
-                                    'Edit master object geometry',
-                                  );
+                                  const target = event.currentTarget;
+                                  void commitOnBlur(target, () => {
+                                    const persistedValue = Math.round(
+                                      designSelectedElement.frame[property],
+                                    );
+                                    if (
+                                      target.value.trim() === '' ||
+                                      !Number.isFinite(target.valueAsNumber)
+                                    )
+                                      return restoreBlurValue(
+                                        target,
+                                        persistedValue,
+                                        'Enter a valid object position or size.',
+                                      );
+                                    if (target.valueAsNumber === persistedValue)
+                                      return restoreBlurValue(target, persistedValue);
+                                    const value =
+                                      property === 'rotationDeg'
+                                        ? clamp(target.valueAsNumber, -180, 180)
+                                        : property === 'widthPt' || property === 'heightPt'
+                                          ? clamp(target.valueAsNumber, 12, 20_000)
+                                          : clamp(target.valueAsNumber, -20_000, 20_000);
+                                    target.value = String(value);
+                                    return updateMaster(
+                                      {
+                                        ...designMaster,
+                                        elements: designMaster.elements.map((element) =>
+                                          element.id === designSelectedElement.id
+                                            ? {
+                                                ...element,
+                                                frame: { ...element.frame, [property]: value },
+                                              }
+                                            : element,
+                                        ),
+                                      },
+                                      'Edit master object geometry',
+                                    );
+                                  });
                                 }}
                               />
                             </label>
@@ -4339,26 +4556,33 @@ function EditorApp() {
                             <textarea
                               key={`${designSelectedElement.id}-text`}
                               defaultValue={contentToPlainText(designSelectedElement.content)}
-                              onBlur={(event) =>
-                                updateMaster(
-                                  {
-                                    ...designMaster,
-                                    elements: designMaster.elements.map((element) =>
-                                      element.id === designSelectedElement.id &&
-                                      element.type === 'text'
-                                        ? {
-                                            ...element,
-                                            content: replacePlainTextPreservingStyles(
-                                              element.content,
-                                              event.currentTarget.value,
-                                            ),
-                                          }
-                                        : element,
-                                    ),
-                                  },
-                                  'Edit master text',
-                                )
-                              }
+                              onBlur={(event) => {
+                                const target = event.currentTarget;
+                                void commitOnBlur(target, () => {
+                                  const persistedText = contentToPlainText(
+                                    designSelectedElement.content,
+                                  );
+                                  if (target.value === persistedText) return true;
+                                  return updateMaster(
+                                    {
+                                      ...designMaster,
+                                      elements: designMaster.elements.map((element) =>
+                                        element.id === designSelectedElement.id &&
+                                        element.type === 'text'
+                                          ? {
+                                              ...element,
+                                              content: replacePlainTextPreservingStyles(
+                                                element.content,
+                                                target.value,
+                                              ),
+                                            }
+                                          : element,
+                                      ),
+                                    },
+                                    'Edit master text',
+                                  );
+                                });
+                              }}
                             />
                           </label>
                         ) : null}
@@ -4473,19 +4697,32 @@ function EditorApp() {
                           aria-label="Master guide position in points"
                           defaultValue={guide.positionPt}
                           onBlur={(event) => {
-                            const positionPt = Number(event.currentTarget.value);
-                            if (!Number.isFinite(positionPt)) return;
-                            updateMaster(
-                              {
-                                ...designMaster,
-                                guides: designMaster.guides.map((candidate) =>
-                                  candidate.id === guide.id
-                                    ? { ...candidate, positionPt }
-                                    : candidate,
-                                ),
-                              },
-                              'Move master guide',
-                            );
+                            const target = event.currentTarget;
+                            void commitOnBlur(target, () => {
+                              if (
+                                target.value.trim() === '' ||
+                                !Number.isFinite(target.valueAsNumber)
+                              )
+                                return restoreBlurValue(
+                                  target,
+                                  guide.positionPt,
+                                  'Enter a valid guide position.',
+                                );
+                              const positionPt = target.valueAsNumber;
+                              if (positionPt === guide.positionPt)
+                                return restoreBlurValue(target, guide.positionPt);
+                              return updateMaster(
+                                {
+                                  ...designMaster,
+                                  guides: designMaster.guides.map((candidate) =>
+                                    candidate.id === guide.id
+                                      ? { ...candidate, positionPt }
+                                      : candidate,
+                                  ),
+                                },
+                                'Move master guide',
+                              );
+                            });
                           }}
                         />
                         <button
@@ -4762,7 +4999,8 @@ function EditorApp() {
                   onBlurCapture={(event) => {
                     if (event.currentTarget.contains(event.relatedTarget)) return;
                     textEditorFocusedRef.current = false;
-                    void commitInlineText();
+                    const target = event.currentTarget;
+                    void commitOnBlur(target, () => commitInlineText());
                   }}
                 >
                   <div className="section-heading-row">
@@ -5119,11 +5357,14 @@ function EditorApp() {
                       maxLength={2_000}
                       defaultValue={primaryImage.altText}
                       onBlur={(event) => {
-                        if (event.currentTarget.value !== primaryImage.altText)
-                          patchElement(
-                            { ...primaryImage, altText: event.currentTarget.value },
+                        const target = event.currentTarget;
+                        void commitOnBlur(target, () => {
+                          if (target.value === primaryImage.altText) return true;
+                          return patchElement(
+                            { ...primaryImage, altText: target.value },
                             'Edit image description',
                           );
+                        });
                       }}
                     />
                   </label>
@@ -5157,9 +5398,35 @@ function EditorApp() {
                           max="99"
                           step="1"
                           defaultValue={Math.round(primaryImage.crop[side] * 100)}
-                          onBlur={(event) =>
-                            updateImageCrop(side, String(Number(event.currentTarget.value) / 100))
-                          }
+                          onBlur={(event) => {
+                            const target = event.currentTarget;
+                            void commitOnBlur(target, () => {
+                              const persistedPercent = Math.round(primaryImage.crop[side] * 100);
+                              if (
+                                target.value.trim() === '' ||
+                                !Number.isFinite(target.valueAsNumber)
+                              )
+                                return restoreBlurValue(
+                                  target,
+                                  persistedPercent,
+                                  'Enter a valid crop percentage.',
+                                );
+                              const requested = target.valueAsNumber / 100;
+                              const opposite =
+                                side === 'left'
+                                  ? primaryImage.crop.right
+                                  : side === 'right'
+                                    ? primaryImage.crop.left
+                                    : side === 'top'
+                                      ? primaryImage.crop.bottom
+                                      : primaryImage.crop.top;
+                              const crop = clamp(requested, 0, Math.max(0, 0.99 - opposite));
+                              if (crop === primaryImage.crop[side])
+                                return restoreBlurValue(target, persistedPercent);
+                              target.value = String(crop * 100);
+                              return updateImageCrop(side, String(requested));
+                            });
+                          }}
                         />
                       </label>
                     ))}
@@ -5173,9 +5440,21 @@ function EditorApp() {
                       max="100"
                       defaultValue={Math.round(primaryImage.opacity * 100)}
                       onBlur={(event) => {
-                        const opacity = clamp(Number(event.currentTarget.value) / 100, 0, 1);
-                        if (Number.isFinite(opacity) && opacity !== primaryImage.opacity)
-                          patchElement({ ...primaryImage, opacity }, 'Change image opacity');
+                        const target = event.currentTarget;
+                        void commitOnBlur(target, () => {
+                          const persistedPercent = Math.round(primaryImage.opacity * 100);
+                          if (target.value.trim() === '' || !Number.isFinite(target.valueAsNumber))
+                            return restoreBlurValue(
+                              target,
+                              persistedPercent,
+                              'Enter a valid opacity percentage.',
+                            );
+                          const opacity = clamp(target.valueAsNumber / 100, 0, 1);
+                          if (opacity === primaryImage.opacity)
+                            return restoreBlurValue(target, persistedPercent);
+                          target.value = String(opacity * 100);
+                          return patchElement({ ...primaryImage, opacity }, 'Change image opacity');
+                        });
                       }}
                     />
                   </label>
@@ -5281,15 +5560,29 @@ function EditorApp() {
                         step="0.25"
                         defaultValue={primaryElement.stroke.widthPt}
                         onBlur={(event) => {
-                          const widthPt = clamp(Number(event.currentTarget.value), 0, 24);
-                          if (!Number.isFinite(widthPt)) return;
-                          patchElement(
-                            {
-                              ...primaryElement,
-                              stroke: { ...primaryElement.stroke, widthPt },
-                            },
-                            'Change shape stroke width',
-                          );
+                          const target = event.currentTarget;
+                          void commitOnBlur(target, () => {
+                            if (
+                              target.value.trim() === '' ||
+                              !Number.isFinite(target.valueAsNumber)
+                            )
+                              return restoreBlurValue(
+                                target,
+                                primaryElement.stroke.widthPt,
+                                'Enter a valid stroke width.',
+                              );
+                            const widthPt = clamp(target.valueAsNumber, 0, 24);
+                            if (widthPt === primaryElement.stroke.widthPt)
+                              return restoreBlurValue(target, primaryElement.stroke.widthPt);
+                            target.value = String(widthPt);
+                            return patchElement(
+                              {
+                                ...primaryElement,
+                                stroke: { ...primaryElement.stroke, widthPt },
+                              },
+                              'Change shape stroke width',
+                            );
+                          });
                         }}
                       />
                     </label>
@@ -5303,12 +5596,26 @@ function EditorApp() {
                         step="1"
                         defaultValue={primaryElement.cornerRadiusPt}
                         onBlur={(event) => {
-                          const cornerRadiusPt = clamp(Number(event.currentTarget.value), 0, 240);
-                          if (!Number.isFinite(cornerRadiusPt)) return;
-                          patchElement(
-                            { ...primaryElement, cornerRadiusPt },
-                            'Change corner radius',
-                          );
+                          const target = event.currentTarget;
+                          void commitOnBlur(target, () => {
+                            if (
+                              target.value.trim() === '' ||
+                              !Number.isFinite(target.valueAsNumber)
+                            )
+                              return restoreBlurValue(
+                                target,
+                                primaryElement.cornerRadiusPt,
+                                'Enter a valid corner radius.',
+                              );
+                            const cornerRadiusPt = clamp(target.valueAsNumber, 0, 240);
+                            if (cornerRadiusPt === primaryElement.cornerRadiusPt)
+                              return restoreBlurValue(target, primaryElement.cornerRadiusPt);
+                            target.value = String(cornerRadiusPt);
+                            return patchElement(
+                              { ...primaryElement, cornerRadiusPt },
+                              'Change corner radius',
+                            );
+                          });
                         }}
                       />
                     </label>
@@ -5437,15 +5744,29 @@ function EditorApp() {
                         step="0.25"
                         defaultValue={primaryElement.stroke.widthPt}
                         onBlur={(event) => {
-                          const widthPt = clamp(Number(event.currentTarget.value), 0, 24);
-                          if (!Number.isFinite(widthPt)) return;
-                          patchElement(
-                            {
-                              ...primaryElement,
-                              stroke: { ...primaryElement.stroke, widthPt },
-                            },
-                            'Change connector width',
-                          );
+                          const target = event.currentTarget;
+                          void commitOnBlur(target, () => {
+                            if (
+                              target.value.trim() === '' ||
+                              !Number.isFinite(target.valueAsNumber)
+                            )
+                              return restoreBlurValue(
+                                target,
+                                primaryElement.stroke.widthPt,
+                                'Enter a valid connector width.',
+                              );
+                            const widthPt = clamp(target.valueAsNumber, 0, 24);
+                            if (widthPt === primaryElement.stroke.widthPt)
+                              return restoreBlurValue(target, primaryElement.stroke.widthPt);
+                            target.value = String(widthPt);
+                            return patchElement(
+                              {
+                                ...primaryElement,
+                                stroke: { ...primaryElement.stroke, widthPt },
+                              },
+                              'Change connector width',
+                            );
+                          });
                         }}
                       />
                     </label>
@@ -5535,11 +5856,24 @@ function EditorApp() {
                                 disabled={endpoint.binding.elementId !== undefined}
                                 defaultValue={endpoint[axis]}
                                 onBlur={(event) => {
-                                  const value = Number(event.currentTarget.value);
-                                  if (!Number.isFinite(value)) return;
-                                  updateConnectorEndpoint(primaryElement, endpointName, {
-                                    ...endpoint,
-                                    [axis]: value,
+                                  const target = event.currentTarget;
+                                  void commitOnBlur(target, () => {
+                                    if (
+                                      target.value.trim() === '' ||
+                                      !Number.isFinite(target.valueAsNumber)
+                                    )
+                                      return restoreBlurValue(
+                                        target,
+                                        endpoint[axis],
+                                        'Enter a valid endpoint coordinate.',
+                                      );
+                                    const value = target.valueAsNumber;
+                                    if (value === endpoint[axis])
+                                      return restoreBlurValue(target, endpoint[axis]);
+                                    return updateConnectorEndpoint(primaryElement, endpointName, {
+                                      ...endpoint,
+                                      [axis]: value,
+                                    });
                                   });
                                 }}
                               />
@@ -5662,17 +5996,20 @@ function EditorApp() {
                             defaultValue={contentToPlainText(cell.content)}
                             onFocus={() => setSelectedTableCellId(cell.id)}
                             onBlur={(event) => {
-                              const value = event.currentTarget.value;
-                              if (value === contentToPlainText(cell.content)) return;
-                              void execute('Edit table cell', [
-                                {
-                                  type: 'table.update-cell',
-                                  slideId: activeSlide.id,
-                                  tableId: primaryTable.id,
-                                  cellId: cell.id,
-                                  content: plainParagraph(value),
-                                },
-                              ]);
+                              const target = event.currentTarget;
+                              void commitOnBlur(target, () => {
+                                const value = target.value;
+                                if (value === contentToPlainText(cell.content)) return true;
+                                return execute('Edit table cell', [
+                                  {
+                                    type: 'table.update-cell',
+                                    slideId: activeSlide.id,
+                                    tableId: primaryTable.id,
+                                    cellId: cell.id,
+                                    content: plainParagraph(value),
+                                  },
+                                ]);
+                              });
                             }}
                           />
                         );
@@ -5689,7 +6026,15 @@ function EditorApp() {
                     aria-label="Table cells (tab-separated values)"
                     value={tableTsv}
                     placeholder={'Paste tab-separated cells\nName\tValue'}
-                    onChange={(event) => setTableTsv(event.currentTarget.value)}
+                    onChange={(event) => {
+                      const target = event.currentTarget;
+                      const value = target.value;
+                      setTableTsv(value);
+                      void commitOnBlur(
+                        tableTsvDraftCommitKeyRef.current,
+                        () => value.trim() === '',
+                      );
+                    }}
                   />
                   <button
                     type="button"
@@ -5831,17 +6176,30 @@ function EditorApp() {
                         step="0.25"
                         defaultValue={primaryTable.border.widthPt}
                         onBlur={(event) => {
-                          const widthPt = clamp(Number(event.currentTarget.value), 0, 24);
-                          if (!Number.isFinite(widthPt) || widthPt === primaryTable.border.widthPt)
-                            return;
-                          void execute('Change table border width', [
-                            {
-                              type: 'table.update-style',
-                              slideId: activeSlide.id,
-                              tableId: primaryTable.id,
-                              border: { ...primaryTable.border, widthPt },
-                            },
-                          ]);
+                          const target = event.currentTarget;
+                          void commitOnBlur(target, () => {
+                            if (
+                              target.value.trim() === '' ||
+                              !Number.isFinite(target.valueAsNumber)
+                            )
+                              return restoreBlurValue(
+                                target,
+                                primaryTable.border.widthPt,
+                                'Enter a valid table border width.',
+                              );
+                            const widthPt = clamp(target.valueAsNumber, 0, 24);
+                            if (widthPt === primaryTable.border.widthPt)
+                              return restoreBlurValue(target, primaryTable.border.widthPt);
+                            target.value = String(widthPt);
+                            return execute('Change table border width', [
+                              {
+                                type: 'table.update-style',
+                                slideId: activeSlide.id,
+                                tableId: primaryTable.id,
+                                border: { ...primaryTable.border, widthPt },
+                              },
+                            ]);
+                          });
                         }}
                       />
                     </label>

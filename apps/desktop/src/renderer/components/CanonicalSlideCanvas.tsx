@@ -74,7 +74,12 @@ type CanonicalSlideCanvasProps = {
   readonly onInlineTextPaste?:
     ((event: ReactClipboardEvent<HTMLTextAreaElement>) => void) | undefined;
   readonly onInlineTextCommit?:
-    ((confirmConflict: boolean, relatedTarget: EventTarget | null) => void) | undefined;
+    | ((
+        target: HTMLTextAreaElement,
+        confirmConflict: boolean,
+        relatedTarget: EventTarget | null,
+      ) => void)
+    | undefined;
   readonly onInlineTextCancel?: (() => void) | undefined;
   readonly onInlineTextFocus?: (() => void) | undefined;
 };
@@ -421,7 +426,11 @@ export function InlineTextCanvasEditorOverlay({
   editor: InlineTextCanvasEditor;
   onChange: (value: string) => void;
   onPaste: (event: ReactClipboardEvent<HTMLTextAreaElement>) => void;
-  onCommit: (confirmConflict: boolean, relatedTarget: EventTarget | null) => void;
+  onCommit: (
+    target: HTMLTextAreaElement,
+    confirmConflict: boolean,
+    relatedTarget: EventTarget | null,
+  ) => void;
   onCancel: () => void;
   onFocus: () => void;
 }>) {
@@ -462,7 +471,7 @@ export function InlineTextCanvasEditorOverlay({
           lineHeight: editor.lineHeight,
           textAlign: editor.alignment,
         }}
-        onBlur={(event) => onCommit(false, event.relatedTarget)}
+        onBlur={(event) => onCommit(event.currentTarget, false, event.relatedTarget)}
         onChange={(event) => onChange(event.currentTarget.value)}
         onFocus={onFocus}
         onPaste={onPaste}
@@ -475,7 +484,7 @@ export function InlineTextCanvasEditorOverlay({
           if (action === 'none') return;
           event.preventDefault();
           event.stopPropagation();
-          if (action === 'commit') onCommit(true, null);
+          if (action === 'commit') onCommit(event.currentTarget, true, null);
           else onCancel();
         }}
       />

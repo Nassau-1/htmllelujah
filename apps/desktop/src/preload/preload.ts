@@ -20,6 +20,7 @@ import {
   type HtmllelujahDesktopApi,
   type ImportImageResult,
   type InitializeResult,
+  isWindowCloseRelease,
   isWindowCloseRequest,
   type McpStatus,
   type McpApproval,
@@ -30,6 +31,7 @@ import {
   type SessionInput,
   type SessionView,
   settleWindowCloseListeners,
+  type WindowCloseReleaseListener,
   type WindowCloseRequestListener,
 } from '../shared/desktop-api.js';
 import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
@@ -38,6 +40,7 @@ const invoke = <T>(channel: string, input?: unknown): Promise<DesktopResult<T>> 
   ipcRenderer.invoke(channel, input) as Promise<DesktopResult<T>>;
 
 const windowCloseListeners = new Set<WindowCloseRequestListener>();
+const windowCloseReleaseListeners = new Set<WindowCloseReleaseListener>();
 const activeWindowCloseRequests = new Set<string>();
 
 ipcRenderer.on(DESKTOP_IPC.windowCloseRequested, (_electronEvent, value: unknown): void => {
@@ -61,6 +64,24 @@ ipcRenderer.on(DESKTOP_IPC.windowCloseRequested, (_electronEvent, value: unknown
     })
     .finally(() => activeWindowCloseRequests.delete(request.requestId));
 });
+ipcRenderer.on(DESKTOP_IPC.windowCloseReleased, (_electronEvent, value: unknown): void => {
+  if (!isWindowCloseRelease(value)) return;
+  const release = Object.freeze({ requestId: value.requestId });
+  for (const listener of [...windowCloseReleaseListeners]) {
+    try {
+      listener(release);
+    } catch {
+      // One isolated renderer listener cannot prevent the correlated seal from being released.
+    }
+  }
+});
+
+const onWindowCloseReleased = (listener: WindowCloseReleaseListener): (() => void) => {
+  if (typeof listener !== 'function')
+    throw new TypeError('A window-close release listener is required.');
+  windowCloseReleaseListeners.add(listener);
+  return () => windowCloseReleaseListeners.delete(listener);
+};
 
 const onWindowCloseRequested = (listener: WindowCloseRequestListener): (() => void) => {
   if (typeof listener !== 'function') throw new TypeError('A window-close listener is required.');
@@ -165,6 +186,7 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
   mcpStatus: (): Promise<DesktopResult<McpStatus>> => invoke(DESKTOP_IPC.mcpStatus),
   mcpCreateApproval: (input: McpApprovalInput): Promise<DesktopResult<McpApproval>> =>
     invoke(DESKTOP_IPC.mcpCreateApproval, input),
+  onWindowCloseReleased,
   onWindowCloseRequested,
   onDocumentChanged,
   onPresentationChanged,
