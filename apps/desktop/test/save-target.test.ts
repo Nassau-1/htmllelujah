@@ -12,7 +12,7 @@ describe('save target approval', () => {
         selectedPath: 'C:\\Decks\\quarterly',
         extension: '.hdeck',
         inspect,
-        confirmAddedExtensionOverwrite: confirm,
+        confirmOverwrite: confirm,
       }),
     ).resolves.toBeUndefined();
     expect(inspect).toHaveBeenCalledWith('C:\\Decks\\quarterly.hdeck');
@@ -24,7 +24,7 @@ describe('save target approval', () => {
         selectedPath: 'C:\\Decks\\quarterly',
         extension: '.hdeck',
         inspect,
-        confirmAddedExtensionOverwrite: confirm,
+        confirmOverwrite: confirm,
       }),
     ).resolves.toEqual({
       path: 'C:\\Decks\\quarterly.hdeck',
@@ -32,18 +32,33 @@ describe('save target approval', () => {
     });
   });
 
-  it('relies on the native dialog consent when the selected path is already final', async () => {
-    const confirm = vi.fn(async () => true);
+  it('requires explicit post-dialog consent when the selected path is already final', async () => {
+    const approvedState = { exists: true, fingerprint: 'post-dialog-fingerprint' };
+    const inspect = vi.fn(async () => approvedState);
+    const confirm = vi.fn(async () => false);
 
     await expect(
       resolveSaveTarget({
         selectedPath: 'C:\\Decks\\quarterly.HDECK',
         extension: '.hdeck',
-        inspect: async () => ({ exists: true, fingerprint: 'native-dialog-approved' }),
-        confirmAddedExtensionOverwrite: confirm,
+        inspect,
+        confirmOverwrite: confirm,
       }),
-    ).resolves.toMatchObject({ path: 'C:\\Decks\\quarterly.HDECK' });
-    expect(confirm).not.toHaveBeenCalled();
+    ).resolves.toBeUndefined();
+    expect(confirm).toHaveBeenCalledWith('C:\\Decks\\quarterly.HDECK');
+
+    confirm.mockResolvedValueOnce(true);
+    const approved = await resolveSaveTarget({
+      selectedPath: 'C:\\Decks\\quarterly.HDECK',
+      extension: '.hdeck',
+      inspect,
+      confirmOverwrite: confirm,
+    });
+    expect(approved).toEqual({
+      path: 'C:\\Decks\\quarterly.HDECK',
+      state: approvedState,
+    });
+    expect(approved?.state).toBe(approvedState);
   });
 
   it('does not prompt when the extension-created target does not exist', async () => {
@@ -54,7 +69,7 @@ describe('save target approval', () => {
         selectedPath: 'C:\\Decks\\new-deck',
         extension: '.hdeck',
         inspect: async () => ({ exists: false }),
-        confirmAddedExtensionOverwrite: confirm,
+        confirmOverwrite: confirm,
       }),
     ).resolves.toEqual({ path: 'C:\\Decks\\new-deck.hdeck', state: { exists: false } });
     expect(confirm).not.toHaveBeenCalled();

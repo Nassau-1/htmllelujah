@@ -10,11 +10,23 @@ and releases use semantic versions.
 - Gave the complete Windows source-verification gate a measured one-hour ceiling,
   preserved the timeout diagnosis across process termination, and failed closed when
   its validation process tree cannot be drained.
+- Made opened-app cleanup prove the captured Windows process tree absent at the OS
+  boundary across repeated post-termination inventories, recover newly observed
+  descendants without retargeting a reusable root PID, drain or explicitly destroy
+  inherited pipes, and preserve primary failures alongside any cleanup error.
 - Scoped Windows file and message-box automation to exact visible Win32
   process/HWND/class/control identities, supported both native filename-control variants,
-  made clicks synchronous and bounded, fingerprinted deferred consent generations, and
-  verified automation process-tree drainage without traversing Chromium accessibility
-  trees.
+  entered fully qualified paths through bounded native character messages, revalidated
+  identities during entry, rejected device namespaces, alternate data streams, reserved
+  names, unsafe characters, and overwrite races, kept clicks synchronous and
+  identity-checked, and required an exact file postcondition before reporting success.
+- Defaulted Save As and HTML/PDF exports beside the current presentation, or to an
+  absolute Documents fallback, while neutralizing Win32 device aliases such as `CON`
+  and `LPT1` without weakening UNC support.
+- Made standalone HTML and PDF visual evidence inspect decoded pixels for color,
+  luminance, light/dark regions, and edges; required two identical rendered PDF frames,
+  exact local-file navigation under CDP offline mode, a restrictive host resolver, the
+  browser version, and a verified browser process-tree cleanup receipt.
 - Calibrated the packaged V1 warm-start envelope to four seconds for the unsigned Windows
   executable plus evidence-only DevTools endpoint after repeated three-sample medians near
   3.3 seconds; the three-second optimization target, every raw sample, and every outlier

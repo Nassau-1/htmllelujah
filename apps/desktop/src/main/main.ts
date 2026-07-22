@@ -40,6 +40,10 @@ import {
 } from './image-import-validation.js';
 import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
 import { isTrustedRendererUrl, resolveRendererEntryUrl } from './renderer-entry.js';
+import {
+  buildSaveDialogDefaultPath,
+  neutralizeWindowsReservedFileName,
+} from './save-dialog-default-path.js';
 import { resolveSaveTarget } from './save-target.js';
 import {
   runSerializedStandaloneCollaborationTransition,
@@ -655,21 +659,30 @@ const writeExportAtomically = async (
   }
 };
 
-const safeExportBaseName = (name: string): string =>
-  name
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
-    .trim()
-    .slice(0, 100) || 'Untitled';
+const safeExportBaseName = (name: string): string => {
+  const sanitized =
+    name
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+      .trim()
+      .slice(0, 100) || 'Untitled';
+  return neutralizeWindowsReservedFileName(sanitized, path.win32);
+};
 
 const chooseExportPath = async (
   parent: BrowserWindow | undefined,
   documentName: string,
   format: 'html' | 'pdf',
+  currentSaveTarget: string | undefined,
 ): Promise<ApprovedExportTarget> => {
   const extension = format === 'html' ? 'html' : 'pdf';
+  const defaultFileName = `${safeExportBaseName(documentName)}.${extension}`;
   const result = await saveDialog(parent, {
     title: format === 'html' ? 'Export standalone HTML' : 'Export PDF',
-    defaultPath: `${safeExportBaseName(documentName)}.${extension}`,
+    defaultPath: buildSaveDialogDefaultPath({
+      fallbackDirectory: app.getPath('documents'),
+      defaultFileName,
+      currentSaveTarget,
+    }),
     filters: [
       format === 'html'
         ? { name: 'Standalone HTML', extensions: ['html'] }
@@ -683,25 +696,27 @@ const chooseExportPath = async (
   if (!path.isAbsolute(result.filePath)) {
     throw new DesktopMainError('TARGET_UNAVAILABLE', 'The export destination is invalid.');
   }
-  const targetPath = result.filePath.toLowerCase().endsWith(`.${extension}`)
-    ? result.filePath
-    : `${result.filePath}.${extension}`;
-  const state = await exportTargetState(targetPath);
-  if (targetPath !== result.filePath && state.exists) {
-    const confirmation = await messageBox(parent, {
-      type: 'warning',
-      title: 'Replace export?',
-      message: `“${path.basename(targetPath)}” already exists. Replace it?`,
-      buttons: ['Replace', 'Cancel'],
-      defaultId: 1,
-      cancelId: 1,
-      noLink: true,
-    });
-    if (confirmation.response !== 0) {
-      throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
-    }
+  const approved = await resolveSaveTarget({
+    selectedPath: result.filePath,
+    extension: `.${extension}`,
+    inspect: exportTargetState,
+    confirmOverwrite: async (targetPath) => {
+      const confirmation = await messageBox(parent, {
+        type: 'warning',
+        title: 'Replace export?',
+        message: `“${path.basename(targetPath)}” already exists. Replace it?`,
+        buttons: ['Replace', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      });
+      return confirmation.response === 0;
+    },
+  });
+  if (approved === undefined) {
+    throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
   }
-  return { path: targetPath, state };
+  return approved;
 };
 
 const collectExportAssets = (
@@ -908,7 +923,13 @@ const exportSessionDocument = async (
   if (initialSnapshot.revision !== input.expectedRevision) {
     throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
   }
-  const target = await chooseExportPath(parent, initialSnapshot.document.name, input.format);
+  const currentSaveTarget = await runtime.getSaveTargetMainOnly(sessionId);
+  const target = await chooseExportPath(
+    parent,
+    initialSnapshot.document.name,
+    input.format,
+    currentSaveTarget,
+  );
   const snapshot = runtime.getSnapshot(sessionId);
   if (snapshot.revision !== input.expectedRevision) {
     throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
@@ -976,9 +997,15 @@ const saveAsSerialized = async (
   const snapshot = runtime.getSnapshot(sessionId);
   const safeName =
     snapshot.document.name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').slice(0, 100) || 'Untitled';
+  const currentSaveTarget = await runtime.getSaveTargetMainOnly(sessionId);
+  const defaultFileName = neutralizeWindowsReservedFileName(`${safeName}.hdeck`, path.win32);
   const result = await saveDialog(parent ?? BrowserWindow.getFocusedWindow() ?? undefined, {
     title: 'Save presentation',
-    defaultPath: `${safeName}.hdeck`,
+    defaultPath: buildSaveDialogDefaultPath({
+      fallbackDirectory: app.getPath('documents'),
+      defaultFileName,
+      currentSaveTarget,
+    }),
     filters: [{ name: 'HTMLlelujah presentation', extensions: ['hdeck'] }],
     properties: ['showOverwriteConfirmation', 'createDirectory'],
   });
@@ -987,7 +1014,7 @@ const saveAsSerialized = async (
     selectedPath: result.filePath,
     extension: '.hdeck',
     inspect: exportTargetState,
-    confirmAddedExtensionOverwrite: async (targetPath) => {
+    confirmOverwrite: async (targetPath) => {
       const confirmation = await messageBox(
         parent ?? BrowserWindow.getFocusedWindow() ?? undefined,
         {
@@ -1015,8 +1042,8 @@ const saveAsSerialized = async (
     (guard) =>
       runtime.saveAsMainOnly(sessionId, {
         targetPath,
-        // The relevant dialog supplied overwrite consent; pin that exact post-dialog file so a
-        // later external change is rejected instead of being mistaken for the approved bytes.
+        // Pin the exact state covered by explicit post-dialog consent so a later external change
+        // is rejected instead of being mistaken for the approved bytes.
         expectedFingerprint: approved.state.fingerprint ?? null,
         beforeCommit: guard.beforeCommit,
       }),

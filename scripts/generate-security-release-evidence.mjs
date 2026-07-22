@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -8,8 +8,10 @@ import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { buildDirectoryInventory } from '../apps/desktop/scripts/build-provenance-support.mjs';
+import { drainChildProcess } from '../apps/desktop/scripts/child-process-cleanup.mjs';
 import { assertCandidateManifest } from './release-candidate-manifest.mjs';
 import { captureSourceSnapshot } from './release-source-state.mjs';
+import { terminateProcessTree } from './process-tree-support.mjs';
 import {
   auditEvidenceFromResult,
   buildCodeqlEvidence,
@@ -32,6 +34,8 @@ import {
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
 const EXPECTED_REPOSITORY = 'Nassau-1/htmllelujah';
+
+export { terminateProcessTree };
 
 const parseArgs = (argv) => {
   const options = {
@@ -60,129 +64,17 @@ const parseArgs = (argv) => {
   return options;
 };
 
-const processIsAlive = (pid) => {
-  if (!Number.isSafeInteger(pid) || pid < 1) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code !== 'ESRCH';
-  }
-};
-
-const discoverWindowsProcessTree = (rootPid) => {
-  const script = [
-    `$rootId = ${rootPid}`,
-    '$processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId, ParentProcessId)',
-    '$accepted = [System.Collections.Generic.HashSet[int]]::new()',
-    '[void]$accepted.Add($rootId)',
-    'do {',
-    '  $added = $false',
-    '  foreach ($entry in $processes) {',
-    '    if ($accepted.Contains([int]$entry.ParentProcessId) -and $accepted.Add([int]$entry.ProcessId)) { $added = $true }',
-    '  }',
-    '} while ($added)',
-    "[string]::Join(',', @($accepted | Sort-Object))",
-  ].join('; ');
-  const result = spawnSync(
-    'powershell.exe',
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-    {
-      encoding: 'utf8',
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 15_000,
-      windowsHide: true,
-    },
-  );
-  if (result.error !== undefined || result.status !== 0 || result.signal !== null) {
-    throw new Error(
-      `process-tree discovery failed with ${String(
-        result.error?.code ?? result.signal ?? result.status ?? 'unknown status',
-      )}`,
-    );
-  }
-  const processIds = String(result.stdout ?? '')
-    .trim()
-    .split(',')
-    .filter(Boolean)
-    .map(Number);
-  if (
-    processIds.length < 1 ||
-    processIds.some((pid) => !Number.isSafeInteger(pid) || pid < 1) ||
-    !processIds.includes(rootPid)
-  ) {
-    throw new Error('process-tree discovery returned an invalid or incomplete PID set');
-  }
-  return [...new Set(processIds)];
-};
-
-const killWindowsProcessTree = (rootPid) =>
-  spawnSync('taskkill', ['/PID', String(rootPid), '/T', '/F'], {
-    encoding: 'utf8',
-    shell: false,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 15_000,
-    windowsHide: true,
-  });
-
-export const terminateProcessTree = async ({
-  pid,
-  platform = process.platform,
-  discoverTree = discoverWindowsProcessTree,
-  killWindowsTree = killWindowsProcessTree,
-  isAlive = processIsAlive,
-  drainTimeoutMs = 5_000,
-  pollIntervalMs = 50,
-}) => {
-  if (!Number.isSafeInteger(pid) || pid < 1) {
-    throw new Error('Cannot terminate an invalid process-tree root PID.');
-  }
-  let processIds;
-  let discoveryError;
-  let killResult;
-  if (platform === 'win32') {
-    try {
-      processIds = discoverTree(pid);
-    } catch (error) {
-      discoveryError = error;
-      processIds = [pid];
-    }
-    killResult = killWindowsTree(pid);
-  } else {
-    processIds = [pid];
-    try {
-      process.kill(pid, 'SIGKILL');
-      killResult = { status: 0, signal: null, error: undefined };
-    } catch (error) {
-      killResult = { status: null, signal: null, error };
-    }
-  }
-
-  const deadline = Date.now() + drainTimeoutMs;
-  let remaining = processIds.filter(isAlive);
-  while (remaining.length > 0 && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    remaining = processIds.filter(isAlive);
-  }
-
-  const killSucceeded =
-    killResult?.error === undefined && killResult?.status === 0 && killResult?.signal === null;
-  if (discoveryError !== undefined || !killSucceeded || remaining.length > 0) {
-    throw new Error(
-      `Process-tree termination failed: discovery ${String(
-        discoveryError?.message ?? 'ok',
-      )}; killer status ${String(
-        killResult?.error?.code ?? killResult?.signal ?? killResult?.status ?? 'unknown',
-      )}; live PIDs: ${remaining.length === 0 ? 'none' : remaining.join(', ')}.`,
-    );
-  }
-  return { processIds };
-};
-
-export const defaultRunCommand = ({ command, args, cwd, env, timeoutMs = 15 * 60_000 }) =>
+export const defaultRunCommand = ({
+  command,
+  args,
+  cwd,
+  env,
+  timeoutMs = 15 * 60_000,
+  drainChild = drainChildProcess,
+  spawnChild = spawn,
+}) =>
   new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawnChild(command, args, {
       cwd,
       env,
       shell: false,
@@ -206,18 +98,17 @@ export const defaultRunCommand = ({ command, args, cwd, env, timeoutMs = 15 * 60
     const terminateTree = async (error) => {
       if (settled || terminating) return;
       terminating = true;
-      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
-        try {
-          await terminateProcessTree({ pid: child.pid });
-        } catch (terminationError) {
-          settle(
-            reject,
-            new Error('Security evidence command process tree could not be drained.', {
-              cause: terminationError,
-            }),
-          );
-          return;
-        }
+      try {
+        await drainChild({ child, label: 'Security evidence command' });
+      } catch (terminationError) {
+        settle(
+          reject,
+          new AggregateError(
+            [error, terminationError],
+            'Security evidence command failed and its process tree or handles could not be drained.',
+          ),
+        );
+        return;
       }
       settle(reject, error);
     };
@@ -240,9 +131,10 @@ export const defaultRunCommand = ({ command, args, cwd, env, timeoutMs = 15 * 60
       void terminateTree(new Error(`Security evidence command exceeded ${timeoutMs} ms.`));
     }, timeoutMs);
     child.once('error', (error) => {
+      if (terminating) return;
       settle(reject, error);
     });
-    child.once('exit', (code, signal) => {
+    child.once('close', (code, signal) => {
       if (terminating) return;
       settle(resolve, {
         code,

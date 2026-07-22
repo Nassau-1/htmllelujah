@@ -1,10 +1,11 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { LocalRpcClient } from '@htmllelujah/mcp-server';
 
+import { drainChildProcess, waitForChildClose } from './child-process-cleanup.mjs';
 import {
   assessInteractiveReadinessSamples,
   assertInteractiveReadiness,
@@ -60,44 +61,10 @@ const waitForExit = (child, timeoutMs) => {
 };
 
 const terminate = async (child, label = 'Electron process') => {
-  if (hasExited(child) || child.pid === undefined) return;
-  let taskkillResult;
-  if (process.platform === 'win32' && child.pid !== undefined) {
-    taskkillResult = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
-      windowsHide: true,
-      stdio: 'ignore',
-      timeout: 10_000,
-    });
-    if (await waitForExit(child, 5_000)) return;
-  }
-
-  try {
-    child.kill();
-  } catch {
-    // Continue to the forceful, bounded termination attempt.
-  }
-  if (await waitForExit(child, 2_000)) return;
-
-  try {
-    child.kill('SIGKILL');
-  } catch {
-    // The verified exit check below remains authoritative.
-  }
-  if (await waitForExit(child, 3_000)) return;
-
-  child.stdin?.destroy();
-  child.stdout?.destroy();
-  child.stderr?.destroy();
-  child.unref();
-  throw new Error(
-    `${label} did not exit within the termination deadline.` +
-      (taskkillResult === undefined
-        ? ''
-        : ` taskkill status=${taskkillResult.status ?? 'none'} signal=${taskkillResult.signal ?? 'none'} error=${taskkillResult.error?.message ?? 'none'}.`),
-  );
+  return drainChildProcess({ child, label });
 };
 
-const automateFileDialog = (rootProcessId, windowTitle, targetPath) => {
+const automateFileDialog = (rootProcessId, windowTitle, targetPath, dialogKind) => {
   let child;
   let cancelled = false;
   let timedOut = false;
@@ -124,6 +91,8 @@ const automateFileDialog = (rootProcessId, windowTitle, targetPath) => {
         windowTitle,
         '-TargetPath',
         targetPath,
+        '-DialogKind',
+        dialogKind,
         '-TimeoutSeconds',
         '30',
       ],
@@ -624,6 +593,9 @@ const closeLaunchGracefully = async ({
         `${label} exited abnormally after its native close request (code ${child.exitCode}, signal ${child.signalCode}).`,
       );
     }
+    if (!(await waitForChildClose(child, 15_000))) {
+      throw new Error(`${label} exited but did not close its inherited process handles.`);
+    }
     await waitForProcessTreeExit(nativeClose.processIds, label);
   } finally {
     if (discard !== undefined) await discard.cancel();
@@ -866,6 +838,9 @@ application.stderr.on('data', (chunk) => {
 let cdp;
 let evaluateRenderer;
 let closeRaceRpc;
+let primarySmokeError;
+let successEvidence;
+let finalCleanupEvidence;
 try {
   const debuggingPort = await waitForDebuggingPort(
     application,
@@ -1308,7 +1283,7 @@ try {
   );
 
   if (application.pid === undefined) throw new Error('The Electron process ID is unavailable.');
-  const imageDialog = automateFileDialog(application.pid, 'Insert image', imageFixturePath);
+  const imageDialog = automateFileDialog(application.pid, 'Insert image', imageFixturePath, 'Open');
   try {
     await clickWithPointer('[aria-label="Add image"]', 'Add image');
   } catch (error) {
@@ -1846,6 +1821,7 @@ try {
     application.pid,
     'Save presentation',
     closeHandshakeDeckPath,
+    'Save',
   );
   try {
     await clickButtonWithText('File', 'File menu before close-handshake save');
@@ -2186,9 +2162,7 @@ try {
     ],
   };
 
-  const report = {
-    passed: true,
-    testedAt: new Date().toISOString(),
+  const reportPayload = {
     launchMode: executable === undefined ? 'source-build' : 'packaged-executable',
     performance: performanceReport,
     rendererTitle: initial.title,
@@ -2223,18 +2197,13 @@ try {
       'stable PNG screenshot captured after the real presentation window decoded its image',
     ],
   };
-  await mkdir(evidenceDirectory, { recursive: true });
-  await Promise.all([
-    writeFile(screenshotPath, Buffer.from(screenshot.data, 'base64')),
-    writeFile(presentationScreenshotPath, presentationScreenshotBytes),
-    writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8'),
-  ]);
-
-  process.stdout.write(
-    `Electron UI smoke passed: real window edited, undo/redo verified, dialogs exercised.\n` +
-      `Screenshots: ${screenshotPath}, ${presentationScreenshotPath}\nReport: ${reportPath}\n`,
-  );
+  successEvidence = {
+    reportPayload,
+    editorScreenshotBytes: Buffer.from(screenshot.data, 'base64'),
+    presentationScreenshotBytes,
+  };
 } catch (error) {
+  primarySmokeError = error;
   if (evaluateRenderer !== undefined) {
     try {
       const diagnostic = await Promise.race([
@@ -2258,20 +2227,88 @@ try {
   }
   throw error;
 } finally {
-  await closeRaceRpc?.close().catch(() => undefined);
-  cdp?.close();
-  await terminate(application);
-  await waitFor(
-    async () => {
-      try {
-        await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
-        return true;
-      } catch (error) {
-        if (error?.code === 'EBUSY' || error?.code === 'EPERM') return false;
-        throw error;
-      }
-    },
-    10_000,
-    'Electron UI smoke cleanup',
-  );
+  const cleanupErrors = [];
+  let rpcClosed = closeRaceRpc === undefined;
+  try {
+    if (closeRaceRpc !== undefined) {
+      await closeRaceRpc.close();
+      closeRaceRpc = undefined;
+      rpcClosed = true;
+    }
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  let cdpClosed = cdp === undefined;
+  try {
+    cdp?.close();
+    cdp = undefined;
+    cdpClosed = true;
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  let applicationCleanup;
+  try {
+    applicationCleanup = await terminate(application);
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  let temporaryProfileRemoved = false;
+  try {
+    await waitFor(
+      async () => {
+        try {
+          await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+          return true;
+        } catch (error) {
+          if (error?.code === 'EBUSY' || error?.code === 'EPERM') return false;
+          throw error;
+        }
+      },
+      10_000,
+      'Electron UI smoke cleanup',
+    );
+    temporaryProfileRemoved = true;
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (cleanupErrors.length > 0) {
+    if (primarySmokeError !== undefined) {
+      throw new AggregateError(
+        [primarySmokeError, ...cleanupErrors],
+        'Electron UI smoke failed and its cleanup did not complete.',
+      );
+    }
+    throw new AggregateError(cleanupErrors, 'Electron UI smoke cleanup did not complete.');
+  }
+  finalCleanupEvidence = {
+    rpcClosed,
+    cdpClosed,
+    application: applicationCleanup,
+    temporaryProfileRemoved,
+  };
 }
+
+if (successEvidence === undefined || finalCleanupEvidence === undefined) {
+  throw new Error('Electron UI smoke completed without publishable cleanup evidence.');
+}
+const report = {
+  passed: true,
+  testedAt: new Date().toISOString(),
+  ...successEvidence.reportPayload,
+  cleanup: finalCleanupEvidence,
+  checks: [
+    ...successEvidence.reportPayload.checks,
+    'RPC client, CDP session, Electron process tree, and temporary profile closed without residue',
+  ],
+};
+await mkdir(evidenceDirectory, { recursive: true });
+await Promise.all([
+  writeFile(screenshotPath, successEvidence.editorScreenshotBytes),
+  writeFile(presentationScreenshotPath, successEvidence.presentationScreenshotBytes),
+]);
+await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+
+process.stdout.write(
+  `Electron UI smoke passed: real window edited, undo/redo verified, dialogs exercised.\n` +
+    `Screenshots: ${screenshotPath}, ${presentationScreenshotPath}\nReport: ${reportPath}\n`,
+);

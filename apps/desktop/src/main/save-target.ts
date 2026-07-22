@@ -11,15 +11,15 @@ export interface ResolveSaveTargetOptions<State extends SaveTargetState> {
   readonly selectedPath: string;
   readonly extension: `.${string}`;
   readonly inspect: (targetPath: string) => Promise<State>;
-  readonly confirmAddedExtensionOverwrite: (targetPath: string) => Promise<boolean>;
+  readonly confirmOverwrite: (targetPath: string) => Promise<boolean>;
 }
 
 /**
  * Resolves the exact path that will be written after adding a required extension.
  *
- * Native save dialogs only confirm replacement of the path selected by the user. If
- * the application appends an extension, the resulting file is a different target and
- * therefore needs its own explicit overwrite confirmation.
+ * The post-dialog inspection is authoritative for the exact path that will be written.
+ * Any file observed there requires explicit application consent: native dialog consent
+ * cannot cover a file that appeared after the dialog performed its own existence check.
  */
 export const resolveSaveTarget = async <State extends SaveTargetState>(
   options: ResolveSaveTargetOptions<State>,
@@ -29,11 +29,7 @@ export const resolveSaveTarget = async <State extends SaveTargetState>(
     : `${options.selectedPath}${options.extension}`;
   const state = await options.inspect(targetPath);
 
-  if (
-    targetPath !== options.selectedPath &&
-    state.exists &&
-    !(await options.confirmAddedExtensionOverwrite(targetPath))
-  ) {
+  if (state.exists && !(await options.confirmOverwrite(targetPath))) {
     return undefined;
   }
 

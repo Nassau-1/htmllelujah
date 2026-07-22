@@ -8,6 +8,10 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$TargetPath,
 
+  [Parameter(Mandatory = $true)]
+  [ValidateSet('Open', 'Save')]
+  [string]$DialogKind,
+
   [ValidateRange(1, 30)]
   [int]$TimeoutSeconds = 30
 )
@@ -25,11 +29,18 @@ using System.Text;
 public static class HtmllelujahNativeDialog
 {
     private const uint AbortIfHung = 0x0002;
+    private const uint DialogGetDefaultId = 0x0400;
+    private const uint DialogGetFolderPath = 0x0466;
+    private const int DialogHasDefaultId = 0x534B;
+    private const int DefaultButtonControlId = 1;
     private const uint ButtonClick = 0x00F5;
+    private const uint EditSetSelection = 0x00B1;
+    private const uint ClearSelection = 0x0303;
+    private const uint CharacterInput = 0x0102;
     private const uint GetText = 0x000D;
     private const uint GetTextLength = 0x000E;
-    private const uint SetText = 0x000C;
     private const uint MessageTimeoutMilliseconds = 1000;
+    private const int IdentityRecheckIntervalCharacters = 16;
 
     public delegate bool EnumWindowsProc(IntPtr window, IntPtr data);
 
@@ -66,6 +77,9 @@ public static class HtmllelujahNativeDialog
 
     [DllImport("user32.dll")]
     public static extern bool IsChild(IntPtr parent, IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetParent(IntPtr window);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr SendMessageTimeout(
@@ -151,22 +165,188 @@ public static class HtmllelujahNativeDialog
         return GetDlgCtrlID(window);
     }
 
-    public static bool SetControlText(IntPtr window, string value)
+    public static IntPtr WindowParent(IntPtr window)
     {
+        return GetParent(window);
+    }
+
+    private static uint RemainingMessageTimeout(long deadlineUtcTicks, string operation)
+    {
+        long remainingTicks = deadlineUtcTicks - DateTime.UtcNow.Ticks;
+        if (remainingTicks <= 0) {
+            throw new TimeoutException(
+                "The exact native dialog reached the global deadline before " + operation + "."
+            );
+        }
+        long remainingMilliseconds = Math.Max(
+            1,
+            (remainingTicks + TimeSpan.TicksPerMillisecond - 1) /
+                TimeSpan.TicksPerMillisecond
+        );
+        return (uint)Math.Min(MessageTimeoutMilliseconds, remainingMilliseconds);
+    }
+
+    private static void DispatchRequired(
+        IntPtr window,
+        uint message,
+        IntPtr word,
+        IntPtr data,
+        string operation,
+        long deadlineUtcTicks
+    )
+    {
+        uint messageTimeout = RemainingMessageTimeout(deadlineUtcTicks, operation);
         IntPtr messageResult;
         IntPtr dispatched = SendMessageTimeout(
             window,
-            SetText,
-            IntPtr.Zero,
-            value,
+            message,
+            word,
+            data,
             AbortIfHung,
-            MessageTimeoutMilliseconds,
+            messageTimeout,
             out messageResult
         );
-        return dispatched != IntPtr.Zero && messageResult != IntPtr.Zero;
+        if (dispatched == IntPtr.Zero) {
+            throw new TimeoutException(
+                "The exact native editor did not accept " + operation + "."
+            );
+        }
     }
 
-    public static string ReadControlText(IntPtr window, int maximumCharacters)
+    private static void AssertExactEditorIdentity(
+        IntPtr dialog,
+        IntPtr editor,
+        int expectedDialogProcessId,
+        string expectedDialogTitle,
+        string expectedDialogClassName,
+        int expectedEditorProcessId,
+        string expectedEditorClassName,
+        int expectedEditorControlId
+    )
+    {
+        if (
+            dialog == IntPtr.Zero ||
+            editor == IntPtr.Zero ||
+            !IsWindow(dialog) ||
+            !IsWindowVisible(dialog) ||
+            WindowProcessId(dialog) != expectedDialogProcessId ||
+            !string.Equals(
+                WindowTitle(dialog),
+                expectedDialogTitle,
+                StringComparison.Ordinal
+            ) ||
+            !string.Equals(
+                WindowClassName(dialog),
+                expectedDialogClassName,
+                StringComparison.Ordinal
+            ) ||
+            !IsWindow(editor) ||
+            !IsChild(dialog, editor) ||
+            !IsWindowVisible(editor) ||
+            !IsWindowEnabled(editor) ||
+            WindowProcessId(editor) != expectedEditorProcessId ||
+            !string.Equals(
+                WindowClassName(editor),
+                expectedEditorClassName,
+                StringComparison.Ordinal
+            ) ||
+            WindowControlId(editor) != expectedEditorControlId
+        ) {
+            throw new InvalidOperationException(
+                "The exact native file-name editor changed identity during bounded input."
+            );
+        }
+    }
+
+    public static void TypeControlText(
+        IntPtr dialog,
+        IntPtr editor,
+        string value,
+        long deadlineUtcTicks,
+        int expectedDialogProcessId,
+        string expectedDialogTitle,
+        string expectedDialogClassName,
+        int expectedEditorProcessId,
+        string expectedEditorClassName,
+        int expectedEditorControlId
+    )
+    {
+        if (value == null) throw new ArgumentNullException("value");
+        AssertExactEditorIdentity(
+            dialog,
+            editor,
+            expectedDialogProcessId,
+            expectedDialogTitle,
+            expectedDialogClassName,
+            expectedEditorProcessId,
+            expectedEditorClassName,
+            expectedEditorControlId
+        );
+        DispatchRequired(
+            editor,
+            EditSetSelection,
+            IntPtr.Zero,
+            new IntPtr(-1),
+            "select-all",
+            deadlineUtcTicks
+        );
+        DispatchRequired(
+            editor,
+            ClearSelection,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            "selection clearing",
+            deadlineUtcTicks
+        );
+        AssertExactEditorIdentity(
+            dialog,
+            editor,
+            expectedDialogProcessId,
+            expectedDialogTitle,
+            expectedDialogClassName,
+            expectedEditorProcessId,
+            expectedEditorClassName,
+            expectedEditorControlId
+        );
+        for (int index = 0; index < value.Length; index++) {
+            if (index % IdentityRecheckIntervalCharacters == 0) {
+                AssertExactEditorIdentity(
+                    dialog,
+                    editor,
+                    expectedDialogProcessId,
+                    expectedDialogTitle,
+                    expectedDialogClassName,
+                    expectedEditorProcessId,
+                    expectedEditorClassName,
+                    expectedEditorControlId
+                );
+            }
+            DispatchRequired(
+                editor,
+                CharacterInput,
+                new IntPtr(value[index]),
+                new IntPtr(1),
+                "character input",
+                deadlineUtcTicks
+            );
+        }
+        AssertExactEditorIdentity(
+            dialog,
+            editor,
+            expectedDialogProcessId,
+            expectedDialogTitle,
+            expectedDialogClassName,
+            expectedEditorProcessId,
+            expectedEditorClassName,
+            expectedEditorControlId
+        );
+    }
+
+    public static string ReadControlText(
+        IntPtr window,
+        int maximumCharacters,
+        long deadlineUtcTicks
+    )
     {
         if (maximumCharacters < 1) {
             throw new ArgumentOutOfRangeException("maximumCharacters");
@@ -179,7 +359,7 @@ public static class HtmllelujahNativeDialog
             IntPtr.Zero,
             IntPtr.Zero,
             AbortIfHung,
-            MessageTimeoutMilliseconds,
+            RemainingMessageTimeout(deadlineUtcTicks, "text-length read"),
             out lengthResult
         );
         if (lengthDispatched == IntPtr.Zero) {
@@ -200,7 +380,7 @@ public static class HtmllelujahNativeDialog
             new IntPtr(capacity),
             text,
             AbortIfHung,
-            MessageTimeoutMilliseconds,
+            RemainingMessageTimeout(deadlineUtcTicks, "text read"),
             out readResult
         );
         if (readDispatched == IntPtr.Zero) {
@@ -209,20 +389,127 @@ public static class HtmllelujahNativeDialog
         return text.ToString();
     }
 
-    public static bool ClickNativeButton(IntPtr window)
+    public static string ReadDialogFolderPath(
+        IntPtr dialog,
+        int maximumCharacters,
+        long deadlineUtcTicks
+    )
     {
-        if (window == IntPtr.Zero) return false;
+        if (maximumCharacters < 2) {
+            throw new ArgumentOutOfRangeException("maximumCharacters");
+        }
+        var folder = new StringBuilder(maximumCharacters);
         IntPtr messageResult;
-        return SendMessageTimeout(
-            window,
-            ButtonClick,
+        IntPtr dispatched = SendMessageTimeout(
+            dialog,
+            DialogGetFolderPath,
+            new IntPtr(maximumCharacters),
+            folder,
+            AbortIfHung,
+            RemainingMessageTimeout(deadlineUtcTicks, "folder-path read"),
+            out messageResult
+        );
+        if (dispatched == IntPtr.Zero) {
+            throw new TimeoutException("The exact native dialog did not return its current folder.");
+        }
+        long length = messageResult.ToInt64();
+        if (length < 0 || length >= maximumCharacters) {
+            throw new InvalidOperationException(
+                "The exact native dialog returned an invalid current-folder length."
+            );
+        }
+        return folder.ToString();
+    }
+
+    private static IntPtr ExactDefaultButtonParent(IntPtr dialog, IntPtr button)
+    {
+        if (dialog == IntPtr.Zero || button == IntPtr.Zero) {
+            throw new InvalidOperationException("The exact native dialog button identity was empty.");
+        }
+
+        uint dialogProcessId;
+        uint buttonProcessId;
+        uint dialogThreadId = GetWindowThreadProcessId(dialog, out dialogProcessId);
+        uint buttonThreadId = GetWindowThreadProcessId(button, out buttonProcessId);
+        IntPtr buttonParent = GetParent(button);
+        uint parentProcessId;
+        uint parentThreadId = GetWindowThreadProcessId(buttonParent, out parentProcessId);
+        if (
+            dialogThreadId == 0 ||
+            buttonThreadId != dialogThreadId ||
+            parentThreadId != dialogThreadId ||
+            dialogProcessId == 0 ||
+            buttonProcessId != dialogProcessId ||
+            parentProcessId != dialogProcessId ||
+            GetDlgCtrlID(button) != DefaultButtonControlId ||
+            (buttonParent != dialog && !IsChild(dialog, buttonParent))
+        ) {
+            throw new InvalidOperationException(
+                "The exact native default button no longer shared the dialog's strict process, " +
+                "thread, control ID, and parent hierarchy."
+            );
+        }
+        return buttonParent;
+    }
+
+    public static bool IsExactDefaultButtonReady(
+        IntPtr dialog,
+        IntPtr button,
+        long deadlineUtcTicks
+    )
+    {
+        ExactDefaultButtonParent(dialog, button);
+
+        IntPtr defaultIdResult;
+        IntPtr defaultIdDispatched = SendMessageTimeout(
+            dialog,
+            DialogGetDefaultId,
             IntPtr.Zero,
             IntPtr.Zero,
             AbortIfHung,
-            MessageTimeoutMilliseconds,
-            out messageResult
-        ) != IntPtr.Zero;
+            RemainingMessageTimeout(deadlineUtcTicks, "default-button validation"),
+            out defaultIdResult
+        );
+        if (defaultIdDispatched == IntPtr.Zero) {
+            return false;
+        }
+
+        long defaultId = defaultIdResult.ToInt64();
+        int defaultControlId = (int)(defaultId & 0xFFFFL);
+        int defaultMarker = (int)((defaultId >> 16) & 0xFFFFL);
+        if (
+            defaultMarker != DialogHasDefaultId ||
+            defaultControlId != DefaultButtonControlId
+        ) {
+            throw new InvalidOperationException(
+                "The exact native dialog did not identify control 1 as its default button " +
+                "(marker=" + defaultMarker + ",controlId=" + defaultControlId + ")."
+            );
+        }
+        return true;
     }
+
+    public static void ClickExactDefaultButton(
+        IntPtr dialog,
+        IntPtr button,
+        long deadlineUtcTicks
+    )
+    {
+        if (!IsExactDefaultButtonReady(dialog, button, deadlineUtcTicks)) {
+            throw new InvalidOperationException(
+                "The exact native default button was not ready for bounded confirmation."
+            );
+        }
+        DispatchRequired(
+            button,
+            ButtonClick,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            "default-button confirmation",
+            deadlineUtcTicks
+        );
+    }
+
 }
 '@
 
@@ -381,6 +668,37 @@ function Describe-ProcessWindows {
   return $descriptions
 }
 
+function Find-SecondaryNativeDialogs {
+  param(
+    [System.Collections.Generic.HashSet[int]]$AllowedProcessIds,
+    [int64]$ExcludedHandle
+  )
+
+  $matches = [System.Collections.Generic.List[object]]::new()
+  foreach ($handle in [HtmllelujahNativeDialog]::EnumerateTopLevelWindows()) {
+    try {
+      if ($handle -eq [IntPtr]::Zero -or $handle.ToInt64() -eq $ExcludedHandle) { continue }
+      if (-not [HtmllelujahNativeDialog]::IsWindow($handle)) { continue }
+      if (-not [HtmllelujahNativeDialog]::IsWindowVisible($handle)) { continue }
+      $processId = [HtmllelujahNativeDialog]::WindowProcessId($handle)
+      if (-not $AllowedProcessIds.Contains($processId)) { continue }
+      $className = [HtmllelujahNativeDialog]::WindowClassName($handle)
+      if (-not [string]::Equals($className, '#32770', [System.StringComparison]::Ordinal)) {
+        continue
+      }
+      $matches.Add([ordered]@{
+          processId = $processId
+          nativeWindowHandle = $handle.ToInt64()
+          title = [HtmllelujahNativeDialog]::WindowTitle($handle)
+        })
+    }
+    catch {
+      # A secondary top-level window can disappear during the bounded inspection.
+    }
+  }
+  return @($matches)
+}
+
 function Describe-DialogChildren {
   param([object]$DialogIdentity)
 
@@ -398,10 +716,38 @@ function Describe-DialogChildren {
           enabled = [HtmllelujahNativeDialog]::IsWindowEnabled($handle)
           className = [HtmllelujahNativeDialog]::WindowClassName($handle)
           controlId = [HtmllelujahNativeDialog]::WindowControlId($handle)
+          title = [HtmllelujahNativeDialog]::WindowTitle($handle)
         })
     }
     catch {
       # A child can disappear while bounded diagnostics are collected.
+    }
+  }
+  return $descriptions
+}
+
+function Describe-DialogVisibleText {
+  param([object]$DialogIdentity)
+
+  $descriptions = [System.Collections.Generic.List[object]]::new()
+  foreach ($handle in [HtmllelujahNativeDialog]::EnumerateDescendantWindows($DialogIdentity.Handle)) {
+    if ($descriptions.Count -ge 12) { break }
+    try {
+      if ($handle -eq [IntPtr]::Zero) { continue }
+      if (-not [HtmllelujahNativeDialog]::IsWindowVisible($handle)) { continue }
+      $processId = [HtmllelujahNativeDialog]::WindowProcessId($handle)
+      if ($processId -ne $DialogIdentity.ProcessId) { continue }
+      $title = [HtmllelujahNativeDialog]::WindowTitle($handle)
+      if ([string]::IsNullOrWhiteSpace($title)) { continue }
+      $descriptions.Add([ordered]@{
+          nativeWindowHandle = $handle.ToInt64()
+          className = [HtmllelujahNativeDialog]::WindowClassName($handle)
+          controlId = [HtmllelujahNativeDialog]::WindowControlId($handle)
+          title = $title
+        })
+    }
+    catch {
+      # The diagnostic child can disappear while its exact text is read.
     }
   }
   return $descriptions
@@ -474,8 +820,277 @@ function Test-NativeChildIdentity {
   return $true
 }
 
-if (-not [System.IO.Path]::IsPathRooted($TargetPath)) {
-  throw 'The requested destination must be an absolute path.'
+function Test-NativeMessageTimeoutException {
+  param([System.Exception]$Exception)
+
+  $current = $Exception
+  while ($null -ne $current) {
+    if ($current -is [System.TimeoutException]) {
+      return $true
+    }
+    $current = $current.InnerException
+  }
+  return $false
+}
+
+function Read-ExactNativeEditorText {
+  param(
+    [object]$DialogIdentity,
+    [object]$EditorIdentity,
+    [int]$MaximumCharacters,
+    [DateTime]$Deadline
+  )
+
+  $attempts = 0
+  $lastTimeout = 'none'
+  while ([DateTime]::UtcNow -lt $Deadline) {
+    if (-not (Test-NativeDialogIdentity -DialogIdentity $DialogIdentity)) {
+      throw 'The exact native save dialog closed while its file-name value was being verified.'
+    }
+    if (-not (Test-NativeChildIdentity `
+        -DialogIdentity $DialogIdentity `
+        -ChildIdentity $EditorIdentity `
+        -Role 'file-name editor'
+      )) {
+      throw 'The exact native file-name editor closed while its value was being verified.'
+    }
+
+    $attempts += 1
+    try {
+      return [HtmllelujahNativeDialog]::ReadControlText(
+        $EditorIdentity.Handle,
+        $MaximumCharacters,
+        $Deadline.Ticks
+      )
+    }
+    catch {
+      if (-not (Test-NativeMessageTimeoutException -Exception $_.Exception)) {
+        throw
+      }
+      $lastTimeout = $_.Exception.GetBaseException().Message
+    }
+
+    if ([DateTime]::UtcNow -lt $Deadline) {
+      Start-Sleep -Milliseconds 100
+    }
+  }
+
+  throw "The exact native file-name editor did not return its text before the global deadline (attempts=$attempts,lastTimeout=$lastTimeout)."
+}
+
+function Set-StableNativeEditorValue {
+  param(
+    [object]$DialogIdentity,
+    [object]$EditorIdentity,
+    [object]$ButtonIdentity,
+    [string]$Value,
+    [DateTime]$Deadline
+  )
+
+  $maximumTextLength = [Math]::Min([Math]::Max($Value.Length + 16, 260), 32768)
+  $attempts = 0
+  $observedValue = ''
+  $stable = $false
+  while ([DateTime]::UtcNow -lt $Deadline -and -not $stable) {
+    if (-not (Test-NativeDialogIdentity -DialogIdentity $DialogIdentity)) {
+      throw 'The exact native save dialog closed while its file-name value was being stabilized.'
+    }
+    if (-not (Test-NativeChildIdentity `
+        -DialogIdentity $DialogIdentity `
+        -ChildIdentity $EditorIdentity `
+        -Role 'file-name editor'
+      )) {
+      throw 'The exact native file-name editor closed while its value was being stabilized.'
+    }
+    if (-not (Test-NativeChildIdentity `
+        -DialogIdentity $DialogIdentity `
+        -ChildIdentity $ButtonIdentity `
+        -Role 'confirmation button'
+      )) {
+      throw 'The exact native save-dialog confirmation button changed during value stabilization.'
+    }
+
+    $attempts += 1
+    [HtmllelujahNativeDialog]::TypeControlText(
+      $DialogIdentity.Handle,
+      $EditorIdentity.Handle,
+      $Value,
+      $Deadline.Ticks,
+      $DialogIdentity.ProcessId,
+      $DialogIdentity.Title,
+      $DialogIdentity.ClassName,
+      $EditorIdentity.ProcessId,
+      $EditorIdentity.ClassName,
+      $EditorIdentity.ControlId
+    )
+    if (-not (Test-NativeDialogIdentity -DialogIdentity $DialogIdentity)) {
+      throw 'The exact native save dialog changed immediately after bounded input.'
+    }
+    if (-not (Test-NativeChildIdentity `
+        -DialogIdentity $DialogIdentity `
+        -ChildIdentity $EditorIdentity `
+        -Role 'file-name editor'
+      )) {
+      throw 'The exact native file-name editor changed immediately after bounded input.'
+    }
+    $firstValue = Read-ExactNativeEditorText `
+      -DialogIdentity $DialogIdentity `
+      -EditorIdentity $EditorIdentity `
+      -MaximumCharacters $maximumTextLength `
+      -Deadline $Deadline
+    if (-not [string]::Equals(
+        $firstValue,
+        $Value,
+        [System.StringComparison]::Ordinal
+      )) {
+      $observedValue = $firstValue
+      if ([DateTime]::UtcNow -lt $Deadline) {
+        Start-Sleep -Milliseconds 100
+      }
+      continue
+    }
+
+    Start-Sleep -Milliseconds 150
+    $secondValue = Read-ExactNativeEditorText `
+      -DialogIdentity $DialogIdentity `
+      -EditorIdentity $EditorIdentity `
+      -MaximumCharacters $maximumTextLength `
+      -Deadline $Deadline
+    $observedValue = $secondValue
+    $stable = [string]::Equals(
+      $secondValue,
+      $Value,
+      [System.StringComparison]::Ordinal
+    )
+  }
+  if (-not $stable) {
+    throw "The exact native file-name editor did not retain a stable requested value before the global deadline (hwnd=$($EditorIdentity.HandleValue),actualLength=$($observedValue.Length),expectedLength=$($Value.Length),attempts=$attempts)."
+  }
+  return [pscustomobject]@{
+    Value = $observedValue
+    Length = $observedValue.Length
+    MaximumTextLength = $maximumTextLength
+    Attempts = $attempts
+  }
+}
+
+function Test-WindowsDeviceNamespacePath {
+  param([string]$PathValue)
+
+  if ([string]::IsNullOrEmpty($PathValue)) { return $false }
+  return (
+    $PathValue.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase) -or
+    $PathValue.StartsWith('\\.\', [System.StringComparison]::OrdinalIgnoreCase) -or
+    $PathValue.StartsWith('\\?/', [System.StringComparison]::OrdinalIgnoreCase) -or
+    $PathValue.StartsWith('\\./', [System.StringComparison]::OrdinalIgnoreCase)
+  )
+}
+
+function Assert-SafeWindowsPathComponent {
+  param(
+    [string]$Component,
+    [string]$Role
+  )
+
+  if (
+    [string]::IsNullOrWhiteSpace($Component) -or
+    [string]::Equals($Component, '.', [System.StringComparison]::Ordinal) -or
+    [string]::Equals($Component, '..', [System.StringComparison]::Ordinal)
+  ) {
+    throw "The requested destination contains an empty or relative $Role."
+  }
+  foreach ($character in $Component.ToCharArray()) {
+    if ([char]::IsControl($character)) {
+      throw "The requested destination contains a control character in its $Role."
+    }
+  }
+  if ($Component.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+    throw "The requested destination contains an invalid Windows character in its $Role."
+  }
+  if ($Component.EndsWith(' ', [System.StringComparison]::Ordinal) -or
+      $Component.EndsWith('.', [System.StringComparison]::Ordinal)) {
+    throw "The requested destination contains a $Role ending in a space or period."
+  }
+
+  $deviceStem = (($Component -split '\.', 2)[0]).TrimEnd([char[]]@(' ', '.'))
+  if ([System.Text.RegularExpressions.Regex]::IsMatch(
+      $deviceStem,
+      '^(?i:CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM(?:[1-9]|\u00B9|\u00B2|\u00B3)|LPT(?:[1-9]|\u00B9|\u00B2|\u00B3))$'
+    )) {
+    throw "The requested destination contains a reserved Windows device name in its $Role."
+  }
+}
+
+foreach ($character in $TargetPath.ToCharArray()) {
+  if ([char]::IsControl($character)) {
+    throw 'The requested destination contains a control character.'
+  }
+}
+if (Test-WindowsDeviceNamespacePath -PathValue $TargetPath) {
+  throw 'Windows device-namespace destinations are not supported.'
+}
+$driveAbsolute = [System.Text.RegularExpressions.Regex]::IsMatch(
+  $TargetPath,
+  '^[A-Za-z]:[\\/]'
+)
+$uncAbsolute = [System.Text.RegularExpressions.Regex]::IsMatch(
+  $TargetPath,
+  '^\\\\[^\\/]+[\\/][^\\/]+'
+)
+if (-not $driveAbsolute -and -not $uncAbsolute) {
+  throw 'The requested destination must be a fully qualified local or UNC path.'
+}
+if (
+  ($driveAbsolute -and $TargetPath.Substring(2).Contains(':')) -or
+  ($uncAbsolute -and $TargetPath.Contains(':'))
+) {
+  throw 'Windows alternate data stream destinations are not supported.'
+}
+$TargetPath = [System.IO.Path]::GetFullPath($TargetPath)
+if (Test-WindowsDeviceNamespacePath -PathValue $TargetPath) {
+  throw 'Windows device-namespace destinations are not supported.'
+}
+if ($TargetPath.Length -gt 32767) {
+  throw 'The requested destination exceeds the supported Windows path bound.'
+}
+
+$pathRoot = [System.IO.Path]::GetPathRoot($TargetPath)
+if ([string]::IsNullOrWhiteSpace($pathRoot)) {
+  throw 'The requested destination has no valid Windows path root.'
+}
+if ($driveAbsolute) {
+  if ($TargetPath.Substring(2).Contains(':')) {
+    throw 'Windows alternate data stream destinations are not supported.'
+  }
+}
+else {
+  if ($TargetPath.Contains(':')) {
+    throw 'Windows alternate data stream destinations are not supported.'
+  }
+  $uncRootComponents = @(
+    $pathRoot.TrimStart([char[]]@('\', '/')).TrimEnd([char[]]@('\', '/')) -split '[\\/]'
+  )
+  if ($uncRootComponents.Count -lt 2) {
+    throw 'The requested UNC destination must include a server and share.'
+  }
+  $uncServer = $uncRootComponents[0]
+  if (
+    [string]::Equals($uncServer, '?', [System.StringComparison]::Ordinal) -or
+    [string]::Equals($uncServer, '.', [System.StringComparison]::Ordinal)
+  ) {
+    throw 'UNC server names cannot use Windows device-namespace markers.'
+  }
+  Assert-SafeWindowsPathComponent -Component $uncServer -Role 'UNC server name'
+  Assert-SafeWindowsPathComponent -Component $uncRootComponents[1] -Role 'UNC share name'
+}
+
+$relativePath = $TargetPath.Substring($pathRoot.Length)
+$pathComponents = @($relativePath -split '[\\/]' | Where-Object { $_.Length -gt 0 })
+if ($pathComponents.Count -eq 0) {
+  throw 'The requested destination must identify a file below its Windows path root.'
+}
+foreach ($component in $pathComponents) {
+  Assert-SafeWindowsPathComponent -Component $component -Role 'path component'
 }
 
 $parentDirectory = [System.IO.Path]::GetDirectoryName($TargetPath)
@@ -484,6 +1099,16 @@ if (
   -not [System.IO.Directory]::Exists($parentDirectory)
 ) {
   throw 'The requested destination directory does not exist.'
+}
+$targetExistedAtStart = [System.IO.File]::Exists($TargetPath)
+if ([System.IO.Directory]::Exists($TargetPath)) {
+  throw 'The requested destination identifies an existing directory.'
+}
+if ($DialogKind -eq 'Save' -and $targetExistedAtStart) {
+  throw 'The release smoke refuses to overwrite an existing save destination.'
+}
+if ($DialogKind -eq 'Open' -and -not $targetExistedAtStart) {
+  throw 'The requested open target does not exist.'
 }
 
 $deadline = $globalStartedAt.AddSeconds([Math]::Min($TimeoutSeconds, 30))
@@ -578,24 +1203,6 @@ $editorMetadata = [ordered]@{
   controlId = $editorIdentity.ControlId
 }
 
-Write-Output 'phase=value'
-if (-not [HtmllelujahNativeDialog]::SetControlText($editorIdentity.Handle, $TargetPath)) {
-  throw "The exact native file-name editor rejected the requested value (hwnd=$($editorIdentity.HandleValue),class=$($editorIdentity.ClassName),id=$($editorIdentity.ControlId))."
-}
-$maximumTextLength = [Math]::Min([Math]::Max($TargetPath.Length + 16, 260), 32768)
-$editorValue = [HtmllelujahNativeDialog]::ReadControlText(
-  $editorIdentity.Handle,
-  $maximumTextLength
-)
-if (-not [string]::Equals(
-    $editorValue,
-    $TargetPath,
-    [System.StringComparison]::Ordinal
-  )) {
-  throw "The exact native file-name editor did not retain the requested value (hwnd=$($editorIdentity.HandleValue),actualLength=$($editorValue.Length),expectedLength=$($TargetPath.Length))."
-}
-$editorValueLength = $editorValue.Length
-
 Write-Output 'phase=button'
 $buttonIdentity = $null
 while ([DateTime]::UtcNow -lt $deadline -and $null -eq $buttonIdentity) {
@@ -635,30 +1242,198 @@ $buttonMetadata = [ordered]@{
   nativeWindowHandle = $buttonIdentity.HandleValue
   className = $buttonIdentity.ClassName
   controlId = $buttonIdentity.ControlId
+  immediateParentHandle = ([HtmllelujahNativeDialog]::WindowParent(
+      $buttonIdentity.Handle
+    )).ToInt64()
 }
 
+Write-Output 'phase=value'
+$defaultReadyAttempts = 0
+$defaultButtonReady = $false
+while ([DateTime]::UtcNow -lt $deadline -and -not $defaultButtonReady) {
+  if (-not (Test-NativeDialogIdentity -DialogIdentity $dialogIdentity)) {
+    throw 'The exact native save dialog closed before its default button was validated.'
+  }
+  if (-not (Test-NativeChildIdentity `
+      -DialogIdentity $dialogIdentity `
+      -ChildIdentity $buttonIdentity `
+      -Role 'confirmation button'
+    )) {
+    throw 'The exact native save-dialog confirmation button closed before validation.'
+  }
+  $defaultReadyAttempts += 1
+  $defaultButtonReady = [HtmllelujahNativeDialog]::IsExactDefaultButtonReady(
+    $dialogIdentity.Handle,
+    $buttonIdentity.Handle,
+    $deadline.Ticks
+  )
+  if (-not $defaultButtonReady -and [DateTime]::UtcNow -lt $deadline) {
+    Start-Sleep -Milliseconds 100
+  }
+}
+if (-not $defaultButtonReady) {
+  throw "The exact native save dialog did not expose control 1 as its default button before the global deadline (attempts=$defaultReadyAttempts)."
+}
+
+$expectedEditorValue = $TargetPath
+if ([string]::IsNullOrWhiteSpace($expectedEditorValue) -or $expectedEditorValue.Length -gt 32767) {
+  throw 'The requested native file-name value is empty or exceeds the supported bound.'
+}
+$valueState = Set-StableNativeEditorValue `
+  -DialogIdentity $dialogIdentity `
+  -EditorIdentity $editorIdentity `
+  -ButtonIdentity $buttonIdentity `
+  -Value $expectedEditorValue `
+  -Deadline $deadline
+$maximumTextLength = $valueState.MaximumTextLength
+$editorValueLength = $valueState.Length
+
 Write-Output 'phase=click'
-if (-not [HtmllelujahNativeDialog]::ClickNativeButton($buttonIdentity.Handle)) {
-  throw "The exact native save-dialog confirmation button rejected its targeted click (hwnd=$($buttonIdentity.HandleValue),class=$($buttonIdentity.ClassName),id=$($buttonIdentity.ControlId))."
+if (-not (Test-NativeDialogIdentity -DialogIdentity $dialogIdentity)) {
+  throw 'The exact native save dialog closed before accessibility confirmation.'
+}
+if (-not (Test-NativeChildIdentity `
+    -DialogIdentity $dialogIdentity `
+    -ChildIdentity $buttonIdentity `
+    -Role 'confirmation button'
+  )) {
+  throw 'The exact native save-dialog confirmation button changed before accessibility confirmation.'
+}
+$currentEditorValue = Read-ExactNativeEditorText `
+  -DialogIdentity $dialogIdentity `
+  -EditorIdentity $editorIdentity `
+  -MaximumCharacters $maximumTextLength `
+  -Deadline $deadline
+if (-not [string]::Equals(
+    $currentEditorValue,
+    $expectedEditorValue,
+    [System.StringComparison]::Ordinal
+  )) {
+  throw "The exact native file-name editor changed after stabilization (hwnd=$($editorIdentity.HandleValue),actualLength=$($currentEditorValue.Length),expectedLength=$($expectedEditorValue.Length))."
+}
+if (-not [HtmllelujahNativeDialog]::IsExactDefaultButtonReady(
+    $dialogIdentity.Handle,
+    $buttonIdentity.Handle,
+    $deadline.Ticks
+  )) {
+  throw 'The exact native save dialog stopped reporting control 1 as ready before confirmation.'
+}
+if ($DialogKind -eq 'Save' -and [System.IO.File]::Exists($TargetPath)) {
+  throw 'The exact save destination appeared concurrently before confirmation; overwrite was refused.'
+}
+$secondaryDialogsBeforeAction = @(Find-SecondaryNativeDialogs `
+  -AllowedProcessIds $allowedProcessIds `
+  -ExcludedHandle $dialogIdentity.HandleValue)
+if ($secondaryDialogsBeforeAction.Count -gt 0) {
+  throw 'An unexpected secondary native dialog was already open before confirmation.'
+}
+$dialogFolderBeforeAction = [HtmllelujahNativeDialog]::ReadDialogFolderPath(
+  $dialogIdentity.Handle,
+  32768,
+  $deadline.Ticks
+)
+
+$confirmationMetadata = [ordered]@{
+  nativeWindowHandle = $buttonIdentity.HandleValue
+  processId = $buttonIdentity.ProcessId
+  controlId = $buttonIdentity.ControlId
+  message = 'BM_CLICK'
+}
+$confirmationAction = 'BM_CLICK via SendMessageTimeout'
+$commandAttempted = $false
+$clickAccepted = $false
+$confirmationError = 'none'
+$commandAttempted = $true
+try {
+  [HtmllelujahNativeDialog]::ClickExactDefaultButton(
+    $dialogIdentity.Handle,
+    $buttonIdentity.Handle,
+    $deadline.Ticks
+  )
+  $clickAccepted = $true
+}
+catch {
+  # A bounded native message may report a timeout after dispatch. The one-shot HWND
+  # close check below remains authoritative and never retries the confirmation.
+  $confirmationError = $_.Exception.GetBaseException().Message
 }
 
 Write-Output 'phase=wait-close'
-$dialogCloseDeadline = [DateTime]::UtcNow.AddSeconds(5)
-if ($dialogCloseDeadline -gt $deadline) {
-  $dialogCloseDeadline = $deadline
-}
+$dialogCloseDeadline = $deadline
 while ([DateTime]::UtcNow -lt $dialogCloseDeadline) {
   if (-not [HtmllelujahNativeDialog]::IsWindow($dialogIdentity.Handle)) {
-    Write-Output 'Windows save dialog completed.'
-    exit 0
+    break
   }
   Start-Sleep -Milliseconds 100
 }
 if (-not [HtmllelujahNativeDialog]::IsWindow($dialogIdentity.Handle)) {
-  Write-Output 'Windows save dialog completed.'
+  $secondaryDialogsAfterAction = @(Find-SecondaryNativeDialogs `
+    -AllowedProcessIds $allowedProcessIds `
+    -ExcludedHandle $dialogIdentity.HandleValue)
+  if ($secondaryDialogsAfterAction.Count -gt 0) {
+    throw 'The native file dialog closed but an unexpected secondary dialog remained.'
+  }
+  if ($DialogKind -eq 'Save') {
+    $savePostconditionDeadline = $deadline
+    $savedFileReady = $false
+    while (-not $savedFileReady) {
+      if ([System.IO.File]::Exists($TargetPath)) {
+        $savedFileReady = [System.IO.FileInfo]::new($TargetPath).Length -gt 0
+      }
+      if ($savedFileReady) { break }
+      $remainingPostconditionMilliseconds = [Math]::Floor(
+        ($savePostconditionDeadline - [DateTime]::UtcNow).TotalMilliseconds
+      )
+      if ($remainingPostconditionMilliseconds -le 0) { break }
+      Start-Sleep -Milliseconds ([int][Math]::Min(100, $remainingPostconditionMilliseconds))
+    }
+    if (-not $savedFileReady) {
+      throw 'The native save dialog closed without creating the exact non-empty destination.'
+    }
+  }
+  Write-Output 'Windows file dialog completed.'
   exit 0
 }
 
+$remainingProcessWindows = Describe-ProcessWindows -AllowedProcessIds $allowedProcessIds
+$remainingDialogChildren = Describe-DialogChildren -DialogIdentity $dialogIdentity
+$dialogFolderAfterAction = if ([DateTime]::UtcNow -lt $deadline) {
+  [HtmllelujahNativeDialog]::ReadDialogFolderPath(
+    $dialogIdentity.Handle,
+    32768,
+    $deadline.Ticks
+  )
+}
+else {
+  '<global deadline reached>'
+}
+$secondaryDialogs = [System.Collections.Generic.List[object]]::new()
+foreach ($window in $remainingProcessWindows) {
+  if (
+    $window.visible -and
+    [string]::Equals($window.className, '#32770', [System.StringComparison]::Ordinal) -and
+    [int64]$window.nativeWindowHandle -ne $dialogIdentity.HandleValue
+  ) {
+    $secondaryIdentity = [pscustomobject]@{
+      Handle = [IntPtr]::new([int64]$window.nativeWindowHandle)
+      HandleValue = [int64]$window.nativeWindowHandle
+      ProcessId = [int]$window.processId
+    }
+    $secondaryDialogs.Add([ordered]@{
+        processId = [int]$window.processId
+        nativeWindowHandle = [int64]$window.nativeWindowHandle
+        title = [string]$window.title
+        visibleText = @(Describe-DialogVisibleText -DialogIdentity $secondaryIdentity)
+      })
+  }
+}
+$targetExistsNow = [System.IO.File]::Exists($TargetPath)
+$targetSizeNow = if ($targetExistsNow) {
+  [System.IO.FileInfo]::new($TargetPath).Length
+}
+else {
+  $null
+}
 $detail = ConvertTo-Json -InputObject ([ordered]@{
     phase = 'wait-close-timeout'
     dialog = [ordered]@{
@@ -670,5 +1445,20 @@ $detail = ConvertTo-Json -InputObject ([ordered]@{
     editor = $editorMetadata
     editorValueLength = $editorValueLength
     button = $buttonMetadata
+    confirmationCommandAttempted = $commandAttempted
+    confirmationCommandDispatched = $clickAccepted
+    confirmation = $confirmationMetadata
+    confirmationAction = $confirmationAction
+    confirmationError = $confirmationError
+    dialogChildren = @($remainingDialogChildren)
+    processWindows = @($remainingProcessWindows)
+    secondaryDialogs = @($secondaryDialogs)
+    targetState = [ordered]@{
+      existedAtStart = $targetExistedAtStart
+      existsNow = $targetExistsNow
+      sizeNow = $targetSizeNow
+    }
+    dialogFolderBeforeAction = $dialogFolderBeforeAction
+    dialogFolderAfterAction = $dialogFolderAfterAction
   }) -Compress -Depth 4
 throw "The exact Windows save-dialog HWND remained open after confirmation. Diagnostics: $detail"

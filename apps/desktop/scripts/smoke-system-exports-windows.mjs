@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,6 +17,9 @@ import {
   sleep,
   waitFor,
 } from './system-export-harness.mjs';
+import { drainChildProcess } from './child-process-cleanup.mjs';
+import { runWithCleanup } from './operation-cleanup.mjs';
+import { analyzePngVisual, visualThresholds } from './png-visual-evidence.mjs';
 
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
@@ -99,50 +102,6 @@ const exists = async (filePath) => {
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
-const hasExited = (child) => child.exitCode !== null || child.signalCode !== null;
-
-const waitForChildExit = (child, timeoutMs) => {
-  if (hasExited(child)) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      child.off('exit', onExit);
-      resolve(hasExited(child));
-    }, timeoutMs);
-    const onExit = () => {
-      clearTimeout(timer);
-      resolve(true);
-    };
-    child.once('exit', onExit);
-  });
-};
-
-const terminateTree = async (child) => {
-  if (hasExited(child)) return;
-  let taskkillResult;
-  if (process.platform === 'win32' && child.pid !== undefined) {
-    taskkillResult = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
-      windowsHide: true,
-      stdio: 'ignore',
-      timeout: 10_000,
-    });
-  } else {
-    child.kill('SIGTERM');
-  }
-  if (await waitForChildExit(child, 5_000)) return;
-  try {
-    child.kill('SIGKILL');
-  } catch {
-    // The verified exit check below remains authoritative.
-  }
-  if (await waitForChildExit(child, 3_000)) return;
-  throw new Error(
-    `Process tree ${child.pid ?? 'unknown'} did not drain after termination` +
-      (taskkillResult === undefined
-        ? '.'
-        : ` (taskkill status ${taskkillResult.status ?? 'none'}, signal ${taskkillResult.signal ?? 'none'}, error ${taskkillResult.error?.message ?? 'none'}).`),
-  );
-};
-
 const run = (command, arguments_, options = {}) =>
   new Promise((resolve, reject) => {
     const child = spawn(command, arguments_, {
@@ -165,18 +124,19 @@ const run = (command, arguments_, options = {}) =>
         .filter(Boolean)
         .map((value) => value.slice(-1_500))
         .join(' | ');
-      void terminateTree(child).then(
-        () =>
-          reject(
-            new Error(
-              `${options.label ?? path.basename(command)} timed out.` +
-                (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
-            ),
-          ),
+      const timeoutError = new Error(
+        `${options.label ?? path.basename(command)} timed out.` +
+          (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
+      );
+      void drainChildProcess({
+        child,
+        label: options.label ?? path.basename(command),
+      }).then(
+        () => reject(timeoutError),
         (terminationError) =>
           reject(
             new AggregateError(
-              [terminationError],
+              [timeoutError, terminationError],
               `${options.label ?? path.basename(command)} timed out and its process tree could not be drained.` +
                 (diagnostics === '' ? '' : ` Diagnostics: ${diagnostics}`),
             ),
@@ -224,20 +184,14 @@ const findBrowserExecutable = async () => {
   );
 };
 
-const pngDimensions = (bytes) => {
-  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  if (bytes.length < 24 || !bytes.subarray(0, 8).equals(signature)) {
-    throw new Error('The browser visual evidence is not a valid PNG.');
-  }
-  return { widthPx: bytes.readUInt32BE(16), heightPx: bytes.readUInt32BE(20) };
-};
-
 const captureLocalVisual = async ({
   browserExecutable,
   sourcePath,
   screenshotPath,
   profilePath,
   fragment = '',
+  virtualTimeBudgetMs = 3_000,
+  captureDelayMs = 3_000,
 }) => {
   await mkdir(profilePath, { recursive: true });
   await rm(screenshotPath, { force: true });
@@ -251,10 +205,12 @@ const captureLocalVisual = async ({
       '--disable-default-apps',
       '--disable-sync',
       '--hide-scrollbars',
+      '--host-resolver-rules=MAP * ~NOTFOUND',
       '--metrics-recording-only',
       '--no-first-run',
       '--run-all-compositor-stages-before-draw',
-      '--virtual-time-budget=3000',
+      `--timeout=${captureDelayMs}`,
+      `--virtual-time-budget=${virtualTimeBudgetMs}`,
       '--window-size=1280,800',
       `--user-data-dir=${profilePath}`,
       `--screenshot=${screenshotPath}`,
@@ -263,14 +219,219 @@ const captureLocalVisual = async ({
     { label: `Visual capture for ${path.extname(sourcePath)}`, timeoutMs: 45_000 },
   );
   const bytes = await readFile(screenshotPath);
-  const dimensions = pngDimensions(bytes);
-  if (bytes.length < 5_000 || dimensions.widthPx !== 1_280 || dimensions.heightPx !== 800) {
-    throw new Error('The browser returned incomplete export visual evidence.');
+  const visualMetrics = analyzePngVisual(bytes);
+  if (
+    bytes.length < 5_000 ||
+    visualMetrics.widthPx !== 1_280 ||
+    visualMetrics.heightPx !== 800 ||
+    !visualMetrics.passed
+  ) {
+    throw new Error(
+      `The browser returned incomplete export visual evidence ` +
+        `(bytes=${bytes.length},dimensions=${visualMetrics.widthPx}x${visualMetrics.heightPx},` +
+        `failures=${visualMetrics.failures.join(',') || 'none'}).`,
+    );
   }
-  return { bytes: bytes.length, sha256: sha256(bytes), ...dimensions };
+  return { bytes: bytes.length, sha256: sha256(bytes), visualMetrics };
 };
 
-const inspectRuntime = async (rootProcessId) => {
+const captureStablePdfVisual = async ({
+  browserExecutable,
+  sourcePath,
+  screenshotPath,
+  profilePath,
+  fragment = '',
+}) => {
+  await mkdir(profilePath, { recursive: true });
+  await rm(screenshotPath, { force: true });
+  const browser = spawn(
+    browserExecutable,
+    [
+      '--headless=new',
+      '--disable-background-networking',
+      '--disable-component-update',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--hide-scrollbars',
+      '--host-resolver-rules=MAP * ~NOTFOUND',
+      '--metrics-recording-only',
+      '--no-first-run',
+      '--remote-debugging-address=127.0.0.1',
+      '--remote-debugging-port=0',
+      '--window-size=1280,800',
+      `--user-data-dir=${profilePath}`,
+      'about:blank',
+    ],
+    { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] },
+  );
+  let stderr = '';
+  let browserSpawnError;
+  browser.once('error', (error) => {
+    browserSpawnError = error;
+  });
+  browser.stderr.on('data', (chunk) => {
+    stderr = (stderr + chunk.toString('utf8')).slice(-4_000);
+  });
+  let cdp;
+  const startedAt = Date.now();
+  const { value, cleanupReceipt } = await runWithCleanup({
+    label: 'PDF visual capture',
+    operation: async () => {
+      const debuggingPort = await waitFor(
+        async () => {
+          if (browserSpawnError !== undefined) {
+            browserSpawnError.fatal = true;
+            throw browserSpawnError;
+          }
+          if (browser.exitCode !== null || browser.signalCode !== null) {
+            const earlyExit = new Error(
+              `PDF visual browser exited before its debugging endpoint was ready ` +
+                `(exit=${String(browser.exitCode)},signal=${String(browser.signalCode)}). ` +
+                stderr.trim(),
+            );
+            earlyExit.fatal = true;
+            throw earlyExit;
+          }
+          try {
+            const value = await readFile(path.join(profilePath, 'DevToolsActivePort'), 'utf8');
+            const port = Number.parseInt(value.split(/\r?\n/u)[0] ?? '', 10);
+            if (Number.isInteger(port) && port > 0) return port;
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+          }
+          const match = stderr.match(/DevTools listening on ws:\/\/[^:]+:(\d+)\//u);
+          return match === null ? undefined : Number.parseInt(match[1], 10);
+        },
+        20_000,
+        'PDF visual browser debugging endpoint',
+      );
+      const target = await waitFor(
+        async (remainingMs) => {
+          const targets = await fetchJsonWithTimeout(
+            `http://127.0.0.1:${debuggingPort}/json/list`,
+            Math.min(5_000, remainingMs),
+            'PDF visual browser target discovery',
+          );
+          return Array.isArray(targets)
+            ? targets.find(
+                (candidate) =>
+                  candidate.type === 'page' && typeof candidate.webSocketDebuggerUrl === 'string',
+              )
+            : undefined;
+        },
+        20_000,
+        'PDF visual browser page target',
+      );
+      cdp = await CdpSession.connect(target.webSocketDebuggerUrl, {
+        timeoutMs: 5_000,
+        commandTimeoutMs: 5_000,
+      });
+      const browserVersion = await cdp.send('Browser.getVersion');
+      await cdp.send('Page.enable');
+      await cdp.send('Runtime.enable');
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 1_280,
+        height: 800,
+        deviceScaleFactor: 1,
+        mobile: false,
+        screenWidth: 1_280,
+        screenHeight: 800,
+      });
+      await cdp.send('Network.enable');
+      await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+      await cdp.send('Network.setBlockedURLs', {
+        urls: ['http://*', 'https://*', 'ws://*', 'wss://*'],
+      });
+      await cdp.send('Network.emulateNetworkConditions', {
+        offline: true,
+        latency: 0,
+        downloadThroughput: -1,
+        uploadThroughput: -1,
+        connectionType: 'none',
+      });
+      const targetUrl = `${pathToFileURL(sourcePath).href}${fragment}`;
+      const navigation = await cdp.send('Page.navigate', { url: targetUrl }, 10_000);
+      if (typeof navigation.errorText === 'string' && navigation.errorText !== '') {
+        throw new Error(`The local PDF visual navigation failed: ${navigation.errorText}`);
+      }
+      const exactLocalUrlVerified = await waitFor(
+        async () => {
+          const location = await cdp.send('Runtime.evaluate', {
+            expression: 'globalThis.location.href',
+            returnByValue: true,
+          });
+          return location.result?.value === targetUrl ? true : undefined;
+        },
+        10_000,
+        'Exact local PDF URL',
+      );
+
+      const deadline = Date.now() + 30_000;
+      let attempts = 0;
+      let previousAcceptedHash;
+      let lastFrame = { bytes: 0, sha256: '', visualMetrics: null };
+      while (Date.now() < deadline) {
+        await sleep(250);
+        const captured = await cdp.send(
+          'Page.captureScreenshot',
+          { format: 'png', fromSurface: true, captureBeyondViewport: false },
+          5_000,
+        );
+        const bytes = Buffer.from(captured.data ?? '', 'base64');
+        const visualMetrics = analyzePngVisual(bytes);
+        const frameHash = sha256(bytes);
+        attempts += 1;
+        lastFrame = { bytes: bytes.length, sha256: frameHash, visualMetrics };
+        const accepted =
+          bytes.length >= 8_000 &&
+          visualMetrics.widthPx === 1_280 &&
+          visualMetrics.heightPx === 800 &&
+          visualMetrics.passed;
+        if (accepted && frameHash === previousAcceptedHash) {
+          await writeFile(screenshotPath, bytes);
+          return {
+            ...lastFrame,
+            attempts,
+            stableAfterMs: Date.now() - startedAt,
+            browserVersion: {
+              protocolVersion: browserVersion.protocolVersion,
+              product: browserVersion.product,
+              revision: browserVersion.revision,
+              userAgent: browserVersion.userAgent,
+              jsVersion: browserVersion.jsVersion,
+            },
+            networkIsolation: {
+              cdpOfflineEmulation: true,
+              cacheDisabled: true,
+              blockedUrlSchemes: ['http', 'https', 'ws', 'wss'],
+              hostResolverRule: 'MAP * ~NOTFOUND',
+              exactLocalUrlVerified,
+              navigatedUrlSha256: sha256(Buffer.from(targetUrl, 'utf8')),
+            },
+          };
+        }
+        previousAcceptedHash = accepted ? frameHash : undefined;
+      }
+      throw new Error(
+        `The local PDF did not produce two stable rendered frames before the deadline ` +
+          `(attempts=${attempts},bytes=${lastFrame.bytes},` +
+          `dimensions=${lastFrame.visualMetrics?.widthPx ?? 0}x${lastFrame.visualMetrics?.heightPx ?? 0},` +
+          `failures=${lastFrame.visualMetrics?.failures?.join(',') || 'unknown'}).`,
+      );
+    },
+    cleanup: async () => {
+      const cleanup = await runWithCleanup({
+        label: 'PDF visual browser connection',
+        operation: async () => cdp?.close(),
+        cleanup: async () => drainChildProcess({ child: browser, label: 'PDF visual browser' }),
+      });
+      return cleanup.cleanupReceipt;
+    },
+  });
+  return { ...value, cleanup: cleanupReceipt };
+};
+
+const inspectRuntime = async (rootProcessId, timeoutMs = 20_000) => {
   const { stdout } = await run(
     'powershell.exe',
     [
@@ -283,7 +444,7 @@ const inspectRuntime = async (rootProcessId) => {
       '-RootProcessId',
       String(rootProcessId),
     ],
-    { label: 'Electron runtime inspection', timeoutMs: 20_000 },
+    { label: 'Electron runtime inspection', timeoutMs },
   );
   const sample = JSON.parse(stdout.trim());
   const validProcessIds =
@@ -449,15 +610,15 @@ const summarizeRuntimeGrowth = (baseline, samples) => {
 
 const waitForRuntimeExit = async (rootProcessId, label) =>
   waitFor(
-    async () => {
-      const sample = await inspectRuntime(rootProcessId);
+    async (remainingMs) => {
+      const sample = await inspectRuntime(rootProcessId, Math.min(10_000, remainingMs));
       return sample.processCount === 0 &&
         sample.topLevelWindowCount === 0 &&
         sample.visibleWindowCount === 0
         ? sample
         : undefined;
     },
-    20_000,
+    45_000,
     label,
   );
 
@@ -556,13 +717,27 @@ const launchEditor = async ({ deckPath, userData }) => {
       waitForRenderer,
       async close() {
         cdp?.close();
-        await terminateTree(application);
+        return drainChildProcess({ child: application, label: 'Electron editor' });
       },
     };
   } catch (error) {
     cdp?.close();
-    await terminateTree(application);
+    let cleanupError;
+    try {
+      await drainChildProcess({
+        child: application,
+        label: 'Electron editor after launch failure',
+      });
+    } catch (candidate) {
+      cleanupError = candidate;
+    }
     if (applicationError !== '') process.stderr.write(`[desktop stderr]\n${applicationError}\n`);
+    if (cleanupError !== undefined) {
+      throw new AggregateError(
+        [error, cleanupError],
+        'Electron editor launch failed and its process tree could not be drained.',
+      );
+    }
     throw error;
   }
 };
@@ -598,6 +773,8 @@ const chooseNativeDestination = async (application, title, targetPath) => {
       title,
       '-TargetPath',
       targetPath,
+      '-DialogKind',
+      'Save',
       '-TimeoutSeconds',
       '30',
     ],
@@ -624,15 +801,30 @@ const runSaveOperation = async ({ editor, menuPrefix, dialogTitle, targetPath, s
   if (immediateToasts.length > 0 && !immediateToasts.some((text) => text.includes(successText))) {
     throw new Error(`${menuPrefix} returned an application error: ${immediateToasts.join(' | ')}`);
   }
-  await waitFor(
-    async () => {
-      if (!(await exists(targetPath))) return undefined;
-      const metadata = await stat(targetPath);
-      return metadata.isFile() && metadata.size > 0 ? metadata : undefined;
-    },
-    30_000,
-    `${menuPrefix} output`,
-  );
+  try {
+    await waitFor(
+      async () => {
+        if (!(await exists(targetPath))) return undefined;
+        const metadata = await stat(targetPath);
+        return metadata.isFile() && metadata.size > 0 ? metadata : undefined;
+      },
+      30_000,
+      `${menuPrefix} output`,
+    );
+  } catch (error) {
+    const [directoryEntries, toastTexts] = await Promise.all([
+      readdir(path.dirname(targetPath)).catch(() => []),
+      editor.evaluate(
+        `([...document.querySelectorAll('.toast')].map((toast) => toast.textContent?.trim() ?? ''))`,
+      ),
+    ]);
+    throw new Error(
+      `${menuPrefix} did not create the exact requested output. ` +
+        `Directory entries: ${JSON.stringify(directoryEntries)}. ` +
+        `Toasts: ${JSON.stringify(toastTexts)}.`,
+      { cause: error },
+    );
+  }
   await waitFor(
     async () => {
       const toastTexts = await editor.evaluate(
@@ -738,6 +930,7 @@ const validatePdf = (bytes, expectedPages, expectedPage) => {
 };
 
 if (process.platform !== 'win32') throw new Error('The system export smoke requires Windows.');
+await rm(evidencePath, { force: true });
 const temporaryRoot = await mkdtemp(path.join(tmpdir(), 'htmllelujah-system-export-smoke-'));
 const safePrefix = path.join(path.resolve(tmpdir()), 'htmllelujah-system-export-smoke-');
 if (!path.resolve(temporaryRoot).startsWith(safePrefix)) {
@@ -920,7 +1113,7 @@ try {
       screenshotPath: path.join(repositoryRoot, htmlRelativePath),
       profilePath: path.join(temporaryRoot, 'Profil visuel HTML'),
     });
-    const pdfVisual = await captureLocalVisual({
+    const pdfVisual = await captureStablePdfVisual({
       browserExecutable,
       sourcePath: pdfPath,
       screenshotPath: path.join(repositoryRoot, pdfRelativePath),
@@ -929,13 +1122,18 @@ try {
     });
     visualEvidence = {
       browser: path.basename(browserExecutable),
+      validationPolicy: {
+        ...visualThresholds,
+        exactViewport: { widthPx: 1_280, heightPx: 800 },
+        stablePdfFramesRequired: 2,
+      },
       standaloneHtml: { path: htmlRelativePath, ...htmlVisual },
       pdfFirstPage: { path: pdfRelativePath, ...pdfVisual },
     };
   }
 
   const firstApplicationPid = activeApplicationPid;
-  await editor.close();
+  const firstEditorProcessTreeCleanup = await editor.close();
   editor = undefined;
   const firstRuntimeCleanup = await waitForRuntimeExit(
     firstApplicationPid,
@@ -981,7 +1179,7 @@ try {
     throw new Error('The reopened editor runtime was not completely observable.');
   }
   const reopenApplicationPid = activeApplicationPid;
-  await editor.close();
+  const reopenEditorProcessTreeCleanup = await editor.close();
   editor = undefined;
   const reopenRuntimeCleanup = await waitForRuntimeExit(
     reopenApplicationPid,
@@ -1036,6 +1234,10 @@ try {
       savedHdeckReopenedInRealEditor: true,
       nativeDialogsClosedAfterEveryExport: true,
       standaloneHtmlAndPdfVisualsCaptured: exportRun.mode === 'stress' || visualEvidence !== null,
+      pdfVisualBrowserProcessTreeClosed:
+        exportRun.mode === 'stress' ||
+        (Array.isArray(visualEvidence?.pdfFirstPage.cleanup?.processIds) &&
+          visualEvidence.pdfFirstPage.cleanup.processIds.length > 0),
       exactWindowHandlesAndVisibilityRestoredAfterEveryExport: true,
       processCountStable: runtimeGrowth.processCountStable,
       processTreesAndWindowsClosedAfterEditorsExit:
@@ -1067,8 +1269,14 @@ try {
       samples: runtimeSamples.map((sample, index) => ({ ordinal: index + 1, ...sample })),
       growth: runtimeGrowth,
       cleanup: {
-        primaryEditor: firstRuntimeCleanup,
-        reopenedEditor: reopenRuntimeCleanup,
+        primaryEditor: {
+          processTree: firstEditorProcessTreeCleanup,
+          observedRuntime: firstRuntimeCleanup,
+        },
+        reopenedEditor: {
+          processTree: reopenEditorProcessTreeCleanup,
+          observedRuntime: reopenRuntimeCleanup,
+        },
       },
     },
     security: {
