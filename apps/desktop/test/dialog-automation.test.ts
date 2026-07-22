@@ -10,7 +10,7 @@ const windowsIt = process.platform === 'win32' ? it : it.skip;
 
 describe('native file-dialog editor selection', () => {
   it('selects the exact native file-name Edit and confirmation Button and fails closed otherwise', async () => {
-    const source = await readFile(scriptPath, 'utf8');
+    const source = (await readFile(scriptPath, 'utf8')).replace(/\r\n?/g, '\n');
 
     expect(source).toContain('EnumWindows');
     expect(source).toContain('EnumChildWindows');
