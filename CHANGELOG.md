@@ -51,6 +51,11 @@ and releases use semantic versions.
 
 ### Fixed
 
+- Pinned patched transitive MCP dependencies for URI validation and the optional
+  Node HTTP adapter; the production dependency audit now reports no known
+  vulnerabilities while the desktop integration continues to use the local stdio
+  transport.
+
 - Sanitized public export evidence to record only the browser family, major version,
   and DevTools protocol version, preventing Chromium's dotted version strings from
   being mistaken for private network addresses without weakening the privacy screen.

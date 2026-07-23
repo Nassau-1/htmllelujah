@@ -8,5 +8,9 @@ allowBuilds:
   esbuild: true
   libxmljs2: true
 
+overrides:
+  '@hono/node-server': 2.0.11
+  fast-uri: 3.1.4
+
 minimumReleaseAgeExclude:
   - electron@43.1.1
