@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -44,6 +46,53 @@ const defenderLogs = new Map([
   ['private-security/installer-defender-scan.log', Buffer.from('clean installer scan\n')],
   ['private-security/win-unpacked-defender-scan.log', Buffer.from('clean directory scan\n')],
 ]);
+const inspectWindowsProcessCommandLines = (processIds) => {
+  const uniqueProcessIds = [...new Set(processIds)];
+  assert.ok(uniqueProcessIds.length > 0);
+  for (const processId of uniqueProcessIds) {
+    assert.ok(Number.isSafeInteger(processId) && processId > 0);
+  }
+
+  const wqlFilter = uniqueProcessIds.map((processId) => `ProcessId = ${processId}`).join(' OR ');
+  const script = [
+    `$rows = @(Get-CimInstance Win32_Process -Filter '${wqlFilter}' -ErrorAction Stop | Select-Object ProcessId, CommandLine)`,
+    '$rows | ConvertTo-Json -Compress',
+  ].join('; ');
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+    {
+      encoding: 'utf8',
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000,
+      windowsHide: true,
+    },
+  );
+  const outcome = result.error?.code ?? result.signal ?? result.status ?? 'unknown';
+  assert.equal(
+    outcome,
+    0,
+    `Windows process inspection failed with ${String(outcome)}: ${String(result.stderr ?? '')
+      .trim()
+      .slice(-1_000)}`,
+  );
+
+  const serialized = String(result.stdout ?? '').trim();
+  if (serialized.length === 0) return [];
+  const parsed = JSON.parse(serialized);
+  return Array.isArray(parsed) ? parsed : [parsed];
+};
+
+const assertWindowsProcessNonceAbsent = (processIds, nonce) => {
+  for (const process of inspectWindowsProcessCommandLines(processIds)) {
+    assert.equal(
+      String(process.CommandLine ?? '').includes(nonce),
+      false,
+      `Timed-out test process ${String(process.ProcessId)} is still running.`,
+    );
+  }
+};
 
 const dependencySbomFixture = () => ({
   bomFormat: 'CycloneDX',
@@ -669,10 +718,13 @@ test(
   async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'htmllelujah-security-timeout-'));
     const pidPath = path.join(root, 'pids.json');
+    const nonce = randomUUID();
     const childSource = [
       "const {spawn}=require('node:child_process');",
       "const fs=require('node:fs');",
-      "const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});",
+      `const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)',${JSON.stringify(
+        nonce,
+      )}],{stdio:'ignore'});`,
       `fs.writeFileSync(${JSON.stringify(pidPath)},JSON.stringify({root:process.pid,child:child.pid}));`,
       'setInterval(()=>{},1000);',
     ].join('');
@@ -680,7 +732,7 @@ test(
       await assert.rejects(
         defaultRunCommand({
           command: process.execPath,
-          args: ['-e', childSource],
+          args: ['-e', childSource, nonce],
           cwd: root,
           env: process.env,
           timeoutMs: 2_000,
@@ -688,10 +740,7 @@ test(
         /exceeded 2000 ms/u,
       );
       const pids = JSON.parse(await readFile(pidPath, 'utf8'));
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      for (const pid of [pids.root, pids.child]) {
-        assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
-      }
+      assertWindowsProcessNonceAbsent([pids.root, pids.child], nonce);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -704,6 +753,7 @@ test(
   async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'htmllelujah-security-cleanup-error-'));
     const pidPath = path.join(root, 'pid.txt');
+    const nonce = randomUUID();
     const childSource = [
       "const fs=require('node:fs');",
       `fs.writeFileSync(${JSON.stringify(pidPath)},String(process.pid));`,
@@ -713,7 +763,7 @@ test(
       await assert.rejects(
         defaultRunCommand({
           command: process.execPath,
-          args: ['-e', childSource],
+          args: ['-e', childSource, nonce],
           cwd: root,
           env: process.env,
           timeoutMs: 1_000,
@@ -729,7 +779,7 @@ test(
           error.errors[1].message === 'simulated cleanup receipt failure',
       );
       const pid = Number(await readFile(pidPath, 'utf8'));
-      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+      assertWindowsProcessNonceAbsent([pid], nonce);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

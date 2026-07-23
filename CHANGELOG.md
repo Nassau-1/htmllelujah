@@ -18,6 +18,10 @@ and releases use semantic versions.
   and DevTools protocol version, preventing Chromium's dotted version strings from
   being mistaken for private network addresses without weakening the privacy screen.
 
+- Made Windows process-drain tests compare a unique command-line identity instead of
+  raw PID liveness, avoiding false failures when the operating system reuses a
+  successfully terminated process identifier.
+
 - Made every editable inspector and canvas field register its exact blur commit before
   native window closure, retain rejected or failed values visibly, drain superseded and
   concurrent commits to a bounded deadline, and keep the presentation open whenever the
