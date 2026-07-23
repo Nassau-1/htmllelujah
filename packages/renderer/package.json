@@ -23,8 +23,8 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "react": "19.2.7",
-    "react-dom": "19.2.7"
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@twemoji/svg": "15.0.0",
