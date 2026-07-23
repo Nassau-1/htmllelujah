@@ -22,6 +22,11 @@ and releases use semantic versions.
   raw PID liveness, avoiding false failures when the operating system reuses a
   successfully terminated process identifier.
 
+- Translated known document-command rejections at the desktop MCP boundary into
+  redacted `INVALID_REQUEST`, `NOT_FOUND`, or `REVISION_CONFLICT` responses, preserving
+  atomic state and immediate bridge reuse instead of misreporting them as service
+  outages.
+
 - Made every editable inspector and canvas field register its exact blur commit before
   native window closure, retain rejected or failed values visibly, drain superseded and
   concurrent commits to a bounded deadline, and keep the presentation open whenever the

@@ -1,5 +1,11 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 
+import { DocumentCommandError } from '@htmllelujah/document-core';
+import {
+  DocumentRuntimeError,
+  DocumentSessionManager,
+  type DocumentSessionSnapshot,
+} from '@htmllelujah/document-runtime';
 import {
   affectedSlideIds,
   commandsRequireApproval,
@@ -16,11 +22,6 @@ import {
   type SafeRecord,
   type TransactionTargetInput,
 } from '@htmllelujah/mcp-server';
-import {
-  DocumentRuntimeError,
-  DocumentSessionManager,
-  type DocumentSessionSnapshot,
-} from '@htmllelujah/document-runtime';
 
 export type McpApprovalAction = Parameters<McpPermissionGate['consumeApproval']>[0]['action'];
 
@@ -76,6 +77,15 @@ const asSafeError = (error: unknown): never => {
       error.code === 'AGENT_UNDO_CONFLICT'
         ? 'REVISION_CONFLICT'
         : error.code === 'PROPOSAL_NOT_FOUND' || error.code === 'SESSION_NOT_FOUND'
+          ? 'NOT_FOUND'
+          : 'INVALID_REQUEST';
+    throw new McpSafeError(code, 'The document operation could not be completed.');
+  }
+  if (error instanceof DocumentCommandError) {
+    const code =
+      error.code === 'REVISION_CONFLICT'
+        ? 'REVISION_CONFLICT'
+        : error.code === 'NOT_FOUND'
           ? 'NOT_FOUND'
           : 'INVALID_REQUEST';
     throw new McpSafeError(code, 'The document operation could not be completed.');

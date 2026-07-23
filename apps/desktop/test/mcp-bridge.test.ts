@@ -1,7 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm as remove } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { createDuplicateSlide } from '@htmllelujah/document-core';
 import { DocumentSessionManager } from '@htmllelujah/document-runtime';
 import { MCP_LIMITS } from '@htmllelujah/mcp-server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -226,6 +228,97 @@ describe('DesktopMcpBridge', () => {
     collaborationMode = 'host';
     await expect(bridge.canRead(source.documentId)).resolves.toBe(true);
     await expect(bridge.canEdit(source.documentId)).resolves.toBe(false);
+  });
+
+  it('maps atomic command rejections safely without mutating or disabling the bridge', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-mcp-atomic-'));
+    const now = new Date('2026-07-15T12:00:00.000Z');
+    const runtime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'recovery'),
+      autosaveDelayMs: 0,
+      now: () => now.toISOString(),
+    });
+    const source = await runtime.createMainOnly();
+    const bridge = new DesktopMcpBridge({
+      runtime,
+      appVersion: () => '1.0.0',
+      visibleSessionIds: () => [source.sessionId],
+      collaborationStatus: () => ({
+        mode: 'offline',
+        connectedPeers: 0,
+        discoveryEnabled: false,
+      }),
+      importAsset: vi.fn(async () => ({ assetId: 'approved-asset' })),
+      exportDocument: vi.fn(async () => ({ format: 'pdf', pageCount: 1 })),
+      now: () => now,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(async () => {
+      await Promise.all(
+        runtime
+          .listSessions()
+          .map((session) => runtime.close(session.sessionId, { discardUnsaved: true })),
+      );
+    });
+
+    const rejectMissingSlide = (expectedRevision: string) =>
+      bridge.proposeCommands({
+        documentId: source.documentId,
+        expectedRevision,
+        label: 'Reject an atomic mixed batch',
+        commands: [
+          { type: 'deck.rename', name: 'This rename must not apply' },
+          {
+            type: 'slide.delete',
+            slideId: '00000000-0000-4000-8000-000000000099',
+          },
+        ],
+      });
+
+    const oneSlideBefore = runtime.getSnapshot(source.sessionId);
+    await expect(rejectMissingSlide(oneSlideBefore.revision)).rejects.toMatchObject({
+      code: 'INVALID_REQUEST',
+      message: 'The document operation could not be completed.',
+    });
+    expect(runtime.getSnapshot(source.sessionId)).toEqual(oneSlideBefore);
+    expect(runtime.getAgentAudit(source.sessionId)).toEqual([]);
+
+    const originalSlide = oneSlideBefore.document.slides[0];
+    if (originalSlide === undefined) throw new Error('Missing default slide.');
+    const duplicate = createDuplicateSlide(oneSlideBefore.document, originalSlide.id, randomUUID);
+    const twoSlides = await runtime.execute(source.sessionId, {
+      expectedRevision: oneSlideBefore.revision,
+      commands: [{ type: 'slide.duplicate', slideId: originalSlide.id, duplicate }],
+      metadata: {
+        transactionId: randomUUID(),
+        actorId: 'desktop-test',
+        origin: 'user',
+        label: 'Create a second slide',
+        timestamp: now.toISOString(),
+      },
+    });
+    const twoSlidesBefore = runtime.getSnapshot(source.sessionId);
+    expect(twoSlidesBefore.revision).toBe(twoSlides.revision);
+    await expect(rejectMissingSlide(twoSlidesBefore.revision)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      message: 'The document operation could not be completed.',
+    });
+    expect(runtime.getSnapshot(source.sessionId)).toEqual(twoSlidesBefore);
+    expect(runtime.getAgentAudit(source.sessionId)).toEqual([]);
+
+    const recoveryProposal = await bridge.proposeCommands({
+      documentId: source.documentId,
+      expectedRevision: twoSlidesBefore.revision,
+      label: 'Prove the bridge remains available',
+      commands: [{ type: 'deck.rename', name: 'Bridge recovered safely' }],
+    });
+    await expect(
+      bridge.commitProposal({ proposalId: recoveryProposal.proposalId }),
+    ).resolves.toMatchObject({
+      previousRevision: twoSlidesBefore.revision,
+      acceptedCommandCount: 1,
+    });
+    expect(runtime.getSnapshot(source.sessionId).document.name).toBe('Bridge recovered safely');
   });
 
   it('purges expired proposals and fails closed at proposal, approval, and receipt caps', async () => {
