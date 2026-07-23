@@ -108,8 +108,8 @@ const assertCandidateShape = (inventory, version) => {
   for (const required of [
     'win-unpacked/HTMLlelujah.exe',
     'win-unpacked/HTMLlelujah-MCP.cmd',
-    'win-unpacked/EULA.txt',
     'win-unpacked/LICENSE.txt',
+    'win-unpacked/COMMERCIAL-LICENSING.md',
     'win-unpacked/LICENSE.electron.txt',
     'win-unpacked/LICENSES.chromium.html',
     'win-unpacked/THIRD_PARTY_NOTICES.md',

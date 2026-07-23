@@ -9,6 +9,8 @@ import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import { pendingPublicDistributionCompliance } from './public-distribution-compliance.mjs';
+
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const GENERATOR = path.join(SCRIPT_DIR, 'generate-release-evidence.mjs');
 const VERIFIER = path.join(SCRIPT_DIR, 'verify-release-evidence.mjs');
@@ -64,8 +66,8 @@ async function main() {
     await writeFile(path.join(resourcesDir, 'app.asar'), 'synthetic application fixture\n');
     for (const [name, content] of [
       ['HTMLlelujah-MCP.cmd', '@echo off\n'],
-      ['EULA.txt', 'Synthetic EULA fixture\n'],
       ['LICENSE.txt', 'Synthetic project license fixture\n'],
+      ['COMMERCIAL-LICENSING.md', '# Synthetic commercial licensing fixture\n'],
       ['LICENSE.electron.txt', 'Synthetic Electron license fixture\n'],
       ['LICENSES.chromium.html', '<!doctype html><title>Synthetic notices</title>\n'],
       ['THIRD_PARTY_NOTICES.md', '# Synthetic notices\n'],
@@ -95,6 +97,10 @@ async function main() {
       await readFile(path.join(evidenceDir, 'build-sbom.cdx.json'), 'utf8'),
     );
     assert.equal(diagnosticManifest.quality.releaseReady, false);
+    assert.deepEqual(
+      diagnosticManifest.quality.publicDistributionCompliance,
+      pendingPublicDistributionCompliance(),
+    );
     assert.equal(diagnosticManifest.quality.nativeRuntime.passed, false);
     assert.equal(diagnosticManifest.quality.nativeRuntime.componentCount, 0);
     assert.deepEqual(diagnosticSbom.components, []);
@@ -197,8 +203,9 @@ async function main() {
       VERIFIER,
       ['--artifact-dir', artifactDir, '--evidence-dir', evidenceDir],
       1,
-      'releaseReady contradicts the incomplete native runtime inventory',
+      'releaseReady contradicts pending public-distribution compliance',
     );
+    mismatchedManifest.quality.releaseReady = false;
     mismatchedManifest.release.source.commit = '0000000000000000000000000000000000000000';
     await writeFile(manifestPath, `${JSON.stringify(mismatchedManifest, null, 2)}\n`, 'utf8');
     run(

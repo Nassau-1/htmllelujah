@@ -61,7 +61,7 @@ export const latestReleaseInput = async (repositoryRoot) => {
     path.join(repositoryRoot, 'pnpm-lock.yaml'),
     path.join(repositoryRoot, 'pnpm-workspace.yaml'),
     path.join(repositoryRoot, 'LICENSE'),
-    path.join(repositoryRoot, 'EULA.txt'),
+    path.join(repositoryRoot, 'COMMERCIAL-LICENSING.md'),
     path.join(repositoryRoot, 'THIRD_PARTY_NOTICES.md'),
     path.join(repositoryRoot, 'apps', 'desktop', 'index.html'),
     path.join(repositoryRoot, 'apps', 'desktop', 'package.json'),

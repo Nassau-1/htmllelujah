@@ -7,6 +7,16 @@ and releases use semantic versions.
 
 ### Changed
 
+- Replaced the source-visible proprietary and separate binary terms with one
+  source-available PolyForm Noncommercial 1.0.0 license for original source and
+  official binaries, added a separate commercial-licensing contact path, aligned
+  first-party package metadata and installer notices, propagated the required notice
+  into standalone HTML viewer exports, and kept external contributions closed until
+  a dual-licensing contributor agreement exists.
+- Replaced the legacy dependency-license crawler with pnpm's bounded native license
+  inventory, retaining separate runtime and development allowlists and documenting
+  the build-only WTFPL path used by Electron Builder.
+
 - Adopted the owner-provided HTMLlelujah identity across the Windows executable,
   installer, file association, browser metadata, editor header, and loading screen,
   with exact source hashes and multi-resolution icon coverage recorded in the asset
@@ -137,10 +147,11 @@ and releases use semantic versions.
   exports, packaged MCP, scaling, two-process text locks, installer lifecycle,
   performance limits, a continuous 30-minute collaboration soak, and a deterministic
   public evidence bundle.
-- Source-visible proprietary notice, separate V1 binary terms, direct-dependency
-  notices, an engineering Electron/FFmpeg license review, and bundled-asset
-  provenance ledger. The review does not replace qualified legal approval for
-  commercial distribution.
+- Source-available PolyForm Noncommercial 1.0.0 terms for original source and
+  binaries, a separate commercial-licensing contact path, direct-dependency notices,
+  an engineering Electron/FFmpeg license review, and a bundled-asset provenance
+  ledger. The review does not replace qualified legal approval for commercial
+  distribution or the source-availability gate for any public binary.
 
 ### Fixed
 
@@ -217,9 +228,12 @@ and releases use semantic versions.
 
 ### Known V1 boundaries
 
-- The official no-charge public V1 pipeline deliberately produces and verifies
+- The official noncommercial public V1 pipeline deliberately produces and verifies
   exactly unsigned artifacts and refuses signing credentials. Any later signed or
   commercial distribution requires a separately reviewed candidate and release gate.
+  Every public binary also remains blocked until the exact FFmpeg
+  corresponding-source mechanism, complete packaged notices, and qualified approval
+  are recorded.
 - MCP mutations are paused during a live LAN session; read tools remain available.
 - Collaboration has no internet relay, automatic writer election, disconnected edit
   merge, or simultaneous editing of one text element.

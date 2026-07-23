@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "HTMLlelujah desktop presentation editor",
-  "license": "UNLICENSED",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "author": "Nassau-1",
   "homepage": "https://github.com/Nassau-1/htmllelujah",
   "type": "module",
@@ -71,8 +71,8 @@
         "to": "LICENSE.txt"
       },
       {
-        "from": "../../EULA.txt",
-        "to": "EULA.txt"
+        "from": "../../COMMERCIAL-LICENSING.md",
+        "to": "COMMERCIAL-LICENSING.md"
       },
       {
         "from": "../../THIRD_PARTY_NOTICES.md",
@@ -113,7 +113,7 @@
       "createStartMenuShortcut": true,
       "deleteAppDataOnUninstall": false,
       "include": "scripts/installer-association.nsh",
-      "license": "../../EULA.txt",
+      "license": "../../LICENSE",
       "menuCategory": false
     }
   }

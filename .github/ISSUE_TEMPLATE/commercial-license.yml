@@ -1,0 +1,16 @@
+name: Commercial licensing inquiry
+description: Ask the maintainer to establish a private channel for commercial terms.
+title: '[Licensing]: '
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This public issue starts contact only. Do not include confidential business,
+        pricing, product, customer, or legal information.
+  - type: checkboxes
+    id: acknowledgement
+    attributes:
+      label: Public-contact acknowledgement
+      options:
+        - label: I have not included confidential information and would like a private follow-up channel.
+          required: true

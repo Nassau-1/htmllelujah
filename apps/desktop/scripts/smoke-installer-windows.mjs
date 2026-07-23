@@ -613,8 +613,8 @@ const requiredInstalledFiles = (installDirectory) => [
   path.join(installDirectory, 'HTMLlelujah.exe'),
   path.join(installDirectory, 'HTMLlelujah-MCP.cmd'),
   path.join(installDirectory, 'Uninstall HTMLlelujah.exe'),
-  path.join(installDirectory, 'EULA.txt'),
   path.join(installDirectory, 'LICENSE.txt'),
+  path.join(installDirectory, 'COMMERCIAL-LICENSING.md'),
   path.join(installDirectory, 'THIRD_PARTY_NOTICES.md'),
   path.join(installDirectory, 'LICENSE.electron.txt'),
   path.join(installDirectory, 'LICENSES.chromium.html'),
@@ -625,6 +625,18 @@ const assertInstalledFiles = async (installDirectory) => {
     const metadata = await stat(required);
     if (!metadata.isFile() || metadata.size === 0) {
       throw new Error(`Installed release file is invalid: ${path.basename(required)}`);
+    }
+  }
+  for (const [installedName, sourceName] of [
+    ['LICENSE.txt', 'LICENSE'],
+    ['COMMERCIAL-LICENSING.md', 'COMMERCIAL-LICENSING.md'],
+  ]) {
+    const [installed, source] = await Promise.all([
+      readFile(path.join(installDirectory, installedName)),
+      readFile(path.join(repositoryRoot, sourceName)),
+    ]);
+    if (!installed.equals(source)) {
+      throw new Error(`Installed ${installedName} does not match the release source.`);
     }
   }
 };

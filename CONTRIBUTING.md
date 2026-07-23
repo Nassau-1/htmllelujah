@@ -4,9 +4,19 @@ Thank you for your interest in HTMLlelujah.
 
 ## Current contribution policy
 
-HTMLlelujah is a source-visible proprietary project. During Alpha, external code,
+HTMLlelujah is a source-available project. During V1, external code,
 documentation, design, asset, and translation contributions are not accepted.
 Please do not open a pull request or submit patches by another channel.
+
+This restriction preserves the licensor's ability to offer separate commercial
+terms. A future contribution process must first adopt an explicit contributor
+agreement that grants the rights needed for both the public noncommercial license
+and separate commercial licensing.
+
+Automated dependency-update pull requests are maintenance proposals, not an
+exception for external authored code. An authorized maintainer must review the
+upstream change, validate licensing and provenance, and apply or merge only the
+mechanical manifest and lockfile update under the maintainer workflow.
 
 Opening an issue, discussion, or security report does not grant HTMLlelujah a
 license to unrelated code, designs, assets, confidential information, or patents.
@@ -36,17 +46,22 @@ public.
 
 Authorized maintainers must:
 
-1. start material work from the applicable feature spec under `specs/`;
-2. update the spec or ADR before changing an established contract;
-3. keep mutations typed, transactional, attributable, and undoable;
-4. add tests for schema, renderer, geometry, export, IPC, or collaboration changes;
-5. run `pnpm verify` before merge;
-6. update `CHANGELOG.md`, `TODO.md`, and third-party notices when applicable;
-7. ensure every tracked artifact is safe for a public repository.
+1. confirm a written IP assignment or other applicable employment or contractor
+   agreement gives the licensor the rights needed for both public noncommercial and
+   separate commercial licensing;
+2. start material work from the applicable feature spec under `specs/`;
+3. update the spec or ADR before changing an established contract;
+4. keep mutations typed, transactional, attributable, and undoable;
+5. add tests for schema, renderer, geometry, export, IPC, or collaboration changes;
+6. run `pnpm verify` before merge;
+7. update `CHANGELOG.md`, `TODO.md`, and third-party notices when applicable;
+8. ensure every tracked artifact is safe for a public repository.
 
 ## Licensing
 
 No contribution process in this file modifies [`LICENSE`](LICENSE). Original
-HTMLlelujah code remains all rights reserved. Third-party material must not be copied
-into the repository unless its license is approved, its provenance is recorded, and
-all notice obligations are satisfied.
+HTMLlelujah code is available under PolyForm Noncommercial 1.0.0; ordinary
+commercial use requires separate written terms as described in
+[`COMMERCIAL-LICENSING.md`](COMMERCIAL-LICENSING.md). Third-party material must not
+be copied into the repository unless its license is approved, its provenance is
+recorded, and all notice obligations are satisfied.

@@ -16,6 +16,7 @@ import {
   inspectNativeRuntimeEvidence,
   nativeRuntimeQuality,
 } from './native-runtime-evidence-support.mjs';
+import { pendingPublicDistributionCompliance } from './public-distribution-compliance.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
@@ -331,8 +332,8 @@ async function validateCandidatePolicy({ artifactDir, grouped, inventory, versio
   const requiredUnpackedFiles = [
     'win-unpacked/HTMLlelujah.exe',
     'win-unpacked/HTMLlelujah-MCP.cmd',
-    'win-unpacked/EULA.txt',
     'win-unpacked/LICENSE.txt',
+    'win-unpacked/COMMERCIAL-LICENSING.md',
     'win-unpacked/LICENSE.electron.txt',
     'win-unpacked/LICENSES.chromium.html',
     'win-unpacked/THIRD_PARTY_NOTICES.md',
@@ -646,6 +647,7 @@ async function main() {
 
   const installerPresent = grouped.installers.length > 0;
   const unpackedApplicationPresent = grouped.unpacked.length > 0;
+  const publicDistributionCompliance = pendingPublicDistributionCompliance();
   const manifest = {
     schemaVersion: 1,
     release: {
@@ -674,11 +676,13 @@ async function main() {
       cleanSource: source.dirty === false,
       candidateManifestPresent: candidateManifest !== null,
       nativeRuntime,
+      publicDistributionCompliance,
       releaseReady:
         installerPresent &&
         unpackedApplicationPresent &&
         candidateManifest !== null &&
         nativeRuntime.passed &&
+        publicDistributionCompliance.passed &&
         candidatePolicy.passed &&
         !freshness.stale &&
         source.dirty === false,
@@ -687,6 +691,7 @@ async function main() {
       limitations: [
         'This manifest is not a cryptographic signature or code-signing proof.',
         'The build SBOM supplements dependency SBOMs; it does not replace legal review of packaged notices.',
+        'Public distribution remains blocked until the exact FFmpeg corresponding-source mechanism, complete packaged third-party notices, and qualified approval are recorded.',
         ...(installerPresent
           ? []
           : ['No Windows installer was present; only the unpacked application was inventoried.']),

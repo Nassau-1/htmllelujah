@@ -3,6 +3,8 @@ export type { DataAssetResolverOptions } from './assets.js';
 export { writeHtmlAtomically } from './atomic.js';
 export {
   BoundedUtf8Builder,
+  HTMLLELUJAH_LICENSE_URL,
+  HTMLLELUJAH_REQUIRED_NOTICE,
   buildHtmlDocument,
   createContentSecurityPolicy,
   escapeHtmlAttribute,

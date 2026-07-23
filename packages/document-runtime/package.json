@@ -2,6 +2,7 @@
   "name": "@htmllelujah/document-runtime",
   "version": "0.1.0",
   "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "description": "Main-process document authority, durable sessions, recovery, and agent proposals for HTMLlelujah.",
   "exports": {

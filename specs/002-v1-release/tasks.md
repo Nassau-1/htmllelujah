@@ -514,10 +514,15 @@ files safely, upgrades, rolls back when compatible, and uninstalls without user-
     never silently truncate.
 
 - [ ] **V1-121 Complete license, asset provenance, notices, and SBOM review**.
-  - **Acceptance**: Locked runtime/build graphs pass policy; every bundled asset and
-    local icon source has applicable license/provenance/notice/version/SHA-256 evidence;
-    system-font and Unicode-flag non-bundling is recorded; CycloneDX matches distribution.
-  - **Edges**: Generated code, optional binary, transitive license, duplicate asset.
+  - **Acceptance**: The canonical first-party PolyForm text, SPDX metadata, installer
+    copy, commercial contact notice, and standalone-viewer notice pass their exact
+    checks; locked runtime/build graphs pass policy; every bundled third-party
+    component and asset has applicable license/provenance/attribution/text/version/
+    SHA-256 evidence; system-font and Unicode-flag non-bundling is recorded; CycloneDX
+    matches distribution; and the exact FFmpeg corresponding-source mechanism plus
+    qualified public-distribution approval are recorded.
+  - **Edges**: Generated code, optional binary, transitive license, duplicate asset,
+    modified runtime, stale approval, or incomplete source offer.
   - **Containment**: Remove or replace unapproved component before release.
 
 - [ ] **V1-122 Complete diagnostics, secret, and public-hygiene review**.

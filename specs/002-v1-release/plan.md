@@ -48,7 +48,7 @@ one text element is protected by an expiring soft lock.
 | Local-first and safe         | Offline core workflows, opaque IPC, bounded archives, no remote assets | Pass   |
 | Human and agent parity       | UI, MCP, imports, recovery, and peers share commands and revisions     | Pass   |
 | Verifiable fidelity          | One renderer and inherited `001` geometry/visual gates                 | Pass   |
-| Public hygiene and licensing | Synthetic fixtures, proprietary narrative, provenance and SBOM gates   | Pass   |
+| Public hygiene and licensing | Synthetic fixtures, source-available terms, provenance and SBOM gates  | Pass   |
 
 Re-run the check when a persistent type, IPC method, MCP tool, LAN message, renderer
 mode, asset source, dependency, or installer capability changes.
@@ -256,8 +256,8 @@ before merge.
 - Fonts require OFL or another explicitly approved license and bundled notices.
 - Flag and icon assets require per-source provenance, deterministic hashes, and
   distribution permission.
-- No paid, source-available, copyleft, network-hosted, or runtime-token-gated feature
-  may become necessary for V1 operation.
+- No third-party paid, source-available, copyleft, network-hosted, or
+  runtime-token-gated dependency or service may become necessary for V1 operation.
 - Every release regenerates and reviews its CycloneDX SBOM and third-party notices.
 
 ## Risk register and containment

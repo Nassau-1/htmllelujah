@@ -1,12 +1,18 @@
 # HTMLlelujah Agent Guide
 
-This repository is a public, source-visible proprietary project. Treat every tracked file,
+This repository is a public, source-available project. Treat every tracked file,
 commit message, workflow log, fixture, and screenshot as public.
 
 ## Non-negotiable boundaries
 
 - Do not mention private employers, clients, or competing commercial products in tracked files.
-- Do not add an open-source license for original HTMLlelujah code.
+- Keep original HTMLlelujah code under PolyForm Noncommercial 1.0.0 unless the
+  licensor explicitly records a different decision.
+- Do not call the project Open Source or copyleft: the public license restricts
+  commercial purposes and does not require publication of modified source.
+- Do not accept external code, documentation, design, asset, or translation
+  contributions until a contributor agreement that preserves separate commercial
+  licensing has been adopted.
 - Only add runtime dependencies covered by the repository license allowlist.
 - Never expose arbitrary HTML, JavaScript, shell access, filesystem paths, or remote URL fetching
   through the document model or MCP surface.

@@ -247,7 +247,15 @@ unresponsive recovery, watchdog termination, or memory exhaustion.
 
 ## License, provenance, SBOM, and public hygiene
 
+- The canonical first-party `LICENSE` matches PolyForm Noncommercial 1.0.0 with the
+  exact required notice, and every first-party package declares its SPDX identifier.
+- The installer displays that canonical license and installs `LICENSE.txt` plus
+  `COMMERCIAL-LICENSING.md`.
+- Every standalone HTML export contains exactly one canonical PolyForm URL and the
+  required notice for its bundled viewer without adding an active remote dependency.
 - Production and build dependency license scans pass the repository policy.
+- Every third-party component actually bundled into the application appears in the
+  installed notices with the required attribution and license text.
 - Every bundled asset and local slide-icon source has provenance and SHA-256. The
   ledger records that presentation fonts are system-provided and round flags use
   Unicode/Windows emoji rather than bundled third-party files.
@@ -275,8 +283,8 @@ The release candidate record must contain:
 - thirty-minute LAN soak result;
 - performance measurements;
 - SBOM, license report, asset provenance, and notices;
-- Electron/FFmpeg engineering-review status and the still-pending qualified legal
-  decision required before commercial distribution;
+- Electron/FFmpeg engineering-review status and the still-pending corresponding-source
+  mechanism and qualified decision required before public binary distribution;
 - all deviations, waived tests, baseline changes, or residual risks.
 
 No hard-gate waiver is permitted for V1. A failed hard gate returns the release to

@@ -15,7 +15,8 @@
     "BlueOak-1.0.0": "Permissive build-tool license; not shipped as application code.",
     "CC-BY-3.0": "SPDX metadata used by SBOM tooling; attribution retained in the dependency graph.",
     "MPL-2.0": "CSS compiler dependency used at build time only; no MPL source is bundled into the application.",
-    "Python-2.0": "argparse@2.0.1 is reached only through electron-builder -> js-yaml and is absent from the production dependency graph and packaged application runtime."
+    "Python-2.0": "argparse@2.0.1 is reached only through electron-builder -> js-yaml and is absent from the production dependency graph and packaged application runtime.",
+    "WTFPL": "truncate-utf8-bytes@1.0.2 is reached only through electron-builder -> builder-util -> sanitize-filename and is absent from the production dependency graph and packaged application runtime."
   },
   "blocked": [
     "AGPL",

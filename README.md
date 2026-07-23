@@ -194,14 +194,25 @@ constitution at [`.specify/memory/constitution.md`](.specify/memory/constitution
 
 ## Licensing
 
-The repository is **source-visible proprietary software**, not open-source software.
-Viewing the public source does not grant permission to use, copy, modify, or
-redistribute it. See [`LICENSE`](LICENSE).
+HTMLlelujah is **source-available** under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). It may be used, changed, and
+distributed for the noncommercial purposes permitted by that license. Copies must
+pass on the PolyForm terms or their canonical URL, together with the required notice.
 
-Official compiled applications are available under the separate binary terms in
-[`EULA.txt`](EULA.txt), which permit personal and internal business use and sharing
-of user-created exported presentations. Third-party licenses and asset provenance
-are recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
-[`docs/legal`](docs/legal/asset-provenance.md). The Electron/FFmpeg record is an
-engineering compliance review, not legal advice; qualified approval of the
-corresponding-source mechanism remains required before commercial distribution.
+Work for a commercial purpose, ordinary for-profit business use, or use with an
+anticipated commercial application requires a separate written commercial license. See
+[`COMMERCIAL-LICENSING.md`](COMMERCIAL-LICENSING.md) for the contact path. The
+public license does not require modified or surrounding code to be published, so the
+project does not describe it as copyleft. Because it restricts commercial purposes,
+it is not Open Source under the Open Source Definition.
+
+The same PolyForm terms cover official compiled applications and are shown by the
+installer. The project does not claim ownership of user-created presentation content,
+and the public software license does not grant trademark rights in the HTMLlelujah
+name or logo. Third-party licenses and asset provenance are recorded in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
+[`docs/legal`](docs/legal/asset-provenance.md). Those third-party terms remain
+independent and cannot be replaced by an HTMLlelujah commercial license. The
+Electron/FFmpeg record is an engineering compliance review, not legal advice;
+qualified approval of the corresponding-source mechanism remains required before
+public binary distribution.

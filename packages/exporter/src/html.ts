@@ -3,6 +3,9 @@ import { createHash } from 'node:crypto';
 import { EXPORT_LIMITS } from './limits.js';
 import { ExporterError } from './types.js';
 
+export const HTMLLELUJAH_LICENSE_URL = 'https://polyformproject.org/licenses/noncommercial/1.0.0';
+export const HTMLLELUJAH_REQUIRED_NOTICE = 'Required Notice: Copyright (c) 2026 Nassau-1.';
+
 export interface HtmlDocumentInput {
   readonly kind: 'standalone' | 'print';
   readonly locale: string;
@@ -101,8 +104,19 @@ export const buildHtmlDocument = (
   const css = escapeInlineStyle(input.css);
   const csp = createContentSecurityPolicy(script, css);
   const output = new BoundedUtf8Builder(maxUtf8Bytes);
-  output.append(`<!doctype html>
-<html lang="${escapeHtmlAttribute(input.locale)}" data-htmllelujah-export="${input.kind}-v1"`);
+  output.append('<!doctype html>\n');
+  if (input.kind === 'standalone') {
+    output.append(`<!--
+HTMLlelujah viewer software: PolyForm Noncommercial License 1.0.0
+${HTMLLELUJAH_LICENSE_URL}
+${HTMLLELUJAH_REQUIRED_NOTICE}
+This notice applies to the viewer software, not to user presentation content.
+-->
+`);
+  }
+  output.append(
+    `<html lang="${escapeHtmlAttribute(input.locale)}" data-htmllelujah-export="${input.kind}-v1"`,
+  );
   for (const [name, value] of Object.entries(input.htmlDataAttributes ?? {})) {
     output.append(` data-${name}="${escapeHtmlAttribute(value)}"`);
   }

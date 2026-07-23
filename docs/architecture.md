@@ -287,10 +287,11 @@ has no automatic updater or per-machine installation path, and NSIS performs its
 installer UAC flow. Reintroducing automatic updates or per-machine installation must
 revisit this packaging decision and the executable attestation set.
 
-Release packaging must preserve the project source notice, binary terms,
-third-party notices, Electron and Chromium license files, exact artifact checksums,
-and the SBOM. Authenticode signing is applied when a certificate is configured;
-otherwise the artifact is labelled unsigned without weakening runtime fuses.
+Release packaging must preserve the canonical project license, commercial-licensing
+contact notice, third-party notices, Electron and Chromium license files, exact
+artifact checksums, and the SBOM. Authenticode signing is applied when a certificate
+is configured; otherwise the artifact is labelled unsigned without weakening runtime
+fuses.
 
 ## Security invariants
 

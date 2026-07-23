@@ -1,12 +1,13 @@
 # Third-Party Notices
 
-Last reviewed: 2026-07-15.
+Last reviewed: 2026-07-23.
 
-HTMLlelujah's original source is governed by [`LICENSE`](LICENSE), and official
-compiled distributions are governed by [`EULA.txt`](EULA.txt). Third-party
-components remain governed by their own terms. This notice identifies every direct
-external dependency declared by the workspace at the reviewed versions; the locked
-transitive graph is recorded separately in the release SBOM.
+HTMLlelujah's original source and official compiled distributions are governed by
+[`LICENSE`](LICENSE). [`COMMERCIAL-LICENSING.md`](COMMERCIAL-LICENSING.md) provides
+a contact path but does not alter any third-party terms. Third-party components remain
+governed by their own licenses. This notice identifies every direct external
+dependency declared by the workspace at the reviewed versions; the locked transitive
+graph is recorded separately in the release SBOM.
 
 Workspace packages under the `@htmllelujah` scope are original project components,
 not third-party dependencies.
@@ -45,29 +46,30 @@ The components below are used to type-check, test, format, bundle, inspect licen
 or package HTMLlelujah. They are not application features and must not be copied into
 the application runtime unless a later release review explicitly reclassifies them.
 
-| Component                     | Version | License      |
-| ----------------------------- | ------: | ------------ |
-| `@electron/fuses`             |   2.1.3 | MIT          |
-| `@types/node`                 | 24.13.3 | MIT          |
-| `@types/react`                | 19.2.17 | MIT          |
-| `@types/react-dom`            |  19.2.3 | MIT          |
-| `@types/ws`                   |  8.18.1 | MIT          |
-| `@vitejs/plugin-react`        |   6.0.3 | MIT          |
-| `electron-builder`            | 26.15.3 | MIT          |
-| `license-checker-rseidelsohn` |   5.0.1 | BSD-3-Clause |
-| `prettier`                    |   3.9.5 | MIT          |
-| `tsx`                         |  4.23.1 | MIT          |
-| `typescript`                  |   7.0.2 | Apache-2.0   |
-| `vite`                        |   8.1.4 | MIT          |
-| `vite-plugin-electron`        |   1.1.0 | MIT          |
-| `vitest`                      |  4.1.10 | MIT          |
+| Component              | Version | License    |
+| ---------------------- | ------: | ---------- |
+| `@electron/fuses`      |   2.1.3 | MIT        |
+| `@types/node`          | 24.13.3 | MIT        |
+| `@types/react`         | 19.2.17 | MIT        |
+| `@types/react-dom`     |  19.2.3 | MIT        |
+| `@types/ws`            |  8.18.1 | MIT        |
+| `@vitejs/plugin-react` |   6.0.3 | MIT        |
+| `electron-builder`     | 26.15.3 | MIT        |
+| `prettier`             |   3.9.5 | MIT        |
+| `tsx`                  |  4.23.1 | MIT        |
+| `typescript`           |   7.0.2 | Apache-2.0 |
+| `vite`                 |   8.1.4 | MIT        |
+| `vite-plugin-electron` |   1.1.0 | MIT        |
+| `vitest`               |  4.1.10 | MIT        |
 
 The build graph also reaches packages licensed under BlueOak-1.0.0, CC-BY-3.0,
-MPL-2.0, and Python-2.0. They are reviewed build-only exceptions in
+MPL-2.0, Python-2.0, and WTFPL. They are reviewed build-only exceptions in
 [`policy/licenses.json`](policy/licenses.json). The Python-2.0 item is
 `argparse@2.0.1`, reached only through `electron-builder -> js-yaml`; it is absent
-from the production dependency graph. These exceptions do not relax the runtime
-allowlist.
+from the production dependency graph. The WTFPL item is
+`truncate-utf8-bytes@1.0.2`, reached only through
+`electron-builder -> builder-util -> sanitize-filename`; it is also absent from the
+production dependency graph. These exceptions do not relax the runtime allowlist.
 
 ## Direct-component copyright notices
 
@@ -139,11 +141,11 @@ with their respective copyright notices:
 
 ## Release compliance contract
 
-Every distributed Windows build must include this file, `EULA.txt`, the project
-source notice, Electron's complete license files, and the release SBOM. A release
-review must compare the packaged contents to the locked dependency graph, confirm
-that no build-only exception entered the runtime, and update this inventory when a
-dependency or bundled asset changes.
+Every distributed Windows build must include this file, the canonical project
+`LICENSE.txt`, `COMMERCIAL-LICENSING.md`, Electron's complete license files, and the
+release SBOM. A release review must compare the packaged contents to the locked
+dependency graph, confirm that no build-only exception entered the runtime, and
+update this inventory when a dependency or bundled asset changes.
 
 Bundled visual-asset provenance is recorded in
 [`docs/legal/asset-provenance.md`](docs/legal/asset-provenance.md).

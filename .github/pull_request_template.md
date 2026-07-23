@@ -1,3 +1,7 @@
+> Authorized-maintainer workflow only. External pull requests are closed without
+> review or merge until a contributor agreement supporting separate commercial
+> licensing is adopted. See [`CONTRIBUTING.md`](../CONTRIBUTING.md).
+
 ## Summary
 
 <!-- Describe the observable product or engineering outcome. -->

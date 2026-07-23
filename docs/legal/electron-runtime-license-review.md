@@ -1,20 +1,21 @@
 # Electron Runtime License Review
 
-Status: engineering compliance review; legal approval required before commercial
-distribution.
+Status: engineering compliance review; corresponding-source mechanism and qualified
+approval required before public binary distribution.
 
 Reviewed: 2026-07-15.
 
 ## Scope and deployment model
 
 This review covers the unmodified Electron 43.1.1 Windows x64 runtime distributed
-with the HTMLlelujah desktop binary. HTMLlelujah is a distributed proprietary binary,
-so bundled runtime licenses and weak-copyleft distribution obligations apply even
-though the application works locally and offline.
+with the HTMLlelujah desktop binary. HTMLlelujah's first-party code is distributed
+under a source-available noncommercial license, while bundled runtime licenses and
+weak-copyleft distribution obligations continue to apply independently even though
+the application works locally and offline.
 
 This document is an engineering record, not a legal opinion. Any conclusion that
 depends on linking doctrine, source-offer sufficiency, or a particular jurisdiction
-must be confirmed by qualified counsel before commercial distribution.
+must be confirmed by qualified counsel before public binary distribution.
 
 ## Evidence reviewed
 
@@ -72,14 +73,16 @@ license and source-availability steps below are absent.
   and installed application.
 - Keep `ffmpeg.dll` separable. Do not statically combine HTMLlelujah source with it,
   rename it to conceal its identity, or prevent a lawful compatible replacement.
-- Do not prohibit reverse engineering needed to debug lawful modifications to an
-  LGPL component. [`EULA.txt`](../../EULA.txt) contains this carve-out.
+- Do not impose first-party terms that prohibit reverse engineering needed to debug
+  lawful modifications to an LGPL component. The canonical project
+  [`LICENSE`](../../LICENSE) contains no contrary restriction, and mandatory
+  third-party rights continue to control.
 - Preserve a reproducible reference to the exact Electron 43.1.1 source and build
   inputs. The release evidence must identify the upstream tag and checksums and retain
   the exact dependency lockfile.
-- Before commercial distribution, have counsel choose and approve the mechanism for
-  satisfying corresponding-source availability for the exact FFmpeg binary. A bare
-  project homepage is not treated here as a completed source offer.
+- Before any public binary distribution, have counsel choose and approve the
+  mechanism for satisfying corresponding-source availability for the exact FFmpeg
+  binary. A bare project homepage is not treated here as a completed source offer.
 - Confirm the packaged `ffmpeg.dll` hash and the two Electron license-file hashes in
   the final artifact. Treat a mismatch as a new binary requiring review.
 - Scan the packaged binary contents, not only npm metadata, because npm license
@@ -91,6 +94,6 @@ license and source-availability steps below are absent.
 
 Engineering review: documented.
 
-Commercial legal approval: pending. The release owner must record the decision and
-source-availability mechanism in the private or public release record before the
-first commercial distribution.
+Public-distribution legal approval: pending. The release owner must record the
+decision and source-availability mechanism in the private or public release record
+before the first public binary distribution.

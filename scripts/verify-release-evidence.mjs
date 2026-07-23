@@ -19,6 +19,7 @@ import {
   inspectNativeRuntimeEvidence,
   nativeRuntimeQuality,
 } from './native-runtime-evidence-support.mjs';
+import { pendingPublicDistributionCompliance } from './public-distribution-compliance.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
@@ -152,8 +153,8 @@ const revalidateCandidateShape = (entries, version) => {
   for (const required of [
     'win-unpacked/HTMLlelujah.exe',
     'win-unpacked/HTMLlelujah-MCP.cmd',
-    'win-unpacked/EULA.txt',
     'win-unpacked/LICENSE.txt',
+    'win-unpacked/COMMERCIAL-LICENSING.md',
     'win-unpacked/LICENSE.electron.txt',
     'win-unpacked/LICENSES.chromium.html',
     'win-unpacked/THIRD_PARTY_NOTICES.md',
@@ -182,6 +183,19 @@ async function main() {
   const artifactDir = options.artifactDir ?? path.resolve(REPO_ROOT, manifest.artifact.root);
 
   const errors = [];
+  const expectedPublicDistributionCompliance = pendingPublicDistributionCompliance();
+  if (
+    JSON.stringify(manifest.quality?.publicDistributionCompliance) !==
+    JSON.stringify(expectedPublicDistributionCompliance)
+  ) {
+    errors.push('Manifest public-distribution compliance evidence is malformed');
+  }
+  if (
+    manifest.quality?.releaseReady === true &&
+    manifest.quality?.publicDistributionCompliance?.passed !== true
+  ) {
+    errors.push('releaseReady contradicts pending public-distribution compliance');
+  }
   const artifactRootEntries = await readdir(artifactDir, { withFileTypes: true });
   const unexpectedRootDirectories = artifactRootEntries
     .filter((entry) => entry.isDirectory() && entry.name !== 'win-unpacked')
@@ -356,6 +370,11 @@ async function main() {
     }
     if (manifest.quality.candidatePolicy?.passed !== true) {
       readinessErrors.push('the manifest lacks a passing current candidate policy');
+    }
+    if (manifest.quality.publicDistributionCompliance?.passed !== true) {
+      readinessErrors.push(
+        'the corresponding-source, complete-notices, and qualified-approval gate is pending',
+      );
     }
     if (candidateManifest === null) {
       readinessErrors.push('the evidence lacks a validated release candidate manifest');

@@ -41,9 +41,13 @@ never leak into presentation or export.
 Every tracked file, commit, fixture, workflow log, and screenshot MUST be safe for a
 public repository. Secrets, real deck content, private organizations, private paths,
 and competitive comparisons MUST NOT be committed. Original HTMLlelujah code remains
-source-visible proprietary and all rights reserved. Dependencies and assets MUST have
-documented provenance, an approved license, required notices, and a release SBOM.
-Third-party source MUST NOT be copied or reconstructed to evade license obligations.
+source-available under PolyForm Noncommercial 1.0.0, with separate written terms
+required for ordinary commercial use. The project MUST NOT be described as Open
+Source or copyleft while those restrictions apply. External contributions MUST NOT be
+accepted until a contributor agreement preserves separate commercial licensing.
+Dependencies and assets MUST have documented provenance, an approved license,
+required notices, and a release SBOM. Third-party source MUST NOT be copied or
+reconstructed to evade license obligations.
 
 ## Product and Technical Constraints
 
@@ -108,4 +112,4 @@ Every feature plan MUST record a constitution check before implementation and ag
 after design changes. Non-compliance blocks merge unless the constitution itself is
 amended through the process above.
 
-**Version**: 1.0.0 | **Ratified**: 2026-07-15 | **Last Amended**: 2026-07-15
+**Version**: 2.0.0 | **Ratified**: 2026-07-15 | **Last Amended**: 2026-07-23

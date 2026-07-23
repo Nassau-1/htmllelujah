@@ -5,7 +5,10 @@ labels: [bug]
 body:
   - type: markdown
     attributes:
-      value: Do not upload confidential presentations, logs containing document content, or credentials.
+      value: |
+        Do not upload confidential presentations, logs containing document content,
+        or credentials. Describe the problem and use synthetic reproduction data; do
+        not submit patches, code, designs, assets, or translations through an issue.
   - type: input
     id: version
     attributes:

@@ -25,6 +25,8 @@ import { analyzePngVisual, visualThresholds } from './png-visual-evidence.mjs';
 const desktopRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(desktopRoot, '..', '..');
 const runtimeInspectionPath = path.join(import.meta.dirname, 'inspect-electron-runtime.ps1');
+const htmllelujahLicenseUrl = 'https://polyformproject.org/licenses/noncommercial/1.0.0';
+const htmllelujahRequiredNotice = 'Required Notice: Copyright (c) 2026 Nassau-1.';
 const pagePresets = {
   widescreen: { widthPt: 960, heightPt: 540 },
   standard: { widthPt: 720, heightPt: 540 },
@@ -880,7 +882,16 @@ const validateStandaloneHtml = (bytes, expectedTitle) => {
   if (/<(?:script|iframe|object|embed|link)\b[^>]*(?:src|href)\s*=/iu.test(html)) {
     throw new Error('Standalone HTML references an external executable resource.');
   }
-  if (/\b(?:https?:|wss?:|ftp:|file:|\/\/)/iu.test(html)) {
+  if (html.split(htmllelujahLicenseUrl).length !== 2) {
+    throw new Error('Standalone HTML must contain exactly one canonical project license URL.');
+  }
+  if (html.split(htmllelujahRequiredNotice).length !== 2) {
+    throw new Error('Standalone HTML must contain exactly one project required notice.');
+  }
+  const htmlWithoutLicenseNotice = html
+    .replace(htmllelujahLicenseUrl, '')
+    .replace(htmllelujahRequiredNotice, '');
+  if (/\b(?:https?:|wss?:|ftp:|file:|\/\/)/iu.test(htmlWithoutLicenseNotice)) {
     throw new Error('Standalone HTML contains a network or local-file URL.');
   }
   return { csp, scriptHash, styleHash };

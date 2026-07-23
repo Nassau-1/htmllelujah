@@ -208,7 +208,7 @@ file-protocol privileges. `RunAsNode` is enabled only to support the console std
 launcher; the accepted tradeoff is documented in
 [`ADR-008`](decisions/ADR-008-local-stdio-mcp.md).
 
-The official no-charge public V1 pipeline is deliberately **unsigned**: it refuses
+The official noncommercial public V1 pipeline is deliberately **unsigned**: it refuses
 signing credentials, requires unsigned filenames and notes, and verifies that the
 installer and application executable are exactly `NotSigned`. Windows may display a
 reputation warning. Do not disable sandboxing, fuses, archive checks, or antivirus
@@ -409,18 +409,21 @@ Dependency additions and upgrades must:
 
 `policy/licenses.json` permits Python-2.0 only as the reviewed build-only
 `electron-builder -> js-yaml -> argparse@2.0.1` chain. It remains blocked from the
-production graph. LGPL remains blocked for npm runtime dependencies; Electron's
-separate unmodified FFmpeg binary has its own narrow review in
+production graph. WTFPL is likewise limited to the build-only
+`electron-builder -> builder-util -> sanitize-filename -> truncate-utf8-bytes@1.0.2`
+chain. LGPL remains blocked for npm runtime dependencies; Electron's separate
+unmodified FFmpeg binary has its own narrow review in
 [`docs/legal/electron-runtime-license-review.md`](legal/electron-runtime-license-review.md).
-That document is an engineering compliance record, not legal advice. Qualified legal
-approval of the corresponding-source mechanism remains pending and is required before
-commercial distribution. The V1 publication procedure is scoped to an official
-no-charge public build governed by `EULA.txt`; it does not clear that separate
-commercial-distribution gate.
+That document is an engineering compliance record, not legal advice. The exact
+corresponding-source mechanism and qualified approval remain pending and are required
+before any public binary distribution. The V1 publication procedure is scoped to an
+official noncommercial public build governed by `LICENSE`; it grants no commercial
+rights and cannot clear the independent source-availability gate by itself.
 
-The installer and installed directory must contain `EULA.txt`, the project source
-notice, `THIRD_PARTY_NOTICES.md`, `LICENSE.electron.txt`, and
-`LICENSES.chromium.html`. Missing notices block publication.
+The installer and installed directory must contain the canonical project
+`LICENSE.txt`, `COMMERCIAL-LICENSING.md`, `THIRD_PARTY_NOTICES.md`,
+`LICENSE.electron.txt`, and `LICENSES.chromium.html`. Missing notices block
+publication.
 
 ## SBOM, inventory, and checksums
 
@@ -455,6 +458,10 @@ the exact installer, not from a potentially unrelated local builder cache. A
 release-ready record requires exactly one of each of these five components with valid
 versions, fuse evidence, and binding hashes. Non-ready diagnostic evidence may record
 an explicitly incomplete runtime inventory, but it can never satisfy `--require-ready`.
+The same readiness decision also fails closed while
+`quality.publicDistributionCompliance.passed` is false. That gate may pass only after
+the exact public candidate has a complete bundled third-party-notice set, an available
+FFmpeg corresponding-source mechanism, and recorded qualified legal approval.
 
 Generate SHA-256 values only after the artifact is final:
 
@@ -474,7 +481,8 @@ Before publication, inspect the exact candidate for:
   trees;
 - `.env` files, tokens, keys, certificates, endpoint descriptors, recovery records,
   private paths, usernames, or real decks;
-- missing EULA, project, dependency, Electron, Chromium, and asset notices;
+- missing project, commercial-contact, dependency, Electron, Chromium, and asset
+  notices;
 - unexpected native binaries, DLLs, codecs, archives, or executables;
 - a production dependency carrying a build-only exception; and
 - artifact names or metadata that incorrectly imply signing.

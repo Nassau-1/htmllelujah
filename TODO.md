@@ -94,21 +94,29 @@ reported as passed until their results are recorded.
 
 ## Distribution and compliance
 
-- [x] Separate the source-visible proprietary notice from the compiled-application
-      license in `EULA.txt`.
+- [x] Adopt PolyForm Noncommercial 1.0.0 for original source and official binaries,
+      provide a separate commercial-licensing contact path, and keep the canonical
+      terms in `LICENSE`.
 - [x] Inventory every direct external dependency and retain the direct runtime
       license texts in `THIRD_PARTY_NOTICES.md`.
+- [ ] Generate and package complete attribution and license notices for every
+      third-party component actually present in the compiled application, not only
+      direct dependencies or the SBOM inventory.
 - [x] Scope Python-2.0 to the build-only
       `electron-builder -> js-yaml -> argparse@2.0.1` chain without relaxing the
       production allowlist.
 - [x] Record application-icon, local-icon, Lucide, Unicode-flag, and font provenance.
 - [x] Document the narrow Electron/FFmpeg LGPL runtime exception, evidence, duties,
       and re-review triggers.
-- [ ] Obtain qualified legal approval for the Electron/FFmpeg corresponding-source
-      mechanism before commercial distribution.
-- [ ] Confirm the final installer and installed directory contain `EULA.txt`, the
-      project source notice, `THIRD_PARTY_NOTICES.md`, `LICENSE.electron.txt`, and the
-      complete `LICENSES.chromium.html`.
+- [ ] Establish and obtain qualified approval for the Electron/FFmpeg
+      corresponding-source mechanism before any public binary distribution.
+- [ ] Have the separate commercial agreement and contributor agreement reviewed
+      before granting commercial rights or accepting external contributions.
+- [ ] Confirm the legal licensor identity and retain private chain-of-title records
+      before signing a commercial agreement.
+- [ ] Confirm the final installer and installed directory contain `LICENSE.txt`,
+      `COMMERCIAL-LICENSING.md`, `THIRD_PARTY_NOTICES.md`,
+      `LICENSE.electron.txt`, and the complete `LICENSES.chromium.html`.
 - [ ] Generate the locked production npm SBOM plus an exact packaged-file and native
       runtime inventory covering Electron, Chromium, FFmpeg, and NSIS.
 - [ ] Audit the exact locked JavaScript graphs for known vulnerabilities, scan the

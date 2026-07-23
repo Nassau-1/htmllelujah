@@ -16,6 +16,8 @@ import {
   BoundedUtf8Builder,
   EXPORT_LIMITS,
   ExporterError,
+  HTMLLELUJAH_LICENSE_URL,
+  HTMLLELUJAH_REQUIRED_NOTICE,
   PRINT_READINESS_SCRIPT,
   STANDALONE_VIEWER_SCRIPT,
   createDataAssetResolver,
@@ -161,13 +163,18 @@ describe('createStandaloneHtml', () => {
     expect(first).toContain('ArrowRight');
     expect(first).toContain('requestFullscreen');
     expect(first).toContain('data-render-mode="html"');
+    expect(first).toContain(HTMLLELUJAH_REQUIRED_NOTICE);
+    expect(first.split(HTMLLELUJAH_LICENSE_URL)).toHaveLength(2);
+    expect(first).toContain(
+      'This notice applies to the viewer software, not to user presentation content.',
+    );
     expect(first).toContain(
       `data:image/png;base64,${Buffer.from(fixture.visibleBytes).toString('base64')}`,
     );
     expect(first).not.toContain(Buffer.from(fixture.hiddenBytes).toString('base64'));
     expect(first).not.toContain('HIDDEN_SLIDE_SECRET');
     expect(first).not.toContain('private-visible.png');
-    expect(first).not.toMatch(/https?:\/\//i);
+    expect(first.replace(HTMLLELUJAH_LICENSE_URL, '')).not.toMatch(/https?:\/\//i);
     expect(first).not.toMatch(/file:\/\//i);
     expect(first).not.toMatch(/wss?:\/\//i);
     expect(first).not.toContain('serviceWorker');

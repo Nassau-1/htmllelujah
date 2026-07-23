@@ -4,7 +4,7 @@
   "private": true,
   "description": "AI-native, local-first presentation editor for structured HTML slides.",
   "author": "Nassau-1",
-  "license": "UNLICENSED",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "packageManager": "pnpm@11.13.0",
   "engines": {
     "node": ">=24.0.0"
@@ -33,7 +33,6 @@
   },
   "devDependencies": {
     "@types/node": "24.13.3",
-    "license-checker-rseidelsohn": "5.0.1",
     "prettier": "3.9.5",
     "tsx": "4.23.1",
     "typescript": "7.0.2",
