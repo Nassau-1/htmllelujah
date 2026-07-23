@@ -14,6 +14,10 @@ and releases use semantic versions.
 
 ### Fixed
 
+- Sanitized public export evidence to record only the browser family, major version,
+  and DevTools protocol version, preventing Chromium's dotted version strings from
+  being mistaken for private network addresses without weakening the privacy screen.
+
 - Made every editable inspector and canvas field register its exact blur commit before
   native window closure, retain rejected or failed values visibly, drain superseded and
   concurrent commits to a bounded deadline, and keep the presentation open whenever the

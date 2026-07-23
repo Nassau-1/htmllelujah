@@ -5,6 +5,7 @@ import {
   CdpSession,
   HarnessTimeoutError,
   fetchJsonWithTimeout,
+  publicBrowserRuntime,
   runtimeWindowFingerprint,
   sameRuntimeWindows,
   waitFor,
@@ -83,6 +84,34 @@ describe('system export harness deadlines', () => {
       }),
     ).rejects.toThrow(CdpCommandTimeoutError);
     expect(NeverConnectingSocket.lastInstance?.readyState).toBe(3);
+  });
+});
+
+describe('system export harness public browser evidence', () => {
+  it('keeps useful runtime identity without serializing dotted versions or user-agent data', () => {
+    const runtime = publicBrowserRuntime({
+      protocolVersion: '1.3',
+      product: 'Edg/150.0.4078.83',
+      revision: '@private-build-detail',
+      userAgent: 'Mozilla/5.0 HeadlessChrome/150.0.0.0 Safari/537.36 Edg/150.0.4078.83',
+      jsVersion: '15.0.23.10',
+    });
+
+    expect(runtime).toEqual({
+      productFamily: 'Edge',
+      majorVersion: 150,
+      devtoolsProtocolVersion: '1.3',
+    });
+    expect(JSON.stringify(runtime)).not.toMatch(/150\.0|private-build|Mozilla|15\.0/u);
+  });
+
+  it('fails closed for unsupported products and malformed protocol versions', () => {
+    expect(() =>
+      publicBrowserRuntime({ protocolVersion: '1.3', product: 'Unknown/150.0.0.0' }),
+    ).toThrow('unsupported public product identity');
+    expect(() =>
+      publicBrowserRuntime({ protocolVersion: '1.3.1', product: 'Chrome/150.0.0.0' }),
+    ).toThrow('invalid DevTools protocol version');
   });
 });
 

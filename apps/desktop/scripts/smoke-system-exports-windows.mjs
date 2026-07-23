@@ -12,6 +12,7 @@ import electronPath from 'electron';
 import {
   CdpSession,
   fetchJsonWithTimeout,
+  publicBrowserRuntime,
   runtimeWindowFingerprint,
   sameRuntimeWindows,
   sleep,
@@ -393,13 +394,7 @@ const captureStablePdfVisual = async ({
             ...lastFrame,
             attempts,
             stableAfterMs: Date.now() - startedAt,
-            browserVersion: {
-              protocolVersion: browserVersion.protocolVersion,
-              product: browserVersion.product,
-              revision: browserVersion.revision,
-              userAgent: browserVersion.userAgent,
-              jsVersion: browserVersion.jsVersion,
-            },
+            browserRuntime: publicBrowserRuntime(browserVersion),
             networkIsolation: {
               cdpOfflineEmulation: true,
               cacheDisabled: true,

@@ -14,6 +14,32 @@ export class CdpCommandTimeoutError extends HarnessTimeoutError {
 }
 
 export const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const PUBLIC_BROWSER_FAMILIES = new Map([
+  ['Chrome', 'Chrome'],
+  ['Edg', 'Edge'],
+  ['HeadlessChrome', 'Chrome'],
+]);
+
+export const publicBrowserRuntime = (version) => {
+  const productMatch =
+    typeof version?.product === 'string'
+      ? /^(Chrome|Edg|HeadlessChrome)\/(\d{1,6})(?:\.|$)/u.exec(version.product)
+      : null;
+  if (productMatch === null) {
+    throw new Error('The browser returned an unsupported public product identity.');
+  }
+  if (
+    typeof version?.protocolVersion !== 'string' ||
+    !/^\d{1,3}(?:\.\d{1,3})?$/u.test(version.protocolVersion)
+  ) {
+    throw new Error('The browser returned an invalid DevTools protocol version.');
+  }
+  return {
+    productFamily: PUBLIC_BROWSER_FAMILIES.get(productMatch[1]),
+    majorVersion: Number(productMatch[2]),
+    devtoolsProtocolVersion: version.protocolVersion,
+  };
+};
 
 export const withTimeout = (operation, timeoutMs, label, onTimeout = undefined) => {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
