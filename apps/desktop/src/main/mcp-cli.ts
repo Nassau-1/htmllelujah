@@ -2,6 +2,8 @@ import path from 'node:path';
 
 import { runHtmllelujahMcpStdioFromDescriptor } from '@htmllelujah/mcp-server';
 
+import { loadBootstrapTrustedClientCredential } from './mcp-trusted-clients.js';
+
 const defaultUserDataDirectory = (): string => {
   const roamingAppData = process.env.APPDATA;
   if (roamingAppData === undefined || !path.isAbsolute(roamingAppData)) {
@@ -17,8 +19,11 @@ const userDataDirectory =
     : defaultUserDataDirectory();
 
 try {
+  const mcpDirectory = path.join(userDataDirectory, 'mcp');
+  const credential = await loadBootstrapTrustedClientCredential(mcpDirectory);
   await runHtmllelujahMcpStdioFromDescriptor(
-    path.join(userDataDirectory, 'mcp', 'endpoint-v1.json'),
+    path.join(mcpDirectory, 'endpoint-v2.json'),
+    credential,
   );
 } catch {
   process.stderr.write('HTMLlelujah desktop bridge is unavailable.\n');

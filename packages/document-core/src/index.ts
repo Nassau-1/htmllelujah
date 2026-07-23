@@ -5,6 +5,8 @@ export * from './connector-geometry.js';
 export * from './clone.js';
 export * from './defaults.js';
 export * from './demo.js';
+export * from './design-authority.js';
+export * from './dynamic-fields.js';
 export * from './limits.js';
 export * from './migrations/index.js';
 export * from './model.js';

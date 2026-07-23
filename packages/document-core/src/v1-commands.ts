@@ -61,6 +61,12 @@ export interface UpdateThemeCommand {
   readonly replacement: Theme;
 }
 
+/** Applies one existing theme across every theme-managed design surface in the deck. */
+export interface EnforceDeckThemeCommand {
+  readonly type: 'theme.enforce-deck';
+  readonly themeId: string;
+}
+
 export interface DeleteThemeCommand {
   readonly type: 'theme.delete';
   readonly themeId: string;
@@ -247,6 +253,7 @@ export type V1DocumentCommand =
   | SetDeckExportOptionsCommand
   | CreateThemeCommand
   | UpdateThemeCommand
+  | EnforceDeckThemeCommand
   | DeleteThemeCommand
   | CreateMasterCommand
   | UpdateMasterCommand
@@ -405,6 +412,7 @@ export const v1DocumentCommandSchema: z.ZodType<V1DocumentCommand> = z.union([
     .object({ type: z.literal('theme.create'), theme: themeSchema, index: index.optional() })
     .strict(),
   z.object({ type: z.literal('theme.update'), themeId: id, replacement: themeSchema }).strict(),
+  z.object({ type: z.literal('theme.enforce-deck'), themeId: id }).strict(),
   z
     .object({ type: z.literal('theme.delete'), themeId: id, replacementThemeId: id.optional() })
     .strict(),

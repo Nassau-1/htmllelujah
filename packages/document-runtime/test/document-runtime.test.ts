@@ -255,6 +255,63 @@ describe('document session authority', () => {
     expect(redone.document.name).toBe('Grouped two');
   });
 
+  it('records deck-wide theme enforcement as one durable undo entry', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory);
+    const source = createDefaultDeck({
+      idFactory: ids(),
+      now: () => '2026-07-15T12:00:00.000Z',
+    });
+    const theme = source.themes[0]!;
+    const slide = source.slides[0]!;
+    const text = slide.elements.find((element) => element.type === 'text');
+    if (text?.type !== 'text') throw new Error('Missing text fixture.');
+    const document = {
+      ...source,
+      slides: source.slides.map((candidate) =>
+        candidate.id === slide.id
+          ? {
+              ...candidate,
+              elements: candidate.elements.map((element) =>
+                element.id === text.id
+                  ? {
+                      ...text,
+                      style: {
+                        ...text.style,
+                        fontFamily: 'Local override',
+                        color: '#123456',
+                      },
+                    }
+                  : element,
+              ),
+            }
+          : candidate,
+      ),
+    };
+    const session = await manager.createMainOnly({ document });
+    const enforced = await manager.execute(session.sessionId, {
+      expectedRevision: session.revision,
+      commands: [{ type: 'theme.enforce-deck', themeId: theme.id }],
+      metadata: metadata(5),
+    });
+    const enforcedText = enforced.document.slides[0]!.elements.find(
+      (element) => element.id === text.id,
+    );
+    expect(enforcedText?.type === 'text' ? enforcedText.style : undefined).not.toMatchObject({
+      fontFamily: 'Local override',
+      color: '#123456',
+    });
+    expect(enforced.canUndo).toBe(true);
+
+    const undone = await manager.undo(session.sessionId, {
+      expectedRevision: enforced.revision,
+      metadata: metadata(6),
+    });
+    expect(undone.document).toEqual(session.document);
+    expect(undone.canUndo).toBe(false);
+    expect(undone.canRedo).toBe(true);
+  });
+
   it('guards dirty close and allows an explicit discard', async () => {
     const directory = await temporaryDirectory();
     const manager = managerFor(directory);

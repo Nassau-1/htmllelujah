@@ -43,24 +43,28 @@ runtime.
 ## Direct development and packaging components
 
 The components below are used to type-check, test, format, bundle, inspect licenses,
-or package HTMLlelujah. They are not application features and must not be copied into
-the application runtime unless a later release review explicitly reclassifies them.
+or package HTMLlelujah. Their package trees are not application features and are not
+copied into the runtime. The three catalog-source rows have a separately reviewed,
+allowlisted transformation into bundled data as documented below.
 
-| Component              | Version | License    |
-| ---------------------- | ------: | ---------- |
-| `@electron/fuses`      |   2.1.3 | MIT        |
-| `@types/node`          | 24.13.3 | MIT        |
-| `@types/react`         | 19.2.17 | MIT        |
-| `@types/react-dom`     |  19.2.3 | MIT        |
-| `@types/ws`            |  8.18.1 | MIT        |
-| `@vitejs/plugin-react` |   6.0.3 | MIT        |
-| `electron-builder`     | 26.15.3 | MIT        |
-| `prettier`             |   3.9.5 | MIT        |
-| `tsx`                  |  4.23.1 | MIT        |
-| `typescript`           |   7.0.2 | Apache-2.0 |
-| `vite`                 |   8.1.4 | MIT        |
-| `vite-plugin-electron` |   1.1.0 | MIT        |
-| `vitest`               |  4.1.10 | MIT        |
+| Component              | Version | License                                    |
+| ---------------------- | ------: | ------------------------------------------ |
+| `@electron/fuses`      |   2.1.3 | MIT                                        |
+| `@twemoji/svg`         |  15.0.0 | MIT wrapper; graphics treated as CC-BY-4.0 |
+| `@types/node`          | 24.13.3 | MIT                                        |
+| `@types/react`         | 19.2.17 | MIT                                        |
+| `@types/react-dom`     |  19.2.3 | MIT                                        |
+| `@types/ws`            |  8.18.1 | MIT                                        |
+| `@vitejs/plugin-react` |   6.0.3 | MIT                                        |
+| `circle-flags`         |   2.8.3 | MIT                                        |
+| `electron-builder`     | 26.15.3 | MIT                                        |
+| `emojibase-data`       |  17.0.0 | MIT                                        |
+| `prettier`             |   3.9.5 | MIT                                        |
+| `tsx`                  |  4.23.1 | MIT                                        |
+| `typescript`           |   7.0.2 | Apache-2.0                                 |
+| `vite`                 |   8.1.4 | MIT                                        |
+| `vite-plugin-electron` |   1.1.0 | MIT                                        |
+| `vitest`               |  4.1.10 | MIT                                        |
 
 The build graph also reaches packages licensed under BlueOak-1.0.0, CC-BY-3.0,
 MPL-2.0, Python-2.0, and WTFPL. They are reviewed build-only exceptions in
@@ -87,6 +91,49 @@ The following notices are retained from the installed license files:
 - ws: Copyright 2011 Einar Otto Stangvik; 2013 Arnout Kazemier and contributors;
   2016 Luigi Pinca and contributors.
 - Zod: Copyright 2025 Colin McDonnell.
+- `@twemoji/svg`: Copyright 2023 Samuel Kopp for the package wrapper.
+- Twemoji graphics: Copyright Twitter, Inc. and other contributors.
+- Circle Flags: Copyright 2026 HatScripts.
+- Emojibase data: Copyright 2017-2019 Miles Johnson.
+
+## Bundled catalog artwork and metadata
+
+HTMLlelujah compiles the following pinned build sources into closed, local renderer
+catalogs. The source packages are not loaded by the application at runtime, and no
+catalog item performs a network request.
+
+### Twemoji
+
+The emoji artwork bundled through `@twemoji/svg@15.0.0` is treated as Twemoji
+graphics and attributed under the
+[Creative Commons Attribution 4.0 International license](https://creativecommons.org/licenses/by/4.0/),
+even though the intermediary package manifest identifies its wrapper as MIT.
+
+Attribution: **Twemoji graphics copyright Twitter, Inc. and other contributors,
+licensed under CC-BY 4.0.**
+
+HTMLlelujah modifies the distribution form by validating the source against a closed
+SVG element and attribute allowlist, removing redundant namespaces, prefixing
+internal identifiers, and compiling each accepted graphic into application-owned
+lookup tables. It does not claim endorsement by the licensors.
+
+### Circle Flags
+
+The circular country artwork is compiled from `circle-flags@2.8.3` under the MIT
+license. Copyright 2026 HatScripts. HTMLlelujah prefixes internal SVG identifiers and
+compiles the accepted two-letter country entries into its local lookup tables.
+
+### Emojibase metadata
+
+English and French labels and search terms are compiled from
+`emojibase-data@17.0.0` under the MIT license. Copyright 2017-2019 Miles Johnson.
+Only metadata that resolves to bundled artwork is exposed by the application.
+
+Exact package integrity values, source-tree hashes, output hashes, and catalog counts
+are recorded in
+[`packages/renderer/src/catalog/generated/catalog-integrity.json`](packages/renderer/src/catalog/generated/catalog-integrity.json).
+The `catalogs:check` release gate regenerates every output in memory and rejects any
+drift, unsafe SVG construct, unreviewed version, or license metadata mismatch.
 
 ## License texts for direct runtime components
 

@@ -5,13 +5,28 @@ import path from 'node:path';
 
 import { createDuplicateSlide } from '@htmllelujah/document-core';
 import { DocumentSessionManager } from '@htmllelujah/document-runtime';
-import { MCP_LIMITS } from '@htmllelujah/mcp-server';
+import { generateTrustedClient, MCP_LIMITS, trustedClientContext } from '@htmllelujah/mcp-server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DesktopMcpBridge } from '../src/main/mcp-bridge.js';
 
 const rm = (target: string, options: { readonly recursive: true; readonly force: true }) =>
   remove(target, { ...options, maxRetries: 5, retryDelay: 100 });
+
+const trustedClient = trustedClientContext(
+  generateTrustedClient({
+    clientId: '10000000-0000-4000-8000-000000000010',
+    displayName: 'Desktop bridge test client',
+    now: new Date('2026-07-15T12:00:00.000Z'),
+  }).profile,
+);
+const otherTrustedClient = trustedClientContext(
+  generateTrustedClient({
+    clientId: '10000000-0000-4000-8000-000000000011',
+    displayName: 'Other desktop bridge client',
+    now: new Date('2026-07-15T12:00:00.000Z'),
+  }).profile,
+);
 
 describe('DesktopMcpBridge', () => {
   const cleanup: Array<() => Promise<void>> = [];
@@ -81,15 +96,52 @@ describe('DesktopMcpBridge', () => {
       documentId: source.documentId,
       slides: expect.any(Array),
     });
-
-    const renameProposal = await bridge.proposeCommands({
+    await expect(
+      bridge.getDesignContext({
+        documentId: source.documentId,
+        elementScope: 'selected-projection',
+        elementOffset: 0,
+        elementLimit: 250,
+        assetOffset: 0,
+        assetLimit: 100,
+      }),
+    ).resolves.toMatchObject({
       documentId: source.documentId,
-      expectedRevision: source.revision,
-      label: 'Rename deck',
-      commands: [{ type: 'deck.rename', name: 'Agent-renamed deck' }],
+      revision: source.revision,
+      inheritance: {
+        themeId: source.document.themes[0]?.id,
+        masterId: source.document.masters[0]?.id,
+        layoutId: source.document.layouts[0]?.id,
+        slideId: source.document.slides[0]?.id,
+      },
+      constraints: {
+        proposal: {
+          expectedRevisionRequired: true,
+          arbitraryMarkupAccepted: false,
+          arbitraryUrlsAccepted: false,
+          arbitraryFilesystemPathsAccepted: false,
+        },
+      },
+      validation: { valid: true, issueCount: 0 },
     });
+
+    const renameProposal = await bridge.proposeCommands(
+      {
+        documentId: source.documentId,
+        expectedRevision: source.revision,
+        label: 'Rename deck',
+        commands: [{ type: 'deck.rename', name: 'Agent-renamed deck' }],
+      },
+      trustedClient,
+    );
     expect(renameProposal.requiresApproval).toBe(false);
-    const renamed = await bridge.commitProposal({ proposalId: renameProposal.proposalId });
+    await expect(
+      bridge.commitProposal({ proposalId: renameProposal.proposalId }, otherTrustedClient),
+    ).rejects.toMatchObject({ code: 'MCP_UNAUTHORIZED' });
+    const renamed = await bridge.commitProposal(
+      { proposalId: renameProposal.proposalId },
+      trustedClient,
+    );
     expect(renamed).toMatchObject({
       documentId: source.documentId,
       previousRevision: source.revision,
@@ -97,28 +149,55 @@ describe('DesktopMcpBridge', () => {
     });
     expect(runtime.getSnapshot(source.sessionId).document.name).toBe('Agent-renamed deck');
     expect(runtime.getAgentAudit(source.sessionId)).toEqual([
-      expect.objectContaining({ actorId: 'mcp-local-agent', transactionId: renamed.transactionId }),
+      expect.objectContaining({
+        actorId: trustedClient.actorId,
+        transactionId: renamed.transactionId,
+      }),
     ]);
+
+    const beforeDesignEdit = runtime.getSnapshot(source.sessionId);
+    const designTheme = beforeDesignEdit.document.themes[0];
+    if (designTheme === undefined) throw new Error('Missing default design theme.');
+    const designProposal = await bridge.proposeDesignOperations(
+      {
+        documentId: source.documentId,
+        expectedRevision: beforeDesignEdit.revision,
+        label: 'Update semantic accent',
+        operations: [
+          {
+            type: 'theme.update',
+            themeId: designTheme.id,
+            patch: { colors: { accent: '#123456' } },
+          },
+        ],
+      },
+      trustedClient,
+    );
+    expect(designProposal.requiresApproval).toBe(false);
+    await expect(
+      bridge.commitProposal({ proposalId: designProposal.proposalId }, trustedClient),
+    ).resolves.toMatchObject({ acceptedCommandCount: 1 });
+    expect(runtime.getSnapshot(source.sessionId).document.themes[0]?.colors.accent).toBe('#123456');
 
     const beforeReplacement = runtime.getSnapshot(source.sessionId);
     const layout = beforeReplacement.document.layouts[0];
     if (layout === undefined) throw new Error('Missing default layout.');
-    const replacementProposal = await bridge.proposeCommands({
-      documentId: source.documentId,
-      expectedRevision: beforeReplacement.revision,
-      label: 'Submit complete layout replacement',
-      commands: [
-        {
-          type: 'layout.update',
-          layoutId: layout.id,
-          replacement: layout,
-        },
-      ],
-    });
-    expect(replacementProposal.requiresApproval).toBe(true);
-    await expect(
-      bridge.commitProposal({ proposalId: replacementProposal.proposalId }),
-    ).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
+    const replacementProposal = await bridge.proposeCommands(
+      {
+        documentId: source.documentId,
+        expectedRevision: beforeReplacement.revision,
+        label: 'Submit complete layout replacement',
+        commands: [
+          {
+            type: 'layout.update',
+            layoutId: layout.id,
+            replacement: layout,
+          },
+        ],
+      },
+      trustedClient,
+    );
+    expect(replacementProposal.requiresApproval).toBe(false);
     expect(runtime.getSnapshot(source.sessionId).document.layouts[0]?.elements).toHaveLength(
       layout.elements.length,
     );
@@ -126,83 +205,119 @@ describe('DesktopMcpBridge', () => {
     const beforeThemeReplacement = runtime.getSnapshot(source.sessionId);
     const theme = beforeThemeReplacement.document.themes[0];
     if (theme === undefined) throw new Error('Missing default theme.');
-    const themeProposal = await bridge.proposeCommands({
-      documentId: source.documentId,
-      expectedRevision: beforeThemeReplacement.revision,
-      label: 'Submit complete theme replacement',
-      commands: [
-        {
-          type: 'theme.update',
-          themeId: theme.id,
-          replacement: { ...theme, name: 'Agent replacement theme' },
-        },
-      ],
-    });
-    expect(themeProposal.requiresApproval).toBe(true);
+    const themeProposal = await bridge.proposeCommands(
+      {
+        documentId: source.documentId,
+        expectedRevision: beforeThemeReplacement.revision,
+        label: 'Submit complete theme replacement',
+        commands: [
+          {
+            type: 'theme.update',
+            themeId: theme.id,
+            replacement: { ...theme, name: 'Agent replacement theme' },
+          },
+        ],
+      },
+      trustedClient,
+    );
+    expect(themeProposal.requiresApproval).toBe(false);
     await expect(
-      bridge.commitProposal({ proposalId: themeProposal.proposalId }),
-    ).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
-    expect(runtime.getSnapshot(source.sessionId).document.themes[0]?.name).toBe(theme.name);
+      bridge.commitProposal({ proposalId: themeProposal.proposalId }, trustedClient),
+    ).resolves.toMatchObject({ acceptedCommandCount: 1 });
+    expect(runtime.getSnapshot(source.sessionId).document.themes[0]?.name).toBe(
+      'Agent replacement theme',
+    );
 
     const beforePage = runtime.getSnapshot(source.sessionId);
-    const destructive = await bridge.proposeCommands({
-      documentId: source.documentId,
-      expectedRevision: beforePage.revision,
-      label: 'Change page format',
-      commands: [
-        {
-          type: 'deck.set-page',
-          page: { widthPt: 900, heightPt: 600 },
-        },
-      ],
-    });
+    const destructive = await bridge.proposeDesignOperations(
+      {
+        documentId: source.documentId,
+        expectedRevision: beforePage.revision,
+        label: 'Change page format',
+        operations: [{ type: 'page.set', page: { widthPt: 900, heightPt: 600 } }],
+      },
+      trustedClient,
+    );
     expect(destructive.requiresApproval).toBe(true);
     await expect(
-      bridge.commitProposal({ proposalId: destructive.proposalId }),
+      bridge.commitProposal({ proposalId: destructive.proposalId }, trustedClient),
     ).rejects.toMatchObject({ code: 'APPROVAL_REQUIRED' });
-    const approval = bridge.issueApproval(source.documentId, 'commit-destructive');
+    const approval = bridge.issueApproval(
+      source.documentId,
+      'commit-destructive',
+      trustedClient.clientId,
+    );
     await expect(
-      bridge.consumeApproval({
-        approvalId: approval.approvalId,
-        documentId: source.documentId,
-        action: 'commit-destructive',
-      }),
+      bridge.consumeApproval(
+        {
+          approvalId: approval.approvalId,
+          documentId: source.documentId,
+          action: 'commit-destructive',
+        },
+        otherTrustedClient,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      bridge.consumeApproval(
+        {
+          approvalId: approval.approvalId,
+          documentId: source.documentId,
+          action: 'commit-destructive',
+        },
+        trustedClient,
+      ),
     ).resolves.toBe(true);
     await expect(
-      bridge.commitProposal({
-        proposalId: destructive.proposalId,
-        approvalId: approval.approvalId,
-      }),
+      bridge.commitProposal(
+        {
+          proposalId: destructive.proposalId,
+          approvalId: approval.approvalId,
+        },
+        trustedClient,
+      ),
     ).resolves.toMatchObject({ acceptedCommandCount: 1 });
     await expect(
-      bridge.consumeApproval({
-        approvalId: approval.approvalId,
-        documentId: source.documentId,
-        action: 'commit-destructive',
-      }),
+      bridge.consumeApproval(
+        {
+          approvalId: approval.approvalId,
+          documentId: source.documentId,
+          action: 'commit-destructive',
+        },
+        trustedClient,
+      ),
     ).resolves.toBe(false);
 
     const current = runtime.getSnapshot(source.sessionId);
-    const exportApproval = bridge.issueApproval(source.documentId, 'export-pdf');
+    const exportApproval = bridge.issueApproval(
+      source.documentId,
+      'export-pdf',
+      trustedClient.clientId,
+    );
     await expect(
-      bridge.consumeApproval({
-        approvalId: exportApproval.approvalId,
-        documentId: source.documentId,
-        action: 'export-pdf',
-      }),
+      bridge.consumeApproval(
+        {
+          approvalId: exportApproval.approvalId,
+          documentId: source.documentId,
+          action: 'export-pdf',
+        },
+        trustedClient,
+      ),
     ).resolves.toBe(true);
     await expect(
-      bridge.exportDocument({
-        documentId: source.documentId,
-        expectedRevision: current.revision,
-        format: 'pdf',
-        includeHidden: false,
-        approvalId: exportApproval.approvalId,
-      }),
+      bridge.exportDocument(
+        {
+          documentId: source.documentId,
+          expectedRevision: current.revision,
+          format: 'pdf',
+          includeHidden: false,
+          approvalId: exportApproval.approvalId,
+        },
+        trustedClient,
+      ),
     ).resolves.toMatchObject({ format: 'pdf', pageCount: 1 });
     expect(exportDocument).toHaveBeenCalledOnce();
 
-    const staleApproval = bridge.issueApproval(source.documentId, 'import');
+    const staleApproval = bridge.issueApproval(source.documentId, 'import', trustedClient.clientId);
     await runtime.execute(source.sessionId, {
       expectedRevision: runtime.getSnapshot(source.sessionId).revision,
       commands: [{ type: 'deck.rename', name: 'Human changed it' }],
@@ -215,19 +330,22 @@ describe('DesktopMcpBridge', () => {
       },
     });
     await expect(
-      bridge.consumeApproval({
-        approvalId: staleApproval.approvalId,
-        documentId: source.documentId,
-        action: 'import',
-      }),
+      bridge.consumeApproval(
+        {
+          approvalId: staleApproval.approvalId,
+          documentId: source.documentId,
+          action: 'import',
+        },
+        trustedClient,
+      ),
     ).resolves.toBe(false);
     expect(importAsset).not.toHaveBeenCalled();
 
     now = new Date(now.getTime() + 3 * 60_000);
     expect(bridge.pendingApprovalCount()).toBe(0);
     collaborationMode = 'host';
-    await expect(bridge.canRead(source.documentId)).resolves.toBe(true);
-    await expect(bridge.canEdit(source.documentId)).resolves.toBe(false);
+    await expect(bridge.canRead(source.documentId, trustedClient)).resolves.toBe(true);
+    await expect(bridge.canEdit(source.documentId, trustedClient)).resolves.toBe(false);
   });
 
   it('maps atomic command rejections safely without mutating or disabling the bridge', async () => {
@@ -262,18 +380,21 @@ describe('DesktopMcpBridge', () => {
     });
 
     const rejectMissingSlide = (expectedRevision: string) =>
-      bridge.proposeCommands({
-        documentId: source.documentId,
-        expectedRevision,
-        label: 'Reject an atomic mixed batch',
-        commands: [
-          { type: 'deck.rename', name: 'This rename must not apply' },
-          {
-            type: 'slide.delete',
-            slideId: '00000000-0000-4000-8000-000000000099',
-          },
-        ],
-      });
+      bridge.proposeCommands(
+        {
+          documentId: source.documentId,
+          expectedRevision,
+          label: 'Reject an atomic mixed batch',
+          commands: [
+            { type: 'deck.rename', name: 'This rename must not apply' },
+            {
+              type: 'slide.delete',
+              slideId: '00000000-0000-4000-8000-000000000099',
+            },
+          ],
+        },
+        trustedClient,
+      );
 
     const oneSlideBefore = runtime.getSnapshot(source.sessionId);
     await expect(rejectMissingSlide(oneSlideBefore.revision)).rejects.toMatchObject({
@@ -306,14 +427,17 @@ describe('DesktopMcpBridge', () => {
     expect(runtime.getSnapshot(source.sessionId)).toEqual(twoSlidesBefore);
     expect(runtime.getAgentAudit(source.sessionId)).toEqual([]);
 
-    const recoveryProposal = await bridge.proposeCommands({
-      documentId: source.documentId,
-      expectedRevision: twoSlidesBefore.revision,
-      label: 'Prove the bridge remains available',
-      commands: [{ type: 'deck.rename', name: 'Bridge recovered safely' }],
-    });
+    const recoveryProposal = await bridge.proposeCommands(
+      {
+        documentId: source.documentId,
+        expectedRevision: twoSlidesBefore.revision,
+        label: 'Prove the bridge remains available',
+        commands: [{ type: 'deck.rename', name: 'Bridge recovered safely' }],
+      },
+      trustedClient,
+    );
     await expect(
-      bridge.commitProposal({ proposalId: recoveryProposal.proposalId }),
+      bridge.commitProposal({ proposalId: recoveryProposal.proposalId }, trustedClient),
     ).resolves.toMatchObject({
       previousRevision: twoSlidesBefore.revision,
       acceptedCommandCount: 1,
@@ -354,12 +478,15 @@ describe('DesktopMcpBridge', () => {
     });
 
     const propose = (index: number) =>
-      bridge.proposeCommands({
-        documentId: source.documentId,
-        expectedRevision: source.revision,
-        label: `Bounded proposal ${index}`,
-        commands: [{ type: 'deck.rename', name: `Proposed ${index}` }],
-      });
+      bridge.proposeCommands(
+        {
+          documentId: source.documentId,
+          expectedRevision: source.revision,
+          label: `Bounded proposal ${index}`,
+          commands: [{ type: 'deck.rename', name: `Proposed ${index}` }],
+        },
+        trustedClient,
+      );
     await Promise.all(
       Array.from({ length: MCP_LIMITS.maxPendingProposals }, (_, index) => propose(index)),
     );
@@ -372,53 +499,69 @@ describe('DesktopMcpBridge', () => {
     expect(afterExpiry.proposalId).toEqual(expect.any(String));
     now = new Date(now.getTime() + 1_001);
     await expect(
-      bridge.commitProposal({ proposalId: afterExpiry.proposalId }),
+      bridge.commitProposal({ proposalId: afterExpiry.proposalId }, trustedClient),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
 
     const grants = Array.from({ length: MCP_LIMITS.maxPendingApprovals }, () =>
-      bridge.issueApproval(source.documentId, 'import'),
+      bridge.issueApproval(source.documentId, 'import', trustedClient.clientId),
     );
     expect(bridge.pendingApprovalCount()).toBe(MCP_LIMITS.maxPendingApprovals);
-    expect(() => bridge.issueApproval(source.documentId, 'import')).toThrowError(
-      expect.objectContaining({ code: 'INVALID_REQUEST' }),
-    );
+    expect(() =>
+      bridge.issueApproval(source.documentId, 'import', trustedClient.clientId),
+    ).toThrowError(expect.objectContaining({ code: 'INVALID_REQUEST' }));
     await Promise.all(
       grants.map((grant) =>
-        bridge.consumeApproval({
-          approvalId: grant.approvalId,
-          documentId: source.documentId,
-          action: 'import',
-        }),
+        bridge.consumeApproval(
+          {
+            approvalId: grant.approvalId,
+            documentId: source.documentId,
+            action: 'import',
+          },
+          trustedClient,
+        ),
       ),
     );
     const secondBatch = Array.from({ length: MCP_LIMITS.maxPendingApprovals }, () =>
-      bridge.issueApproval(source.documentId, 'import'),
+      bridge.issueApproval(source.documentId, 'import', trustedClient.clientId),
     );
     await Promise.all(
       secondBatch.map((grant) =>
-        bridge.consumeApproval({
-          approvalId: grant.approvalId,
-          documentId: source.documentId,
-          action: 'import',
-        }),
+        bridge.consumeApproval(
+          {
+            approvalId: grant.approvalId,
+            documentId: source.documentId,
+            action: 'import',
+          },
+          trustedClient,
+        ),
       ),
     );
-    const blockedByReceiptCap = bridge.issueApproval(source.documentId, 'import');
+    const blockedByReceiptCap = bridge.issueApproval(
+      source.documentId,
+      'import',
+      trustedClient.clientId,
+    );
     await expect(
-      bridge.consumeApproval({
-        approvalId: blockedByReceiptCap.approvalId,
-        documentId: source.documentId,
-        action: 'import',
-      }),
+      bridge.consumeApproval(
+        {
+          approvalId: blockedByReceiptCap.approvalId,
+          documentId: source.documentId,
+          action: 'import',
+        },
+        trustedClient,
+      ),
     ).resolves.toBe(false);
 
     now = new Date(now.getTime() + 30_001);
     await expect(
-      bridge.consumeApproval({
-        approvalId: blockedByReceiptCap.approvalId,
-        documentId: source.documentId,
-        action: 'import',
-      }),
+      bridge.consumeApproval(
+        {
+          approvalId: blockedByReceiptCap.approvalId,
+          documentId: source.documentId,
+          action: 'import',
+        },
+        trustedClient,
+      ),
     ).resolves.toBe(true);
   });
 });

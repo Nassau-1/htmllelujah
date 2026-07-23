@@ -3,12 +3,7 @@ import { lstat, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import {
-  documentCommandSchema,
-  type Element,
-  type ImageElement,
-  type TransactionMetadata,
-} from '@htmllelujah/document-core';
+import { documentCommandSchema, type TransactionMetadata } from '@htmllelujah/document-core';
 import { CollaborationError, RemoteTransportError } from '@htmllelujah/collaboration';
 import {
   DocumentRuntimeError,
@@ -36,10 +31,16 @@ import { DesktopCollaborationCoordinator } from './collaboration-service.js';
 import {
   assertDecodedDimensions,
   ImageImportValidationError,
-  imageFrameForPage,
   inspectImageBeforeDecode,
 } from './image-import-validation.js';
+import {
+  imageImportPresetSchema,
+  imageImportTargetSchema,
+  ImageImportMutationError,
+  prepareImageImportMutation,
+} from './image-import-target.js';
 import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
+import { TrustedMcpClientStore } from './mcp-trusted-clients.js';
 import { isTrustedRendererUrl, resolveRendererEntryUrl } from './renderer-entry.js';
 import {
   buildSaveDialogDefaultPath,
@@ -102,6 +103,8 @@ const runtime = new DocumentSessionManager({
   autosaveDelayMs: 0,
 });
 const collaboration = new DesktopCollaborationCoordinator(runtime);
+const mcpDirectory = path.join(app.getPath('userData'), 'mcp');
+const trustedMcpClients = new TrustedMcpClientStore(mcpDirectory);
 
 type WindowMode = 'editor' | 'presentation';
 
@@ -443,7 +446,11 @@ const collaborationTextLeaseInputSchema = sessionInputSchema
   .extend({ slideId: identifier, elementId: identifier })
   .strict();
 const importImageInputSchema = historyInputSchema
-  .extend({ slideId: identifier, replaceElementId: identifier.optional() })
+  .extend({
+    target: imageImportTargetSchema,
+    replaceElementId: identifier.optional(),
+    preset: imageImportPresetSchema.optional(),
+  })
   .strict();
 const executeInputSchema = historyInputSchema
   .extend({
@@ -1346,38 +1353,6 @@ const selectImageFile = async (parent: BrowserWindow | undefined): Promise<Selec
   };
 };
 
-const findElementById = (elements: readonly Element[], elementId: string): Element | undefined => {
-  for (const element of elements) {
-    if (element.id === elementId) return element;
-    if (element.type === 'group') {
-      const nested = findElementById(element.children, elementId);
-      if (nested !== undefined) return nested;
-    }
-  }
-  return undefined;
-};
-
-const defaultImageElement = (
-  assetId: string,
-  widthPx: number,
-  heightPx: number,
-  page: DocumentSessionSnapshot['document']['page'],
-): ImageElement => {
-  return {
-    id: randomUUID(),
-    type: 'image',
-    name: 'Image',
-    frame: imageFrameForPage(widthPx, heightPx, page),
-    opacity: 1,
-    visible: true,
-    locked: false,
-    assetId,
-    altText: 'Presentation image',
-    fit: 'cover',
-    crop: { top: 0, right: 0, bottom: 0, left: 0 },
-  };
-};
-
 const importImageAssetForSession = async (input: {
   readonly sessionId: string;
   readonly expectedRevision: string;
@@ -1399,8 +1374,12 @@ const importImageAssetForSession = async (input: {
 const importImageForSession = async (input: {
   readonly sessionId: string;
   readonly expectedRevision: string;
-  readonly slideId: string;
+  readonly target:
+    | Readonly<{ surface: 'slide'; slideId: string }>
+    | Readonly<{ surface: 'layout'; layoutId: string }>
+    | Readonly<{ surface: 'master'; masterId: string }>;
   readonly replaceElementId?: string | undefined;
+  readonly preset?: 'watermark' | undefined;
   readonly parent: BrowserWindow | undefined;
   readonly metadata: TransactionMetadata;
 }): Promise<{
@@ -1411,46 +1390,36 @@ const importImageForSession = async (input: {
   collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
   const selected = await selectImageFile(input.parent);
   const current = runtime.getSnapshot(input.sessionId);
-  const slide = current.document.slides.find((candidate) => candidate.id === input.slideId);
-  if (slide === undefined) {
-    throw new DesktopMainError('INVALID_REQUEST', 'The destination slide no longer exists.');
-  }
   const assetId = randomUUID();
-  let element: ImageElement;
-  if (input.replaceElementId === undefined) {
-    element = defaultImageElement(
+  let mutation: ReturnType<typeof prepareImageImportMutation>;
+  try {
+    mutation = prepareImageImportMutation({
+      document: current.document,
+      target: input.target,
       assetId,
-      selected.widthPx,
-      selected.heightPx,
-      current.document.page,
-    );
-  } else {
-    const existing = findElementById(slide.elements, input.replaceElementId);
-    if (existing?.type !== 'image') {
-      throw new DesktopMainError('INVALID_REQUEST', 'The image to replace no longer exists.');
+      widthPx: selected.widthPx,
+      heightPx: selected.heightPx,
+      ...(input.replaceElementId === undefined ? {} : { replaceElementId: input.replaceElementId }),
+      ...(input.preset === undefined ? {} : { preset: input.preset }),
+      createElementId: randomUUID,
+    });
+  } catch (error) {
+    if (error instanceof ImageImportMutationError) {
+      throw new DesktopMainError('INVALID_REQUEST', error.message);
     }
-    element = { ...existing, assetId };
+    throw error;
   }
   const imported = await runtime.importAssetAndExecute(input.sessionId, {
     id: assetId,
     ...selected,
     expectedRevision: input.expectedRevision,
     metadata: input.metadata,
-    commands: [
-      input.replaceElementId === undefined
-        ? { type: 'element.insert', slideId: slide.id, element }
-        : {
-            type: 'element.update',
-            slideId: slide.id,
-            elementId: input.replaceElementId,
-            replacement: element,
-          },
-    ],
+    commands: mutation.commands,
   });
   return {
     snapshot: imported.snapshot,
     assetId: imported.assetId,
-    elementId: element.id,
+    elementId: mutation.element.id,
   };
 };
 
@@ -1468,14 +1437,14 @@ const mcpBridge = new DesktopMcpBridge({
   appVersion: () => app.getVersion(),
   visibleSessionIds: visibleEditorSessionIds,
   collaborationStatus: (sessionId) => collaboration.status(sessionId),
-  importAsset: async (sessionId, expectedRevision) => {
+  importAsset: async (sessionId, expectedRevision, client) => {
     const imported = await importImageAssetForSession({
       sessionId,
       expectedRevision,
       parent: BrowserWindow.getFocusedWindow() ?? undefined,
       metadata: {
         transactionId: randomUUID(),
-        actorId: 'mcp-local-agent',
+        actorId: client.actorId,
         origin: 'agent',
         label: 'Import approved image',
         timestamp: new Date().toISOString(),
@@ -2050,10 +2019,14 @@ const configureIpc = (): void => {
     const imported = await importImageForSession({
       sessionId: input.sessionId,
       expectedRevision: input.expectedRevision,
-      slideId: input.slideId,
+      target: input.target,
       ...(input.replaceElementId === undefined ? {} : { replaceElementId: input.replaceElementId }),
+      ...(input.preset === undefined ? {} : { preset: input.preset }),
       parent: findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined,
-      metadata: metadataFor(event, 'Import image'),
+      metadata: metadataFor(
+        event,
+        input.preset === 'watermark' ? 'Import image watermark' : 'Import image',
+      ),
     });
     return {
       session: sessionView(event.sender.id, imported.snapshot),
@@ -2268,6 +2241,7 @@ const configureIpc = (): void => {
     const approval = mcpBridge.issueApproval(
       snapshot.documentId,
       input.action as McpApprovalAction,
+      trustedMcpClients.bootstrapClientId,
     );
     return {
       approvalId: approval.approvalId,
@@ -2350,10 +2324,12 @@ else {
       registerSecureProtocols();
       configureIpc();
       try {
+        await trustedMcpClients.initialize();
         mcpRpcServer = await startLocalRpcServer({
           service: mcpBridge,
           permissions: mcpBridge,
-          descriptorPath: path.join(app.getPath('userData'), 'mcp', 'endpoint-v1.json'),
+          resolveTrustedClient: (clientId) => trustedMcpClients.resolve(clientId),
+          descriptorPath: path.join(mcpDirectory, 'endpoint-v2.json'),
         });
       } catch {
         // The editor remains usable if local automation cannot start. No path or secret is logged.

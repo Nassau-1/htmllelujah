@@ -1,6 +1,6 @@
 # Architecture
 
-Status: V1 release-candidate implementation baseline, 2026-07-20.
+Status: V1 release-candidate implementation baseline, 2026-07-23.
 
 ## System objective
 
@@ -129,9 +129,10 @@ surfaces consume the same renderer contract. Differences are explicit mode, scal
 slide filtering, and overlay inclusion. Export waits for fonts, images, and layout
 readiness before printing.
 
-Round flags are Unicode regional-indicator glyphs inside a circular frame, not a
-bundled image catalog. Interface icons come from the reviewed Lucide dependency;
-slide-content vector paths are local project source. See
+Twemoji and circular country flags are closed, searchable, bundled vector catalogs
+with stable document identities and no runtime network fallback. Interface icons come
+from the reviewed Lucide dependency; other slide-content vector paths are local
+project source. See
 [`legal/asset-provenance.md`](legal/asset-provenance.md).
 
 The desktop shell keeps a three-pane editor at a supported minimum width of 1080 CSS
@@ -238,21 +239,40 @@ until an explicit rejoin or independent copy flow.
 The installed `HTMLlelujah-MCP.cmd` starts the packaged MCP entrypoint as a console
 stdio process. Standard output is reserved for MCP protocol frames; redacted startup
 failure text goes to standard error. The process reads the current desktop endpoint
-descriptor from `%APPDATA%\HTMLlelujah\mcp\endpoint-v1.json` and connects to a random
+descriptor from `%APPDATA%\HTMLlelujah\mcp\endpoint-v2.json` and connects to a random
 local named pipe.
 
-The descriptor contains a random secret, instance identity, PID, and expiry. Client
-and server authenticate with fresh nonces and HMAC proofs; nonces cannot be reused.
-Frames, rates, authentication time, and service calls are bounded. The descriptor is
+The descriptor contains a random secret, instance identity, PID, and expiry. It proves
+the current desktop endpoint with fresh HMAC nonces. The launcher additionally signs
+the instance, stable client ID, and both nonces with its persistent Ed25519 credential;
+the main process verifies the public profile in `trusted-clients-v1.json`. Frames,
+rates, authentication time, and service calls are bounded. The descriptor is
 atomically created under the current user profile and removed only by its owning
-desktop instance.
+desktop instance. Persistent private credentials live in the fixed
+`client-credentials-v1/` directory and are never returned by an MCP tool.
 
 Only currently visible documents are exposed. Read tools return bounded structured
-projections. Mutations use a propose/commit flow with document ID, expected revision,
-actor attribution, and transaction label. Destructive commit, undo, import, and
-export require a single-use desktop approval bound to action, document, and revision.
-MCP edits are paused during a live LAN session in V1; reads and redacted collaboration
-status remain available.
+projections. `documents_get_design_context` follows the canonical
+theme → master → layout → slide projection and returns paginated element provenance,
+effective locks, placeholder bindings, semantic tokens, page constraints, bounded
+asset metadata, and validation state. Mutations use a propose/commit flow with
+document ID, expected revision, server-injected `mcp-client:<uuid>` attribution, and
+transaction label. The closed `documents_propose_design_operations` schema translates
+theme, master, layout, slide-layout, theme-enforcement, and page operations into the
+same canonical command engine; it accepts no arbitrary markup, URL, or filesystem
+target. The local RPC dispatch enforces the trusted profile even when a caller
+bypasses helper-side preflights. Proposals, approvals, receipts, and undo ownership
+are client-bound.
+Deck-wide enforcement is represented by one `theme.enforce-deck` command rather than
+one replacement command per design object. It validates the target theme, preserves
+all resource and element identities, participates in collaboration conflict analysis,
+and uses the standard revision, durable history, and undo boundary.
+Ordinary reversible changes need no one-time approval. Complete theme, master, layout,
+or element replacements qualify as ordinary only when typed simulation proves that
+they preserve resources, nested elements, table structure, and placeholder bindings.
+Destructive commit, undo, import, and export retain a single-use desktop approval
+bound to client, action, document, and revision. MCP edits are paused during a live
+LAN session in V1; reads and redacted collaboration status remain available.
 
 The V1 MCP boundary accepts at most 100 commands per proposal and 2 MiB frames/results.
 Desktop proposals expire after one minute and are capped at 64; desktop approvals
@@ -266,7 +286,8 @@ remain enabled, and the MCP entrypoint exposes only typed RPC-backed tools. Enab
 `RunAsNode` still means a user who already controls the local account can use the
 packaged executable as a same-user Node runtime. This grants no elevation, but it is
 an explicit V1 tradeoff; a dedicated signed helper should be evaluated for a later
-release. ADR-008 records the decision.
+release. ADR-008 records the transport decision and ADR-014 records persistent
+trusted-client identity, attribution, revocation, and approval ownership.
 
 ## Packaged startup evidence
 

@@ -10,6 +10,7 @@ import {
   BringToFront,
   Check,
   ChevronDown,
+  ClipboardPaste,
   Code2,
   Columns3,
   Copy,
@@ -36,9 +37,11 @@ import {
   Redo2,
   Rows3,
   Save,
+  Scissors,
   SendToBack,
   Share2,
   SlidersHorizontal,
+  Smile,
   Sparkles,
   Square,
   Table2,
@@ -54,7 +57,10 @@ import {
   ZoomOut,
 } from 'lucide-react';
 import {
+  createBlankTheme,
+  createBoundedPageSize,
   createDuplicateSlide,
+  resetElementThemeStyles,
   resolveSlide,
   resolveSlideFromValidatedDocument,
   STANDARD_PAGE_SIZES,
@@ -78,7 +84,8 @@ import {
   type TextStyleRole,
   type Theme,
 } from '@htmllelujah/document-core';
-import { LOCAL_ICON_PATHS, SlideSurface } from '@htmllelujah/renderer';
+import { alignItems, distributeItems } from '@htmllelujah/geometry';
+import { SlideSurface, type CatalogId, type ContentCatalogEntry } from '@htmllelujah/renderer';
 import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
 import {
   useCallback,
@@ -89,6 +96,7 @@ import {
   useState,
   type CSSProperties,
   type ClipboardEvent as ReactClipboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 
 import type {
@@ -96,8 +104,6 @@ import type {
   CollaborationTextLeaseInput,
   CollaborationTextLeaseStatus,
   DesktopResult,
-  McpApproval,
-  McpApprovalAction,
   McpStatus,
   SessionView,
 } from '../shared/desktop-api';
@@ -106,11 +112,15 @@ import { reconcileHostAddressSelection } from './collaboration-host-address';
 import { EditorButton } from './components/EditorButton';
 import { CanonicalSlideCanvas, sameCanvasSelection } from './components/CanonicalSlideCanvas';
 import { CollaborationParticipants } from './components/CollaborationParticipants';
+import { ContentCatalogPicker } from './components/ContentCatalogPicker';
+import {
+  applyCanonicalTableMutation,
+  type TableCommandFactory,
+} from './editor/canonical-table-mutations';
 import {
   contentFromPlainText,
   contentToPlainText,
   createConnectorElement,
-  createFlagElement,
   createIconElement,
   createShapeElement,
   createSlide,
@@ -171,6 +181,12 @@ import {
   RichClipboardError,
   sanitizeClipboardHtml,
 } from './editor/rich-clipboard';
+import {
+  deserializeObjectClipboard,
+  OBJECT_CLIPBOARD_MIME,
+  serializeObjectClipboard,
+  validateObjectClipboardPaste,
+} from './editor/object-clipboard';
 
 const menuItems = ['File', 'Edit', 'View', 'Insert', 'Arrange', 'Help'] as const;
 const themeTextStyleRoles: readonly TextStyleRole[] = [
@@ -181,40 +197,15 @@ const themeTextStyleRoles: readonly TextStyleRole[] = [
   'label',
   'quote',
 ];
-const commonCountryCodes = [
-  'AR',
-  'AU',
-  'BE',
-  'BR',
-  'CA',
-  'CH',
-  'CN',
-  'DE',
-  'DK',
-  'ES',
-  'EU',
-  'FI',
-  'FR',
-  'GB',
-  'GR',
-  'IE',
-  'IN',
-  'IT',
-  'JP',
-  'KR',
-  'LU',
-  'MX',
-  'NL',
-  'NO',
-  'PL',
-  'PT',
-  'SE',
-  'SG',
-  'US',
-] as const;
 type MenuItem = (typeof menuItems)[number];
 type InspectorTab = 'properties' | 'design';
 type Toast = { readonly kind: 'success' | 'error' | 'info'; readonly message: string };
+type ObjectContextMenu = Readonly<{ x: number; y: number; elementId: string }>;
+type ContentPickerState = Readonly<{
+  initialCatalog: CatalogId;
+  catalogs: readonly CatalogId[];
+  replaceElementId?: string | undefined;
+}>;
 type MutableTextMarksPatch = {
   -readonly [Key in keyof TextMarks]?: TextMarks[Key];
 };
@@ -277,14 +268,9 @@ const textAlignment = (element: TextElement): TextAlignment => {
   return element.style?.alignment ?? 'left';
 };
 
-const initialTextDraft = (
-  element: TextElement,
-  document: DeckDocument,
-  slide: Slide,
-): TextDraft => {
+const initialTextDraft = (element: TextElement, theme: Theme | undefined): TextDraft => {
   const marks = firstMarks(element.content);
   const firstBlock = element.content.blocks[0];
-  const theme = themeForSlide(document, slide);
   const roleStyle = theme?.textStyles.find((style) => style.role === element.styleRole);
   return {
     text: contentToPlainText(element.content),
@@ -310,18 +296,51 @@ const initialTextDraft = (
   };
 };
 
-const textEditingFingerprint = (
-  element: TextElement,
-  document: DeckDocument,
-  slide: Slide,
-): string =>
+const textEditingFingerprint = (element: TextElement, theme: Theme | undefined): string =>
   JSON.stringify({
+    locked: element.locked,
     styleRole: element.styleRole,
     verticalAlignment: element.verticalAlignment,
     content: element.content,
     style: element.style,
-    resolvedDraft: initialTextDraft(element, document, slide),
+    resolvedDraft: initialTextDraft(element, theme),
   });
+
+type AuthoringSurfaceReference =
+  | Readonly<{ surface: 'slide'; id: string }>
+  | Readonly<{ surface: 'layout'; id: string }>
+  | Readonly<{ surface: 'master'; id: string }>;
+
+const elementsForAuthoringSurface = (
+  document: DeckDocument,
+  reference: AuthoringSurfaceReference,
+): readonly Element[] =>
+  reference.surface === 'slide'
+    ? (document.slides.find((slide) => slide.id === reference.id)?.elements ?? [])
+    : reference.surface === 'layout'
+      ? (document.layouts.find((layout) => layout.id === reference.id)?.elements ?? [])
+      : (document.masters.find((master) => master.id === reference.id)?.elements ?? []);
+
+const themeForAuthoringSurface = (
+  document: DeckDocument,
+  reference: AuthoringSurfaceReference,
+): Theme | undefined => {
+  if (reference.surface === 'slide') {
+    const slide = document.slides.find((candidate) => candidate.id === reference.id);
+    return slide === undefined ? document.themes[0] : themeForSlide(document, slide);
+  }
+  const master =
+    reference.surface === 'master'
+      ? document.masters.find((candidate) => candidate.id === reference.id)
+      : document.masters.find(
+          (candidate) =>
+            candidate.id ===
+            document.layouts.find((layout) => layout.id === reference.id)?.masterId,
+        );
+  return (
+    document.themes.find((candidate) => candidate.id === master?.themeId) ?? document.themes[0]
+  );
+};
 
 const duplicateGuides = (guides: readonly Guide[]): readonly Guide[] =>
   guides.map((guide) => ({ ...guide, id: crypto.randomUUID() }));
@@ -597,6 +616,9 @@ function EditorApp() {
   const [gridEnabled, setGridEnabled] = useState(true);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('properties');
   const [activeMenu, setActiveMenu] = useState<MenuItem | null>(null);
+  const [objectContextMenu, setObjectContextMenu] = useState<ObjectContextMenu | null>(null);
+  const objectContextMenuRef = useRef<HTMLDivElement>(null);
+  const [contentPicker, setContentPicker] = useState<ContentPickerState | null>(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const [fatalError, setFatalError] = useState<string | null>(null);
@@ -634,9 +656,6 @@ function EditorApp() {
   const joiningCollaborationRef = useRef(false);
   const [mcpOpen, setMcpOpen] = useState(false);
   const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
-  const [mcpApprovalAction, setMcpApprovalAction] =
-    useState<McpApprovalAction>('commit-destructive');
-  const [mcpApproval, setMcpApproval] = useState<McpApproval | null>(null);
   const [recoveryCandidates, setRecoveryCandidates] = useState<readonly RecoveryCandidate[]>([]);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
@@ -660,6 +679,8 @@ function EditorApp() {
   const textLeasePendingRef = useRef(false);
   const textLeaseRequestRef = useRef<CollaborationTextLeaseInput | null>(null);
   const textEditorFocusedRef = useRef(false);
+  const objectClipboardRef = useRef<string | null>(null);
+  const objectClipboardPlainTextRef = useRef<string | null>(null);
   const textDraftVersionRef = useRef(0);
   const textDraftAutosaveFailedVersionRef = useRef<number | null>(null);
   const [tableTsv, setTableTsv] = useState('');
@@ -668,6 +689,9 @@ function EditorApp() {
   const [designLayoutId, setDesignLayoutId] = useState('');
   const [designThemeId, setDesignThemeId] = useState('');
   const [designSurface, setDesignSurface] = useState<DesignSurface>('slide');
+  const [customPageWidthPt, setCustomPageWidthPt] = useState(960);
+  const [customPageHeightPt, setCustomPageHeightPt] = useState(540);
+  const [customPageEditorOpen, setCustomPageEditorOpen] = useState(false);
   const workspaceRef = useRef<HTMLDivElement>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
   const executeQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -834,12 +858,60 @@ function EditorApp() {
     () => document?.slides.find((slide) => slide.id === activeSlideId) ?? document?.slides[0],
     [activeSlideId, document],
   );
+  const designMaster = document?.masters.find((master) => master.id === designMasterId);
+  const designLayout = document?.layouts.find((layout) => layout.id === designLayoutId);
+  const designTheme = document?.themes.find((theme) => theme.id === designThemeId);
+  const activeAuthoringSurface: DesignSurface = designSurface;
+  const activeAuthoringReference: AuthoringSurfaceReference =
+    activeAuthoringSurface === 'master'
+      ? { surface: 'master', id: designMaster?.id ?? '' }
+      : activeAuthoringSurface === 'layout'
+        ? { surface: 'layout', id: designLayout?.id ?? '' }
+        : { surface: 'slide', id: activeSlide?.id ?? '' };
+  const activeAuthoringTheme =
+    document === undefined
+      ? undefined
+      : themeForAuthoringSurface(document, activeAuthoringReference);
+  const activeSurfaceElements = useMemo(
+    () =>
+      activeAuthoringSurface === 'master'
+        ? (designMaster?.elements ?? [])
+        : activeAuthoringSurface === 'layout'
+          ? (designLayout?.elements ?? [])
+          : (activeSlide?.elements ?? []),
+    [activeAuthoringSurface, activeSlide?.elements, designLayout?.elements, designMaster?.elements],
+  );
   const selectedElements = useMemo(
-    () => activeSlide?.elements.filter((element) => selectedIds.includes(element.id)) ?? [],
-    [activeSlide, selectedIds],
+    () => activeSurfaceElements.filter((element) => selectedIds.includes(element.id)),
+    [activeSurfaceElements, selectedIds],
   );
   const primaryElement = selectedElements.at(-1);
   const primaryText = primaryElement?.type === 'text' ? primaryElement : undefined;
+  const primaryThemeReset = useMemo(
+    () =>
+      primaryElement === undefined ||
+      activeAuthoringTheme === undefined ||
+      primaryElement.type === 'image'
+        ? undefined
+        : resetElementThemeStyles(primaryElement, activeAuthoringTheme),
+    [activeAuthoringTheme, primaryElement],
+  );
+  const primaryStyleSource = useMemo(() => {
+    if (primaryElement === undefined) return 'No object selected';
+    if (primaryElement.type === 'image') return 'Local asset style';
+    const matchesTheme =
+      primaryThemeReset !== undefined &&
+      JSON.stringify(primaryThemeReset) === JSON.stringify(primaryElement);
+    const styleOverride = primaryElement.placeholderBinding?.overrides.includes('style') ?? false;
+    if (activeAuthoringSurface !== 'slide') {
+      return matchesTheme ? 'Template default · theme-managed' : 'Template local override';
+    }
+    if (primaryElement.placeholderBinding !== undefined) {
+      if (styleOverride) return matchesTheme ? 'Theme-managed override' : 'Local style override';
+      return matchesTheme ? 'Inherited from layout · theme-managed' : 'Inherited + local style';
+    }
+    return matchesTheme ? 'Theme-managed local object' : 'Local style override';
+  }, [activeAuthoringSurface, primaryElement, primaryThemeReset]);
   const textDraftMatchesPrimary =
     primaryText !== undefined && textBaselineRef.current?.id === primaryText.id;
   const hasOrphanedTextDraft = textDraft !== null && textDraftDirty && !textDraftMatchesPrimary;
@@ -847,9 +919,6 @@ function EditorApp() {
   const primaryImage = primaryElement?.type === 'image' ? primaryElement : undefined;
   const primaryTable = primaryElement?.type === 'table' ? primaryElement : undefined;
   const selectedTableCell = primaryTable?.cells.find((cell) => cell.id === selectedTableCellId);
-  const designMaster = document?.masters.find((master) => master.id === designMasterId);
-  const designLayout = document?.layouts.find((layout) => layout.id === designLayoutId);
-  const designTheme = document?.themes.find((theme) => theme.id === designThemeId);
   const designSelectedElement =
     designSurface === 'master'
       ? designMaster?.elements.find((element) => element.id === selectedIds.at(-1))
@@ -858,6 +927,18 @@ function EditorApp() {
         : undefined;
   const canvasScale = resolveCanvasScale(zoom, fitScale);
   const zoomPercent = effectiveZoomPercent(zoom, fitScale);
+
+  useEffect(() => {
+    if (document === undefined) return;
+    setCustomPageWidthPt(document.page.widthPt);
+    setCustomPageHeightPt(document.page.heightPt);
+    setCustomPageEditorOpen(
+      !Object.values(STANDARD_PAGE_SIZES).some(
+        (page) =>
+          page.widthPt === document.page.widthPt && page.heightPt === document.page.heightPt,
+      ),
+    );
+  }, [document?.page.heightPt, document?.page.widthPt]);
 
   useLayoutEffect(() => {
     const retained = retainInlineTextEditingTarget(inlineTextElementId, primaryText?.id);
@@ -870,6 +951,7 @@ function EditorApp() {
     if (
       session === null ||
       (shareStatus?.mode !== 'host' && shareStatus?.mode !== 'guest') ||
+      activeAuthoringSurface !== 'slide' ||
       activeSlide === undefined
     ) {
       return;
@@ -896,6 +978,7 @@ function EditorApp() {
     };
   }, [
     activeSlide,
+    activeAuthoringSurface,
     acceptShareStatus,
     inlineTextElementId,
     primaryText,
@@ -937,7 +1020,7 @@ function EditorApp() {
       updateTextDraftConflict(true);
       return;
     }
-    if (primaryText === undefined || document === undefined || activeSlide === undefined) {
+    if (primaryText === undefined || document === undefined) {
       textDraftVersionRef.current += 1;
       updateTextDraft(null);
       updateTextDraftDirty(false);
@@ -945,11 +1028,11 @@ function EditorApp() {
       textBaselineRef.current = null;
       return;
     }
-    const value = textEditingFingerprint(primaryText, document, activeSlide);
+    const value = textEditingFingerprint(primaryText, activeAuthoringTheme);
     const baseline = textBaselineRef.current;
     if (baseline === null || baseline.id !== primaryText.id) {
       textDraftVersionRef.current += 1;
-      updateTextDraft(initialTextDraft(primaryText, document, activeSlide));
+      updateTextDraft(initialTextDraft(primaryText, activeAuthoringTheme));
       updateTextDraftDirty(false);
       updateTextDraftConflict(false);
       textBaselineRef.current = { id: primaryText.id, value };
@@ -961,11 +1044,11 @@ function EditorApp() {
       return;
     }
     textDraftVersionRef.current += 1;
-    updateTextDraft(initialTextDraft(primaryText, document, activeSlide));
+    updateTextDraft(initialTextDraft(primaryText, activeAuthoringTheme));
     updateTextDraftConflict(false);
     textBaselineRef.current = { id: primaryText.id, value };
   }, [
-    activeSlide,
+    activeAuthoringTheme,
     document,
     primaryText,
     textDraft,
@@ -1054,6 +1137,7 @@ function EditorApp() {
     const current = sessionRef.current;
     if (
       current === null ||
+      activeAuthoringSurface !== 'slide' ||
       activeSlide === undefined ||
       primaryText === undefined ||
       shareStatus?.mode === undefined ||
@@ -1135,6 +1219,7 @@ function EditorApp() {
       window.setTimeout(() => textAreaRef.current?.focus(), 0);
     }
   }, [
+    activeAuthoringSurface,
     activeSlide,
     acceptShareStatus,
     notify,
@@ -1314,31 +1399,94 @@ function EditorApp() {
     [acceptSession, busy, showFailure],
   );
 
+  const mutateActiveTemplateElements = useCallback(
+    (
+      label: string,
+      mutation: (elements: readonly Element[]) => readonly Element[],
+    ): Promise<boolean> => {
+      const surfaceAtRequest = activeAuthoringSurface;
+      const containerId =
+        surfaceAtRequest === 'master'
+          ? designMaster?.id
+          : surfaceAtRequest === 'layout'
+            ? designLayout?.id
+            : undefined;
+      if (containerId === undefined || surfaceAtRequest === 'slide') return Promise.resolve(false);
+      return execute(label, (latestDocument) => {
+        if (surfaceAtRequest === 'master') {
+          const latest = latestDocument.masters.find((master) => master.id === containerId);
+          if (latest === undefined) return [];
+          return [
+            {
+              type: 'master.update',
+              masterId: latest.id,
+              replacement: { ...latest, elements: mutation(latest.elements) },
+            },
+          ];
+        }
+        const latest = latestDocument.layouts.find((layout) => layout.id === containerId);
+        if (latest === undefined) return [];
+        return [
+          {
+            type: 'layout.update',
+            layoutId: latest.id,
+            replacement: { ...latest, elements: mutation(latest.elements) },
+          },
+        ];
+      });
+    },
+    [activeAuthoringSurface, designLayout?.id, designMaster?.id, execute],
+  );
+
   const addElement = useCallback(
     async (element: Element): Promise<void> => {
-      if (activeSlide === undefined || designSurface !== 'slide') return;
-      await execute(
-        'Insert element',
-        [{ type: 'element.insert', slideId: activeSlide.id, element }],
-        { select: [element.id] },
-      );
+      if (activeAuthoringSurface === 'slide') {
+        if (activeSlide === undefined) return;
+        await execute(
+          'Insert element',
+          [{ type: 'element.insert', slideId: activeSlide.id, element }],
+          { select: [element.id] },
+        );
+        return;
+      }
+      if (
+        await mutateActiveTemplateElements('Insert template element', (elements) => [
+          ...elements,
+          element,
+        ])
+      ) {
+        setSelectedIds([element.id]);
+      }
     },
-    [activeSlide, designSurface, execute],
+    [activeAuthoringSurface, activeSlide, execute, mutateActiveTemplateElements],
   );
 
   const importImage = useCallback(
-    async (replace?: ImageElement): Promise<void> => {
+    async (replace?: ImageElement, asWatermark = false): Promise<void> => {
       if (!(await canLeaveInlineTextEditorRef.current())) return;
       const current = sessionRef.current;
-      if (current === null || activeSlide === undefined || designSurface !== 'slide' || busy)
-        return;
+      if (current === null || busy) return;
+      const target =
+        activeAuthoringSurface === 'master'
+          ? designMaster === undefined
+            ? null
+            : ({ surface: 'master', masterId: designMaster.id } as const)
+          : activeAuthoringSurface === 'layout'
+            ? designLayout === undefined
+              ? null
+              : ({ surface: 'layout', layoutId: designLayout.id } as const)
+            : activeSlide === undefined
+              ? null
+              : ({ surface: 'slide', slideId: activeSlide.id } as const);
+      if (target === null) return;
       setBusy(true);
       try {
         const imported = await window.htmllelujah.importImage({
           sessionId: current.snapshot.sessionId,
           expectedRevision: current.snapshot.revision,
-          slideId: activeSlide.id,
+          target,
           ...(replace === undefined ? {} : { replaceElementId: replace.id }),
+          ...(asWatermark ? { preset: 'watermark' as const } : {}),
         });
         if (!imported.ok) {
           showFailure(imported);
@@ -1346,12 +1494,28 @@ function EditorApp() {
         }
         acceptSession(imported.value.session);
         setSelectedIds([imported.value.elementId]);
-        notify(replace === undefined ? 'Image added.' : 'Image replaced.', 'success');
+        notify(
+          asWatermark
+            ? 'Image watermark added.'
+            : replace === undefined
+              ? 'Image added.'
+              : 'Image replaced.',
+          'success',
+        );
       } finally {
         setBusy(false);
       }
     },
-    [acceptSession, activeSlide, busy, designSurface, notify, showFailure],
+    [
+      acceptSession,
+      activeAuthoringSurface,
+      activeSlide,
+      busy,
+      designLayout,
+      designMaster,
+      notify,
+      showFailure,
+    ],
   );
 
   const addSlide = useCallback(async (): Promise<void> => {
@@ -1370,6 +1534,7 @@ function EditorApp() {
     });
     if (added && createdSlide !== undefined) {
       setActiveSlideId(createdSlide.id);
+      setDesignSurface('slide');
       setSelectedIds(createdSlide.elements[0] === undefined ? [] : [createdSlide.elements[0].id]);
     }
   }, [activeSlide?.id, document, execute]);
@@ -1386,6 +1551,7 @@ function EditorApp() {
     });
     if (duplicated && duplicate !== undefined) {
       setActiveSlideId(duplicate.id);
+      setDesignSurface('slide');
       setSelectedIds([]);
     }
   }, [activeSlide?.id, document, execute]);
@@ -1410,28 +1576,61 @@ function EditorApp() {
     const next = document.slides[index + 1] ?? document.slides[index - 1];
     if (await execute('Delete slide', [{ type: 'slide.delete', slideId: activeSlide.id }])) {
       setActiveSlideId(next?.id ?? '');
+      setDesignSurface('slide');
       setSelectedIds([]);
     }
   }, [activeSlide, document, execute]);
 
   const deleteSelection = useCallback(async (): Promise<void> => {
     if (!(await canLeaveInlineTextEditorRef.current())) return;
-    if (designSurface !== 'slide' || activeSlide === undefined || selectedIds.length === 0) return;
-    if (
-      await execute('Delete objects', [
-        { type: 'element.delete', slideId: activeSlide.id, elementIds: selectedIds },
-      ])
-    )
-      setSelectedIds([]);
-  }, [activeSlide, designSurface, execute, selectedIds]);
+    if (selectedIds.length === 0) return;
+    if (selectedElements.some((element) => element.locked)) {
+      notify('Unlock the selected objects before deleting them.', 'error');
+      return;
+    }
+    const deleted =
+      activeAuthoringSurface === 'slide'
+        ? activeSlide !== undefined &&
+          (await execute('Delete objects', [
+            { type: 'element.delete', slideId: activeSlide.id, elementIds: selectedIds },
+          ]))
+        : await mutateActiveTemplateElements('Delete template objects', (elements) =>
+            elements.filter((element) => !selectedIds.includes(element.id)),
+          );
+    if (deleted) setSelectedIds([]);
+  }, [
+    activeAuthoringSurface,
+    activeSlide,
+    execute,
+    mutateActiveTemplateElements,
+    notify,
+    selectedElements,
+    selectedIds,
+  ]);
 
   const duplicateSelection = useCallback(async (): Promise<void> => {
     if (!(await canLeaveInlineTextEditorRef.current())) return;
-    if (designSurface !== 'slide' || activeSlide === undefined || selectedIds.length === 0) return;
+    if (selectedIds.length === 0) return;
+    if (activeAuthoringSurface !== 'slide') {
+      let copyIds: readonly string[] = [];
+      const succeeded = await mutateActiveTemplateElements(
+        'Duplicate template objects',
+        (elements) => {
+          const selected = elements.filter((element) => selectedIds.includes(element.id));
+          if (selected.length !== selectedIds.length) return elements;
+          const copies = duplicateElements(selected);
+          copyIds = copies.map((element) => element.id);
+          return [...elements, ...copies];
+        },
+      );
+      if (succeeded && copyIds.length > 0) setSelectedIds(copyIds);
+      return;
+    }
+    if (activeSlide === undefined) return;
     const sourceSlideId = activeSlide.id;
     const selectedAtRequest = [...selectedIds];
     let copyIds: readonly string[] = [];
-    await execute('Duplicate objects', (latestDocument) => {
+    const succeeded = await execute('Duplicate objects', (latestDocument) => {
       const latestSlide = latestDocument.slides.find((slide) => slide.id === sourceSlideId);
       if (latestSlide === undefined) return [];
       const latestSelected = latestSlide.elements.filter((element) =>
@@ -1446,53 +1645,203 @@ function EditorApp() {
         element,
       }));
     });
-    if (copyIds.length > 0) setSelectedIds(copyIds);
-  }, [activeSlide, designSurface, execute, selectedIds]);
+    if (succeeded && copyIds.length > 0) setSelectedIds(copyIds);
+  }, [activeAuthoringSurface, activeSlide, execute, mutateActiveTemplateElements, selectedIds]);
+
+  const serializeSelectedObjects = useCallback(() => {
+    if (document === undefined || selectedElements.length === 0) return null;
+    try {
+      return serializeObjectClipboard(document.id, selectedElements);
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : 'The selected objects cannot be copied.',
+        'error',
+      );
+      return null;
+    }
+  }, [document, notify, selectedElements]);
+
+  const copySelectionToInternalClipboard = useCallback((): boolean => {
+    const payload = serializeSelectedObjects();
+    if (payload === null) return false;
+    objectClipboardRef.current = payload.serialized;
+    objectClipboardPlainTextRef.current = payload.plainText;
+    void navigator.clipboard?.writeText(payload.plainText).catch(() => undefined);
+    notify(
+      `${selectedElements.length} object${selectedElements.length === 1 ? '' : 's'} copied.`,
+      'success',
+    );
+    return true;
+  }, [notify, selectedElements.length, serializeSelectedObjects]);
+
+  const cutSelectionToInternalClipboard = useCallback(async (): Promise<void> => {
+    if (copySelectionToInternalClipboard()) await deleteSelection();
+  }, [copySelectionToInternalClipboard, deleteSelection]);
+
+  const pasteSerializedObjects = useCallback(
+    async (serialized: string): Promise<void> => {
+      if (document === undefined) return;
+      let payload: ReturnType<typeof deserializeObjectClipboard>;
+      try {
+        payload = deserializeObjectClipboard(serialized);
+      } catch (error) {
+        notify(
+          error instanceof Error ? error.message : 'Clipboard object data is invalid.',
+          'error',
+        );
+        return;
+      }
+      const compatibility = validateObjectClipboardPaste(payload, document.id);
+      if (!compatibility.compatible) {
+        notify(compatibility.message, 'error');
+        return;
+      }
+      const pasted = payload.elements;
+      if (pasted.length === 0) return;
+      if (
+        activeAuthoringSurface === 'slide' &&
+        pasted.some((element) => element.type === 'placeholder')
+      ) {
+        notify('Template placeholders can only be pasted into a layout or master.', 'error');
+        return;
+      }
+      const inserted =
+        activeAuthoringSurface === 'slide'
+          ? activeSlide !== undefined &&
+            (await execute(
+              'Paste objects',
+              pasted.map((element): DocumentCommand => ({
+                type: 'element.insert',
+                slideId: activeSlide.id,
+                element,
+              })),
+            ))
+          : await mutateActiveTemplateElements('Paste template objects', (elements) => [
+              ...elements,
+              ...pasted,
+            ]);
+      if (inserted) {
+        setSelectedIds(pasted.map((element) => element.id));
+        notify(`${pasted.length} object${pasted.length === 1 ? '' : 's'} pasted.`, 'success');
+      }
+    },
+    [activeAuthoringSurface, activeSlide, document, execute, mutateActiveTemplateElements, notify],
+  );
 
   const transform = useCallback(
     (frames: readonly { readonly elementId: string; readonly frame: Frame }[]): void => {
-      if (designSurface !== 'slide' || activeSlide === undefined || frames.length === 0) return;
-      void execute('Move or resize objects', [
-        { type: 'element.transform', slideId: activeSlide.id, transforms: frames },
-      ]);
+      const unlockedIds = new Set(
+        activeSurfaceElements.filter((element) => !element.locked).map((element) => element.id),
+      );
+      const permittedFrames = frames.filter((frame) => unlockedIds.has(frame.elementId));
+      if (permittedFrames.length === 0) return;
+      if (activeAuthoringSurface === 'slide') {
+        if (activeSlide === undefined) return;
+        void execute('Move or resize objects', [
+          { type: 'element.transform', slideId: activeSlide.id, transforms: permittedFrames },
+        ]);
+        return;
+      }
+      void mutateActiveTemplateElements('Move or resize template objects', (elements) =>
+        replaceElementFrames(elements, permittedFrames),
+      );
     },
-    [activeSlide, designSurface, execute],
+    [
+      activeAuthoringSurface,
+      activeSlide,
+      activeSurfaceElements,
+      execute,
+      mutateActiveTemplateElements,
+    ],
   );
 
   const align = useCallback(
     (mode: 'left' | 'horizontal-center' | 'right' | 'top' | 'vertical-middle' | 'bottom'): void => {
-      if (designSurface !== 'slide' || activeSlide === undefined || selectedIds.length < 2) return;
-      void execute('Align objects', [
-        {
-          type: 'element.align',
-          slideId: activeSlide.id,
-          elementIds: selectedIds,
-          mode,
-          relativeTo: 'selection',
-        },
-      ]);
+      if (selectedIds.length < 2) return;
+      if (selectedElements.some((element) => element.locked)) {
+        notify('Unlock the selected objects before aligning them.', 'error');
+        return;
+      }
+      if (activeAuthoringSurface === 'slide') {
+        if (activeSlide === undefined) return;
+        void execute('Align objects', [
+          {
+            type: 'element.align',
+            slideId: activeSlide.id,
+            elementIds: selectedIds,
+            mode,
+            relativeTo: 'selection',
+          },
+        ]);
+        return;
+      }
+      const geometryMode =
+        mode === 'horizontal-center' ? 'center' : mode === 'vertical-middle' ? 'middle' : mode;
+      const aligned = alignItems(selectedElements, geometryMode);
+      transform(
+        aligned.map((element) => ({
+          elementId: element.id,
+          frame: element.frame,
+        })),
+      );
     },
-    [activeSlide, designSurface, execute, selectedIds],
+    [
+      activeAuthoringSurface,
+      activeSlide,
+      execute,
+      notify,
+      selectedElements,
+      selectedIds,
+      transform,
+    ],
   );
 
   const distribute = useCallback(
     (axis: 'horizontal' | 'vertical'): void => {
-      if (designSurface !== 'slide' || activeSlide === undefined || selectedIds.length < 3) return;
-      void execute('Distribute objects', [
-        {
-          type: 'element.distribute',
-          slideId: activeSlide.id,
-          elementIds: selectedIds,
-          axis,
-          relativeTo: 'selection',
-        },
-      ]);
+      if (selectedIds.length < 3) return;
+      if (selectedElements.some((element) => element.locked)) {
+        notify('Unlock the selected objects before distributing them.', 'error');
+        return;
+      }
+      if (activeAuthoringSurface === 'slide') {
+        if (activeSlide === undefined) return;
+        void execute('Distribute objects', [
+          {
+            type: 'element.distribute',
+            slideId: activeSlide.id,
+            elementIds: selectedIds,
+            axis,
+            relativeTo: 'selection',
+          },
+        ]);
+        return;
+      }
+      const distributed = distributeItems(selectedElements, axis);
+      transform(
+        distributed.map((element) => ({
+          elementId: element.id,
+          frame: element.frame,
+        })),
+      );
     },
-    [activeSlide, designSurface, execute, selectedIds],
+    [
+      activeAuthoringSurface,
+      activeSlide,
+      execute,
+      notify,
+      selectedElements,
+      selectedIds,
+      transform,
+    ],
   );
 
   const groupSelection = useCallback(async (): Promise<void> => {
-    if (designSurface !== 'slide' || activeSlide === undefined || selectedIds.length < 2) return;
+    if (activeAuthoringSurface !== 'slide' || activeSlide === undefined || selectedIds.length < 2)
+      return;
+    if (selectedElements.some((element) => element.locked)) {
+      notify('Unlock the selected objects before grouping them.', 'error');
+      return;
+    }
     const groupId = crypto.randomUUID();
     await execute(
       'Group objects',
@@ -1507,10 +1856,15 @@ function EditorApp() {
       ],
       { select: [groupId] },
     );
-  }, [activeSlide, designSurface, execute, selectedIds]);
+  }, [activeAuthoringSurface, activeSlide, execute, notify, selectedElements, selectedIds]);
 
   const ungroupSelection = useCallback(async (): Promise<void> => {
-    if (designSurface !== 'slide' || activeSlide === undefined || primaryElement?.type !== 'group')
+    if (
+      activeAuthoringSurface !== 'slide' ||
+      activeSlide === undefined ||
+      primaryElement?.type !== 'group' ||
+      primaryElement.locked
+    )
       return;
     const children = primaryElement.children.map((child) => child.id);
     await execute(
@@ -1518,12 +1872,29 @@ function EditorApp() {
       [{ type: 'element.ungroup', slideId: activeSlide.id, groupId: primaryElement.id }],
       { select: children },
     );
-  }, [activeSlide, designSurface, execute, primaryElement]);
+  }, [activeAuthoringSurface, activeSlide, execute, primaryElement]);
 
   const reorder = useCallback(
     (to: 'front' | 'back'): void => {
-      if (designSurface !== 'slide' || activeSlide === undefined || primaryElement === undefined)
+      if (primaryElement === undefined) return;
+      if (primaryElement.locked) {
+        notify('Unlock the object before changing its layer order.', 'error');
         return;
+      }
+      if (activeAuthoringSurface !== 'slide') {
+        const elementId = primaryElement.id;
+        void mutateActiveTemplateElements(
+          to === 'front' ? 'Bring template object to front' : 'Send template object to back',
+          (elements) => {
+            const target = elements.find((element) => element.id === elementId);
+            if (target === undefined) return elements;
+            const remaining = elements.filter((element) => element.id !== elementId);
+            return to === 'front' ? [...remaining, target] : [target, ...remaining];
+          },
+        );
+        return;
+      }
+      if (activeSlide === undefined) return;
       const slideId = activeSlide.id;
       const elementId = primaryElement.id;
       void execute(to === 'front' ? 'Bring to front' : 'Send to back', (latestDocument) => {
@@ -1543,12 +1914,43 @@ function EditorApp() {
         ];
       });
     },
-    [activeSlide, designSurface, execute, primaryElement],
+    [
+      activeAuthoringSurface,
+      activeSlide,
+      execute,
+      mutateActiveTemplateElements,
+      notify,
+      primaryElement,
+    ],
   );
 
   const patchElement = useCallback(
     (replacement: Element, label = 'Update object'): Promise<boolean> => {
-      if (designSurface !== 'slide' || activeSlide === undefined) return Promise.resolve(false);
+      const surfaceBaseline = activeSurfaceElements.find(
+        (element) => element.id === replacement.id,
+      );
+      if (
+        surfaceBaseline?.locked &&
+        JSON.stringify({ ...surfaceBaseline, locked: replacement.locked }) !==
+          JSON.stringify(replacement)
+      ) {
+        notify('Unlock the object before editing it.', 'error');
+        return Promise.resolve(false);
+      }
+      if (activeAuthoringSurface !== 'slide') {
+        const baseline = surfaceBaseline;
+        if (baseline === undefined) return Promise.resolve(false);
+        return mutateActiveTemplateElements(label, (elements) =>
+          elements.map((latest) =>
+            latest.id === replacement.id &&
+            latest.type === replacement.type &&
+            baseline.type === latest.type
+              ? rebaseEntityReplacement(baseline, replacement, latest)
+              : latest,
+          ),
+        );
+      }
+      if (activeSlide === undefined) return Promise.resolve(false);
       const slideId = activeSlide.id;
       const baseline = sessionRef.current?.snapshot.document.slides
         .find((slide) => slide.id === slideId)
@@ -1574,13 +1976,98 @@ function EditorApp() {
         ];
       });
     },
-    [activeSlide, designSurface, execute],
+    [
+      activeAuthoringSurface,
+      activeSlide,
+      activeSurfaceElements,
+      execute,
+      mutateActiveTemplateElements,
+      notify,
+    ],
+  );
+
+  const resetPrimaryElementToTheme = useCallback(async (): Promise<void> => {
+    if (primaryElement === undefined || primaryThemeReset === undefined || primaryElement.locked)
+      return;
+    if (JSON.stringify(primaryElement) === JSON.stringify(primaryThemeReset)) {
+      notify('This object already uses theme-managed fonts and colors.', 'info');
+      return;
+    }
+    if (await patchElement(primaryThemeReset, 'Reset object to theme')) {
+      notify('Object fonts and colors reset to the active theme.', 'success');
+    }
+  }, [notify, patchElement, primaryElement, primaryThemeReset]);
+
+  const resetPrimaryElementToLayout = useCallback(async (): Promise<void> => {
+    if (
+      activeAuthoringSurface !== 'slide' ||
+      activeSlide === undefined ||
+      primaryElement?.placeholderBinding === undefined ||
+      primaryElement.locked
+    )
+      return;
+    const reset = await execute('Reset object to layout', [
+      {
+        type: 'slide.reset-placeholder',
+        slideId: activeSlide.id,
+        placeholderId: primaryElement.placeholderBinding.placeholderId,
+      },
+    ]);
+    if (reset) notify('Object geometry, visibility and style reset to its layout.', 'success');
+  }, [activeAuthoringSurface, activeSlide, execute, notify, primaryElement]);
+
+  const selectContentCatalogEntry = useCallback(
+    async (entry: ContentCatalogEntry): Promise<void> => {
+      const replaceElement =
+        contentPicker?.replaceElementId === undefined
+          ? undefined
+          : activeSurfaceElements.find((element) => element.id === contentPicker.replaceElementId);
+      let changed = false;
+      if (replaceElement !== undefined) {
+        if (entry.insert.type === 'shape' && replaceElement.type === 'shape') {
+          changed = await patchElement(
+            {
+              ...replaceElement,
+              name: entry.localizedLabel || entry.label,
+              shape: entry.insert.shape,
+              cornerRadiusPt: entry.insert.shape === 'rounded-rectangle' ? 12 : 0,
+            },
+            'Change shape',
+          );
+        } else if (entry.insert.type === 'icon' && replaceElement.type === 'icon') {
+          changed = await patchElement(
+            {
+              ...replaceElement,
+              name: entry.localizedLabel || entry.label,
+              iconSet: entry.insert.iconSet,
+              iconName: entry.insert.iconName,
+            },
+            'Change catalog visual',
+          );
+        } else {
+          notify('Choose a visual from the same object family.', 'error');
+          return;
+        }
+      } else if (entry.insert.type === 'shape') {
+        await addElement(createShapeElement(entry.insert.shape));
+        changed = true;
+      } else {
+        await addElement({
+          ...createIconElement(entry.insert.iconName),
+          name: entry.localizedLabel || entry.label,
+          iconSet: entry.insert.iconSet,
+          iconName: entry.insert.iconName,
+        });
+        changed = true;
+      }
+      if (changed) setContentPicker(null);
+    },
+    [activeSurfaceElements, addElement, contentPicker, notify, patchElement],
   );
 
   const updateFrameNumber = useCallback(
     (property: keyof Frame, raw: string): void => {
-      if (designSurface !== 'slide' || primaryElement === undefined || document === undefined)
-        return;
+      if (primaryElement === undefined || document === undefined) return;
       const value = Number(raw);
       if (!Number.isFinite(value)) return;
       const frame = { ...primaryElement.frame };
@@ -1595,7 +2082,7 @@ function EditorApp() {
       else frame.rotationDeg = clamp(value, -180, 180);
       transform([{ elementId: primaryElement.id, frame }]);
     },
-    [designSurface, document, primaryElement, transform],
+    [document, primaryElement, transform],
   );
 
   const applyTextDraft = useCallback(
@@ -1606,25 +2093,33 @@ function EditorApp() {
       }> = {},
     ): Promise<boolean> => {
       const draft = textDraftRef.current;
-      if (
-        activeSlide === undefined ||
-        primaryText === undefined ||
-        draft === null ||
-        document === undefined
-      )
-        return false;
+      if (activeSlide === undefined || primaryText === undefined || draft === null) return false;
       const draftVersion = textDraftVersionRef.current;
       const targetTextId = primaryText.id;
+      const surfaceReference: AuthoringSurfaceReference =
+        activeAuthoringSurface === 'master'
+          ? { surface: 'master', id: designMaster?.id ?? '' }
+          : activeAuthoringSurface === 'layout'
+            ? { surface: 'layout', id: designLayout?.id ?? '' }
+            : { surface: 'slide', id: activeSlide.id };
+      if (surfaceReference.id === '') return false;
       const latestDocument = sessionRef.current?.snapshot.document;
-      const latestSlide = latestDocument?.slides.find((slide) => slide.id === activeSlide.id);
-      const latestText = latestSlide?.elements.find(
-        (element): element is TextElement => element.id === targetTextId && element.type === 'text',
-      );
-      if (latestDocument === undefined || latestSlide === undefined || latestText === undefined) {
+      const latestText = latestDocument
+        ? elementsForAuthoringSurface(latestDocument, surfaceReference).find(
+            (element): element is TextElement =>
+              element.id === targetTextId && element.type === 'text',
+          )
+        : undefined;
+      if (latestDocument === undefined || latestText === undefined) {
         updateTextDraftConflict(true);
         return false;
       }
-      const latestFingerprint = textEditingFingerprint(latestText, latestDocument, latestSlide);
+      if (latestText.locked) {
+        notify('Unlock the text object before editing it.', 'error');
+        return false;
+      }
+      const latestTheme = themeForAuthoringSurface(latestDocument, surfaceReference);
+      const latestFingerprint = textEditingFingerprint(latestText, latestTheme);
       const recordedBaseline = textBaselineRef.current;
       const hasExternalConflict = textDraftTargetHasChanged(
         recordedBaseline,
@@ -1643,7 +2138,7 @@ function EditorApp() {
           return false;
       }
       const expectedFingerprint = latestFingerprint;
-      const baseline = initialTextDraft(latestText, latestDocument, latestSlide);
+      const baseline = initialTextDraft(latestText, latestTheme);
       const markPatch: MutableTextMarksPatch = {};
       if (draft.bold !== baseline.bold) {
         markPatch.bold = draft.bold;
@@ -1720,6 +2215,14 @@ function EditorApp() {
         };
       }
 
+      const contentChanged =
+        kindChanged ||
+        textChanged ||
+        marksChanged ||
+        alignmentChanged ||
+        listLevelChanged ||
+        headingLevelChanged ||
+        draft.contentOverride !== null;
       const styleChanged =
         draft.role !== baseline.role ||
         alignmentChanged ||
@@ -1730,45 +2233,48 @@ function EditorApp() {
         draft.color !== baseline.color ||
         draft.lineHeight !== baseline.lineHeight ||
         draft.letterSpacingPt !== baseline.letterSpacingPt;
+      const textStyleOverrides: NonNullable<TextElement['style']> = {
+        alignment: draft.alignment,
+        fontFamily: draft.fontFamily,
+        fontSizePt: draft.fontSizePt,
+        fontWeight: draft.bold ? 700 : 400,
+        italic: draft.italic,
+        color: draft.color,
+        lineHeight: draft.lineHeight,
+        letterSpacingPt: draft.letterSpacingPt,
+      };
+      const applyChanges = (current: TextElement): TextElement => ({
+        ...current,
+        ...(contentChanged ? { content } : {}),
+        ...(styleChanged
+          ? {
+              styleRole: draft.role,
+              style: { ...(current.style ?? {}), ...textStyleOverrides },
+            }
+          : {}),
+      });
       const commands: DocumentCommand[] = [];
-      if (
-        kindChanged ||
-        textChanged ||
-        marksChanged ||
-        alignmentChanged ||
-        listLevelChanged ||
-        headingLevelChanged ||
-        draft.contentOverride !== null
-      ) {
+      if (surfaceReference.surface === 'slide' && contentChanged) {
         commands.push({
           type: 'text.replace-content',
-          slideId: latestSlide.id,
+          slideId: surfaceReference.id,
           textId: latestText.id,
           content,
         });
       }
-      if (styleChanged) {
+      if (surfaceReference.surface === 'slide' && styleChanged) {
         commands.push({
           type: 'element.update-style',
-          slideId: latestSlide.id,
+          slideId: surfaceReference.id,
           elementId: latestText.id,
           patch: {
             kind: 'text',
             styleRole: draft.role,
-            style: {
-              alignment: draft.alignment,
-              fontFamily: draft.fontFamily,
-              fontSizePt: draft.fontSizePt,
-              fontWeight: draft.bold ? 700 : 400,
-              italic: draft.italic,
-              color: draft.color,
-              lineHeight: draft.lineHeight,
-              letterSpacingPt: draft.letterSpacingPt,
-            },
+            style: textStyleOverrides,
           },
         });
       }
-      if (commands.length === 0) {
+      if (!contentChanged && !styleChanged) {
         updateTextDraftDirty(false);
         updateTextDraftConflict(false);
         return true;
@@ -1795,42 +2301,82 @@ function EditorApp() {
         const applied = await execute(
           'Edit text',
           (queuedDocument) => {
-            const queuedSlide = queuedDocument.slides.find((slide) => slide.id === latestSlide.id);
-            const queuedText = queuedSlide?.elements.find(
+            const queuedText = elementsForAuthoringSurface(queuedDocument, surfaceReference).find(
               (element): element is TextElement =>
                 element.id === targetTextId && element.type === 'text',
             );
             if (
-              queuedSlide === undefined ||
               queuedText === undefined ||
-              textEditingFingerprint(queuedText, queuedDocument, queuedSlide) !==
-                expectedFingerprint
+              queuedText.locked ||
+              textEditingFingerprint(
+                queuedText,
+                themeForAuthoringSurface(queuedDocument, surfaceReference),
+              ) !== expectedFingerprint
             ) {
               updateTextDraftConflict(true);
               return [];
             }
-            return commands;
+            if (surfaceReference.surface === 'slide') return commands;
+            if (surfaceReference.surface === 'master') {
+              const master = queuedDocument.masters.find(
+                (candidate) => candidate.id === surfaceReference.id,
+              );
+              if (master === undefined) return [];
+              return [
+                {
+                  type: 'master.update',
+                  masterId: master.id,
+                  replacement: {
+                    ...master,
+                    elements: master.elements.map((element) =>
+                      element.id === targetTextId && element.type === 'text'
+                        ? applyChanges(element)
+                        : element,
+                    ),
+                  },
+                },
+              ];
+            }
+            const layout = queuedDocument.layouts.find(
+              (candidate) => candidate.id === surfaceReference.id,
+            );
+            if (layout === undefined) return [];
+            return [
+              {
+                type: 'layout.update',
+                layoutId: layout.id,
+                replacement: {
+                  ...layout,
+                  elements: layout.elements.map((element) =>
+                    element.id === targetTextId && element.type === 'text'
+                      ? applyChanges(element)
+                      : element,
+                  ),
+                },
+              },
+            ];
           },
           { preserveInlineTextDraft: true },
         );
         if (!applied) return false;
         const committedDocument = sessionRef.current?.snapshot.document;
-        const committedSlide = committedDocument?.slides.find(
-          (slide) => slide.id === latestSlide.id,
-        );
-        const committedText = committedSlide?.elements.find(
-          (element): element is TextElement =>
-            element.id === targetTextId && element.type === 'text',
-        );
+        const committedText = committedDocument
+          ? elementsForAuthoringSurface(committedDocument, surfaceReference).find(
+              (element): element is TextElement =>
+                element.id === targetTextId && element.type === 'text',
+            )
+          : undefined;
         const targetUnchanged =
           textBaselineRef.current?.id === targetTextId &&
           committedDocument !== undefined &&
-          committedSlide !== undefined &&
           committedText !== undefined;
         if (targetUnchanged) {
           textBaselineRef.current = {
             id: targetTextId,
-            value: textEditingFingerprint(committedText, committedDocument, committedSlide),
+            value: textEditingFingerprint(
+              committedText,
+              themeForAuthoringSurface(committedDocument, surfaceReference),
+            ),
           };
         }
         if (!targetUnchanged || textDraftVersionRef.current !== draftVersion) return false;
@@ -1850,7 +2396,17 @@ function EditorApp() {
         }
       }
     },
-    [activeSlide, document, execute, primaryText, updateTextDraftConflict, updateTextDraftDirty],
+    [
+      activeAuthoringSurface,
+      activeSlide,
+      designLayout?.id,
+      designMaster?.id,
+      execute,
+      notify,
+      primaryText,
+      updateTextDraftConflict,
+      updateTextDraftDirty,
+    ],
   );
   const pasteRichText = useCallback(
     (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
@@ -1908,13 +2464,13 @@ function EditorApp() {
       }, 0);
     }
     textDraftVersionRef.current += 1;
-    if (primaryText !== undefined && document !== undefined && activeSlide !== undefined) {
-      updateTextDraft(initialTextDraft(primaryText, document, activeSlide));
+    if (primaryText !== undefined && document !== undefined) {
+      updateTextDraft(initialTextDraft(primaryText, activeAuthoringTheme));
       updateTextDraftDirty(false);
       updateTextDraftConflict(false);
       textBaselineRef.current = {
         id: primaryText.id,
-        value: textEditingFingerprint(primaryText, document, activeSlide),
+        value: textEditingFingerprint(primaryText, activeAuthoringTheme),
       };
     } else {
       updateTextDraft(null);
@@ -1924,7 +2480,7 @@ function EditorApp() {
     }
     finishInlineTextEditing();
   }, [
-    activeSlide,
+    activeAuthoringTheme,
     document,
     finishInlineTextEditing,
     primaryText,
@@ -2104,10 +2660,21 @@ function EditorApp() {
     [releaseClosePreparation],
   );
   useEffect(() => {
-    if (inlineTextElementId === null || primaryText?.id !== inlineTextElementId) return;
+    if (
+      activeAuthoringSurface !== 'slide' ||
+      inlineTextElementId === null ||
+      primaryText?.id !== inlineTextElementId
+    )
+      return;
     textEditorFocusedRef.current = true;
     if (shareStatus?.mode === 'host' || shareStatus?.mode === 'guest') void beginTextLease();
-  }, [beginTextLease, inlineTextElementId, primaryText?.id, shareStatus?.mode]);
+  }, [
+    activeAuthoringSurface,
+    beginTextLease,
+    inlineTextElementId,
+    primaryText?.id,
+    shareStatus?.mode,
+  ]);
 
   useEffect(() => {
     if (
@@ -2219,6 +2786,7 @@ function EditorApp() {
     if (
       requested !== null &&
       (current === null ||
+        activeAuthoringSurface !== 'slide' ||
         current.snapshot.sessionId !== requested.sessionId ||
         activeSlide?.id !== requested.slideId ||
         primaryText?.id !== requested.elementId)
@@ -2226,7 +2794,13 @@ function EditorApp() {
       textEditorFocusedRef.current = false;
       void releaseTextLease(requested);
     }
-  }, [activeSlide?.id, primaryText?.id, releaseTextLease, session?.snapshot.sessionId]);
+  }, [
+    activeAuthoringSurface,
+    activeSlide?.id,
+    primaryText?.id,
+    releaseTextLease,
+    session?.snapshot.sessionId,
+  ]);
 
   useEffect(() => {
     if (shareStatus?.mode === 'offline' && textLeaseRequestRef.current !== null) {
@@ -2236,24 +2810,49 @@ function EditorApp() {
     }
   }, [releaseTextLease, shareStatus?.mode]);
 
+  const mutateTable = useCallback(
+    async (label: string, createCommand: TableCommandFactory): Promise<boolean> => {
+      if (primaryTable === undefined || document === undefined) return false;
+      if (primaryTable.locked) {
+        notify('Unlock the table before editing it.', 'error');
+        return false;
+      }
+      if (activeAuthoringSurface === 'slide') {
+        if (activeSlide === undefined) return false;
+        return execute(label, [createCommand(activeSlide.id, primaryTable.id)]);
+      }
+      try {
+        return patchElement(
+          applyCanonicalTableMutation(primaryTable, document.page, createCommand),
+          label,
+        );
+      } catch (error) {
+        notify(
+          error instanceof Error ? error.message : 'The table change could not be applied.',
+          'error',
+        );
+        return false;
+      }
+    },
+    [activeAuthoringSurface, activeSlide, document, execute, notify, patchElement, primaryTable],
+  );
+
   const pasteTable = useCallback(async (): Promise<void> => {
-    if (activeSlide === undefined || primaryTable === undefined || tableTsv.trim() === '') return;
+    if (primaryTable === undefined || tableTsv.trim() === '') return;
     if (
-      await execute('Paste table data', [
-        {
-          type: 'table.paste-tsv',
-          slideId: activeSlide.id,
-          tableId: primaryTable.id,
-          startRow: 0,
-          startColumn: 0,
-          tsv: tableTsv,
-        },
-      ])
+      await mutateTable('Paste table data', (slideId, tableId) => ({
+        type: 'table.paste-tsv',
+        slideId,
+        tableId,
+        startRow: 0,
+        startColumn: 0,
+        tsv: tableTsv,
+      }))
     ) {
       setTableTsv('');
       void commitOnBlur(tableTsvDraftCommitKeyRef.current, () => true);
     }
-  }, [activeSlide, commitOnBlur, execute, primaryTable, tableTsv]);
+  }, [commitOnBlur, mutateTable, primaryTable, tableTsv]);
 
   const updateImageCrop = useCallback(
     (side: keyof ImageElement['crop'], raw: string): Promise<boolean> => {
@@ -2288,6 +2887,12 @@ function EditorApp() {
       endpoint: 'start' | 'end',
       value: ConnectorElement['start'],
     ): Promise<boolean> => {
+      if (activeAuthoringSurface !== 'slide') {
+        return patchElement(
+          { ...connector, [endpoint]: value },
+          'Update template connector endpoint',
+        );
+      }
       if (activeSlide === undefined) return Promise.resolve(false);
       return execute('Update connector endpoint', [
         {
@@ -2299,7 +2904,7 @@ function EditorApp() {
         },
       ]);
     },
-    [activeSlide, execute],
+    [activeAuthoringSurface, activeSlide, execute, patchElement],
   );
 
   const updateTheme = useCallback(
@@ -2324,6 +2929,29 @@ function EditorApp() {
     if (await execute('Create theme', [{ type: 'theme.create', theme }]))
       setDesignThemeId(theme.id);
   }, [designTheme, document, execute]);
+
+  const createNewBlankTheme = useCallback(async (): Promise<void> => {
+    const theme = createBlankTheme(() => crypto.randomUUID(), 'New theme');
+    if (await execute('Create blank theme', [{ type: 'theme.create', theme }]))
+      setDesignThemeId(theme.id);
+  }, [execute]);
+
+  const enforceThemeById = useCallback(
+    async (themeId: string): Promise<void> => {
+      const themeName =
+        sessionRef.current?.snapshot.document.themes.find((theme) => theme.id === themeId)?.name ??
+        'Selected theme';
+      const applied = await execute('Apply theme to presentation', [
+        { type: 'theme.enforce-deck', themeId },
+      ]);
+      if (applied) notify(`Theme “${themeName}” applied to the full presentation.`, 'success');
+    },
+    [execute, notify],
+  );
+
+  const enforceSelectedTheme = useCallback(async (): Promise<void> => {
+    if (designTheme !== undefined) await enforceThemeById(designTheme.id);
+  }, [designTheme, enforceThemeById]);
 
   const deleteTheme = useCallback(async (): Promise<void> => {
     if (document === undefined || designTheme === undefined || document.themes.length <= 1) return;
@@ -2374,6 +3002,44 @@ function EditorApp() {
       });
     },
     [execute],
+  );
+
+  const addMasterTextField = useCallback(
+    (
+      name: string,
+      text: string,
+      alignment: TextAlignment,
+      frame: Frame,
+      options: Readonly<{
+        opacity?: number;
+        fontSizePt?: number;
+        locked?: boolean;
+      }> = {},
+    ): Promise<boolean> => {
+      if (designMaster === undefined) return Promise.resolve(false);
+      const element: TextElement = {
+        ...createTextElement('caption', text),
+        name,
+        frame,
+        opacity: options.opacity ?? 1,
+        locked: options.locked ?? true,
+        verticalAlignment: 'middle',
+        content: contentFromPlainText(text, {
+          kind: 'paragraph',
+          alignment,
+          marks: emptyMarks(),
+        }),
+        style: {
+          alignment,
+          ...(options.fontSizePt === undefined ? {} : { fontSizePt: options.fontSizePt }),
+        },
+      };
+      return updateMaster(
+        { ...designMaster, elements: [...designMaster.elements, element] },
+        `Add ${name.toLowerCase()}`,
+      );
+    },
+    [designMaster, updateMaster],
   );
 
   const updateLayout = useCallback(
@@ -2469,55 +3135,50 @@ function EditorApp() {
 
   const transformCanvasElements = useCallback(
     (frames: readonly { readonly elementId: string; readonly frame: Frame }[]): void => {
-      if (frames.length === 0) return;
-      if (designSurface === 'master' && designMaster !== undefined) {
-        updateMaster(
-          {
-            ...designMaster,
-            elements: replaceElementFrames(designMaster.elements, frames),
-          },
-          'Transform master objects',
-        );
-        return;
-      }
-      if (designSurface === 'layout' && designLayout !== undefined) {
-        updateLayout(
-          {
-            ...designLayout,
-            elements: replaceElementFrames(designLayout.elements, frames),
-          },
-          'Transform layout objects',
-        );
-        return;
-      }
       transform(frames);
     },
-    [designLayout, designMaster, designSurface, transform, updateLayout, updateMaster],
+    [transform],
   );
 
   const toggleLock = useCallback((): void => {
-    if (activeSlide === undefined || primaryElement === undefined) return;
-    void execute(primaryElement.locked ? 'Unlock object' : 'Lock object', [
-      {
-        type: 'element.set-locked',
-        slideId: activeSlide.id,
-        elementId: primaryElement.id,
-        locked: !primaryElement.locked,
-      },
-    ]);
-  }, [activeSlide, execute, primaryElement]);
+    if (primaryElement === undefined) return;
+    if (activeAuthoringSurface === 'slide') {
+      if (activeSlide === undefined) return;
+      void execute(primaryElement.locked ? 'Unlock object' : 'Lock object', [
+        {
+          type: 'element.set-locked',
+          slideId: activeSlide.id,
+          elementId: primaryElement.id,
+          locked: !primaryElement.locked,
+        },
+      ]);
+      return;
+    }
+    void patchElement(
+      { ...primaryElement, locked: !primaryElement.locked },
+      primaryElement.locked ? 'Unlock template object' : 'Lock template object',
+    );
+  }, [activeAuthoringSurface, activeSlide, execute, patchElement, primaryElement]);
 
   const toggleVisible = useCallback((): void => {
-    if (activeSlide === undefined || primaryElement === undefined) return;
-    void execute(primaryElement.visible ? 'Hide object' : 'Show object', [
-      {
-        type: 'element.set-visible',
-        slideId: activeSlide.id,
-        elementId: primaryElement.id,
-        visible: !primaryElement.visible,
-      },
-    ]);
-  }, [activeSlide, execute, primaryElement]);
+    if (primaryElement === undefined) return;
+    if (activeAuthoringSurface === 'slide') {
+      if (activeSlide === undefined) return;
+      void execute(primaryElement.visible ? 'Hide object' : 'Show object', [
+        {
+          type: 'element.set-visible',
+          slideId: activeSlide.id,
+          elementId: primaryElement.id,
+          visible: !primaryElement.visible,
+        },
+      ]);
+      return;
+    }
+    void patchElement(
+      { ...primaryElement, visible: !primaryElement.visible },
+      primaryElement.visible ? 'Hide template object' : 'Show template object',
+    );
+  }, [activeAuthoringSurface, activeSlide, execute, patchElement, primaryElement]);
 
   const renameDocument = useCallback((): void => {
     if (document === undefined) return;
@@ -2572,29 +3233,10 @@ function EditorApp() {
 
   const openMcp = useCallback(async (): Promise<void> => {
     setMcpOpen(true);
-    setMcpApproval(null);
     const result = await window.htmllelujah.mcpStatus();
     if (result.ok) setMcpStatus(result.value);
     else showFailure(result);
-  }, [acceptShareStatus, showFailure]);
-
-  const createMcpApproval = useCallback(async (): Promise<void> => {
-    if (!(await canLeaveInlineTextEditorRef.current())) return;
-    const current = sessionRef.current;
-    if (current === null) return;
-    const result = await window.htmllelujah.mcpCreateApproval({
-      sessionId: current.snapshot.sessionId,
-      action: mcpApprovalAction,
-    });
-    if (!result.ok) {
-      showFailure(result);
-      return;
-    }
-    setMcpApproval(result.value);
-    notify('One-time MCP approval created for two minutes.', 'success');
-    const status = await window.htmllelujah.mcpStatus();
-    if (status.ok) setMcpStatus(status.value);
-  }, [mcpApprovalAction, notify, showFailure]);
+  }, [showFailure]);
 
   const openShare = useCallback(async (): Promise<void> => {
     const current = sessionRef.current;
@@ -2745,6 +3387,120 @@ function EditorApp() {
   );
 
   useEffect(() => {
+    const writeSelection = (event: ClipboardEvent, cut: boolean): void => {
+      if (event.defaultPrevented || isTypingTarget(event.target)) return;
+      const payload = serializeSelectedObjects();
+      if (payload === null || event.clipboardData === null) return;
+      event.preventDefault();
+      event.clipboardData.setData(OBJECT_CLIPBOARD_MIME, payload.serialized);
+      event.clipboardData.setData('text/plain', payload.plainText);
+      objectClipboardRef.current = payload.serialized;
+      objectClipboardPlainTextRef.current = payload.plainText;
+      notify(
+        `${selectedElements.length} object${selectedElements.length === 1 ? '' : 's'} ${
+          cut ? 'cut' : 'copied'
+        }.`,
+        'success',
+      );
+      if (cut) void deleteSelection();
+    };
+    const onCopy = (event: ClipboardEvent): void => writeSelection(event, false);
+    const onCut = (event: ClipboardEvent): void => writeSelection(event, true);
+    const onPaste = (event: ClipboardEvent): void => {
+      if (event.defaultPrevented || isTypingTarget(event.target) || event.clipboardData === null)
+        return;
+      const privateSerialized = event.clipboardData.getData(OBJECT_CLIPBOARD_MIME);
+      const serialized =
+        privateSerialized !== ''
+          ? privateSerialized
+          : event.clipboardData.getData('text/plain') === objectClipboardPlainTextRef.current
+            ? objectClipboardRef.current
+            : null;
+      if (serialized === null) return;
+      event.preventDefault();
+      objectClipboardRef.current = serialized;
+      void pasteSerializedObjects(serialized);
+    };
+    window.addEventListener('copy', onCopy);
+    window.addEventListener('cut', onCut);
+    window.addEventListener('paste', onPaste);
+    return () => {
+      window.removeEventListener('copy', onCopy);
+      window.removeEventListener('cut', onCut);
+      window.removeEventListener('paste', onPaste);
+    };
+  }, [
+    deleteSelection,
+    notify,
+    pasteSerializedObjects,
+    selectedElements.length,
+    serializeSelectedObjects,
+  ]);
+
+  const focusCanvasObject = useCallback((elementId: string): void => {
+    const target = [
+      ...window.document.querySelectorAll<HTMLElement>('[data-canvas-element-id]'),
+    ].find((candidate) => candidate.dataset.canvasElementId === elementId);
+    target?.focus({ preventScroll: true });
+  }, []);
+
+  const dismissObjectContextMenu = useCallback(
+    (restoreFocus: boolean): void => {
+      const elementId = objectContextMenu?.elementId;
+      setObjectContextMenu(null);
+      if (restoreFocus && elementId !== undefined) {
+        window.requestAnimationFrame(() => focusCanvasObject(elementId));
+      }
+    },
+    [focusCanvasObject, objectContextMenu?.elementId],
+  );
+
+  useEffect(() => {
+    if (objectContextMenu === null) return;
+    const frame = window.requestAnimationFrame(() => {
+      objectContextMenuRef.current
+        ?.querySelector<HTMLButtonElement>('button[role="menuitem"]:not(:disabled)')
+        ?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [objectContextMenu]);
+
+  const navigateObjectContextMenu = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+      const buttons = [
+        ...(objectContextMenuRef.current?.querySelectorAll<HTMLButtonElement>(
+          'button[role="menuitem"]:not(:disabled)',
+        ) ?? []),
+      ];
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        dismissObjectContextMenu(true);
+        return;
+      }
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) || buttons.length === 0)
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      const currentIndex = buttons.findIndex((button) => button === window.document.activeElement);
+      const nextIndex =
+        event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? buttons.length - 1
+            : event.key === 'ArrowDown'
+              ? currentIndex < 0
+                ? 0
+                : (currentIndex + 1) % buttons.length
+              : currentIndex <= 0
+                ? buttons.length - 1
+                : currentIndex - 1;
+      buttons[nextIndex]?.focus({ preventScroll: true });
+    },
+    [dismissObjectContextMenu],
+  );
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.defaultPrevented || isTypingTarget(event.target)) return;
       const modifier = event.ctrlKey || event.metaKey;
@@ -2764,39 +3520,39 @@ function EditorApp() {
       } else if (modifier && key === 'y') {
         event.preventDefault();
         void undo(true);
-      } else if (modifier && key === 'd' && designSurface === 'slide') {
+      } else if (modifier && key === 'd') {
         event.preventDefault();
         void duplicateSelection();
-      } else if (modifier && key === 'g' && designSurface === 'slide') {
+      } else if (modifier && key === 'g' && activeAuthoringSurface === 'slide') {
         event.preventDefault();
         if (event.shiftKey) void ungroupSelection();
         else void groupSelection();
       } else if (event.key === 'Delete' || event.key === 'Backspace') {
-        if (designSurface === 'slide' && selectedIds.length > 0) {
+        if (selectedIds.length > 0) {
           event.preventDefault();
           void deleteSelection();
         }
       } else if (event.key === 'F5') {
         event.preventDefault();
         void present();
-      } else if (
-        event.key.startsWith('Arrow') &&
-        designSurface === 'slide' &&
-        selectedIds.length > 0
-      ) {
+      } else if (event.key.startsWith('Arrow') && selectedIds.length > 0) {
         event.preventDefault();
         const step = event.shiftKey ? 10 : 1;
         nudge(
           event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0,
           event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0,
         );
-      } else if (event.key === 'Escape') setActiveMenu(null);
+      } else if (event.key === 'Escape') {
+        setActiveMenu(null);
+        dismissObjectContextMenu(true);
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [
+    activeAuthoringSurface,
     deleteSelection,
-    designSurface,
+    dismissObjectContextMenu,
     duplicateSelection,
     groupSelection,
     nudge,
@@ -2810,16 +3566,19 @@ function EditorApp() {
 
   useEffect(() => {
     const close = (event: PointerEvent): void => {
-      if (
-        activeMenu !== null &&
-        event.target instanceof HTMLElement &&
-        event.target.closest('.application-menu') === null
-      )
+      if (!(event.target instanceof HTMLElement)) return;
+      if (activeMenu !== null && event.target.closest('.application-menu') === null)
         setActiveMenu(null);
+      if (
+        objectContextMenu !== null &&
+        event.target.closest('.object-context-menu') === null &&
+        event.button === 0
+      )
+        dismissObjectContextMenu(false);
     };
     window.addEventListener('pointerdown', close);
     return () => window.removeEventListener('pointerdown', close);
-  }, [activeMenu]);
+  }, [activeMenu, dismissObjectContextMenu, objectContextMenu]);
 
   if (fatalError !== null) return <LoadingScreen message={fatalError} />;
   if (session === null || document === undefined || activeSlide === undefined)
@@ -2828,7 +3587,7 @@ function EditorApp() {
   const canvasContext = createDesignCanvasContext(
     document,
     activeSlide,
-    inspectorTab === 'design' ? designSurface : 'slide',
+    designSurface,
     designLayout,
     designMaster,
   );
@@ -2838,9 +3597,11 @@ function EditorApp() {
   const canvasEditableSource = canvasContext.editableSource;
   const canvasContextLabel = canvasContext.label;
 
-  const collaborationTextActive = shareStatus?.mode === 'host' || shareStatus?.mode === 'guest';
+  const collaborationTextActive =
+    activeAuthoringSurface === 'slide' &&
+    (shareStatus?.mode === 'host' || shareStatus?.mode === 'guest');
   const currentTextLeaseRequest: CollaborationTextLeaseInput | null =
-    primaryText === undefined
+    activeAuthoringSurface !== 'slide' || primaryText === undefined
       ? null
       : {
           sessionId: session.snapshot.sessionId,
@@ -2919,13 +3680,35 @@ function EditorApp() {
             </MenuButton>
             <span className="menu-separator" />
             <MenuButton
-              disabled={designSurface !== 'slide' || selectedIds.length === 0}
+              disabled={selectedIds.length === 0}
+              onClick={closeThen(() => copySelectionToInternalClipboard())}
+            >
+              Copy <kbd>Ctrl C</kbd>
+            </MenuButton>
+            <MenuButton
+              disabled={selectedIds.length === 0}
+              onClick={closeThen(() => void cutSelectionToInternalClipboard())}
+            >
+              Cut <kbd>Ctrl X</kbd>
+            </MenuButton>
+            <MenuButton
+              disabled={objectClipboardRef.current === null}
+              onClick={closeThen(() => {
+                const serialized = objectClipboardRef.current;
+                if (serialized !== null) void pasteSerializedObjects(serialized);
+              })}
+            >
+              Paste <kbd>Ctrl V</kbd>
+            </MenuButton>
+            <span className="menu-separator" />
+            <MenuButton
+              disabled={selectedIds.length === 0}
               onClick={closeThen(() => void duplicateSelection())}
             >
               Duplicate <kbd>Ctrl D</kbd>
             </MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide' || selectedIds.length === 0}
+              disabled={selectedIds.length === 0}
               onClick={closeThen(() => void deleteSelection())}
             >
               Delete <kbd>Del</kbd>
@@ -2949,46 +3732,48 @@ function EditorApp() {
         {activeMenu === 'Insert' ? (
           <>
             <MenuButton onClick={closeThen(() => void addSlide())}>New slide</MenuButton>
-            <MenuButton
-              disabled={designSurface !== 'slide'}
-              onClick={closeThen(() => void addElement(createTextElement()))}
-            >
+            <MenuButton onClick={closeThen(() => void addElement(createTextElement()))}>
               Text box
             </MenuButton>
+            <MenuButton onClick={closeThen(() => void importImage())}>Image…</MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide'}
-              onClick={closeThen(() => void importImage())}
+              onClick={closeThen(() =>
+                setContentPicker({ initialCatalog: 'shapes', catalogs: ['shapes'] }),
+              )}
             >
-              Image…
+              Shape…
             </MenuButton>
-            <MenuButton
-              disabled={designSurface !== 'slide'}
-              onClick={closeThen(() => void addElement(createShapeElement()))}
-            >
-              Shape
-            </MenuButton>
-            <MenuButton
-              disabled={designSurface !== 'slide'}
-              onClick={closeThen(() => void addElement(createTableElement()))}
-            >
+            <MenuButton onClick={closeThen(() => void addElement(createTableElement()))}>
               Table
             </MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide'}
-              onClick={closeThen(() => void addElement(createIconElement()))}
+              onClick={closeThen(() =>
+                setContentPicker({
+                  initialCatalog: 'local-icons',
+                  catalogs: ['local-icons'],
+                }),
+              )}
             >
-              Icon
+              Icon…
             </MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide'}
-              onClick={closeThen(() => void addElement(createFlagElement()))}
+              onClick={closeThen(() =>
+                setContentPicker({ initialCatalog: 'twemoji', catalogs: ['twemoji'] }),
+              )}
             >
-              Flag
+              Emoji…
             </MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide'}
-              onClick={closeThen(() => void addElement(createConnectorElement()))}
+              onClick={closeThen(() =>
+                setContentPicker({
+                  initialCatalog: 'circle-flags',
+                  catalogs: ['circle-flags'],
+                }),
+              )}
             >
+              Circle flag…
+            </MenuButton>
+            <MenuButton onClick={closeThen(() => void addElement(createConnectorElement()))}>
               Connector
             </MenuButton>
           </>
@@ -2996,38 +3781,35 @@ function EditorApp() {
         {activeMenu === 'Arrange' ? (
           <>
             <MenuButton
-              disabled={designSurface !== 'slide' || selectedIds.length < 2}
+              disabled={activeAuthoringSurface !== 'slide' || selectedIds.length < 2}
               onClick={closeThen(groupSelection)}
             >
               Group <kbd>Ctrl G</kbd>
             </MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide' || primaryElement?.type !== 'group'}
+              disabled={activeAuthoringSurface !== 'slide' || primaryElement?.type !== 'group'}
               onClick={closeThen(ungroupSelection)}
             >
               Ungroup <kbd>Ctrl Shift G</kbd>
             </MenuButton>
             <span className="menu-separator" />
-            <MenuButton
-              disabled={designSurface !== 'slide' || selectedIds.length < 2}
-              onClick={closeThen(() => align('left'))}
-            >
+            <MenuButton disabled={selectedIds.length < 2} onClick={closeThen(() => align('left'))}>
               Align left
             </MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide' || selectedIds.length < 3}
+              disabled={selectedIds.length < 3}
               onClick={closeThen(() => distribute('horizontal'))}
             >
               Distribute horizontally
             </MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide' || primaryElement === undefined}
+              disabled={primaryElement === undefined}
               onClick={closeThen(() => reorder('front'))}
             >
               Bring to front
             </MenuButton>
             <MenuButton
-              disabled={designSurface !== 'slide' || primaryElement === undefined}
+              disabled={primaryElement === undefined}
               onClick={closeThen(() => reorder('back'))}
             >
               Send to back
@@ -3163,7 +3945,6 @@ function EditorApp() {
             <EditorButton
               label="Add text"
               text="Text"
-              disabled={designSurface !== 'slide'}
               onClick={() => void addElement(createTextElement())}
             >
               <Type size={17} />
@@ -3171,44 +3952,54 @@ function EditorApp() {
             <EditorButton
               label="Add shape"
               text="Shape"
-              disabled={designSurface !== 'slide'}
-              onClick={() => void addElement(createShapeElement())}
+              onClick={() => setContentPicker({ initialCatalog: 'shapes', catalogs: ['shapes'] })}
             >
               <Square size={17} />
+              <ChevronDown size={11} />
             </EditorButton>
-            <EditorButton
-              label="Add image"
-              text="Image"
-              disabled={designSurface !== 'slide'}
-              onClick={() => void importImage()}
-            >
+            <EditorButton label="Add image" text="Image" onClick={() => void importImage()}>
               <Image size={17} />
             </EditorButton>
             <EditorButton
               label="Add table"
               text="Table"
-              disabled={designSurface !== 'slide'}
               onClick={() => void addElement(createTableElement())}
             >
               <Table2 size={17} />
             </EditorButton>
             <EditorButton
               label="Add icon"
-              disabled={designSurface !== 'slide'}
-              onClick={() => void addElement(createIconElement())}
+              onClick={() =>
+                setContentPicker({
+                  initialCatalog: 'local-icons',
+                  catalogs: ['local-icons'],
+                })
+              }
             >
               <Sparkles size={17} />
+              <ChevronDown size={11} />
+            </EditorButton>
+            <EditorButton
+              label="Add emoji"
+              onClick={() => setContentPicker({ initialCatalog: 'twemoji', catalogs: ['twemoji'] })}
+            >
+              <Smile size={17} />
+              <ChevronDown size={11} />
             </EditorButton>
             <EditorButton
               label="Add flag"
-              disabled={designSurface !== 'slide'}
-              onClick={() => void addElement(createFlagElement())}
+              onClick={() =>
+                setContentPicker({
+                  initialCatalog: 'circle-flags',
+                  catalogs: ['circle-flags'],
+                })
+              }
             >
               <Flag size={17} />
+              <ChevronDown size={11} />
             </EditorButton>
             <EditorButton
               label="Add connector"
-              disabled={designSurface !== 'slide'}
               onClick={() => void addElement(createConnectorElement())}
             >
               <Link2 size={17} />
@@ -3217,38 +4008,46 @@ function EditorApp() {
           <div className="toolbar-group">
             <EditorButton
               label="Align left"
-              disabled={designSurface !== 'slide' || selectedIds.length < 2}
+              disabled={selectedIds.length < 2}
               onClick={() => align('left')}
             >
               <AlignStartVertical size={17} />
             </EditorButton>
             <EditorButton
               label="Align centers"
-              disabled={designSurface !== 'slide' || selectedIds.length < 2}
+              disabled={selectedIds.length < 2}
               onClick={() => align('horizontal-center')}
             >
               <AlignCenterVertical size={17} />
             </EditorButton>
             <EditorButton
               label="Align right"
-              disabled={designSurface !== 'slide' || selectedIds.length < 2}
+              disabled={selectedIds.length < 2}
               onClick={() => align('right')}
             >
               <AlignEndHorizontal size={17} />
             </EditorButton>
             <EditorButton
               label="Distribute horizontally"
-              disabled={designSurface !== 'slide' || selectedIds.length < 3}
+              disabled={selectedIds.length < 3}
               onClick={() => distribute('horizontal')}
             >
               <Columns3 size={17} />
             </EditorButton>
             <EditorButton
               label="Distribute vertically"
-              disabled={designSurface !== 'slide' || selectedIds.length < 3}
+              disabled={selectedIds.length < 3}
               onClick={() => distribute('vertical')}
             >
               <Rows3 size={17} />
+            </EditorButton>
+            <EditorButton
+              label={primaryElement?.locked ? 'Unlock object' : 'Lock object'}
+              disabled={primaryElement === undefined}
+              active={primaryElement?.locked === true}
+              onClick={toggleLock}
+            >
+              {primaryElement?.locked ? <Unlock size={17} /> : <Lock size={17} />}
             </EditorButton>
           </div>
           <div className="toolbar-group toolbar-tail">
@@ -3406,8 +4205,8 @@ function EditorApp() {
             onEditText={(elementId) => {
               const beginEditing = (): void => {
                 setSelectedIds([elementId]);
+                setInspectorTab('properties');
                 if (canvasEditableSource === 'slide') {
-                  setInspectorTab('properties');
                   inlineCommitInFlightRef.current = false;
                   updateInlineTextElementId(elementId);
                 }
@@ -3423,6 +4222,14 @@ function EditorApp() {
               }
               void canLeaveInlineTextEditorRef.current().then((canLeave) => {
                 if (canLeave) beginEditing();
+              });
+            }}
+            onContextMenu={(elementId, position) => {
+              setActiveMenu(null);
+              setObjectContextMenu({
+                elementId,
+                x: Math.max(8, Math.min(position.clientX, window.innerWidth - 236)),
+                y: Math.max(8, Math.min(position.clientY, window.innerHeight - 520)),
               });
             }}
             onInlineTextChange={(text) => {
@@ -3478,8 +4285,6 @@ function EditorApp() {
                 void canLeaveInlineTextEditorRef.current().then((canLeave) => {
                   if (!canLeave) return;
                   setInspectorTab('properties');
-                  setDesignSurface('slide');
-                  setSelectedIds([]);
                 });
               }}
             >
@@ -3553,10 +4358,14 @@ function EditorApp() {
                   <span className="section-status">{document.themes.length} available</span>
                 </div>
                 <label className="stacked-field">
-                  <span>Theme to edit</span>
+                  <span>Presentation theme</span>
                   <select
                     value={designTheme?.id ?? ''}
-                    onChange={(event) => setDesignThemeId(event.currentTarget.value)}
+                    onChange={(event) => {
+                      const themeId = event.currentTarget.value;
+                      setDesignThemeId(themeId);
+                      void enforceThemeById(themeId);
+                    }}
                   >
                     {document.themes.map((theme) => (
                       <option key={theme.id} value={theme.id}>
@@ -3823,24 +4632,18 @@ function EditorApp() {
                       );
                     })}
                     <div className="design-actions">
+                      <button type="button" onClick={() => void createNewBlankTheme()}>
+                        <Plus size={13} /> New blank
+                      </button>
                       <button type="button" onClick={() => void duplicateTheme()}>
                         <Copy size={13} /> Create copy
                       </button>
                       <button
                         type="button"
-                        disabled={
-                          designMaster === undefined || designMaster.themeId === designTheme.id
-                        }
-                        onClick={() =>
-                          designMaster === undefined
-                            ? undefined
-                            : updateMaster(
-                                { ...designMaster, themeId: designTheme.id },
-                                'Apply theme to master',
-                              )
-                        }
+                        className="primary-inspector-action"
+                        onClick={() => void enforceSelectedTheme()}
                       >
-                        <Check size={13} /> Apply to master
+                        <Check size={13} /> Apply to presentation
                       </button>
                       <button
                         type="button"
@@ -4033,6 +4836,62 @@ function EditorApp() {
                         <Trash2 size={13} /> Delete
                       </button>
                     </div>
+                    {designSurface === 'layout' && designSelectedElement !== undefined ? (
+                      <div className="selected-template-object">
+                        <div className="design-subheading">Selected layout object</div>
+                        <label className="stacked-field">
+                          <span>Object name</span>
+                          <input
+                            key={`${designSelectedElement.id}-layout-object-name`}
+                            defaultValue={designSelectedElement.name}
+                            maxLength={120}
+                            disabled={designSelectedElement.locked}
+                            onBlur={(event) => {
+                              const name = event.currentTarget.value.trim();
+                              if (name !== '' && name !== designSelectedElement.name) {
+                                void patchElement(
+                                  { ...designSelectedElement, name },
+                                  'Rename layout object',
+                                );
+                              }
+                            }}
+                          />
+                        </label>
+                        <label className="toggle-row">
+                          <input
+                            type="checkbox"
+                            checked={designSelectedElement.locked}
+                            onChange={() => toggleLock()}
+                          />{' '}
+                          Lock inherited object
+                        </label>
+                        {designSelectedElement.type === 'text' ? (
+                          <label className="stacked-field">
+                            <span>Text</span>
+                            <textarea
+                              key={`${designSelectedElement.id}-layout-text`}
+                              defaultValue={contentToPlainText(designSelectedElement.content)}
+                              disabled={designSelectedElement.locked}
+                              onBlur={(event) => {
+                                const text = event.currentTarget.value;
+                                if (text !== contentToPlainText(designSelectedElement.content)) {
+                                  void patchElement(
+                                    {
+                                      ...designSelectedElement,
+                                      content: replacePlainTextPreservingStyles(
+                                        designSelectedElement.content,
+                                        text,
+                                      ),
+                                    },
+                                    'Edit layout text',
+                                  );
+                                }
+                              }}
+                            />
+                          </label>
+                        ) : null}
+                      </div>
+                    ) : null}
                     <div className="design-subheading">Placeholders</div>
                     {designLayout.elements
                       .filter(
@@ -4047,6 +4906,7 @@ function EditorApp() {
                           <button
                             type="button"
                             title="Delete placeholder"
+                            disabled={placeholder.locked}
                             onClick={() =>
                               updateLayout(
                                 {
@@ -4066,6 +4926,7 @@ function EditorApp() {
                             <input
                               key={`${placeholder.id}-prompt`}
                               defaultValue={placeholder.prompt}
+                              disabled={placeholder.locked}
                               onBlur={(event) => {
                                 const target = event.currentTarget;
                                 void commitOnBlur(target, () => {
@@ -4108,6 +4969,7 @@ function EditorApp() {
                                   }
                                   step="1"
                                   defaultValue={Math.round(placeholder.frame[property])}
+                                  disabled={placeholder.locked}
                                   onBlur={(event) => {
                                     const target = event.currentTarget;
                                     void commitOnBlur(target, () => {
@@ -4152,6 +5014,28 @@ function EditorApp() {
                               </label>
                             ))}
                           </div>
+                          <label className="toggle-row">
+                            <input
+                              type="checkbox"
+                              checked={placeholder.locked}
+                              onChange={(event) =>
+                                updateLayout(
+                                  {
+                                    ...designLayout,
+                                    elements: designLayout.elements.map((element) =>
+                                      element.id === placeholder.id
+                                        ? { ...placeholder, locked: event.currentTarget.checked }
+                                        : element,
+                                    ),
+                                  },
+                                  event.currentTarget.checked
+                                    ? 'Lock layout placeholder'
+                                    : 'Unlock layout placeholder',
+                                )
+                              }
+                            />{' '}
+                            Lock inherited placeholder
+                          </label>
                         </div>
                       ))}
                     <div className="placeholder-actions">
@@ -4416,6 +5300,7 @@ function EditorApp() {
                         <button
                           type="button"
                           title="Delete master object"
+                          disabled={element.locked}
                           onClick={() =>
                             updateMaster(
                               {
@@ -4440,6 +5325,7 @@ function EditorApp() {
                             key={`${designSelectedElement.id}-object-name`}
                             defaultValue={designSelectedElement.name}
                             maxLength={120}
+                            disabled={designSelectedElement.locked}
                             onBlur={(event) => {
                               const target = event.currentTarget;
                               void commitOnBlur(target, () => {
@@ -4484,6 +5370,7 @@ function EditorApp() {
                                 key={`${designSelectedElement.id}-${property}`}
                                 type="number"
                                 defaultValue={Math.round(designSelectedElement.frame[property])}
+                                disabled={designSelectedElement.locked}
                                 onBlur={(event) => {
                                   const target = event.currentTarget;
                                   void commitOnBlur(target, () => {
@@ -4556,6 +5443,7 @@ function EditorApp() {
                             <textarea
                               key={`${designSelectedElement.id}-text`}
                               defaultValue={contentToPlainText(designSelectedElement.content)}
+                              disabled={designSelectedElement.locked}
                               onBlur={(event) => {
                                 const target = event.currentTarget;
                                 void commitOnBlur(target, () => {
@@ -4591,28 +5479,108 @@ function EditorApp() {
                     <button
                       type="button"
                       className="secondary-action"
-                      onClick={() => {
-                        const footer = {
-                          ...createTextElement('caption', document.name),
-                          name: 'Master footer',
-                          frame: {
-                            xPt: 72,
-                            yPt: document.page.heightPt - 36,
-                            widthPt: document.page.widthPt - 144,
-                            heightPt: 20,
+                      onClick={() =>
+                        addMasterTextField('Presentation title footer', '{{title}}', 'left', {
+                          xPt: 36,
+                          yPt: document.page.heightPt - 32,
+                          widthPt: Math.max(120, document.page.widthPt - 180),
+                          heightPt: 18,
+                          rotationDeg: 0,
+                        })
+                      }
+                    >
+                      <Plus size={13} /> Add presentation footer
+                    </button>
+                    <div className="design-subheading">Page furniture</div>
+                    <div className="placeholder-actions" aria-label="Add dynamic master fields">
+                      {(['left', 'center', 'right'] as const).map((alignment) => (
+                        <button
+                          type="button"
+                          key={`page-${alignment}`}
+                          onClick={() => {
+                            const widthPt = 108;
+                            const xPt =
+                              alignment === 'left'
+                                ? 36
+                                : alignment === 'center'
+                                  ? (document.page.widthPt - widthPt) / 2
+                                  : document.page.widthPt - widthPt - 36;
+                            void addMasterTextField(
+                              `Page number ${alignment}`,
+                              '{{page}} / {{pages}}',
+                              alignment,
+                              {
+                                xPt,
+                                yPt: document.page.heightPt - 32,
+                                widthPt,
+                                heightPt: 18,
+                                rotationDeg: 0,
+                              },
+                            );
+                          }}
+                        >
+                          <Plus size={12} /> page {alignment}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          addMasterTextField('Date field', '{{date}}', 'left', {
+                            xPt: 36,
+                            yPt: document.page.heightPt - 54,
+                            widthPt: 120,
+                            heightPt: 18,
                             rotationDeg: 0,
-                          },
-                        };
-                        updateMaster(
+                          })
+                        }
+                      >
+                        <Plus size={12} /> date
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          addMasterTextField('Time field', '{{time}}', 'left', {
+                            xPt: 164,
+                            yPt: document.page.heightPt - 54,
+                            widthPt: 90,
+                            heightPt: 18,
+                            rotationDeg: 0,
+                          })
+                        }
+                      >
+                        <Plus size={12} /> time
+                      </button>
+                    </div>
+                    <div className="design-subheading">Watermark</div>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() => {
+                        const text = window.prompt('Watermark text', 'CONFIDENTIAL')?.trim();
+                        if (text === undefined || text === '') return;
+                        void addMasterTextField(
+                          'Text watermark',
+                          text,
+                          'center',
                           {
-                            ...designMaster,
-                            elements: [...designMaster.elements, footer],
+                            xPt: document.page.widthPt * 0.12,
+                            yPt: document.page.heightPt * 0.36,
+                            widthPt: document.page.widthPt * 0.76,
+                            heightPt: Math.max(60, document.page.heightPt * 0.18),
+                            rotationDeg: -32,
                           },
-                          'Add master footer',
+                          { opacity: 0.16, fontSizePt: 42, locked: true },
                         );
                       }}
                     >
-                      <Plus size={13} /> Add presentation footer
+                      <Plus size={13} /> Add text watermark
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() => void importImage(undefined, true)}
+                    >
+                      <Image size={13} /> Add image watermark
                     </button>
                     <div className="placeholder-actions" aria-label="Add master objects">
                       <button
@@ -4643,26 +5611,6 @@ function EditorApp() {
                       >
                         <Plus size={12} /> shape
                       </button>
-                      {(['footer', 'slide-number'] as const).map((role) => (
-                        <button
-                          type="button"
-                          key={role}
-                          onClick={() =>
-                            updateMaster(
-                              {
-                                ...designMaster,
-                                elements: [
-                                  ...designMaster.elements,
-                                  createPlaceholder(role, document.page),
-                                ],
-                              },
-                              `Add master ${role} placeholder`,
-                            )
-                          }
-                        >
-                          <Plus size={12} /> {role}
-                        </button>
-                      ))}
                     </div>
                     <div className="design-subheading">Guides</div>
                     {designMaster.guides.map((guide) => (
@@ -4773,28 +5721,97 @@ function EditorApp() {
                 <h3>Page format</h3>
                 <select
                   value={
-                    Object.entries(STANDARD_PAGE_SIZES).find(
-                      ([, page]) =>
-                        page.widthPt === document.page.widthPt &&
-                        page.heightPt === document.page.heightPt,
-                    )?.[0] ?? 'custom'
+                    customPageEditorOpen
+                      ? 'custom'
+                      : (Object.entries(STANDARD_PAGE_SIZES).find(
+                          ([, page]) =>
+                            page.widthPt === document.page.widthPt &&
+                            page.heightPt === document.page.heightPt,
+                        )?.[0] ?? 'custom')
                   }
                   onChange={(event) => {
+                    if (event.currentTarget.value === 'custom') {
+                      setCustomPageEditorOpen(true);
+                      return;
+                    }
                     const page =
                       STANDARD_PAGE_SIZES[
                         event.currentTarget.value as keyof typeof STANDARD_PAGE_SIZES
                       ];
-                    if (page !== undefined)
+                    if (page !== undefined) {
+                      setCustomPageEditorOpen(false);
                       void execute('Change page format', [{ type: 'deck.set-page', page }]);
+                    }
                   }}
                 >
                   <option value="widescreen">Widescreen 16:9</option>
                   <option value="standard">Standard 4:3</option>
                   <option value="a4Landscape">A4 landscape</option>
-                  <option value="custom" disabled>
-                    Custom
-                  </option>
+                  <option value="custom">Custom</option>
                 </select>
+                {customPageEditorOpen ? (
+                  <>
+                    <div className="field-grid">
+                      <label>
+                        <span>Width</span>
+                        <div className="number-input">
+                          <input
+                            type="number"
+                            min="1"
+                            max="20000"
+                            step="1"
+                            value={customPageWidthPt}
+                            onChange={(event) => {
+                              if (Number.isFinite(event.currentTarget.valueAsNumber))
+                                setCustomPageWidthPt(event.currentTarget.valueAsNumber);
+                            }}
+                          />
+                          <small>pt</small>
+                        </div>
+                      </label>
+                      <label>
+                        <span>Height</span>
+                        <div className="number-input">
+                          <input
+                            type="number"
+                            min="1"
+                            max="20000"
+                            step="1"
+                            value={customPageHeightPt}
+                            onChange={(event) => {
+                              if (Number.isFinite(event.currentTarget.valueAsNumber))
+                                setCustomPageHeightPt(event.currentTarget.valueAsNumber);
+                            }}
+                          />
+                          <small>pt</small>
+                        </div>
+                      </label>
+                    </div>
+                    <button
+                      type="button"
+                      className="primary-inspector-action"
+                      onClick={() => {
+                        try {
+                          const page = createBoundedPageSize(customPageWidthPt, customPageHeightPt);
+                          setCustomPageWidthPt(page.widthPt);
+                          setCustomPageHeightPt(page.heightPt);
+                          void execute('Change custom page format', [
+                            { type: 'deck.set-page', page },
+                          ]);
+                        } catch (error) {
+                          notify(
+                            error instanceof Error
+                              ? error.message
+                              : 'Enter valid custom page dimensions.',
+                            'error',
+                          );
+                        }
+                      }}
+                    >
+                      Apply custom size
+                    </button>
+                  </>
+                ) : null}
               </section>
               <section className="inspector-section">
                 <h3>Slide</h3>
@@ -4891,6 +5908,34 @@ function EditorApp() {
                   {primaryElement?.locked ? <Unlock size={14} /> : <Lock size={14} />}
                 </EditorButton>
               </section>
+              {primaryElement !== undefined ? (
+                <section className="inspector-section style-authority-section">
+                  <div className="section-heading-row">
+                    <h3>Style authority</h3>
+                    <span className="section-status">{primaryStyleSource}</span>
+                  </div>
+                  <div className="design-actions">
+                    <button
+                      type="button"
+                      disabled={primaryThemeReset === undefined || primaryElement.locked}
+                      onClick={() => void resetPrimaryElementToTheme()}
+                    >
+                      <Palette size={13} /> Reset to theme
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        activeAuthoringSurface !== 'slide' ||
+                        primaryElement.placeholderBinding === undefined ||
+                        primaryElement.locked
+                      }
+                      onClick={() => void resetPrimaryElementToLayout()}
+                    >
+                      <Layers3 size={13} /> Reset to layout
+                    </button>
+                  </div>
+                </section>
+              ) : null}
               <section className="inspector-section">
                 <h3>Position & size</h3>
                 <div className="field-grid">
@@ -5042,7 +6087,7 @@ function EditorApp() {
                   ) : null}
                   <fieldset
                     className="text-editor-controls"
-                    disabled={textLeaseBlocked || textEditingLocked}
+                    disabled={primaryText.locked || textLeaseBlocked || textEditingLocked}
                     aria-busy={textEditingLocked || undefined}
                   >
                     <div className="rich-toolbar" role="toolbar" aria-label="Text formatting">
@@ -5506,14 +6551,10 @@ function EditorApp() {
                       type="color"
                       value={primaryElement.fill ?? '#ffffff'}
                       onChange={(event) =>
-                        void execute('Change shape fill', [
-                          {
-                            type: 'element.update-style',
-                            slideId: activeSlide.id,
-                            elementId: primaryElement.id,
-                            patch: { kind: 'shape', fill: event.currentTarget.value },
-                          },
-                        ])
+                        void patchElement(
+                          { ...primaryElement, fill: event.currentTarget.value },
+                          'Change shape fill',
+                        )
                       }
                     />
                   </label>
@@ -5532,20 +6573,16 @@ function EditorApp() {
                       type="color"
                       value={primaryElement.stroke.color}
                       onChange={(event) =>
-                        void execute('Change shape stroke', [
+                        void patchElement(
                           {
-                            type: 'element.update-style',
-                            slideId: activeSlide.id,
-                            elementId: primaryElement.id,
-                            patch: {
-                              kind: 'shape',
-                              stroke: {
-                                ...primaryElement.stroke,
-                                color: event.currentTarget.value,
-                              },
+                            ...primaryElement,
+                            stroke: {
+                              ...primaryElement.stroke,
+                              color: event.currentTarget.value,
                             },
                           },
-                        ])
+                          'Change shape stroke',
+                        )
                       }
                     />
                   </label>
@@ -5813,7 +6850,7 @@ function EditorApp() {
                             }}
                           >
                             <option value="">Free endpoint</option>
-                            {activeSlide.elements
+                            {activeSurfaceElements
                               .filter((element) => element.id !== primaryElement.id)
                               .map((element) => (
                                 <option key={element.id} value={element.id}>
@@ -5888,60 +6925,43 @@ function EditorApp() {
               {primaryElement?.type === 'icon' ? (
                 <section className="inspector-section icon-editor-section">
                   <div className="section-heading-row">
-                    <h3>{primaryElement.iconSet === 'flags' ? 'Flag' : 'Icon'}</h3>
-                    <span className="section-status">Local vector catalog</span>
+                    <h3>
+                      {primaryElement.iconSet === 'twemoji'
+                        ? 'Emoji'
+                        : primaryElement.iconSet === 'circle-flags' ||
+                            primaryElement.iconSet === 'flags'
+                          ? 'Circle flag'
+                          : 'Icon'}
+                    </h3>
+                    <span className="section-status">Offline vector catalog</span>
                   </div>
-                  <label className="stacked-field">
-                    <span>Catalog</span>
-                    <select
-                      value={primaryElement.iconSet === 'flags' ? 'flags' : 'htmllelujah-local'}
-                      onChange={(event) => {
-                        const iconSet = event.currentTarget.value;
-                        patchElement(
-                          {
-                            ...primaryElement,
-                            name: iconSet === 'flags' ? 'FR flag' : 'Icon',
-                            iconSet,
-                            iconName: iconSet === 'flags' ? 'FR' : 'star',
-                          },
-                          'Change icon catalog',
-                        );
-                      }}
-                    >
-                      <option value="htmllelujah-local">Icons</option>
-                      <option value="flags">Round flags</option>
-                    </select>
-                  </label>
-                  <label className="stacked-field">
-                    <span>{primaryElement.iconSet === 'flags' ? 'Country' : 'Symbol'}</span>
-                    <select
-                      value={primaryElement.iconName}
-                      onChange={(event) => {
-                        const iconName = event.currentTarget.value;
-                        patchElement(
-                          {
-                            ...primaryElement,
-                            name:
+                  <div className="mcp-command-card">
+                    <span>Current visual</span>
+                    <code>
+                      {primaryElement.iconSet}:{primaryElement.iconName}
+                    </code>
+                  </div>
+                  <button
+                    type="button"
+                    className="primary-inspector-action"
+                    onClick={() => {
+                      const initialCatalog: CatalogId =
+                        primaryElement.iconSet === 'twemoji'
+                          ? 'twemoji'
+                          : primaryElement.iconSet === 'circle-flags' ||
                               primaryElement.iconSet === 'flags'
-                                ? `${iconName} flag`
-                                : `${iconName} icon`,
-                            iconName,
-                          },
-                          primaryElement.iconSet === 'flags' ? 'Change flag' : 'Change icon',
-                        );
-                      }}
-                    >
-                      {(primaryElement.iconSet === 'flags'
-                        ? commonCountryCodes
-                        : Object.keys(LOCAL_ICON_PATHS)
-                      ).map((name) => (
-                        <option key={name} value={name}>
-                          {name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  {primaryElement.iconSet !== 'flags' ? (
+                            ? 'circle-flags'
+                            : 'local-icons';
+                      setContentPicker({
+                        initialCatalog,
+                        catalogs: ['local-icons', 'twemoji', 'circle-flags'],
+                        replaceElementId: primaryElement.id,
+                      });
+                    }}
+                  >
+                    Choose another visual…
+                  </button>
+                  {primaryElement.iconSet === 'htmllelujah-local' ? (
                     <label className="color-field">
                       Color
                       <input
@@ -6000,15 +7020,13 @@ function EditorApp() {
                               void commitOnBlur(target, () => {
                                 const value = target.value;
                                 if (value === contentToPlainText(cell.content)) return true;
-                                return execute('Edit table cell', [
-                                  {
-                                    type: 'table.update-cell',
-                                    slideId: activeSlide.id,
-                                    tableId: primaryTable.id,
-                                    cellId: cell.id,
-                                    content: plainParagraph(value),
-                                  },
-                                ]);
+                                return mutateTable('Edit table cell', (slideId, tableId) => ({
+                                  type: 'table.update-cell',
+                                  slideId,
+                                  tableId,
+                                  cellId: cell.id,
+                                  content: plainParagraph(value),
+                                }));
                               });
                             }}
                           />
@@ -6066,16 +7084,14 @@ function EditorApp() {
                             },
                           }),
                         );
-                        void execute('Add table row', [
-                          {
-                            type: 'table.insert-row',
-                            slideId: activeSlide.id,
-                            tableId: primaryTable.id,
-                            index: primaryTable.rowCount,
-                            heightPt: 42,
-                            cells,
-                          },
-                        ]);
+                        void mutateTable('Add table row', (slideId, tableId) => ({
+                          type: 'table.insert-row',
+                          slideId,
+                          tableId,
+                          index: primaryTable.rowCount,
+                          heightPt: 42,
+                          cells,
+                        }));
                       }}
                     >
                       <Rows3 size={14} /> Add row
@@ -6098,16 +7114,14 @@ function EditorApp() {
                             paddingPt: 8,
                           },
                         }));
-                        void execute('Add table column', [
-                          {
-                            type: 'table.insert-column',
-                            slideId: activeSlide.id,
-                            tableId: primaryTable.id,
-                            index: primaryTable.columnCount,
-                            widthPt: 120,
-                            cells,
-                          },
-                        ]);
+                        void mutateTable('Add table column', (slideId, tableId) => ({
+                          type: 'table.insert-column',
+                          slideId,
+                          tableId,
+                          index: primaryTable.columnCount,
+                          widthPt: 120,
+                          cells,
+                        }));
                       }}
                     >
                       <Columns3 size={14} /> Add column
@@ -6116,14 +7130,12 @@ function EditorApp() {
                       type="button"
                       disabled={primaryTable.rowCount <= 1}
                       onClick={() =>
-                        void execute('Delete table row', [
-                          {
-                            type: 'table.delete-row',
-                            slideId: activeSlide.id,
-                            tableId: primaryTable.id,
-                            index: primaryTable.rowCount - 1,
-                          },
-                        ])
+                        void mutateTable('Delete table row', (slideId, tableId) => ({
+                          type: 'table.delete-row',
+                          slideId,
+                          tableId,
+                          index: primaryTable.rowCount - 1,
+                        }))
                       }
                     >
                       <Trash2 size={14} /> Last row
@@ -6132,14 +7144,12 @@ function EditorApp() {
                       type="button"
                       disabled={primaryTable.columnCount <= 1}
                       onClick={() =>
-                        void execute('Delete table column', [
-                          {
-                            type: 'table.delete-column',
-                            slideId: activeSlide.id,
-                            tableId: primaryTable.id,
-                            index: primaryTable.columnCount - 1,
-                          },
-                        ])
+                        void mutateTable('Delete table column', (slideId, tableId) => ({
+                          type: 'table.delete-column',
+                          slideId,
+                          tableId,
+                          index: primaryTable.columnCount - 1,
+                        }))
                       }
                     >
                       <Trash2 size={14} /> Last column
@@ -6152,17 +7162,15 @@ function EditorApp() {
                         type="color"
                         value={primaryTable.border.color}
                         onChange={(event) =>
-                          void execute('Change table border', [
-                            {
-                              type: 'table.update-style',
-                              slideId: activeSlide.id,
-                              tableId: primaryTable.id,
-                              border: {
-                                ...primaryTable.border,
-                                color: event.currentTarget.value,
-                              },
+                          void mutateTable('Change table border', (slideId, tableId) => ({
+                            type: 'table.update-style',
+                            slideId,
+                            tableId,
+                            border: {
+                              ...primaryTable.border,
+                              color: event.currentTarget.value,
                             },
-                          ])
+                          }))
                         }
                       />
                     </label>
@@ -6191,14 +7199,12 @@ function EditorApp() {
                             if (widthPt === primaryTable.border.widthPt)
                               return restoreBlurValue(target, primaryTable.border.widthPt);
                             target.value = String(widthPt);
-                            return execute('Change table border width', [
-                              {
-                                type: 'table.update-style',
-                                slideId: activeSlide.id,
-                                tableId: primaryTable.id,
-                                border: { ...primaryTable.border, widthPt },
-                              },
-                            ]);
+                            return mutateTable('Change table border width', (slideId, tableId) => ({
+                              type: 'table.update-style',
+                              slideId,
+                              tableId,
+                              border: { ...primaryTable.border, widthPt },
+                            }));
                           });
                         }}
                       />
@@ -6209,17 +7215,15 @@ function EditorApp() {
                         type="color"
                         value={primaryTable.style?.headerFill ?? '#e8ecf7'}
                         onChange={(event) =>
-                          void execute('Change table header', [
-                            {
-                              type: 'table.update-style',
-                              slideId: activeSlide.id,
-                              tableId: primaryTable.id,
-                              style: {
-                                ...primaryTable.style,
-                                headerFill: event.currentTarget.value,
-                              },
+                          void mutateTable('Change table header', (slideId, tableId) => ({
+                            type: 'table.update-style',
+                            slideId,
+                            tableId,
+                            style: {
+                              ...primaryTable.style,
+                              headerFill: event.currentTarget.value,
                             },
-                          ])
+                          }))
                         }
                       />
                     </label>
@@ -6228,17 +7232,15 @@ function EditorApp() {
                         type="checkbox"
                         checked={primaryTable.style?.bandedRows ?? false}
                         onChange={(event) =>
-                          void execute('Toggle banded rows', [
-                            {
-                              type: 'table.update-style',
-                              slideId: activeSlide.id,
-                              tableId: primaryTable.id,
-                              style: {
-                                ...primaryTable.style,
-                                bandedRows: event.currentTarget.checked,
-                              },
+                          void mutateTable('Toggle banded rows', (slideId, tableId) => ({
+                            type: 'table.update-style',
+                            slideId,
+                            tableId,
+                            style: {
+                              ...primaryTable.style,
+                              bandedRows: event.currentTarget.checked,
                             },
-                          ])
+                          }))
                         }
                       />
                       Banded rows
@@ -6255,18 +7257,16 @@ function EditorApp() {
                           type="color"
                           value={selectedTableCell.style.fill ?? '#ffffff'}
                           onChange={(event) =>
-                            void execute('Change cell fill', [
-                              {
-                                type: 'table.update-cell',
-                                slideId: activeSlide.id,
-                                tableId: primaryTable.id,
-                                cellId: selectedTableCell.id,
-                                style: {
-                                  ...selectedTableCell.style,
-                                  fill: event.currentTarget.value,
-                                },
+                            void mutateTable('Change cell fill', (slideId, tableId) => ({
+                              type: 'table.update-cell',
+                              slideId,
+                              tableId,
+                              cellId: selectedTableCell.id,
+                              style: {
+                                ...selectedTableCell.style,
+                                fill: event.currentTarget.value,
                               },
-                            ])
+                            }))
                           }
                         />
                       </label>
@@ -6276,18 +7276,16 @@ function EditorApp() {
                           type="color"
                           value={selectedTableCell.style.textColor}
                           onChange={(event) =>
-                            void execute('Change cell text color', [
-                              {
-                                type: 'table.update-cell',
-                                slideId: activeSlide.id,
-                                tableId: primaryTable.id,
-                                cellId: selectedTableCell.id,
-                                style: {
-                                  ...selectedTableCell.style,
-                                  textColor: event.currentTarget.value,
-                                },
+                            void mutateTable('Change cell text color', (slideId, tableId) => ({
+                              type: 'table.update-cell',
+                              slideId,
+                              tableId,
+                              cellId: selectedTableCell.id,
+                              style: {
+                                ...selectedTableCell.style,
+                                textColor: event.currentTarget.value,
                               },
-                            ])
+                            }))
                           }
                         />
                       </label>
@@ -6296,18 +7294,16 @@ function EditorApp() {
                         <select
                           value={selectedTableCell.style.horizontalAlignment}
                           onChange={(event) =>
-                            void execute('Align cell text', [
-                              {
-                                type: 'table.update-cell',
-                                slideId: activeSlide.id,
-                                tableId: primaryTable.id,
-                                cellId: selectedTableCell.id,
-                                style: {
-                                  ...selectedTableCell.style,
-                                  horizontalAlignment: event.currentTarget.value as TextAlignment,
-                                },
+                            void mutateTable('Align cell text', (slideId, tableId) => ({
+                              type: 'table.update-cell',
+                              slideId,
+                              tableId,
+                              cellId: selectedTableCell.id,
+                              style: {
+                                ...selectedTableCell.style,
+                                horizontalAlignment: event.currentTarget.value as TextAlignment,
                               },
-                            ])
+                            }))
                           }
                         >
                           <option value="left">Left</option>
@@ -6321,19 +7317,17 @@ function EditorApp() {
                         <select
                           value={selectedTableCell.style.verticalAlignment}
                           onChange={(event) =>
-                            void execute('Align cell vertically', [
-                              {
-                                type: 'table.update-cell',
-                                slideId: activeSlide.id,
-                                tableId: primaryTable.id,
-                                cellId: selectedTableCell.id,
-                                style: {
-                                  ...selectedTableCell.style,
-                                  verticalAlignment: event.currentTarget.value as
-                                    'top' | 'middle' | 'bottom',
-                                },
+                            void mutateTable('Align cell vertically', (slideId, tableId) => ({
+                              type: 'table.update-cell',
+                              slideId,
+                              tableId,
+                              cellId: selectedTableCell.id,
+                              style: {
+                                ...selectedTableCell.style,
+                                verticalAlignment: event.currentTarget.value as
+                                  'top' | 'middle' | 'bottom',
                               },
-                            ])
+                            }))
                           }
                         >
                           <option value="top">Top</option>
@@ -6345,15 +7339,13 @@ function EditorApp() {
                         type="button"
                         className="secondary-action"
                         onClick={() =>
-                          void execute('Clear cell fill', [
-                            {
-                              type: 'table.update-cell',
-                              slideId: activeSlide.id,
-                              tableId: primaryTable.id,
-                              cellId: selectedTableCell.id,
-                              style: { ...selectedTableCell.style, fill: null },
-                            },
-                          ])
+                          void mutateTable('Clear cell fill', (slideId, tableId) => ({
+                            type: 'table.update-cell',
+                            slideId,
+                            tableId,
+                            cellId: selectedTableCell.id,
+                            style: { ...selectedTableCell.style, fill: null },
+                          }))
                         }
                       >
                         Clear cell fill
@@ -6386,14 +7378,22 @@ function EditorApp() {
                 <div className="arrange-actions">
                   <button
                     type="button"
-                    disabled={selectedIds.length < 2}
+                    disabled={
+                      activeAuthoringSurface !== 'slide' ||
+                      selectedIds.length < 2 ||
+                      selectedElements.some((element) => element.locked)
+                    }
                     onClick={() => void groupSelection()}
                   >
                     <Group size={15} /> Group
                   </button>
                   <button
                     type="button"
-                    disabled={primaryElement?.type !== 'group'}
+                    disabled={
+                      activeAuthoringSurface !== 'slide' ||
+                      primaryElement?.type !== 'group' ||
+                      primaryElement.locked
+                    }
                     onClick={() => void ungroupSelection()}
                   >
                     <Ungroup size={15} /> Ungroup
@@ -6502,6 +7502,168 @@ function EditorApp() {
         </div>
       </footer>
 
+      {contentPicker !== null ? (
+        <ContentCatalogPicker
+          initialCatalog={contentPicker.initialCatalog}
+          catalogs={contentPicker.catalogs}
+          locale={document.metadata.locale.toLowerCase().startsWith('fr') ? 'fr' : 'en'}
+          onDismiss={() => setContentPicker(null)}
+          onSelect={(entry) => void selectContentCatalogEntry(entry)}
+        />
+      ) : null}
+
+      {objectContextMenu !== null ? (
+        <div
+          ref={objectContextMenuRef}
+          className="object-context-menu"
+          role="menu"
+          aria-label="Object actions"
+          style={{ left: objectContextMenu.x, top: objectContextMenu.y }}
+          onContextMenu={(event) => event.preventDefault()}
+          onKeyDown={navigateObjectContextMenu}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={selectedElements.length === 0}
+            onClick={() => {
+              copySelectionToInternalClipboard();
+              dismissObjectContextMenu(true);
+            }}
+          >
+            <Copy size={15} /> Copy <kbd>Ctrl C</kbd>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={
+              selectedElements.length === 0 || selectedElements.some((element) => element.locked)
+            }
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void cutSelectionToInternalClipboard();
+            }}
+          >
+            <Scissors size={15} /> Cut <kbd>Ctrl X</kbd>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={objectClipboardRef.current === null}
+            onClick={() => {
+              const serialized = objectClipboardRef.current;
+              dismissObjectContextMenu(false);
+              if (serialized !== null) void pasteSerializedObjects(serialized);
+            }}
+          >
+            <ClipboardPaste size={15} /> Paste <kbd>Ctrl V</kbd>
+          </button>
+          <span className="menu-separator" />
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void duplicateSelection();
+            }}
+          >
+            <Copy size={15} /> Duplicate <kbd>Ctrl D</kbd>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={primaryElement === undefined || primaryElement.locked}
+            onClick={() => {
+              dismissObjectContextMenu(true);
+              reorder('front');
+            }}
+          >
+            <BringToFront size={15} /> Bring to front
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={primaryElement === undefined || primaryElement.locked}
+            onClick={() => {
+              dismissObjectContextMenu(true);
+              reorder('back');
+            }}
+          >
+            <SendToBack size={15} /> Send to back
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={primaryElement === undefined}
+            onClick={() => {
+              dismissObjectContextMenu(true);
+              toggleLock();
+            }}
+          >
+            {primaryElement?.locked ? <Unlock size={15} /> : <Lock size={15} />}
+            {primaryElement?.locked ? 'Unlock' : 'Lock'}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={primaryElement === undefined || primaryElement.locked}
+            onClick={() => {
+              dismissObjectContextMenu(true);
+              toggleVisible();
+            }}
+          >
+            {primaryElement?.visible === false ? <Eye size={15} /> : <EyeOff size={15} />}
+            {primaryElement?.visible === false ? 'Show' : 'Hide'}
+          </button>
+          <span className="menu-separator" />
+          <button
+            type="button"
+            role="menuitem"
+            disabled={
+              activeAuthoringSurface !== 'slide' ||
+              selectedIds.length < 2 ||
+              selectedElements.some((element) => element.locked)
+            }
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void groupSelection();
+            }}
+          >
+            <Group size={15} /> Group <kbd>Ctrl G</kbd>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={
+              activeAuthoringSurface !== 'slide' ||
+              primaryElement?.type !== 'group' ||
+              primaryElement.locked
+            }
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void ungroupSelection();
+            }}
+          >
+            <Ungroup size={15} /> Ungroup <kbd>Ctrl Shift G</kbd>
+          </button>
+          <span className="menu-separator" />
+          <button
+            type="button"
+            role="menuitem"
+            className="is-danger"
+            disabled={
+              selectedElements.length === 0 || selectedElements.some((element) => element.locked)
+            }
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void deleteSelection();
+            }}
+          >
+            <Trash2 size={15} /> Delete <kbd>Del</kbd>
+          </button>
+        </div>
+      ) : null}
+
       {toast !== null ? (
         <div className={`toast toast-${toast.kind}`} role="status">
           <span>{toast.message}</span>
@@ -6589,8 +7751,9 @@ function EditorApp() {
               </button>
             </header>
             <p>
-              The local MCP process can inspect this open deck and propose typed edits. It cannot
-              read arbitrary files, execute HTML, or export without a one-time approval.
+              The installed local agent has a persistent, revocable identity. Codex or Claude can
+              inspect the authoritative theme, masters, layouts and slides, then apply ordinary
+              typed edits without a new approval for every action.
             </p>
             <div className="collaboration-status">
               <Code2 size={18} />
@@ -6605,45 +7768,18 @@ function EditorApp() {
               </div>
             </div>
             <div className="mcp-command-card">
-              <span>Codex MCP command</span>
+              <span>Persistent local MCP launcher</span>
               <code>HTMLlelujah-MCP.cmd</code>
-              <small>Keep the desktop app open while the MCP process is connected.</small>
+              <small>
+                Keep HTMLlelujah open. Every edit remains revision-checked, attributed and undoable;
+                arbitrary files, remote URLs and executable HTML remain inaccessible.
+              </small>
             </div>
-            <div className="mcp-approval-grid">
-              <label className="stacked-field">
-                <span>Approve one action</span>
-                <select
-                  value={mcpApprovalAction}
-                  onChange={(event) =>
-                    setMcpApprovalAction(event.currentTarget.value as McpApprovalAction)
-                  }
-                >
-                  <option value="commit-destructive">Delete or change page format</option>
-                  <option value="undo">Undo the latest agent transaction</option>
-                  <option value="import">Choose and import one image</option>
-                  <option value="export-html">Export one standalone HTML</option>
-                  <option value="export-pdf">Export one PDF</option>
-                </select>
-              </label>
-              <button
-                type="button"
-                className="primary-inspector-action"
-                disabled={!mcpStatus?.available}
-                onClick={() => void createMcpApproval()}
-              >
-                Create one-time approval
-              </button>
-            </div>
-            {mcpApproval !== null ? (
-              <div className="session-secret mcp-approval-secret">
-                <span>
-                  Approval capability · expires{' '}
-                  {new Date(mcpApproval.expiresAt).toLocaleTimeString()}
-                </span>
-                <code>{mcpApproval.approvalId}</code>
-                <small>Give this value only to the current local MCP request. It works once.</small>
-              </div>
-            ) : null}
+            <p className="dialog-footnote">
+              Sensitive external operations such as importing a local file or exporting a
+              deliverable stay under desktop control. Ordinary presentation authoring does not
+              require a one-time token.
+            </p>
           </section>
         </div>
       ) : null}

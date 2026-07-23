@@ -17,6 +17,7 @@ import {
   type ExportResult,
   type HistoryInput,
   type ImportImageInput,
+  type ImageImportTarget,
   type HtmllelujahDesktopApi,
   type ImportImageResult,
   type InitializeResult,
@@ -38,6 +39,17 @@ import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
 
 const invoke = <T>(channel: string, input?: unknown): Promise<DesktopResult<T>> =>
   ipcRenderer.invoke(channel, input) as Promise<DesktopResult<T>>;
+
+const copyImageImportTarget = (target: ImageImportTarget): ImageImportTarget => {
+  switch (target.surface) {
+    case 'slide':
+      return { surface: 'slide', slideId: target.slideId };
+    case 'layout':
+      return { surface: 'layout', layoutId: target.layoutId };
+    case 'master':
+      return { surface: 'master', masterId: target.masterId };
+  }
+};
 
 const windowCloseListeners = new Set<WindowCloseRequestListener>();
 const windowCloseReleaseListeners = new Set<WindowCloseReleaseListener>();
@@ -142,7 +154,13 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
   saveAs: (input: SessionInput): Promise<DesktopResult<SessionView>> =>
     invoke(DESKTOP_IPC.saveAs, input),
   importImage: (input: ImportImageInput): Promise<DesktopResult<ImportImageResult>> =>
-    invoke(DESKTOP_IPC.importImage, input),
+    invoke(DESKTOP_IPC.importImage, {
+      sessionId: input.sessionId,
+      expectedRevision: input.expectedRevision,
+      target: copyImageImportTarget(input.target),
+      ...(input.replaceElementId === undefined ? {} : { replaceElementId: input.replaceElementId }),
+      ...(input.preset === undefined ? {} : { preset: input.preset }),
+    } satisfies ImportImageInput),
   listRecovery: (): Promise<DesktopResult<readonly RecoveryCandidate[]>> =>
     invoke(DESKTOP_IPC.listRecovery),
   recover: (candidateId: string): Promise<DesktopResult<SessionView>> =>

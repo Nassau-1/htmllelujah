@@ -7,6 +7,33 @@ and releases use semantic versions.
 
 ### Changed
 
+- Added familiar object copy/cut/paste and right-click actions, pre-insertion visual
+  choosers, complete slide/layout/master authoring parity, authoritative template
+  locks, blank theme creation, style provenance and reset controls, bounded custom
+  page sizes, dynamic page fields, aligned page numbers, and atomic text/image
+  watermarks.
+
+- Added closed offline content catalogs for seven native shapes, twelve local vector
+  icons, 3,720 Twemoji graphics, and 265 circular country flags; searches use
+  English/French metadata, documents retain only stable catalog identities, legacy
+  flag identities remain readable, and a deterministic generation gate enforces
+  pinned sources, safe SVG constructs, integrity, provenance, and attribution.
+
+- Added the first persistent trusted-agent checkpoint: an Ed25519-backed current-user
+  MCP client profile, RPC v2 server-side identity injection, client-owned proposals
+  and approvals, attributable `mcp-client:<uuid>` transactions, persistent revocation,
+  and approval-free ordinary or simulation-proven non-removing design edits while
+  retaining one-time approval for destructive, undo, import, and export operations.
+
+- Added an authoritative MCP design-context projection with paginated provenance,
+  effective locks, placeholders, semantic themes, constraints, bounded asset
+  metadata, and validation state, plus strict design-aware page, theme, master,
+  layout, slide-layout, and deck-wide theme-enforcement proposals that reuse the
+  canonical revision, transaction, undo, attribution, and effect-aware approval
+  pipeline without accepting arbitrary markup or external targets. Deck-wide
+  enforcement is now one canonical reversible command, so presentations with more
+  than 100 styled objects no longer exceed the MCP proposal-command bound.
+
 - Replaced the source-visible proprietary and separate binary terms with one
   source-available PolyForm Noncommercial 1.0.0 license for original source and
   official binaries, added a separate commercial-licensing contact path, aligned

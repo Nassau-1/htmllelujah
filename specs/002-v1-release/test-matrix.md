@@ -166,17 +166,17 @@ negative size, spacing collapse, nondeterministic snap, or input mutation.
 
 ## MCP
 
-| ID      | Scenario          | Oracle                                               | Edge coverage                                        | Gate    |
-| ------- | ----------------- | ---------------------------------------------------- | ---------------------------------------------------- | ------- |
-| MCP-001 | Stdio lifecycle   | Initialize/list/call/shutdown succeeds               | Client exit and restart                              | Release |
-| MCP-002 | Stdout purity     | Protocol frames only                                 | Warnings, crash, validation errors                   | Hard    |
-| MCP-003 | Authentication    | Current launch nonce and user required               | Reuse, wrong user, expired nonce                     | Hard    |
-| MCP-004 | Read tools        | Correct bounded projections                          | Empty, large, closed document                        | Release |
-| MCP-005 | Mutation tools    | Revision-aware attributable one-batch edit           | Stale/invalid/mixed batch                            | Hard    |
-| MCP-006 | Approvals         | Purpose/session/expiry/single use enforced           | Reuse and operation mismatch                         | Hard    |
-| MCP-007 | Capability denial | No path, URL, shell, raw HTML, raw state access      | Fuzzed tool names and schemas                        | Hard    |
-| MCP-008 | Undo parity       | MCP batch appears and undoes as one action           | Later human edit and stale undo                      | Release |
-| MCP-009 | State quotas      | Atomic capacity reservation, TTL purge, bounded maps | Concurrent 65th proposal, 33rd approval, receipt cap | Hard    |
+| ID      | Scenario          | Oracle                                                     | Edge coverage                                        | Gate    |
+| ------- | ----------------- | ---------------------------------------------------------- | ---------------------------------------------------- | ------- |
+| MCP-001 | Stdio lifecycle   | Initialize/list/call/shutdown succeeds                     | Client exit and restart                              | Release |
+| MCP-002 | Stdout purity     | Protocol frames only                                       | Warnings, crash, validation errors                   | Hard    |
+| MCP-003 | Authentication    | Current endpoint plus registered client signature required | Replay, wrong user/key, unknown/revoked client       | Hard    |
+| MCP-004 | Read tools        | Correct bounded projections                                | Empty, large, closed document                        | Release |
+| MCP-005 | Mutation tools    | Revision-aware client-attributed one-batch edit            | Stale/invalid/mixed/cross-client batch               | Hard    |
+| MCP-006 | Approvals         | Client/purpose/session/expiry/single use enforced          | Reuse, client and operation mismatch                 | Hard    |
+| MCP-007 | Capability denial | No path, URL, shell, raw HTML, raw state access            | Fuzzed tool names and schemas                        | Hard    |
+| MCP-008 | Undo parity       | MCP batch appears and undoes as one action                 | Later human edit and stale undo                      | Release |
+| MCP-009 | State quotas      | Atomic capacity reservation, TTL purge, bounded maps       | Concurrent 65th proposal, 33rd approval, receipt cap | Hard    |
 
 ## Authoritative-host LAN collaboration
 

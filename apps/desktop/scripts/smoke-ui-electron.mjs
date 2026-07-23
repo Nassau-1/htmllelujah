@@ -938,6 +938,98 @@ try {
     });
   };
 
+  const selectCatalogVisual = async (catalogId, label) => {
+    await waitForRenderer(
+      `(() => {
+        const dialog = document.querySelector('.content-catalog-picker[role="dialog"]');
+        const selectedTab = dialog?.querySelector('[role="tab"][aria-selected="true"]');
+        const firstResult = dialog?.querySelector('.content-catalog-item');
+        return dialog !== null &&
+          selectedTab instanceof HTMLButtonElement &&
+          selectedTab.id.includes(${JSON.stringify(`-${catalogId}-tab`)}) &&
+          firstResult instanceof HTMLButtonElement;
+      })()`,
+      `${label} visual picker`,
+    );
+    const selection = await evaluate(`(() => {
+      const dialog = document.querySelector('.content-catalog-picker[role="dialog"]');
+      const selectedTab = dialog?.querySelector('[role="tab"][aria-selected="true"]');
+      const firstResult = dialog?.querySelector('.content-catalog-item');
+      if (
+        !(selectedTab instanceof HTMLButtonElement) ||
+        !(firstResult instanceof HTMLButtonElement)
+      ) return null;
+      const result = {
+        catalogTab: selectedTab.textContent?.trim() ?? '',
+        visualLabel: firstResult.getAttribute('aria-label') ?? firstResult.textContent?.trim() ?? '',
+      };
+      firstResult.click();
+      return result;
+    })()`);
+    if (
+      selection === null ||
+      typeof selection.catalogTab !== 'string' ||
+      selection.catalogTab === '' ||
+      typeof selection.visualLabel !== 'string' ||
+      selection.visualLabel === ''
+    ) {
+      throw new Error(`${label} visual could not be selected.`);
+    }
+    await waitForRenderer(
+      `document.querySelector('.content-catalog-picker[role="dialog"]') === null`,
+      `${label} visual picker closing`,
+    );
+    return selection;
+  };
+
+  const openCatalogAndSelect = async (selector, catalogId, label) => {
+    await click(selector, label);
+    return selectCatalogVisual(catalogId, label);
+  };
+
+  const contextClick = async (selector, label) => {
+    const point = await evaluate(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!(element instanceof HTMLElement)) return null;
+      const bounds = element.getBoundingClientRect();
+      return { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+    })()`);
+    if (point === null) throw new Error(`${label} was not found.`);
+    await cdp.send('Page.bringToFront');
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: point.x,
+      y: point.y,
+      button: 'right',
+      buttons: 2,
+      clickCount: 1,
+    });
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: point.x,
+      y: point.y,
+      button: 'right',
+      buttons: 0,
+      clickCount: 1,
+    });
+  };
+
+  const switchInspectorTab = async (tabName, label) => {
+    const switched = await evaluate(`(() => {
+      const tab = [...document.querySelectorAll('[role="tab"]')].find(
+        (candidate) => candidate.textContent?.trim() === ${JSON.stringify(tabName)},
+      );
+      if (!(tab instanceof HTMLButtonElement)) return false;
+      tab.click();
+      return true;
+    })()`);
+    if (!switched) throw new Error(`${label} was not found.`);
+    await waitForRenderer(
+      `document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() === ${JSON.stringify(tabName)}`,
+      label,
+    );
+  };
+
   const dragElement = async (selector, deltaX, deltaY, label) => {
     const point = await evaluate(`(() => {
       const element = document.querySelector(${JSON.stringify(selector)});
@@ -1228,7 +1320,11 @@ try {
       document.querySelector('.text-content-editor')?.value === ${JSON.stringify(preservedConflictDraft)}`,
     'External text conflict preserves the local draft',
   );
-  await click('[aria-label="Add shape"]', 'Blocked shape insertion during text conflict');
+  await openCatalogAndSelect(
+    '[aria-label="Add shape"]',
+    'shapes',
+    'Blocked shape insertion during text conflict',
+  );
   await sleep(300);
   const countWhileConflicted = Number(
     await evaluate(`document.querySelectorAll('[data-canvas-element-id]').length`),
@@ -1250,7 +1346,11 @@ try {
     'Post-recovery text commit',
   );
 
-  await click('[aria-label="Add shape"]', 'Add shape');
+  const insertedShapeVisual = await openCatalogAndSelect(
+    '[aria-label="Add shape"]',
+    'shapes',
+    'Add shape',
+  );
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 1}`,
     'Shape insertion',
@@ -1302,6 +1402,146 @@ try {
         selected[0]?.getAttribute('data-canvas-element-id') === ${JSON.stringify(insertedShapeId)};
     })()`,
     'Redone shape keyboard selection',
+  );
+  await contextClick('.canonical-hitbox.is-selected', 'Selected shape context click');
+  await waitForRenderer(
+    `(() => {
+      const menu = document.querySelector('[role="menu"][aria-label="Object actions"]');
+      const labels = [...(menu?.querySelectorAll('button[role="menuitem"]') ?? [])].map(
+        (button) => button.textContent?.replace(/\\s+/gu, ' ').trim() ?? '',
+      );
+      return menu !== null &&
+        ['Copy', 'Cut', 'Paste', 'Duplicate', 'Lock', 'Delete'].every((expected) =>
+          labels.some((label) => label.startsWith(expected)),
+        );
+    })()`,
+    'Object context menu actions',
+  );
+  const contextMenuDismissed = await evaluate(`(() => {
+    const menu = document.querySelector('[role="menu"][aria-label="Object actions"]');
+    if (!(menu instanceof HTMLElement)) return false;
+    menu.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Escape',
+        code: 'Escape',
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    return true;
+  })()`);
+  if (!contextMenuDismissed) throw new Error('The object context menu could not be dismissed.');
+  await waitForRenderer(
+    `document.querySelector('[role="menu"][aria-label="Object actions"]') === null`,
+    'Object context menu closing',
+  );
+  const textSelectedForArrangeDuplicate = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('.canonical-hitbox')].find(
+      (candidate) => candidate.getAttribute('aria-label')?.includes(', text'),
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+    return true;
+  })()`);
+  if (!textSelectedForArrangeDuplicate) {
+    throw new Error('A text box was unavailable for the Arrange duplicate smoke.');
+  }
+  await waitForRenderer(
+    `document.querySelector('.canonical-hitbox.is-selected')?.getAttribute('aria-label')?.includes(', text') === true`,
+    'Text box selected for Arrange duplicate',
+  );
+  const arrangeDuplicateStarted = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Arrange',
+    );
+    const button = [...(heading?.closest('.inspector-section')?.querySelectorAll('button') ?? [])]
+      .find(
+        (candidate) => candidate.textContent?.replace(/\\s+/gu, ' ').trim() === 'Duplicate',
+      );
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!arrangeDuplicateStarted) {
+    throw new Error('The Arrange duplicate action was unavailable.');
+  }
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 2} &&
+      document.querySelector('.toast-error') === null`,
+    'Arrange text-box duplicate without error',
+  );
+  await click('[aria-label="Undo"]', 'Undo object duplicate');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 1}`,
+    'Undo object duplicate',
+  );
+  const shapeReselectedForClipboard = await evaluate(`(() => {
+    const element = [...document.querySelectorAll('[data-canvas-element-id]')].find(
+      (candidate) =>
+        candidate.getAttribute('data-canvas-element-id') === ${JSON.stringify(insertedShapeId)},
+    );
+    if (!(element instanceof HTMLElement)) return false;
+    element.focus();
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+    return true;
+  })()`);
+  if (!shapeReselectedForClipboard) {
+    throw new Error('The shape could not be reselected for the object clipboard smoke.');
+  }
+  await waitForRenderer(
+    `document.querySelector('.canonical-hitbox.is-selected')?.getAttribute('data-canvas-element-id') === ${JSON.stringify(insertedShapeId)}`,
+    'Shape selection before object clipboard round trip',
+  );
+  const clipboardRoundTrip = await evaluate(`(() => {
+    if (typeof DataTransfer !== 'function') return { ok: false, reason: 'DataTransfer unavailable' };
+    const clipboardData = new DataTransfer();
+    const copyEvent = new ClipboardEvent('copy', {
+      bubbles: true,
+      cancelable: true,
+      clipboardData,
+    });
+    window.dispatchEvent(copyEvent);
+    const privatePayload = clipboardData.getData('application/x-htmllelujah-elements+json');
+    const plainText = clipboardData.getData('text/plain');
+    if (!copyEvent.defaultPrevented || privatePayload === '' || plainText === '') {
+      return {
+        ok: false,
+        reason: 'Copy event did not expose the bounded object payload',
+        copyPrevented: copyEvent.defaultPrevented,
+        privatePayloadLength: privatePayload.length,
+        plainTextLength: plainText.length,
+      };
+    }
+    const pasteEvent = new ClipboardEvent('paste', {
+      bubbles: true,
+      cancelable: true,
+      clipboardData,
+    });
+    window.dispatchEvent(pasteEvent);
+    return {
+      ok: pasteEvent.defaultPrevented,
+      reason: pasteEvent.defaultPrevented ? '' : 'Paste event was not accepted',
+      privatePayloadLength: privatePayload.length,
+      plainTextLength: plainText.length,
+    };
+  })()`);
+  if (clipboardRoundTrip?.ok !== true) {
+    throw new Error(
+      `The Ctrl+C/Ctrl+V object clipboard flow was unavailable: ${JSON.stringify(
+        clipboardRoundTrip,
+      )}.`,
+    );
+  }
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 2} &&
+      document.querySelector('.toast-error') === null`,
+    'Ctrl+C/Ctrl+V object clipboard flow',
+  );
+  await click('[aria-label="Undo"]', 'Undo pasted object');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 1}`,
+    'Undo pasted object',
   );
   await waitForRenderer(
     `document.querySelector('.app-shell')?.getAttribute('aria-busy') !== 'true'`,
@@ -1386,19 +1626,36 @@ try {
     throw new Error('The native-content slide index is unavailable.');
   }
 
-  await click('[aria-label="Add icon"]', 'Add icon');
+  const insertedIconVisual = await openCatalogAndSelect(
+    '[aria-label="Add icon"]',
+    'local-icons',
+    'Add icon',
+  );
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 4}`,
     'Native icon insertion',
   );
-  await click('[aria-label="Add flag"]', 'Add flag');
+  const insertedEmojiVisual = await openCatalogAndSelect(
+    '[aria-label="Add emoji"]',
+    'twemoji',
+    'Add Twemoji',
+  );
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 5}`,
-    'Unicode flag insertion',
+    'Offline Twemoji insertion',
+  );
+  const insertedFlagVisual = await openCatalogAndSelect(
+    '[aria-label="Add flag"]',
+    'circle-flags',
+    'Add circle flag',
+  );
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 6}`,
+    'Offline circle-flag insertion',
   );
   await click('[aria-label="Add connector"]', 'Add connector');
   await waitForRenderer(
-    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 6}`,
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 7}`,
     'Native connector insertion',
   );
 
@@ -1416,8 +1673,16 @@ try {
   await clickButtonWithText('Codex', 'Codex dialog');
   await waitForRenderer(`document.querySelector('#mcp-title') !== null`, 'Codex dialog opening');
   await waitForRenderer(
-    `document.querySelector('#mcp-title')?.textContent === 'Work with Codex through MCP'`,
-    'Codex dialog content',
+    `(() => {
+      const dialog = document.querySelector('[aria-labelledby="mcp-title"]');
+      const text = dialog?.textContent?.replace(/\\s+/gu, ' ') ?? '';
+      return document.querySelector('#mcp-title')?.textContent === 'Work with Codex through MCP' &&
+        text.includes('persistent, revocable identity') &&
+        text.includes('without a new approval for every action') &&
+        text.includes('HTMLlelujah-MCP.cmd') &&
+        text.includes('Ordinary presentation authoring does not require a one-time token');
+    })()`,
+    'Persistent Codex MCP dialog content',
   );
   await click('[aria-labelledby="mcp-title"] button[aria-label="Close"]', 'Codex dialog close');
   await waitForRenderer(`document.querySelector('#mcp-title') === null`, 'Codex dialog closing');
@@ -1525,19 +1790,56 @@ try {
   const masterObjectCountBefore = await evaluate(
     `document.querySelectorAll('.master-object-row').length`,
   );
-  const addedMasterShape = await evaluate(`(() => {
-    const controls = document.querySelector('[aria-label="Add master objects"]');
+  const addedCenteredPageField = await evaluate(`(() => {
+    const controls = document.querySelector('[aria-label="Add dynamic master fields"]');
     const button = [...(controls?.querySelectorAll('button') ?? [])].find(
-      (candidate) => candidate.textContent?.trim().endsWith('shape'),
+      (candidate) => candidate.textContent?.replace(/\\s+/gu, ' ').trim() === 'page center',
     );
     if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
     button.click();
     return true;
   })()`);
-  if (!addedMasterShape) throw new Error('The dedicated master-shape action was unavailable.');
+  if (!addedCenteredPageField) {
+    throw new Error('The centered dynamic page-field action was unavailable.');
+  }
   await waitForRenderer(
     `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore + 1}`,
-    'Master shape insertion',
+    'Centered dynamic page field insertion',
+  );
+  const addedTextWatermark = await evaluate(`(() => {
+    const button = [...document.querySelectorAll('button')].find(
+      (candidate) => candidate.textContent?.replace(/\\s+/gu, ' ').trim() === 'Add text watermark',
+    );
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    const originalPrompt = window.prompt;
+    try {
+      window.prompt = () => 'SMOKE WATERMARK';
+      button.click();
+    } finally {
+      window.prompt = originalPrompt;
+    }
+    return true;
+  })()`);
+  if (!addedTextWatermark) throw new Error('The text-watermark action was unavailable.');
+  await waitForRenderer(
+    `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore + 2} &&
+      (() => {
+        const rows = [...document.querySelectorAll('.master-object-row')];
+        const pageRow = rows.find((row) => row.textContent?.includes('Page number center'));
+        const watermarkRow = rows.find((row) => row.textContent?.includes('Text watermark'));
+        return pageRow?.querySelector('button[title="Delete master object"]')?.disabled === true &&
+          watermarkRow?.querySelector('button[title="Delete master object"]')?.disabled === true;
+      })()`,
+    'Locked dynamic page field and text watermark',
+  );
+  const insertedMasterShapeVisual = await openCatalogAndSelect(
+    '[aria-label="Add shape"]',
+    'shapes',
+    'Add shape on master',
+  );
+  await waitForRenderer(
+    `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore + 3}`,
+    'Master shape insertion through the authoring toolbar',
   );
   const selectedMasterObject = await evaluate(`(() => {
     const button = [...document.querySelectorAll('.master-object-select')].at(-1);
@@ -1546,6 +1848,65 @@ try {
     return true;
   })()`);
   if (!selectedMasterObject) throw new Error('The inserted master object could not be selected.');
+  await switchInspectorTab('Properties', 'Master object Properties inspector');
+  await waitForRenderer(
+    `(() => {
+      const summary = document.querySelector('.selection-summary');
+      const positionHeading = [...document.querySelectorAll('.inspector-section h3')].find(
+        (heading) => heading.textContent === 'Position & size',
+      );
+      const enabledFrameInput = positionHeading
+        ?.closest('.inspector-section')
+        ?.querySelector('input[type="number"]:not(:disabled)');
+      return summary?.textContent?.includes('shape') === true &&
+        enabledFrameInput instanceof HTMLInputElement;
+    })()`,
+    'Master object editable through Properties',
+  );
+  await switchInspectorTab('Design', 'Design inspector after master Properties');
+  await click('[aria-label="Lock object"]', 'Lock master object');
+  await waitForRenderer(
+    `document.querySelector('.canonical-hitbox.is-selected.is-locked') !== null &&
+      document.querySelector('.master-object-row.is-selected button[title="Delete master object"]')?.disabled === true`,
+    'Locked master object delete guard',
+  );
+  const lockedMasterDeleteAttempted = await evaluate(`(() => {
+    const selected = document.querySelector('.canonical-hitbox.is-selected');
+    if (!(selected instanceof HTMLElement)) return false;
+    selected.focus();
+    selected.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Delete',
+        code: 'Delete',
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    return true;
+  })()`);
+  if (!lockedMasterDeleteAttempted) {
+    throw new Error('The locked master object was unavailable for the delete guard.');
+  }
+  await sleep(250);
+  const lockedMasterRetained = await evaluate(
+    `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore + 3}`,
+  );
+  if (!lockedMasterRetained) throw new Error('A locked master object could be deleted.');
+  await click('[aria-label="Unlock object"]', 'Unlock master object');
+  await waitForRenderer(
+    `document.querySelector('.canonical-hitbox.is-selected.is-locked') === null`,
+    'Master object unlocked',
+  );
+  await click('[aria-label="Undo"]', 'Undo master unlock');
+  await waitForRenderer(
+    `document.querySelector('.canonical-hitbox.is-selected.is-locked') !== null`,
+    'Undo master unlock',
+  );
+  await click('[aria-label="Undo"]', 'Undo master lock');
+  await waitForRenderer(
+    `document.querySelector('.canonical-hitbox.is-selected.is-locked') === null`,
+    'Undo master lock',
+  );
   const masterFrameBefore = await selectedCanvasFrame();
   if (masterFrameBefore === null) throw new Error('The selected master object has no hit frame.');
   await dragElement('.canonical-hitbox.is-selected', 18, 12, 'Master shape drag target');
@@ -1602,8 +1963,11 @@ try {
     'Master selection retained after transform revision',
   );
   await waitForRenderer(
-    `[...document.querySelectorAll('.toolbar .add-tools button')].length >= 7 && [...document.querySelectorAll('.toolbar .add-tools button')].every((button) => button instanceof HTMLButtonElement && button.disabled)`,
-    'Slide-only toolbar disabled on master surface',
+    `[...document.querySelectorAll('.toolbar .add-tools button')].length >= 8 &&
+      [...document.querySelectorAll('.toolbar .add-tools button')].every(
+        (button) => button instanceof HTMLButtonElement && !button.disabled,
+      )`,
+    'Authoring toolbar enabled on master surface',
   );
   await clickButtonWithText('Edit', 'Edit menu on master surface');
   await waitForRenderer(
@@ -1612,9 +1976,10 @@ try {
       const actions = [...(menu?.querySelectorAll('button') ?? [])].filter((button) =>
         ['Duplicate', 'Delete'].some((label) => button.textContent?.includes(label)),
       );
-      return actions.length === 2 && actions.every((button) => button instanceof HTMLButtonElement && button.disabled);
+      return actions.length === 2 &&
+        actions.every((button) => button instanceof HTMLButtonElement && !button.disabled);
     })()`,
-    'Slide-only Edit actions disabled on master surface',
+    'Edit duplicate and delete enabled on master surface',
   );
   await clickButtonWithText('Edit', 'Edit menu close on master surface');
   await click('[aria-label="Undo"]', 'Undo master shape rotation');
@@ -1654,7 +2019,7 @@ try {
   );
   await click('[aria-label="Undo"]', 'Undo master shape insertion');
   await waitForRenderer(
-    `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore}`,
+    `document.querySelectorAll('.master-object-row').length === ${masterObjectCountBefore + 2}`,
     'Undo master shape insertion',
   );
 
@@ -1664,8 +2029,45 @@ try {
     'Layout canvas context',
   );
   await waitForRenderer(
-    `[...document.querySelectorAll('.toolbar .add-tools button')].every((button) => button instanceof HTMLButtonElement && button.disabled)`,
-    'Slide-only toolbar disabled on layout surface',
+    `[...document.querySelectorAll('.toolbar .add-tools button')].length >= 8 &&
+      [...document.querySelectorAll('.toolbar .add-tools button')].every(
+        (button) => button instanceof HTMLButtonElement && !button.disabled,
+      )`,
+    'Authoring toolbar enabled on layout surface',
+  );
+  const layoutCanvasElementCountBefore = await evaluate(
+    `document.querySelectorAll('[data-canvas-element-id]').length`,
+  );
+  await click('[aria-label="Add table"]', 'Add table on layout');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${layoutCanvasElementCountBefore + 1} &&
+      document.querySelector('.canonical-hitbox.is-selected')?.getAttribute('aria-label')?.includes(', table') === true`,
+    'Layout table insertion through the authoring toolbar',
+  );
+  await switchInspectorTab('Properties', 'Layout object Properties inspector');
+  await waitForRenderer(
+    `document.querySelector('[aria-label="Table cells (tab-separated values)"]') !== null &&
+      document.querySelector('.selection-summary')?.textContent?.includes('table') === true`,
+    'Layout table editable through Properties',
+  );
+  await clickButtonWithText('Edit', 'Edit menu on layout surface');
+  await waitForRenderer(
+    `(() => {
+      const menu = document.querySelector('[role="menu"][aria-label="Edit menu"]');
+      const actions = [...(menu?.querySelectorAll('button') ?? [])].filter((button) =>
+        ['Duplicate', 'Delete'].some((label) => button.textContent?.includes(label)),
+      );
+      return actions.length === 2 &&
+        actions.every((button) => button instanceof HTMLButtonElement && !button.disabled);
+    })()`,
+    'Edit duplicate and delete enabled on layout surface',
+  );
+  await clickButtonWithText('Edit', 'Edit menu close on layout surface');
+  await switchInspectorTab('Design', 'Design inspector after layout Properties');
+  await click('[aria-label="Undo"]', 'Undo layout table insertion');
+  await waitForRenderer(
+    `document.querySelectorAll('[data-canvas-element-id]').length === ${layoutCanvasElementCountBefore}`,
+    'Undo layout table insertion',
   );
   const selectedLayoutPlaceholder = await evaluate(`(() => {
     const element = [...document.querySelectorAll('.canonical-hitbox')].find((candidate) =>
@@ -1778,26 +2180,155 @@ try {
     'Undo layout-aware slide insertion',
   );
 
-  const changedPageFormat = await evaluate(`(() => {
+  const themeCountBeforeBlankCreation = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Theme',
+    );
+    const select = heading?.closest('.inspector-section')?.querySelector('select');
+    return select instanceof HTMLSelectElement ? select.options.length : 0;
+  })()`);
+  const blankThemeStarted = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Theme',
+    );
+    const section = heading?.closest('.inspector-section');
+    const button = [...(section?.querySelectorAll('button') ?? [])].find(
+      (candidate) => candidate.textContent?.replace(/\\s+/gu, ' ').trim() === 'New blank',
+    );
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!blankThemeStarted) throw new Error('The blank-theme action was unavailable.');
+  await waitForRenderer(
+    `(() => {
+      const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+        (candidate) => candidate.textContent === 'Theme',
+      );
+      const section = heading?.closest('.inspector-section');
+      const select = section?.querySelector('select');
+      const name = section?.querySelector('.theme-card input[maxlength="120"]');
+      return select instanceof HTMLSelectElement &&
+        select.options.length === ${themeCountBeforeBlankCreation + 1} &&
+        name instanceof HTMLInputElement &&
+        name.value === 'New theme';
+    })()`,
+    'Blank theme creation',
+  );
+  const blankThemeId = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Theme',
+    );
+    const select = heading?.closest('.inspector-section')?.querySelector('select');
+    return select instanceof HTMLSelectElement ? select.value : null;
+  })()`);
+  if (typeof blankThemeId !== 'string' || blankThemeId === '') {
+    throw new Error('The blank theme identity was unavailable.');
+  }
+  const appliedBlankTheme = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Theme',
+    );
+    const section = heading?.closest('.inspector-section');
+    const button = [...(section?.querySelectorAll('button') ?? [])].find(
+      (candidate) =>
+        candidate.textContent?.replace(/\\s+/gu, ' ').trim() === 'Apply to presentation',
+    );
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!appliedBlankTheme) throw new Error('The deck-wide theme action was unavailable.');
+  await waitForRenderer(
+    `(async () => {
+      const initialized = await window.htmllelujah.initialize();
+      return initialized.ok &&
+        initialized.value.session.snapshot.document.masters.length > 0 &&
+        initialized.value.session.snapshot.document.masters.every(
+          (master) => master.themeId === ${JSON.stringify(blankThemeId)},
+        ) &&
+        document.querySelector('.toast-success')?.textContent?.includes(
+          'applied to the full presentation',
+        ) === true;
+    })()`,
+    'Blank theme applied across the full presentation',
+  );
+
+  const openedCustomPageFormat = await evaluate(`(() => {
     const heading = [...document.querySelectorAll('.inspector-section h3')].find(
       (candidate) => candidate.textContent === 'Page format',
     );
     const select = heading?.closest('.inspector-section')?.querySelector('select');
     if (!(select instanceof HTMLSelectElement)) return false;
     const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
-    setter?.call(select, 'standard');
+    setter?.call(select, 'custom');
     select.dispatchEvent(new Event('change', { bubbles: true }));
     return true;
   })()`);
-  if (!changedPageFormat) throw new Error('The page-format control was unavailable.');
+  if (!openedCustomPageFormat) throw new Error('The custom page-format control was unavailable.');
   await waitForRenderer(
-    `document.querySelector('[data-page-width-pt="720"][data-page-height-pt="540"]') !== null`,
-    'Standard 4:3 page format',
+    `(() => {
+      const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+        (candidate) => candidate.textContent === 'Page format',
+      );
+      const section = heading?.closest('.inspector-section');
+      return section?.querySelectorAll('input[type="number"]').length === 2 &&
+        [...(section?.querySelectorAll('button') ?? [])].some(
+          (button) => button.textContent?.trim() === 'Apply custom size' && !button.disabled,
+        );
+    })()`,
+    'Custom page-size controls enabled',
   );
-  await click('[aria-label="Undo"]', 'Undo page-format change');
+  const customDimensionsEntered = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Page format',
+    );
+    const inputs = [
+      ...(heading?.closest('.inspector-section')?.querySelectorAll('input[type="number"]') ?? []),
+    ];
+    if (
+      !(inputs[0] instanceof HTMLInputElement) ||
+      !(inputs[1] instanceof HTMLInputElement)
+    ) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    setter?.call(inputs[0], '1000');
+    inputs[0].dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+    setter?.call(inputs[1], '600');
+    inputs[1].dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+    return true;
+  })()`);
+  if (!customDimensionsEntered) throw new Error('The custom dimensions were unavailable.');
+  await waitForRenderer(
+    `(() => {
+      const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+        (candidate) => candidate.textContent === 'Page format',
+      );
+      const inputs = [
+        ...(heading?.closest('.inspector-section')?.querySelectorAll('input[type="number"]') ?? []),
+      ];
+      return inputs[0]?.value === '1000' && inputs[1]?.value === '600';
+    })()`,
+    'Custom page dimensions entered',
+  );
+  const customPageApplied = await evaluate(`(() => {
+    const heading = [...document.querySelectorAll('.inspector-section h3')].find(
+      (candidate) => candidate.textContent === 'Page format',
+    );
+    const button = [...(heading?.closest('.inspector-section')?.querySelectorAll('button') ?? [])]
+      .find((candidate) => candidate.textContent?.trim() === 'Apply custom size');
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!customPageApplied) throw new Error('The custom page size could not be applied.');
+  await waitForRenderer(
+    `document.querySelector('[data-page-width-pt="1000"][data-page-height-pt="600"]') !== null`,
+    'Custom 1000 × 600 page format',
+  );
+  await click('[aria-label="Undo"]', 'Undo custom page-format change');
   await waitForRenderer(
     `document.querySelector('[data-page-width-pt="960"][data-page-height-pt="540"]') !== null`,
-    'Restored widescreen page format',
+    'Restored widescreen page format after custom size',
   );
   const layoutCountBefore = await evaluate(`(() => {
     const heading = [...document.querySelectorAll('.inspector-section h3')].find(
@@ -2179,15 +2710,11 @@ try {
     const releaseProbeElementCount = await evaluate(
       `document.querySelectorAll('[data-canvas-element-id]').length`,
     );
-    const releaseProbeStarted = await evaluate(`(() => {
-      const button = document.querySelector('button[aria-label="Add shape"]');
-      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
-      button.click();
-      return true;
-    })()`);
-    if (!releaseProbeStarted) {
-      throw new Error('The post-Cancel close-release probe could not start a reversible edit.');
-    }
+    await openCatalogAndSelect(
+      '[aria-label="Add shape"]',
+      'shapes',
+      'Post-Cancel close-release shape',
+    );
     await waitForRenderer(
       `document.querySelectorAll('[data-canvas-element-id]').length === ${releaseProbeElementCount + 1}`,
       'Post-Cancel edit admitted before the old close watchdog',
@@ -2317,7 +2844,24 @@ try {
   );
 
   const concurrentCloseName = 'Concurrent agent edit retained after stale Discard consent';
-  closeRaceRpc = new LocalRpcClient(path.join(userData, 'mcp', 'endpoint-v1.json'));
+  const trustedClientRegistry = JSON.parse(
+    await readFile(path.join(userData, 'mcp', 'trusted-clients-v1.json'), 'utf8'),
+  );
+  const trustedClientCredential = JSON.parse(
+    await readFile(
+      path.join(
+        userData,
+        'mcp',
+        'client-credentials-v1',
+        `${trustedClientRegistry.bootstrapClientId}.json`,
+      ),
+      'utf8',
+    ),
+  );
+  closeRaceRpc = new LocalRpcClient(
+    path.join(userData, 'mcp', 'endpoint-v2.json'),
+    trustedClientCredential,
+  );
   const closeRaceDocuments = await closeRaceRpc.listOpenDocuments();
   const closeRaceDocument = closeRaceDocuments.at(0);
   if (
@@ -2395,7 +2939,7 @@ try {
     activeInspectorTab:
       document.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim() ?? '',
   }))()`);
-  if (finalState.elementCount !== initial.elementCount + 6 || finalState.selectedCount !== 1) {
+  if (finalState.elementCount !== initial.elementCount + 7 || finalState.selectedCount !== 1) {
     throw new Error('The user edit was not preserved after undo and redo.');
   }
   if (finalState.openDialogs !== 0 || finalState.activeInspectorTab !== 'Properties') {
@@ -2444,6 +2988,13 @@ try {
     rendererTitle: initial.title,
     initial,
     final: finalState,
+    catalogSelections: {
+      slideShape: insertedShapeVisual,
+      slideIcon: insertedIconVisual,
+      slideTwemoji: insertedEmojiVisual,
+      slideCircleFlag: insertedFlagVisual,
+      masterShape: insertedMasterShapeVisual,
+    },
     checks: [
       'real Electron renderer opened through the secure app protocol',
       ...(executable === undefined
@@ -2452,15 +3003,22 @@ try {
       'one clean warm-up and three clean measured launches reused the same user-data profile',
       'all measured launches started with zero recovery candidates and closed without residue',
       'essential editor surfaces rendered',
-      'shape insertion, undo, and redo converged',
+      'visual picker selection preceded shape insertion, undo, and redo',
+      'right-click object menu exposed copy, cut, paste, duplicate, lock, and delete',
+      'the Arrange text-box duplicate action completed without an error and undid cleanly',
+      'bounded Ctrl+C/Ctrl+V object clipboard events pasted and undid cleanly',
       'native image chooser imported and decoded one image in the editor with atomic undo and redo',
       'native table insertion and literal TSV paste undid and redid cleanly',
-      'native icon, Unicode flag, and connector insertions rendered',
+      'offline icon, Twemoji, circle-flag, and native connector insertions rendered',
       'File menu opened and closed',
-      'Codex MCP dialog opened and closed',
+      'persistent Codex MCP identity and ordinary approval-free authoring were explained',
       'LAN collaboration dialog opened and closed',
-      'page format changed through the Design inspector and undid cleanly',
-      'master and layout scopes disabled slide-only toolbar and menu mutations',
+      'custom page dimensions applied through enabled controls and undid cleanly',
+      'a blank theme was created by hand and applied across every master',
+      'master and layout scopes enabled the shared authoring toolbar and Edit mutations',
+      'master and layout insertions exposed their full Properties inspectors',
+      'centered dynamic page numbering and a locked text watermark were added to the master',
+      'a locked master object resisted both direct and keyboard deletion',
       'master object drag, resize, rotate, undo, and selection retention stayed inside the master',
       'layout placeholder resize, undo, and selection retention stayed inside the layout',
       'new slide instantiated title/body frames from the active layout exactly',

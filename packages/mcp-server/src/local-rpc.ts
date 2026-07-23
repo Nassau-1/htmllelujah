@@ -10,18 +10,22 @@ import { z } from 'zod';
 
 import type {
   CommitProposalInput,
+  DesignContextInput,
   ExportDocumentInput,
   ImportAssetInput,
   ProposeCommandsInput,
+  ProposeDesignOperationsInput,
   TransactionTargetInput,
 } from './contracts.js';
 import {
   approvalIdSchema,
   commitProposalSchema,
+  designContextSchema,
   documentTargetSchema,
   exportDocumentSchema,
   importAssetSchema,
   proposeCommandsSchema,
+  proposeDesignOperationsSchema,
   slideTargetSchema,
   transactionTargetSchema,
 } from './contracts.js';
@@ -32,8 +36,17 @@ import {
   type McpPermissionGate,
   type SafeRecord,
 } from './service.js';
+import {
+  signTrustedClientChallenge,
+  trustedClientContext,
+  trustedClientCredentialSchema,
+  verifyTrustedClientChallenge,
+  type TrustedClientContext,
+  type TrustedClientCredential,
+  type TrustedClientProfile,
+} from './trusted-client.js';
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 const AUTH_TIMEOUT_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -48,7 +61,7 @@ const MIN_ROTATION_INTERVAL_MS = AUTH_TIMEOUT_MS;
 const MIN_DESCRIPTOR_LIFETIME_MS = MIN_ROTATION_LEAD_MS + MIN_ROTATION_INTERVAL_MS;
 
 export interface LocalRpcEndpointDescriptor {
-  readonly protocolVersion: 1;
+  readonly protocolVersion: 2;
   readonly pipeName: string;
   readonly secret: string;
   readonly instanceId: string;
@@ -60,7 +73,9 @@ export interface LocalRpcEndpointDescriptor {
 export interface LocalRpcServerHandle {
   readonly descriptor: LocalRpcEndpointDescriptor;
   readonly connectionCount: number;
+  readonly connectedClientIds: readonly string[];
   rotateCredentials(): Promise<LocalRpcEndpointDescriptor>;
+  disconnectClient(clientId: string): void;
   close(): Promise<void>;
 }
 
@@ -70,8 +85,10 @@ type RpcMethod =
   | 'getDocumentOutline'
   | 'getSlide'
   | 'getStyleCatalog'
+  | 'getDesignContext'
   | 'validateDocument'
   | 'proposeCommands'
+  | 'proposeDesignOperations'
   | 'commitProposal'
   | 'undoAgentTransaction'
   | 'importAsset'
@@ -102,8 +119,10 @@ const allowedMethods = new Set<RpcMethod>([
   'getDocumentOutline',
   'getSlide',
   'getStyleCatalog',
+  'getDesignContext',
   'validateDocument',
   'proposeCommands',
+  'proposeDesignOperations',
   'commitProposal',
   'undoAgentTransaction',
   'importAsset',
@@ -147,8 +166,12 @@ const constantEqualHex = (left: string, right: string): boolean => {
   return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
 };
 
-const transcript = (clientNonce: string, serverNonce: string): string =>
-  `htmllelujah-rpc-v1|${clientNonce}|${serverNonce}`;
+const transcript = (
+  instanceId: string,
+  clientId: string,
+  clientNonce: string,
+  serverNonce: string,
+): string => `htmllelujah-rpc-v2|${instanceId}|${clientId}|${clientNonce}|${serverNonce}`;
 
 const writeFrame = (socket: Socket, value: unknown): void => {
   const frame = `${JSON.stringify(value)}\n`;
@@ -223,9 +246,19 @@ const requirePermissionDecision = (value: unknown): boolean => {
   return value;
 };
 
+const requireClientCapability = (
+  client: TrustedClientContext,
+  capability: 'documents.read.visible' | 'documents.edit.ordinary',
+): void => {
+  if (!client.capabilities.includes(capability)) {
+    throw new McpSafeError('MCP_UNAUTHORIZED', 'The trusted client capability is not granted.');
+  }
+};
+
 const dispatch = async (
   service: HtmllelujahMcpService,
   permissions: McpPermissionGate,
+  client: TrustedClientContext,
   method: RpcMethod,
   params: unknown,
 ): Promise<unknown> => {
@@ -236,49 +269,80 @@ const dispatch = async (
     }
     case 'listOpenDocuments': {
       parseParams(emptyParamsSchema, params);
+      requireClientCapability(client, 'documents.read.visible');
       return service.listOpenDocuments();
     }
     case 'getDocumentOutline': {
       const input = parseParams(documentTargetSchema, params);
+      requireClientCapability(client, 'documents.read.visible');
       return service.getDocumentOutline(input.documentId);
     }
     case 'getSlide': {
       const input = parseParams(slideTargetSchema, params);
+      requireClientCapability(client, 'documents.read.visible');
       return service.getSlide(input.documentId, input.slideId);
     }
     case 'getStyleCatalog': {
       const input = parseParams(documentTargetSchema, params);
+      requireClientCapability(client, 'documents.read.visible');
       return service.getStyleCatalog(input.documentId);
+    }
+    case 'getDesignContext': {
+      const input = parseParams(designContextSchema, params);
+      requireClientCapability(client, 'documents.read.visible');
+      return service.getDesignContext(input);
     }
     case 'validateDocument': {
       const input = parseParams(documentTargetSchema, params);
+      requireClientCapability(client, 'documents.read.visible');
       return service.validateDocument(input.documentId);
     }
-    case 'proposeCommands':
-      return service.proposeCommands(parseParams(proposeCommandsSchema, params));
-    case 'commitProposal':
-      return service.commitProposal(parseParams(commitProposalSchema, params));
-    case 'undoAgentTransaction':
-      return service.undoAgentTransaction(parseParams(transactionTargetSchema, params));
-    case 'importAsset':
-      return service.importAsset(parseParams(importAssetSchema, params));
-    case 'exportDocument':
-      return service.exportDocument(parseParams(exportDocumentSchema, params));
+    case 'proposeCommands': {
+      requireClientCapability(client, 'documents.edit.ordinary');
+      return service.proposeCommands(parseParams(proposeCommandsSchema, params), client);
+    }
+    case 'proposeDesignOperations': {
+      requireClientCapability(client, 'documents.edit.ordinary');
+      return service.proposeDesignOperations(
+        parseParams(proposeDesignOperationsSchema, params),
+        client,
+      );
+    }
+    case 'commitProposal': {
+      requireClientCapability(client, 'documents.edit.ordinary');
+      return service.commitProposal(parseParams(commitProposalSchema, params), client);
+    }
+    case 'undoAgentTransaction': {
+      requireClientCapability(client, 'documents.edit.ordinary');
+      return service.undoAgentTransaction(parseParams(transactionTargetSchema, params), client);
+    }
+    case 'importAsset': {
+      requireClientCapability(client, 'documents.edit.ordinary');
+      return service.importAsset(parseParams(importAssetSchema, params), client);
+    }
+    case 'exportDocument': {
+      requireClientCapability(client, 'documents.read.visible');
+      return service.exportDocument(parseParams(exportDocumentSchema, params), client);
+    }
     case 'collaborationStatus': {
       const input = parseParams(documentTargetSchema, params);
+      requireClientCapability(client, 'documents.read.visible');
       return service.collaborationStatus(input.documentId);
     }
     case 'canRead': {
       const input = parseParams(documentTargetSchema, params);
-      return requirePermissionDecision(await permissions.canRead(input.documentId));
+      if (!client.capabilities.includes('documents.read.visible')) return false;
+      return requirePermissionDecision(await permissions.canRead(input.documentId, client));
     }
     case 'canEdit': {
       const input = parseParams(documentTargetSchema, params);
-      return requirePermissionDecision(await permissions.canEdit(input.documentId));
+      if (!client.capabilities.includes('documents.edit.ordinary')) return false;
+      return requirePermissionDecision(await permissions.canEdit(input.documentId, client));
     }
     case 'consumeApproval': {
       const input = parseParams(consumeApprovalSchema, params);
-      return requirePermissionDecision(await permissions.consumeApproval(input));
+      requireClientCapability(client, 'documents.edit.ordinary');
+      return requirePermissionDecision(await permissions.consumeApproval(input, client));
     }
   }
 };
@@ -306,14 +370,20 @@ const handleServerSocket = (
   service: HtmllelujahMcpService,
   permissions: McpPermissionGate,
   resolveSecret: (instanceId: string) => string | undefined,
+  resolveTrustedClient: (clientId: string) => TrustedClientProfile | undefined,
   usedNonces: Set<string>,
+  onAuthenticated: (clientId: string) => void,
 ): void => {
   socket.setNoDelay(true);
   socket.setTimeout(AUTH_TIMEOUT_MS, () => socket.destroy());
   let state: 'hello' | 'authenticate' | 'ready' = 'hello';
   let clientNonce = '';
   let serverNonce = '';
+  let instanceId = '';
+  let clientId = '';
   let connectionSecret: string | undefined;
+  let clientProfile: TrustedClientProfile | undefined;
+  let client: TrustedClientContext | undefined;
   let requestWindowStarted = Date.now();
   let requestCount = 0;
 
@@ -321,50 +391,70 @@ const handleServerSocket = (
     if (state === 'hello') {
       if (
         !isRecord(value) ||
-        Object.keys(value).length !== 3 ||
-        Object.keys(value).some((key) => !['type', 'clientNonce', 'instanceId'].includes(key)) ||
+        Object.keys(value).length !== 4 ||
+        Object.keys(value).some(
+          (key) => !['type', 'clientNonce', 'instanceId', 'clientId'].includes(key),
+        ) ||
         value.type !== 'hello' ||
         typeof value.clientNonce !== 'string' ||
         !/^[0-9a-f]{64}$/u.test(value.clientNonce) ||
         typeof value.instanceId !== 'string' ||
+        typeof value.clientId !== 'string' ||
         usedNonces.has(value.clientNonce)
       ) {
         socket.destroy();
         return;
       }
       connectionSecret = resolveSecret(value.instanceId);
-      if (connectionSecret === undefined) {
+      clientProfile = resolveTrustedClient(value.clientId);
+      if (connectionSecret === undefined || clientProfile === undefined) {
         socket.destroy();
         return;
       }
+      instanceId = value.instanceId;
+      clientId = value.clientId;
       clientNonce = value.clientNonce;
       usedNonces.add(clientNonce);
       if (usedNonces.size > 4096) usedNonces.delete(usedNonces.values().next().value ?? '');
       serverNonce = randomBytes(32).toString('hex');
-      const proof = hmac(connectionSecret, `server|${transcript(clientNonce, serverNonce)}`);
+      const proof = hmac(
+        connectionSecret,
+        `server|${transcript(instanceId, clientId, clientNonce, serverNonce)}`,
+      );
       writeFrame(socket, { type: 'challenge', serverNonce, proof });
       state = 'authenticate';
       return;
     }
     if (state === 'authenticate') {
-      if (connectionSecret === undefined) {
+      if (connectionSecret === undefined || clientProfile === undefined) {
         socket.destroy();
         return;
       }
-      const expected = hmac(connectionSecret, `client|${transcript(clientNonce, serverNonce)}`);
+      const challenge = transcript(instanceId, clientId, clientNonce, serverNonce);
       if (
         !isRecord(value) ||
-        Object.keys(value).some((key) => !['type', 'proof'].includes(key)) ||
+        Object.keys(value).length !== 2 ||
+        Object.keys(value).some((key) => !['type', 'signature'].includes(key)) ||
         value.type !== 'authenticate' ||
-        typeof value.proof !== 'string' ||
-        !constantEqualHex(value.proof, expected)
+        typeof value.signature !== 'string' ||
+        !verifyTrustedClientChallenge(clientProfile, challenge, value.signature)
       ) {
         socket.destroy();
         return;
       }
+      const currentProfile = resolveTrustedClient(clientId);
+      if (
+        currentProfile === undefined ||
+        currentProfile.publicKeySpki !== clientProfile.publicKeySpki
+      ) {
+        socket.destroy();
+        return;
+      }
+      client = trustedClientContext(currentProfile);
       state = 'ready';
       socket.setTimeout(0);
       writeFrame(socket, { type: 'ready', protocolVersion: PROTOCOL_VERSION });
+      onAuthenticated(clientId);
       return;
     }
 
@@ -392,8 +482,18 @@ const handleServerSocket = (
       writeFrame(socket, response);
       return;
     }
+    const currentProfile = resolveTrustedClient(clientId);
+    if (
+      client === undefined ||
+      currentProfile === undefined ||
+      currentProfile.publicKeySpki !== clientProfile?.publicKeySpki
+    ) {
+      socket.destroy();
+      return;
+    }
+    client = trustedClientContext(currentProfile);
     try {
-      const result = await dispatch(service, permissions, request.method, request.params);
+      const result = await dispatch(service, permissions, client, request.method, request.params);
       writeFrame(socket, {
         type: 'response',
         id: request.id,
@@ -475,6 +575,7 @@ const listen = async (server: Server, pipeName: string): Promise<void> =>
 export const startLocalRpcServer = async (input: {
   readonly service: HtmllelujahMcpService;
   readonly permissions?: McpPermissionGate | undefined;
+  readonly resolveTrustedClient: (clientId: string) => TrustedClientProfile | undefined;
   readonly descriptorPath: string;
   readonly lifetimeMs?: number | undefined;
   readonly rotationLeadMs?: number | undefined;
@@ -498,7 +599,7 @@ export const startLocalRpcServer = async (input: {
   const createDescriptor = (): LocalRpcEndpointDescriptor => {
     const createdAtMs = Date.now();
     return {
-      protocolVersion: 1,
+      protocolVersion: 2,
       pipeName,
       secret: randomBytes(32).toString('hex'),
       instanceId: randomUUID(),
@@ -523,11 +624,23 @@ export const startLocalRpcServer = async (input: {
   };
   const usedNonces = new Set<string>();
   const sockets = new Set<Socket>();
+  const socketClients = new Map<Socket, string>();
   const permissions = input.permissions ?? FAIL_CLOSED_PERMISSION_GATE;
   const server = createServer((socket) => {
     sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-    handleServerSocket(socket, input.service, permissions, resolveSecret, usedNonces);
+    socket.once('close', () => {
+      sockets.delete(socket);
+      socketClients.delete(socket);
+    });
+    handleServerSocket(
+      socket,
+      input.service,
+      permissions,
+      resolveSecret,
+      input.resolveTrustedClient,
+      usedNonces,
+      (clientId) => socketClients.set(socket, clientId),
+    );
   });
   await listen(server, pipeName);
   try {
@@ -599,6 +712,9 @@ export const startLocalRpcServer = async (input: {
     get connectionCount() {
       return sockets.size;
     },
+    get connectedClientIds() {
+      return [...new Set(socketClients.values())];
+    },
     async rotateCredentials() {
       if (rotationTimer !== undefined) {
         clearTimeout(rotationTimer);
@@ -615,6 +731,11 @@ export const startLocalRpcServer = async (input: {
           scheduleRotation(retryMs);
         }
         throw error;
+      }
+    },
+    disconnectClient(clientId) {
+      for (const [socket, candidateId] of socketClients) {
+        if (candidateId === clientId) socket.destroy();
       }
     },
     async close() {
@@ -644,7 +765,7 @@ const parseDescriptor = (value: unknown): LocalRpcEndpointDescriptor => {
   ]);
   if (
     Object.keys(value).some((key) => !allowed.has(key)) ||
-    value.protocolVersion !== 1 ||
+    value.protocolVersion !== 2 ||
     typeof value.pipeName !== 'string' ||
     typeof value.secret !== 'string' ||
     !/^[0-9a-f]{64}$/u.test(value.secret) ||
@@ -714,7 +835,14 @@ export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate 
   private removeReader: (() => void) | undefined;
   private closed = false;
 
-  public constructor(private readonly descriptorPath: string) {}
+  private readonly credential: TrustedClientCredential;
+
+  public constructor(
+    private readonly descriptorPath: string,
+    credential: TrustedClientCredential,
+  ) {
+    this.credential = trustedClientCredentialSchema.parse(credential);
+  }
 
   public async connect(): Promise<void> {
     if (this.closed) {
@@ -808,16 +936,26 @@ export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate 
             }
             const expected = hmac(
               descriptor.secret,
-              `server|${transcript(clientNonce, value.serverNonce)}`,
+              `server|${transcript(
+                descriptor.instanceId,
+                this.credential.clientId,
+                clientNonce,
+                value.serverNonce,
+              )}`,
             );
             if (!constantEqualHex(value.proof, expected)) {
               throw new Error('Invalid endpoint proof.');
             }
-            const proof = hmac(
-              descriptor.secret,
-              `client|${transcript(clientNonce, value.serverNonce)}`,
+            const signature = signTrustedClientChallenge(
+              this.credential,
+              transcript(
+                descriptor.instanceId,
+                this.credential.clientId,
+                clientNonce,
+                value.serverNonce,
+              ),
             );
-            writeFrame(socket, { type: 'authenticate', proof });
+            writeFrame(socket, { type: 'authenticate', signature });
             state = 'ready';
             return;
           }
@@ -826,7 +964,7 @@ export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate 
             Object.keys(value).length !== 2 ||
             Object.keys(value).some((key) => !['type', 'protocolVersion'].includes(key)) ||
             value.type !== 'ready' ||
-            value.protocolVersion !== 1
+            value.protocolVersion !== 2
           ) {
             throw new Error('Invalid readiness frame.');
           }
@@ -842,7 +980,12 @@ export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate 
           socket.destroy();
         }
       });
-      writeFrame(socket, { type: 'hello', clientNonce, instanceId: descriptor.instanceId });
+      writeFrame(socket, {
+        type: 'hello',
+        clientNonce,
+        instanceId: descriptor.instanceId,
+        clientId: this.credential.clientId,
+      });
     });
     socket.once('close', () => this.rejectAll());
     socket.once('error', () => this.rejectAll());
@@ -958,12 +1101,20 @@ export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate 
   public async getStyleCatalog(documentId: string): Promise<SafeRecord> {
     return (await this.call('getStyleCatalog', { documentId })) as SafeRecord;
   }
+  public async getDesignContext(input: DesignContextInput): Promise<SafeRecord> {
+    return (await this.call('getDesignContext', input)) as SafeRecord;
+  }
   public async validateDocument(documentId: string): Promise<SafeRecord> {
     return (await this.call('validateDocument', { documentId })) as SafeRecord;
   }
   public async proposeCommands(input: ProposeCommandsInput) {
     return (await this.call('proposeCommands', input)) as Awaited<
       ReturnType<HtmllelujahMcpService['proposeCommands']>
+    >;
+  }
+  public async proposeDesignOperations(input: ProposeDesignOperationsInput) {
+    return (await this.call('proposeDesignOperations', input)) as Awaited<
+      ReturnType<HtmllelujahMcpService['proposeDesignOperations']>
     >;
   }
   public async commitProposal(input: CommitProposalInput) {
@@ -1027,6 +1178,7 @@ export interface DescriptorStdioStreams {
  */
 export const runHtmllelujahMcpStdioFromDescriptor = async (
   descriptorPath: string,
+  credential: TrustedClientCredential,
   streams: DescriptorStdioStreams = {},
 ): Promise<void> => {
   if (!path.isAbsolute(descriptorPath)) {
@@ -1035,7 +1187,7 @@ export const runHtmllelujahMcpStdioFromDescriptor = async (
 
   const stdin = streams.stdin ?? process.stdin;
   const stdout = streams.stdout ?? process.stdout;
-  const rpc = new LocalRpcClient(descriptorPath);
+  const rpc = new LocalRpcClient(descriptorPath, credential);
   const mcp = createHtmllelujahMcpServer(rpc, rpc);
   const transport = new StdioServerTransport(stdin, stdout);
 

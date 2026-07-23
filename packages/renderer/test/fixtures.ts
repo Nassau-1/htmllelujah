@@ -294,6 +294,7 @@ const elements: readonly RenderElement[] = [
   icon('icon-check', 'local', 'check', 18),
   icon('icon-flag', 'flags', 'fr', 72),
   icon('icon-unknown', 'local', 'remote-logo', 126),
+  icon('icon-twemoji', 'twemoji', '1f600', 180),
   nestedGroup,
   placeholder,
   hiddenElement,

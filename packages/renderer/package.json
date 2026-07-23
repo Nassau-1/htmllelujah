@@ -17,6 +17,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "catalogs:check": "node scripts/generate-catalogs.mjs --check",
+    "catalogs:generate": "node scripts/generate-catalogs.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json"
   },
@@ -25,8 +27,11 @@
     "react-dom": "19.2.7"
   },
   "devDependencies": {
+    "@twemoji/svg": "15.0.0",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
+    "circle-flags": "2.8.3",
+    "emojibase-data": "17.0.0",
     "typescript": "7.0.2",
     "vitest": "4.1.10"
   }

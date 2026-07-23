@@ -1,10 +1,12 @@
 # Roadmap and TODO
 
-Status: **V1 usability remediation in progress**, last reviewed 2026-07-23.
+Status: **V1 source remediation converging; installed-candidate verification pending**,
+last reviewed 2026-07-23.
 
-The installed preview is available for hands-on feedback, but the reported authoring
-and agent-access gaps below block a usable V1. Publication and another long
-release-candidate campaign remain deferred until this remediation converges.
+The current working tree contains the source checkpoints described below. The installed
+preview remains useful for feedback, but it does not represent these changes until the
+focused opened-app smoke, final repository verification, Windows packaging, and durable
+installation gates are complete.
 
 ## Hands-on authoring and agent remediation
 
@@ -15,70 +17,117 @@ Authoritative scope, sequencing, and acceptance evidence:
 
 - [ ] Add a contextual object menu on right-click with cut, copy, paste, duplicate,
       delete, lock, visibility, layer, grouping, and relevant insert commands.
-- [ ] Add object-level `Ctrl+C`, `Ctrl+X`, and `Ctrl+V`, including safe external text,
-      rich-text, image, and TSV routing.
-- [ ] Fix duplication of placeholder-bound text boxes by detaching copied bindings,
+      Checkpoint complete: pointer right-click and the keyboard context-menu gesture
+      open copy, cut, paste, duplicate, layer, lock, visibility, grouping, and delete;
+      focus enters the menu, arrow/Home/End/Escape navigation works, and focus returns
+      to the canvas. Contextual insertion shortcuts remain an optional follow-up.
+- [x] Add object-level `Ctrl+C`, `Ctrl+X`, and `Ctrl+V` with bounded private object
+      serialization, fresh identifiers, plain-text fallback, and detached
+      out-of-selection connector bindings.
+- [ ] Complete external clipboard routing for rich text, pasted images, and TSV, and
+      wire the safe rejection path for cross-presentation images whose local asset
+      bytes are not present in the destination deck.
+      Safe cross-presentation rejection is wired, including images nested in groups;
+      same-presentation images remain pasteable and connector bindings outside the
+      copied selection are detached. External image-byte routing remains open.
+- [x] Fix duplication of placeholder-bound text boxes by detaching copied bindings,
       generating every nested identifier afresh, and updating selection only after a
       successful transaction.
-- [ ] Separate the application menu from the authoring toolbar so Edit, View, Insert,
+- [x] Separate the application menu from the authoring toolbar so Edit, View, Insert,
       Arrange, and Help expose real command groups and shortcut discovery rather than
       repeating the same insertion buttons.
 
 ### Slides, layouts, and masters
 
-- [ ] Make the full valid insertion palette available on slides, layouts, and masters:
+- [x] Make the full valid insertion palette available on slides, layouts, and masters:
       text, shape, image, table, connector, local icon, Twemoji, and circular flag.
-- [ ] Make transform, align, distribute, layer, duplicate, delete, visibility, and lock
+- [x] Make transform, align, distribute, layer, duplicate, delete, visibility, and lock
       operate consistently on the active slide/layout/master surface.
-- [ ] Make layout and master updates authoritative for every inheriting slide while
+      The active-container adapter routes the shared transform and arrange commands to
+      all three surfaces, and every direct template-object delete path respects locks.
+- [x] Route rich-text, shape, table, connector, image, and icon property editing to the
+      active slide, layout, or master instead of silently falling back to slide mode.
+- [x] Make layout and master updates authoritative for every inheriting slide while
       preserving explicit supported local overrides.
-- [ ] Expose persistent locks for layout and master furniture; locked inherited
+- [x] Expose persistent locks for layout and master furniture; locked inherited
       objects must not be editable from slide mode.
+      Lock state is canonical, inherited by projections, exposed in layout/master
+      controls, and honored by shared transforms, properties, keyboard commands, list
+      actions, image replacement, and direct delete paths.
 
 ### Themes and page furniture
 
-- [ ] Add explicit creation of blank and derived themes rather than hiding creation
+- [x] Add explicit creation of blank and derived themes rather than hiding creation
       behind a copy-only action.
-- [ ] Add one-transaction theme enforcement so switching theme changes all managed
+- [x] Add one-transaction theme enforcement so switching theme changes all managed
       fonts and colors across text, shapes, connectors, icons, tables, backgrounds,
       masters, layouts, and slides.
-- [ ] Distinguish inherited, theme-managed, and local style values and add reset to
+      Checkpoint complete: one strict `theme.enforce-deck` command now handles the
+      complete deck atomically and remains valid beyond 100 styled objects, with
+      standard revision checks, durable history, collaboration conflicts, and undo.
+- [x] Distinguish inherited, theme-managed, and local style values and add reset to
       theme/layout actions.
-- [ ] Enable bounded custom page width and height.
-- [ ] Add dynamic current-page, page-count, deck-title, date, and time fields.
-- [ ] Add master-level page numbering with left, center, and right placement.
-- [ ] Add editable text and image watermarks that default to locked master furniture.
+      The Properties panel reports style authority and exposes reset-to-theme and
+      reset-to-layout actions. The canonical reset preserves content, geometry,
+      identifiers, bindings, and unrelated styling.
+- [x] Enable bounded custom page width and height.
+- [x] Add dynamic current-page, page-count, deck-title, date, and time fields.
+- [x] Add master-level page numbering with left, center, and right placement.
+- [x] Add editable text and image watermarks that default to locked master furniture.
+      Image asset registration and final locked watermark creation share one atomic,
+      single-Undo transaction.
 
 ### Direct content choice and offline catalogs
 
-- [ ] Replace rectangle-first shape insertion with a visual pre-insertion shape
+- [x] Replace rectangle-first shape insertion with a visual pre-insertion shape
       chooser.
-- [ ] Add a searchable pre-insertion local-icon chooser.
-- [ ] Bundle a searchable offline Twemoji catalog with stable Unicode/code-point
+- [x] Add a searchable pre-insertion local-icon chooser.
+- [x] Bundle a searchable offline Twemoji catalog with stable Unicode/code-point
       identity and required attribution.
-- [ ] Replace operating-system Unicode flags with bundled searchable Circle Flags SVG
+      The renderer bundles 3,720 pinned vectors and English/French metadata behind the
+      closed `twemoji:<code-points>` identity.
+- [x] Replace operating-system Unicode flags with bundled searchable Circle Flags SVG
       artwork and stable two-letter country codes.
-- [ ] Keep catalog rendering deterministic across editor, thumbnail, presentation,
+      The renderer bundles 265 pinned circular flags behind
+      `circle-flags:<alpha-2>` identities; legacy `flag`/`flags` values remain readable.
+- [x] Keep catalog rendering deterministic across editor, thumbnail, presentation,
       standalone HTML, PDF, save/reopen, and collaboration without any CDN fallback.
+      Source-level renderer, archive, and collaboration coverage is complete. The final
+      opened-app smoke remains a separate delivery gate.
 
 ### Persistent trusted local agents
 
 - [ ] Replace per-edit one-time approval with persisted current-user trusted-client
       grants scoped to read-only, ordinary reversible editing, or extended actions.
-- [ ] Let trusted local agents inspect the authoritative page, theme, master, layout,
+      Checkpoint complete: the packaged compatibility client has a persistent Ed25519
+      identity, server-derived actor, and closed read/edit capability set. Explicit
+      user-approved named-profile enrollment and profile management remain.
+- [x] Let trusted local agents inspect the authoritative page, theme, master, layout,
       placeholder, lock, asset-metadata, slide, revision, constraint, and validation
       context.
-- [ ] Add design-aware typed operations for themes, masters, layouts, page furniture,
+      `documents_get_design_context` now returns the canonical inheritance chain and
+      paginated authoritative/projection element provenance with effective locks.
+- [x] Add design-aware typed operations for themes, masters, layouts, page furniture,
       and ordinary slide editing.
+      Strict page/theme/master/layout/slide-layout and deck-wide theme-enforcement
+      operations expand through the canonical command engine; ordinary slide edits use
+      the same typed proposal and transaction path.
 - [ ] Keep explicit approval for imports, exports, overwrites, destructive bulk
       replacement, trust changes, and external targets.
+      Authenticated-client binding is complete for destructive commit, undo, import,
+      and export. Overwrite, trust-change, and external-target UX remain to be closed.
 - [ ] Show and revoke trusted clients and retain attributable transaction-level undo.
+      Persistent backend revocation and `mcp-client:<uuid>` attribution are complete;
+      visible management and audit history remain.
 
 ### Verification discipline
 
-- [ ] Run focused unit/integration checks for each completed remediation checkpoint.
+- [x] Run focused code-level unit/integration checks for completed remediation
+      checkpoints; these do not replace the final repository or opened-app gates.
 - [ ] Run one consolidated opened-Electron smoke covering all reported flows.
 - [ ] Run one final complete `pnpm verify` after the implementation has converged.
+- [ ] Build the refreshed Windows x64 candidate and durably install it on this machine
+      after the opened-app smoke and final verification pass.
 - [ ] Do not repeat the 30-minute LAN or complete Windows candidate campaign between
       individual fixes; run them once on the final candidate.
 
@@ -97,9 +146,10 @@ Authoritative scope, sequencing, and acceptance evidence:
       recovery candidates, recovery-blob garbage collection, external-change
       detection, and atomic explicit save.
 - [x] Implement offline presentation, standalone HTML export, and PDF export.
-- [x] Implement authenticated local stdio MCP with typed proposal/commit, revision
-      conflicts, attribution, undo, bounded proposal/approval state, one-time
-      approvals, import, and export.
+- [x] Implement authenticated local stdio MCP with persistent trusted-client identity,
+      typed proposal/commit, revision conflicts, attribution, undo, bounded
+      proposal/approval state, explicit approval for sensitive operations, import, and
+      export.
 - [x] Implement encrypted private-LAN authoritative-host collaboration, optional
       discovery, soft text locks with an owner/read-only editor state, reconnect
       handling, detached guest recovery, and one shared-file writer.

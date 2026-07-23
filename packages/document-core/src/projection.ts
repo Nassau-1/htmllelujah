@@ -13,6 +13,12 @@ import type {
   TextStyleOverrides,
   Theme,
 } from './model.js';
+import {
+  createDynamicFieldValues,
+  resolveElementDynamicFields,
+  type DynamicFieldContext,
+  type DynamicFieldValues,
+} from './dynamic-fields.js';
 import { parseDeck } from './validation.js';
 
 export type ResolvedElementSource = 'master' | 'layout' | 'slide';
@@ -44,6 +50,8 @@ export interface ResolvedSlide {
 export interface ResolveSlideOptions {
   /** Include editable template placeholders for master/layout editing surfaces. */
   readonly includePlaceholders?: boolean | undefined;
+  /** Deterministic context for resolving page, title, date and time fields. */
+  readonly dynamicFields?: DynamicFieldContext | undefined;
 }
 
 export class SlideResolutionError extends Error {
@@ -143,6 +151,7 @@ const fixedElements = (
   source: 'master' | 'layout',
   theme: Theme,
   includePlaceholders: boolean,
+  dynamicFields: DynamicFieldValues,
 ): readonly ResolvedElement[] =>
   elements
     .map((element): Element | undefined => {
@@ -150,6 +159,7 @@ const fixedElements = (
       return stripTemplatePlaceholders(element);
     })
     .filter((element): element is Element => element !== undefined)
+    .map((element) => resolveElementDynamicFields(element, dynamicFields))
     .map((element) => ({
       source,
       element,
@@ -182,6 +192,7 @@ export const resolveSlideFromValidatedDocument = (
   const theme = document.themes.find((candidate) => candidate.id === master.themeId);
   if (theme === undefined)
     throw new SlideResolutionError(`Theme ${master.themeId} does not exist.`);
+  const dynamicFields = createDynamicFieldValues(document, slideId, options.dynamicFields);
 
   const placeholders = new Map<string, PlaceholderElement>();
   collectPlaceholders(master.elements, placeholders);
@@ -191,7 +202,10 @@ export const resolveSlideFromValidatedDocument = (
       element.placeholderBinding === undefined
         ? undefined
         : placeholders.get(element.placeholderBinding.placeholderId);
-    const projected = projectLocalElement(element, placeholder);
+    const projected = resolveElementDynamicFields(
+      projectLocalElement(element, placeholder),
+      dynamicFields,
+    );
     return {
       source: 'slide',
       element: projected,
@@ -212,8 +226,20 @@ export const resolveSlideFromValidatedDocument = (
     background: resolvedBackground(theme, document, master, layout, slide),
     guides: [...master.guides, ...layout.guides],
     elements: [
-      ...fixedElements(master.elements, 'master', theme, options.includePlaceholders ?? false),
-      ...fixedElements(layout.elements, 'layout', theme, options.includePlaceholders ?? false),
+      ...fixedElements(
+        master.elements,
+        'master',
+        theme,
+        options.includePlaceholders ?? false,
+        dynamicFields,
+      ),
+      ...fixedElements(
+        layout.elements,
+        'layout',
+        theme,
+        options.includePlaceholders ?? false,
+        dynamicFields,
+      ),
       ...local,
     ],
   };

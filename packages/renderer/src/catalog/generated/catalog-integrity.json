@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "packages/renderer/scripts/generate-catalogs.mjs",
+  "sources": [
+    {
+      "package": "@twemoji/svg",
+      "version": "15.0.0",
+      "packageLicense": "MIT",
+      "assetLicense": "CC-BY-4.0",
+      "integrity": "sha512-ZSPef2B6nBaYnfgdTbAy4jgW95o7pi2xPGwGCU+WMTxo7J6B1lMPTWwSq/wTuiMq+N0khQ90CcvYp1wFoQpo/w==",
+      "sourceTreeSha256": "2f3dbd7c3c6962dc31c22124912dd630b144b2d22a5e9a8b17230ee490429ba2"
+    },
+    {
+      "package": "circle-flags",
+      "version": "2.8.3",
+      "packageLicense": "MIT",
+      "assetLicense": "MIT",
+      "integrity": "sha512-62gm4tY7evXzNdLP+nFOzxEtCagbY4nSnrPNn/yOWFAvApvOWCAvyqL+NeLN+nfhGOGc4L+oSgEheqM3XE5w7g==",
+      "sourceTreeSha256": "d1902c7b77dfb23b0b49d83d20fa00183232e09db05f2cc70d06cffde5d6a2da"
+    },
+    {
+      "package": "emojibase-data",
+      "version": "17.0.0",
+      "packageLicense": "MIT",
+      "assetLicense": "MIT",
+      "integrity": "sha512-Yvgb5AWoHViHV/gq1qr5ZAarcBip+B27/ZLRsUJkbgAEaLlZ/fof9g882LTpmEpyhBNEC0m2SEmItljHsTygjA==",
+      "sourceTreeSha256": "9328d68426218e2dc867f66991feb5314c49685c1fdbb8ab27d01d74b70b7ae7"
+    }
+  ],
+  "catalogs": {
+    "twemoji": {
+      "count": 3720
+    },
+    "circleFlags": {
+      "count": 265
+    }
+  },
+  "generatedFiles": {
+    "twemoji-assets.ts": {
+      "sha256": "1dcb798c6eae75ce363a317915fd796af4f575066f23d073359c445f86127f9b"
+    },
+    "twemoji-catalog.ts": {
+      "sha256": "d881bf49b8a39d1d13882a065fe080dc2a953996b3bc27291f3f7d1d758133b7"
+    },
+    "circle-flag-assets.ts": {
+      "sha256": "c670cf81dae30b28a0ad287ac22d3c23abd1a645820efe1b7e14f829c5b72e2f"
+    },
+    "circle-flag-catalog.ts": {
+      "sha256": "79374cc1f43ce7c147e4c5304ef8cb1bae09fd45907a68d0559246799efa0ffa"
+    }
+  }
+}

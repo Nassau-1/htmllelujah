@@ -1,8 +1,8 @@
 # ADR-008: Expose Agent Tools through a Local stdio MCP Server
 
-- Status: Accepted
+- Status: Accepted; client authentication and generic actor identity superseded by ADR-014
 - Date: 2026-07-15
-- Last reviewed: 2026-07-16
+- Last reviewed: 2026-07-23
 
 ## Context
 
@@ -30,9 +30,14 @@ permission by itself.
 
 Read tools list visible open documents, inspect bounded outlines, slides, elements,
 and styles, obtain the current revision, validate the document, and inspect redacted
-collaboration status. Mutation tools use a typed propose/commit flow with document ID,
-expected revision, actor identity, and transaction label against the main-owned
-`DocumentSessionManager`.
+collaboration status. The design-context tool uses the canonical theme → master →
+layout → slide projection and paginates authoritative element provenance, effective
+locks, placeholders, constraints, and bounded asset metadata. Mutation tools use a
+typed propose/commit flow with document ID, expected revision, actor identity, and
+transaction label against the main-owned `DocumentSessionManager`. A closed semantic
+design-operation union maps page, theme, master, layout, slide-layout, and deck-wide
+theme enforcement to canonical commands before proposal; it has no arbitrary markup,
+URL, shell, or filesystem target.
 
 Destructive commit, agent undo, import, standalone HTML export, and PDF export require
 a visible desktop-issued approval capability that is purpose-bound, document-bound,

@@ -18,6 +18,9 @@
     "Python-2.0": "argparse@2.0.1 is reached only through electron-builder -> js-yaml and is absent from the production dependency graph and packaged application runtime.",
     "WTFPL": "truncate-utf8-bytes@1.0.2 is reached only through electron-builder -> builder-util -> sanitize-filename and is absent from the production dependency graph and packaged application runtime."
   },
+  "reviewedBundledAssets": {
+    "CC-BY-4.0": "Twemoji graphics only. Attribution, source identity, modification notice, and the license URI are retained in THIRD_PARTY_NOTICES.md; generated catalog integrity is enforced before release."
+  },
   "blocked": [
     "AGPL",
     "BUSL",

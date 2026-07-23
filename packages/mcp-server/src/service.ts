@@ -5,21 +5,26 @@ import { z } from 'zod';
 
 import {
   commitProposalSchema,
+  designContextSchema,
   documentTargetSchema,
   exportDocumentSchema,
   importAssetSchema,
   MCP_LIMITS,
   proposeCommandsSchema,
+  proposeDesignOperationsSchema,
   slideTargetSchema,
   transactionTargetSchema,
   type CommitProposalInput,
   type CommitProposalResult,
+  type DesignContextInput,
   type ExportDocumentInput,
   type ImportAssetInput,
   type ProposalResult,
   type ProposeCommandsInput,
+  type ProposeDesignOperationsInput,
   type TransactionTargetInput,
 } from './contracts.js';
+import type { TrustedClientContext } from './trusted-client.js';
 
 export type SafeRecord = Readonly<Record<string, unknown>>;
 
@@ -29,23 +34,52 @@ export interface HtmllelujahMcpService {
   getDocumentOutline(documentId: string): Promise<SafeRecord>;
   getSlide(documentId: string, slideId: string): Promise<SafeRecord>;
   getStyleCatalog(documentId: string): Promise<SafeRecord>;
+  getDesignContext(input: DesignContextInput): Promise<SafeRecord>;
   validateDocument(documentId: string): Promise<SafeRecord>;
-  proposeCommands(input: ProposeCommandsInput): Promise<ProposalResult>;
-  commitProposal(input: CommitProposalInput): Promise<CommitProposalResult>;
-  undoAgentTransaction(input: TransactionTargetInput): Promise<CommitProposalResult>;
-  importAsset(input: ImportAssetInput): Promise<SafeRecord>;
-  exportDocument(input: ExportDocumentInput): Promise<SafeRecord>;
+  proposeCommands(
+    input: ProposeCommandsInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<ProposalResult>;
+  proposeDesignOperations(
+    input: ProposeDesignOperationsInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<ProposalResult>;
+  commitProposal(
+    input: CommitProposalInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<CommitProposalResult>;
+  undoAgentTransaction(
+    input: TransactionTargetInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<CommitProposalResult>;
+  importAsset(
+    input: ImportAssetInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<SafeRecord>;
+  exportDocument(
+    input: ExportDocumentInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<SafeRecord>;
   collaborationStatus(documentId: string): Promise<SafeRecord>;
 }
 
 export interface McpPermissionGate {
-  canRead(documentId: string): Promise<boolean> | boolean;
-  canEdit(documentId: string): Promise<boolean> | boolean;
-  consumeApproval(input: {
-    readonly approvalId: string;
-    readonly documentId: string;
-    readonly action: 'commit-destructive' | 'undo' | 'import' | 'export-html' | 'export-pdf';
-  }): Promise<boolean> | boolean;
+  canRead(
+    documentId: string,
+    client?: TrustedClientContext | undefined,
+  ): Promise<boolean> | boolean;
+  canEdit(
+    documentId: string,
+    client?: TrustedClientContext | undefined,
+  ): Promise<boolean> | boolean;
+  consumeApproval(
+    input: {
+      readonly approvalId: string;
+      readonly documentId: string;
+      readonly action: 'commit-destructive' | 'undo' | 'import' | 'export-html' | 'export-pdf';
+    },
+    client?: TrustedClientContext | undefined,
+  ): Promise<boolean> | boolean;
 }
 
 export class McpSafeError extends Error {
@@ -252,6 +286,22 @@ export const createHtmllelujahMcpServer = (
   );
 
   server.registerTool(
+    'documents_get_design_context',
+    {
+      title: 'Get authoritative presentation design context',
+      description:
+        'Read the current theme, master, layout, slide inheritance, provenance, locks, placeholders, constraints, assets, and validation state with bounded pagination.',
+      inputSchema: designContextSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async (input) =>
+      toolResult(async () => {
+        await assertRead(permissions, input.documentId);
+        return service.getDesignContext(input);
+      }),
+  );
+
+  server.registerTool(
     'documents_validate',
     {
       title: 'Validate presentation',
@@ -283,6 +333,30 @@ export const createHtmllelujahMcpServer = (
           await assertRead(permissions, input.documentId);
           await assertEdit(permissions, input.documentId);
           const proposal = await service.proposeCommands(input);
+          registerProposal(proposal);
+          return proposal;
+        } finally {
+          proposalReservations -= 1;
+        }
+      }),
+  );
+
+  server.registerTool(
+    'documents_propose_design_operations',
+    {
+      title: 'Propose typed design operations',
+      description:
+        'Resolve bounded theme, master, layout, slide-layout, and page operations into one revision-bound canonical proposal. No HTML, CSS, SVG, URL, shell command, or filesystem path is accepted.',
+      inputSchema: proposeDesignOperationsSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async (input) =>
+      toolResult(async () => {
+        reserveProposalSlot();
+        try {
+          await assertRead(permissions, input.documentId);
+          await assertEdit(permissions, input.documentId);
+          const proposal = await service.proposeDesignOperations(input);
           registerProposal(proposal);
           return proposal;
         } finally {

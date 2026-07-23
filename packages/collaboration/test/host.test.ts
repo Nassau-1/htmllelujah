@@ -164,6 +164,38 @@ describe('authoritative collaboration host', () => {
     expect(transaction.beforeRevision).not.toBe(transaction.afterRevision);
   });
 
+  it('replicates closed catalog identities as typed icon data', () => {
+    const { host } = createHost();
+    const replica = new InMemoryDocumentAdapter(createNeutralDemoDeck());
+    const slide = host.getSnapshot().document.slides[0]!;
+    const catalogIcon: Element = {
+      id: '92000000-0000-4000-8000-000000000001',
+      name: 'Twemoji',
+      type: 'icon',
+      iconSet: 'twemoji',
+      iconName: '1f600',
+      color: '#172033',
+      frame: { xPt: 20, yPt: 20, widthPt: 48, heightPt: 48, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+    };
+    const transaction = host.submit(
+      createRequest(host, {
+        clientId: CLIENT_A,
+        clientRequestId: requestId(70),
+        commands: [{ type: 'element.insert', slideId: slide.id, element: catalogIcon }],
+      }),
+    );
+
+    applyCommittedTransaction(replica, transaction);
+    const replicated = replica
+      .getSnapshot()
+      .document.slides[0]?.elements.find((element) => element.id === catalogIcon.id);
+    expect(replicated).toEqual(catalogIcon);
+    expect(host.getSnapshot()).toEqual(replica.getSnapshot());
+  });
+
   it('rebases stale edits to independent elements', () => {
     const { host } = createHost();
     const replica = new InMemoryDocumentAdapter(createNeutralDemoDeck());

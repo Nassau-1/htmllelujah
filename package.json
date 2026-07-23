@@ -12,6 +12,7 @@
   "scripts": {
     "build": "pnpm --workspace-concurrency=1 -r --if-present build",
     "build:packages": "pnpm --workspace-concurrency=1 --filter \"./packages/**\" -r --if-present build",
+    "catalogs:check": "pnpm --filter @htmllelujah/renderer catalogs:check",
     "dev": "pnpm --filter @htmllelujah/desktop dev",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -29,7 +30,7 @@
     "test:security-release": "node --test --test-isolation=none scripts/security-release-evidence.test.mjs",
     "typecheck": "pnpm build:packages && pnpm --workspace-concurrency=1 -r --if-present typecheck",
     "validate:candidate": "node scripts/run-windows-candidate-validation.mjs",
-    "verify": "pnpm format:check && pnpm typecheck && pnpm test && pnpm test:candidate-validation && pnpm test:release-evidence && pnpm test:release-pipeline && pnpm test:sbom-generate && pnpm test:security-release && pnpm build && pnpm licenses:check"
+    "verify": "pnpm format:check && pnpm catalogs:check && pnpm typecheck && pnpm test && pnpm test:candidate-validation && pnpm test:release-evidence && pnpm test:release-pipeline && pnpm test:sbom-generate && pnpm test:security-release && pnpm build && pnpm licenses:check"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

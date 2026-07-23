@@ -81,14 +81,26 @@ and affected third-party components.
 - The MCP-facing process communicates with its client over stdio and with the desktop
   over an authenticated random local named pipe. It does not create a LAN listener.
 - A random expiring descriptor secret under the current user's application-data
-  directory is proven with fresh HMAC nonces. Replay and oversized or malformed
-  frames fail closed.
+  directory proves the current desktop endpoint with fresh HMAC nonces. The launcher
+  separately signs the complete RPC v2 challenge with a persistent Ed25519 client
+  credential. Unknown, mismatched, or revoked clients and replayed, oversized, or
+  malformed frames fail closed.
+- The RPC server injects the registered client and `mcp-client:<uuid>` actor; tool
+  inputs cannot choose either value. Authorization is enforced again at server-side
+  dispatch, and proposals, approvals, receipts, and undo ownership are client-bound.
 - Only visible open documents are readable. Tools expose no arbitrary path, raw file,
   URL fetch, shell, raw HTML, internal state replacement, or secret-retrieval surface.
+- The design-context projection is paginated and read-only. Semantic design
+  operations use a strict page/theme/master/layout/slide-layout union, expand through
+  the canonical command engine, and accept no HTML, CSS, SVG, URL, shell, or
+  filesystem target.
 - Destructive commit, undo, import, and export use desktop-issued approvals bound to
-  action, document, revision, expiry, and single use.
-- V1 caps typed command proposals at 100 commands and MCP frames/results at 2 MiB. A
-  desktop proposal expires after one minute; at most 64 proposals, 32 unconsumed
+  client, action, document, revision, expiry, and single use. Ordinary reversible
+  typed edits need no per-edit approval; full design replacements qualify only after
+  validated simulation proves that they remove no protected structure or binding.
+- V1 caps typed command proposals at 100 commands, semantic design proposals at 20
+  operations, design-context pages at 500 elements, and MCP frames/results at 2 MiB.
+  A desktop proposal expires after one minute; at most 64 proposals, 32 unconsumed
   approvals, and 64 consumed approval receipts are retained. Approvals expire after
   two minutes and consumed receipts after 30 seconds.
 - V1 pauses MCP mutations while LAN collaboration is active so the collaboration host
@@ -101,6 +113,11 @@ permissions. `NODE_OPTIONS` and CLI inspection are disabled, and the application
 loads only its integrity-checked ASAR. A way to turn this same-user runtime into
 elevated execution, cross-user access, persistence outside normal user permissions,
 or a bypass of the typed MCP boundary is in scope and should be reported.
+
+The persistent client credential is also protected by the current Windows user's
+profile boundary. Software already running as that user may be able to copy it and
+impersonate the registered client until revocation; the credential is an identity and
+revocation mechanism, not a sandbox against same-user malware.
 
 ### LAN collaboration
 

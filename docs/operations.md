@@ -308,7 +308,10 @@ User-selected `.hdeck` files remain wherever the user saves them. Private applic
 state is rooted under `%APPDATA%\HTMLlelujah` and includes:
 
 - `recovery/` for base snapshots, checksummed journals, metadata, and asset blobs; and
-- `mcp/endpoint-v1.json` for the expiring local MCP endpoint while the desktop runs.
+- `mcp/endpoint-v2.json` for the expiring local MCP endpoint while the desktop runs;
+- `mcp/trusted-clients-v1.json` for bounded public client profiles and revocation
+  state; and
+- `mcp/client-credentials-v1/` for user-private launcher credentials.
 
 Every committed edit is appended to the private recovery journal before local
 durability is acknowledged. Recovery blob cleanup uses bounded mark-and-sweep passes
@@ -372,17 +375,45 @@ content in diagnostics or public screenshots.
 
 The desktop must be running before `HTMLlelujah-MCP.cmd` starts. The MCP launcher
 reads the current endpoint descriptor from the user's application-data directory and
-authenticates to a random local named pipe. It does not listen on the LAN.
+authenticates to a random local named pipe. The endpoint proves its current rotating
+descriptor secret and the launcher signs the RPC v2 challenge with its persistent
+current-user client credential. It does not listen on the LAN.
 
-Only visible open documents are readable. A user issues short-lived approvals from
-the desktop Codex panel for destructive commit, agent undo, import, HTML export, or
-PDF export. Approval IDs and the endpoint descriptor are secrets: do not paste them
+Only visible open documents are readable. Ordinary reversible typed edits use the
+persistent client grant and require no per-edit approval. Destructive commit, agent
+undo, import, HTML export, and PDF export remain outside that ordinary grant and need
+a separate desktop-controlled authorization bound to the authenticated client. In
+normal use, perform those sensitive file operations directly in the desktop
+application; no token is required for ordinary authoring. Approval IDs, private client
+credentials, signatures, and the endpoint descriptor are secrets: do not paste them
 into logs, configuration examples, or issue reports.
 
+Use `documents_get_design_context` before design edits. Its default page describes
+the selected slide projection and identifies the authoritative theme, master, layout,
+and slide source for every returned element. Use `elementScope: all-authoritative`
+and advance `elementOffset` when auditing all template and slide
+objects; advance `assetOffset` separately for asset metadata. The response always
+returns the current revision, pagination totals, page limits, semantic themes,
+resource summaries, inheritance chain, effective locks, placeholder bindings, and
+validation issues.
+
+Use `documents_propose_design_operations` for page, theme, master, layout,
+slide-layout, and deck-wide theme-enforcement changes. Every call includes
+`expectedRevision` and a bounded transaction label, then commits through
+`documents_commit_proposal`. Ordinary additive or non-removing replacements need no
+one-time approval. Page changes, resource deletion, slide-layout remapping, and
+replacement batches that remove nested structure require a client-bound
+`commit-destructive` approval. The design operation schema rejects extra fields and
+has no HTML, CSS, SVG, URL, shell, or filesystem-path field.
+
 V1 accepts at most 100 commands in a proposal and 2 MiB per MCP frame or encoded
-result. The desktop retains at most 64 proposals (one-minute default expiry), 32
-unconsumed approvals (two-minute expiry), and 64 consumed receipts (30-second expiry).
-New work is rejected at capacity; expired entries are purged instead of accumulating.
+result. A semantic design proposal accepts at most 20 operations and may expand to at
+most 100 canonical commands; deck-wide theme enforcement deliberately expands to one
+atomic command regardless of object count. Context pages return at most 500 elements
+and 250 assets.
+The desktop retains at most 64 proposals (one-minute default expiry), 32 unconsumed
+approvals (two-minute expiry), and 64 consumed receipts (30-second expiry). New work
+is rejected at capacity; expired entries are purged instead of accumulating.
 
 If the bridge reports unavailable:
 
@@ -392,8 +423,13 @@ If the bridge reports unavailable:
 4. restart the desktop to rotate the endpoint descriptor; and
 5. inspect only redacted stderr and safe error codes.
 
-Do not hand-edit `endpoint-v1.json` or relax its validation. Agent mutations are
-intentionally unavailable during an active LAN session in V1.
+Do not hand-edit `endpoint-v2.json`, `trusted-clients-v1.json`, or client credential
+files, and do not relax their validation. Deleting or corrupting the persistent
+credential does not create a new trusted identity; the bridge fails closed. The first
+checkpoint has one packaged-launcher compatibility profile and backend revocation;
+explicit named-client enrollment and recovery controls remain specification-003
+follow-up work. Agent mutations are intentionally unavailable during an active LAN
+session in V1.
 
 ## Dependency, notice, and asset review
 

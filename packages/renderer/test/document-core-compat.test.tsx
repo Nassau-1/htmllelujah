@@ -221,4 +221,55 @@ describe('document-core V2 compatibility', () => {
     expect(html).toContain('color:#aa2244');
     expect(html).toContain('text-align:center');
   });
+
+  it('renders canonical dynamic fields without changing stored rich text', () => {
+    const source = createCanonicalDeck();
+    const { slideTitle } = titleParts(source);
+    const slide = source.slides[0];
+    const block = slideTitle.content.blocks[0];
+    if (slide === undefined || block?.type === 'list' || block === undefined) {
+      throw new Error('Fixture title block is incomplete.');
+    }
+    const firstRun = block.runs[0];
+    if (firstRun === undefined) throw new Error('Fixture title run is incomplete.');
+    const dynamicTitle: TextElement = {
+      ...slideTitle,
+      content: {
+        blocks: [
+          {
+            ...block,
+            runs: [
+              {
+                ...firstRun,
+                text: 'Slide {{page}} of {{pages}} — {{title}}',
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const deck: DeckDocument = {
+      ...source,
+      name: 'Dynamic deck',
+      slides: [
+        {
+          ...slide,
+          elements: replaceElement(slide.elements, dynamicTitle),
+        },
+      ],
+    };
+
+    const resolved = resolveSlide(deck, slide.id);
+    const html = renderToStaticMarkup(<SlideSurface slide={resolved} mode="presentation" />);
+
+    expect(html).toContain('Slide 1 of 1 — Dynamic deck');
+    expect(html).not.toContain('{{page}}');
+    expect(
+      deck.slides[0]?.elements[0]?.type === 'text'
+        ? deck.slides[0].elements[0].content.blocks[0]?.type !== 'list'
+          ? deck.slides[0].elements[0].content.blocks[0]?.runs[0]?.text
+          : ''
+        : '',
+    ).toContain('{{page}}');
+  });
 });

@@ -37,7 +37,8 @@ export const RENDERER_CSS: string = `
 .hl-group-space { position: relative; transform-origin: top left; }
 .hl-icon { display: grid; place-items: center; overflow: hidden; container-type: size; }
 .hl-icon svg { width: 100%; height: 100%; }
-.hl-flag { width: 100%; height: 100%; display: grid; place-items: center; overflow: hidden; border-radius: 9999px; background: #eef1f5; line-height: 1; }
+.hl-catalog-vector { width: 100%; height: 100%; display: block; overflow: visible; }
+.hl-circle-flag { border-radius: 9999px; overflow: hidden; }
 .hl-placeholder { display: grid; place-items: center; padding: 6pt; border: 1pt dashed #6f7f98; color: #53647d; background: rgb(255 255 255 / 68%); text-align: center; }
 .hl-editor-overlay { position: absolute; inset: 0; z-index: 2147483647; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .hl-selection-outline { fill: none; stroke: #2864dc; vector-effect: non-scaling-stroke; }

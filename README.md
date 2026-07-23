@@ -15,13 +15,15 @@ explicitly labelled unsigned.
 
 - direct slide and object editing with selection, multi-selection, drag, resize,
   rotation, keyboard nudging, snapping, smart guides, alignment, distribution,
-  grouping, layers, lock, visibility, duplicate, delete, undo, and redo;
+  grouping, layers, lock, visibility, right-click actions, object clipboard,
+  duplicate, delete, undo, and redo;
 - typed rich text, headings and lists, font controls, colors, and paragraph alignment;
-- themes, masters, layouts, placeholders, page presets, backgrounds, hidden slides,
-  and reusable style roles;
+- themes with deck-wide enforcement, editable masters and layouts, placeholders,
+  persistent template locks, custom page sizes, page fields, watermarks, backgrounds,
+  hidden slides, and reusable style roles;
 - embedded images whose registration and placement or replacement commit atomically,
   editable native tables with TSV paste, shapes, connectors, local vector icons, and
-  round Unicode flags;
+  searchable offline Twemoji and circular country flags;
 - one shared DOM/SVG renderer for editor canvas, thumbnails, presentation,
   standalone HTML, and PDF;
 - versioned `.hdeck` files with bounded archive validation, content-addressed assets,
@@ -57,24 +59,40 @@ the candidate, and save it as a new file before replacing an existing deck.
 
 The installed `HTMLlelujah-MCP.cmd` is a stdio MCP launcher. Add that command as a
 local MCP server in Codex or another compatible local client, then keep the desktop
-application running with the target deck visible.
+application running with the target deck visible. The launcher uses a persistent
+current-user client identity; the desktop still rotates and authenticates its local
+endpoint on every run.
 
 Read tools can inspect only documents currently visible in the app. Edits are typed,
 revision-checked, attributable, previewed as proposals, and committed as one undoable
-transaction. Destructive commits, agent undo, imports, and exports require a
-single-use approval issued in the desktop **Codex** panel. Approvals are bound to the
-document, action, and revision and expire after two minutes.
+transaction attributed to the persistent client. Ordinary reversible edits, including
+non-removing theme/master/layout replacements proven safe by simulation, require no
+per-edit approval. Sensitive external or destructive operations remain desktop
+controlled and require a separately scoped, short-lived authorization; ordinary
+presentation authoring never asks for a one-time token.
+
+Before changing design infrastructure, an agent can call
+`documents_get_design_context` to inspect the authoritative theme → master → layout →
+slide chain, semantic styles, placeholders, effective locks, provenance, constraints,
+asset metadata, and validation state in bounded pages. It can then call
+`documents_propose_design_operations` with strict page, theme, master, layout,
+slide-layout, or deck-wide theme-enforcement operations. These operations use the
+same proposal, approval, commit, attribution, and undo pipeline as other edits and
+accept no arbitrary markup or external target.
 
 The V1 boundary accepts at most 100 typed commands per proposal, 2 MiB MCP frames and
-results, 64 pending proposals, 32 pending desktop approvals, and 64 consumed approval
-receipts. Desktop proposals expire after one minute; the protocol rejects any proposal
-whose expiry exceeds five minutes. Consumed approval receipts expire after 30 seconds.
+results, 20 semantic design operations per proposal, 500 elements per context page,
+64 pending proposals, 32 pending desktop approvals, and 64 consumed approval receipts.
+Desktop proposals expire after one minute; the protocol rejects any proposal whose
+expiry exceeds five minutes. Consumed approval receipts expire after 30 seconds.
 
 The MCP process receives no arbitrary shell, URL-fetch, HTML-injection, or filesystem
 tool. Reads remain available during LAN collaboration, but V1 pauses MCP mutations
 while a collaboration session is active so the host's command sequence remains
 authoritative. Authentication to the model or agent client is outside HTMLlelujah;
-the application itself requires no model API credential.
+the application itself requires no model API credential. The current checkpoint uses
+one packaged-launcher compatibility profile; explicit named-client enrollment and
+in-app revocation controls remain tracked in specification 003.
 
 ## Collaborate from a synchronized folder
 

@@ -79,9 +79,17 @@ export interface HistoryInput {
   readonly expectedRevision: string;
 }
 
+export type ImageImportTarget =
+  | Readonly<{ surface: 'slide'; slideId: string }>
+  | Readonly<{ surface: 'layout'; layoutId: string }>
+  | Readonly<{ surface: 'master'; masterId: string }>;
+
+export type ImageImportPreset = 'watermark';
+
 export interface ImportImageInput extends HistoryInput {
-  readonly slideId: string;
+  readonly target: ImageImportTarget;
   readonly replaceElementId?: string | undefined;
+  readonly preset?: ImageImportPreset | undefined;
 }
 
 export interface SessionInput {

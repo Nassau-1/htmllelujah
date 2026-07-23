@@ -17,6 +17,7 @@ import {
   createSlide,
   createShapeElement,
   createTextElement,
+  duplicateElements,
   duplicateTemplateElements,
   headingLevelOf,
   replacePlainTextPreservingStyles,
@@ -232,6 +233,41 @@ describe('plain text editing with structured rich text', () => {
     expect(block.runs[0]?.text).toBe('a'.repeat(DOCUMENT_LIMITS.maxTextRunLength - 1));
     expect(block.runs[1]?.text.startsWith('😀')).toBe(true);
     expect(block.runs.map((run) => run.text).join('')).toBe(text);
+  });
+});
+
+describe('ordinary object duplication', () => {
+  it('detaches placeholder-bound text while freshening its nested content identifiers', () => {
+    const document = createDefaultDeck();
+    const slide = document.slides[0]!;
+    const source = slide.elements.find(
+      (element): element is TextElement =>
+        element.type === 'text' && element.placeholderBinding !== undefined,
+    );
+    if (source === undefined) throw new Error('Missing placeholder-bound text fixture.');
+    const original = structuredClone(source);
+
+    const copy = duplicateElements([source])[0];
+    if (copy?.type !== 'text') throw new Error('Expected duplicated text.');
+
+    expect(copy.id).not.toBe(source.id);
+    expect(copy.name).toBe(`${source.name} copy`);
+    expect(copy.frame).toEqual({
+      ...source.frame,
+      xPt: source.frame.xPt + 18,
+      yPt: source.frame.yPt + 18,
+    });
+    expect(copy.placeholderBinding).toBeUndefined();
+    expect(copy.content.blocks.map((block) => block.id)).not.toEqual(
+      source.content.blocks.map((block) => block.id),
+    );
+    expect(source).toEqual(original);
+    expect(
+      validateDeck({
+        ...document,
+        slides: [{ ...slide, elements: [...slide.elements, copy] }],
+      }).success,
+    ).toBe(true);
   });
 });
 

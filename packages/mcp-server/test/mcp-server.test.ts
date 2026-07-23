@@ -7,12 +7,18 @@ import { PassThrough } from 'node:stream';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { createDefaultDeck, type DocumentCommand } from '@htmllelujah/document-core';
+import {
+  applyTransaction,
+  createDefaultDeck,
+  createRevisionToken,
+  type DocumentCommand,
+} from '@htmllelujah/document-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createHtmllelujahMcpServer,
   commandsRequireApproval,
+  generateTrustedClient,
   LocalRpcClient,
   MCP_LIMITS,
   runHtmllelujahMcpStdioFromDescriptor,
@@ -24,6 +30,7 @@ import {
   type McpPermissionGate,
   type ProposalResult,
   type ProposeCommandsInput,
+  type ProposeDesignOperationsInput,
   type TransactionTargetInput,
 } from '../src/index.js';
 
@@ -32,7 +39,24 @@ const slideId = '10000000-0000-4000-8000-000000000002';
 const proposalId = '10000000-0000-4000-8000-000000000003';
 const transactionId = '10000000-0000-4000-8000-000000000004';
 const approvalId = 'approval-00000000000000000001';
+const trustedClient = generateTrustedClient({
+  clientId: '10000000-0000-4000-8000-000000000006',
+  displayName: 'MCP test client',
+  now: new Date('2026-07-16T12:00:00.000Z'),
+});
 const directories: string[] = [];
+
+const resolveTrustedClient = (clientId: string) =>
+  clientId === trustedClient.profile.clientId ? trustedClient.profile : undefined;
+
+const startTestRpcServer = (
+  input: Omit<Parameters<typeof startLocalRpcServer>[0], 'resolveTrustedClient'>,
+) => startLocalRpcServer({ ...input, resolveTrustedClient });
+
+const createRpcClient = (
+  descriptorPath: string,
+  credential = trustedClient.credential,
+): LocalRpcClient => new LocalRpcClient(descriptorPath, credential);
 
 afterEach(async () => {
   await Promise.all(
@@ -128,6 +152,68 @@ describe('MCP destructive command classification', () => {
       ]),
     ).toBe(false);
   });
+
+  it('allows simulated ordinary design replacements but still detects nested removal', () => {
+    const deck = createDefaultDeck();
+    const theme = deck.themes[0];
+    const existingMaster = deck.masters[0];
+    const layout = deck.layouts[0];
+    if (theme === undefined || existingMaster === undefined || layout === undefined) {
+      throw new Error('Missing default styles.');
+    }
+    const metadata = {
+      transactionId: transactionId,
+      actorId: `mcp-client:${trustedClient.profile.clientId}`,
+      origin: 'agent' as const,
+      label: 'Classify simulated design change',
+      timestamp: '2026-07-16T12:00:00.000Z',
+    };
+    const safeCommand: DocumentCommand = {
+      type: 'theme.update',
+      themeId: theme.id,
+      replacement: { ...theme, name: 'Updated theme name' },
+    };
+    const safeAfter = applyTransaction(deck, [safeCommand], {
+      expectedRevision: createRevisionToken(deck),
+      metadata,
+    }).document;
+    expect(commandsRequireApproval([safeCommand], { before: deck, after: safeAfter })).toBe(false);
+
+    const destructiveCommand: DocumentCommand = {
+      type: 'layout.update',
+      layoutId: layout.id,
+      replacement: { ...layout, elements: [] },
+    };
+    const destructiveAfter = applyTransaction(deck, [destructiveCommand], {
+      expectedRevision: createRevisionToken(deck),
+      metadata,
+    }).document;
+    expect(
+      commandsRequireApproval([destructiveCommand], {
+        before: deck,
+        after: destructiveAfter,
+      }),
+    ).toBe(true);
+
+    const replacementMaster = {
+      ...existingMaster,
+      id: '10000000-0000-4000-8000-000000000014',
+      name: 'Replacement master',
+    };
+    const remapCommands: DocumentCommand[] = [
+      { type: 'master.create', master: replacementMaster },
+      {
+        type: 'layout.update',
+        layoutId: layout.id,
+        replacement: { ...layout, masterId: replacementMaster.id },
+      },
+    ];
+    const remapped = applyTransaction(deck, remapCommands, {
+      expectedRevision: createRevisionToken(deck),
+      metadata,
+    }).document;
+    expect(commandsRequireApproval(remapCommands, { before: deck, after: remapped })).toBe(true);
+  });
 });
 
 const createService = (): HtmllelujahMcpService => ({
@@ -136,6 +222,12 @@ const createService = (): HtmllelujahMcpService => ({
   getDocumentOutline: vi.fn(async () => ({ documentId, revision: 'rev-1', slides: [{ slideId }] })),
   getSlide: vi.fn(async () => ({ documentId, slideId, revision: 'rev-1', elements: [] })),
   getStyleCatalog: vi.fn(async () => ({ documentId, themes: [], layouts: [] })),
+  getDesignContext: vi.fn(async () => ({
+    documentId,
+    revision: 'rev-1',
+    inheritance: { slideId },
+    elements: { items: [] },
+  })),
   validateDocument: vi.fn(async () => ({ documentId, valid: true, issueCount: 0 })),
   proposeCommands: vi.fn(async (input: ProposeCommandsInput) => ({
     proposalId,
@@ -149,6 +241,23 @@ const createService = (): HtmllelujahMcpService => ({
     ),
     warnings: [],
     summary: 'One typed command',
+  })),
+  proposeDesignOperations: vi.fn(async (input: ProposeDesignOperationsInput) => ({
+    proposalId,
+    documentId: input.documentId,
+    baseRevision: input.expectedRevision,
+    expiresAt: new Date(Date.now() + MCP_LIMITS.proposalTtlMs).toISOString(),
+    requiresApproval: input.operations.some((operation) =>
+      ['page.set', 'theme.delete', 'master.delete', 'layout.delete', 'slide.set-layout'].includes(
+        operation.type,
+      ),
+    ),
+    commandCount: input.operations.length,
+    affectedSlideIds: input.operations.flatMap((operation) =>
+      operation.type === 'slide.set-layout' ? [operation.slideId] : [],
+    ),
+    warnings: [],
+    summary: 'One typed design operation',
   })),
   commitProposal: vi.fn(async (_input: CommitProposalInput) => ({
     documentId,
@@ -215,12 +324,90 @@ describe('MCP tools', () => {
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toContain('documents_get_outline');
+      expect(tools.tools.map((tool) => tool.name)).toContain('documents_get_design_context');
+      expect(tools.tools.map((tool) => tool.name)).toContain('documents_propose_design_operations');
       const result = await client.callTool({
         name: 'documents_get_outline',
         arguments: { documentId },
       });
       expect(textResult(result)).toMatchObject({ documentId, revision: 'rev-1' });
       expect(service.getDocumentOutline).toHaveBeenCalledWith(documentId);
+      const designContext = await client.callTool({
+        name: 'documents_get_design_context',
+        arguments: { documentId },
+      });
+      expect(textResult(designContext)).toMatchObject({
+        documentId,
+        revision: 'rev-1',
+        inheritance: { slideId },
+      });
+      expect(service.getDesignContext).toHaveBeenCalledWith(
+        expect.objectContaining({
+          documentId,
+          elementScope: 'selected-projection',
+          elementOffset: 0,
+          elementLimit: 250,
+        }),
+      );
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+    }
+  });
+
+  it('proposes strict semantic design operations and rejects arbitrary markup', async () => {
+    const service = createService();
+    const { server, client } = await connectMcp(service, createPermissions());
+    try {
+      const proposal = await client.callTool({
+        name: 'documents_propose_design_operations',
+        arguments: {
+          documentId,
+          expectedRevision: 'rev-1',
+          label: 'Update the presentation theme',
+          operations: [
+            {
+              type: 'theme.update',
+              themeId: proposalId,
+              patch: { colors: { accent: '#123456' } },
+            },
+          ],
+        },
+      });
+      expect(textResult(proposal)).toMatchObject({
+        proposalId,
+        requiresApproval: false,
+      });
+      expect(service.proposeDesignOperations).toHaveBeenCalledWith(
+        expect.objectContaining({
+          documentId,
+          expectedRevision: 'rev-1',
+          operations: [
+            expect.objectContaining({
+              type: 'theme.update',
+              themeId: proposalId,
+            }),
+          ],
+        }),
+      );
+
+      const rejected = await client.callTool({
+        name: 'documents_propose_design_operations',
+        arguments: {
+          documentId,
+          expectedRevision: 'rev-1',
+          label: 'Reject arbitrary markup',
+          operations: [
+            {
+              type: 'theme.update',
+              themeId: proposalId,
+              patch: { name: 'Safe theme' },
+              html: '<script>alert(1)</script>',
+            },
+          ],
+        },
+      });
+      expect(rejected.isError).toBe(true);
+      expect(service.proposeDesignOperations).toHaveBeenCalledTimes(1);
     } finally {
       await Promise.all([client.close(), server.close()]);
     }
@@ -494,8 +681,8 @@ describe('authenticated local RPC', () => {
     const directory = await createTemporaryDirectory();
     const descriptorPath = path.join(directory, 'endpoint-v1.json');
     const service = createService();
-    const server = await startLocalRpcServer({ service, descriptorPath });
-    const client = new LocalRpcClient(descriptorPath);
+    const server = await startTestRpcServer({ service, descriptorPath });
+    const client = createRpcClient(descriptorPath);
     try {
       await expect(client.appStatus()).resolves.toMatchObject({ running: true, version: '1.0.0' });
       await expect(client.getSlide(documentId, slideId)).resolves.toMatchObject({
@@ -503,6 +690,42 @@ describe('authenticated local RPC', () => {
         slideId,
       });
       expect(service.getSlide).toHaveBeenCalledWith(documentId, slideId);
+      await expect(
+        client.getDesignContext({
+          documentId,
+          elementScope: 'selected-projection',
+          elementOffset: 0,
+          elementLimit: 25,
+          assetOffset: 0,
+          assetLimit: 10,
+        }),
+      ).resolves.toMatchObject({ documentId, revision: 'rev-1' });
+      await client.proposeCommands({
+        documentId,
+        expectedRevision: 'rev-1',
+        label: 'Verify injected trusted identity',
+        commands: [{ type: 'deck.rename', name: 'Trusted rename' }],
+      });
+      expect(service.proposeCommands).toHaveBeenCalledWith(
+        expect.objectContaining({ documentId, expectedRevision: 'rev-1' }),
+        expect.objectContaining({
+          clientId: trustedClient.profile.clientId,
+          actorId: `mcp-client:${trustedClient.profile.clientId}`,
+        }),
+      );
+      await client.proposeDesignOperations({
+        documentId,
+        expectedRevision: 'rev-1',
+        label: 'Verify design identity injection',
+        operations: [{ type: 'page.set', page: { widthPt: 900, heightPt: 600 } }],
+      });
+      expect(service.proposeDesignOperations).toHaveBeenCalledWith(
+        expect.objectContaining({ documentId, expectedRevision: 'rev-1' }),
+        expect.objectContaining({
+          clientId: trustedClient.profile.clientId,
+          actorId: `mcp-client:${trustedClient.profile.clientId}`,
+        }),
+      );
     } finally {
       await client.close();
       await server.close();
@@ -514,16 +737,71 @@ describe('authenticated local RPC', () => {
   it('rejects a client when the descriptor secret is tampered', async () => {
     const directory = await createTemporaryDirectory();
     const descriptorPath = path.join(directory, 'endpoint-v1.json');
-    const server = await startLocalRpcServer({ service: createService(), descriptorPath });
+    const server = await startTestRpcServer({ service: createService(), descriptorPath });
     const descriptor = JSON.parse(await readFile(descriptorPath, 'utf8')) as Record<
       string,
       unknown
     >;
     descriptor.secret = '0'.repeat(64);
     await writeFile(descriptorPath, JSON.stringify(descriptor), 'utf8');
-    const client = new LocalRpcClient(descriptorPath);
+    const client = createRpcClient(descriptorPath);
     try {
       await expect(client.appStatus()).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('rejects unknown client identities and mismatched private keys', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v2.json');
+    const server = await startTestRpcServer({ service: createService(), descriptorPath });
+    const unknown = generateTrustedClient({
+      clientId: '10000000-0000-4000-8000-000000000012',
+      displayName: 'Unknown client',
+    });
+    const wrongKey = generateTrustedClient({
+      clientId: '10000000-0000-4000-8000-000000000013',
+      displayName: 'Wrong key',
+    });
+    const unknownClient = createRpcClient(descriptorPath, unknown.credential);
+    const mismatchedClient = createRpcClient(descriptorPath, {
+      ...wrongKey.credential,
+      clientId: trustedClient.profile.clientId,
+    });
+    try {
+      await expect(unknownClient.appStatus()).rejects.toMatchObject({
+        code: 'SERVICE_UNAVAILABLE',
+      });
+      await expect(mismatchedClient.appStatus()).rejects.toMatchObject({
+        code: 'SERVICE_UNAVAILABLE',
+      });
+      expect(server.connectedClientIds).toEqual([]);
+    } finally {
+      await Promise.all([unknownClient.close(), mismatchedClient.close()]);
+      await server.close();
+    }
+  });
+
+  it('revokes an authenticated client on its next request and supports active disconnect', async () => {
+    const directory = await createTemporaryDirectory();
+    const descriptorPath = path.join(directory, 'endpoint-v2.json');
+    let enabled = true;
+    const server = await startLocalRpcServer({
+      service: createService(),
+      descriptorPath,
+      resolveTrustedClient: (clientId) =>
+        enabled && clientId === trustedClient.profile.clientId ? trustedClient.profile : undefined,
+    });
+    const client = createRpcClient(descriptorPath);
+    try {
+      await expect(client.appStatus()).resolves.toMatchObject({ running: true });
+      expect(server.connectedClientIds).toEqual([trustedClient.profile.clientId]);
+      enabled = false;
+      await expect(client.appStatus()).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
+      server.disconnectClient(trustedClient.profile.clientId);
+      await vi.waitFor(() => expect(server.connectedClientIds).toEqual([]));
     } finally {
       await client.close();
       await server.close();
@@ -536,7 +814,7 @@ describe('authenticated local RPC', () => {
     await writeFile(
       descriptorPath,
       JSON.stringify({
-        protocolVersion: 1,
+        protocolVersion: 2,
         pipeName: '\\\\.\\pipe\\missing',
         secret: '1'.repeat(64),
         instanceId: 'instance',
@@ -546,7 +824,7 @@ describe('authenticated local RPC', () => {
       }),
       'utf8',
     );
-    await expect(new LocalRpcClient(descriptorPath).appStatus()).rejects.toMatchObject({
+    await expect(createRpcClient(descriptorPath).appStatus()).rejects.toMatchObject({
       code: 'SERVICE_UNAVAILABLE',
     });
   });
@@ -558,7 +836,7 @@ describe('authenticated local RPC', () => {
     const directory = await createTemporaryDirectory();
     const descriptorPath = path.join(directory, 'endpoint-v1.json');
     const staleDescriptorPath = path.join(directory, 'expired-endpoint-v1.json');
-    const server = await startLocalRpcServer({
+    const server = await startTestRpcServer({
       service: createService(),
       descriptorPath,
       lifetimeMs: 60_000,
@@ -572,7 +850,7 @@ describe('authenticated local RPC', () => {
       readonly expiresAt: string;
     };
     await writeFile(staleDescriptorPath, JSON.stringify(firstDescriptor), 'utf8');
-    const establishedClient = new LocalRpcClient(descriptorPath);
+    const establishedClient = createRpcClient(descriptorPath);
     let overlapClient: LocalRpcClient | undefined;
     const freshClients: LocalRpcClient[] = [];
     try {
@@ -604,14 +882,14 @@ describe('authenticated local RPC', () => {
         secret: currentDescriptor.secret,
       });
 
-      overlapClient = new LocalRpcClient(staleDescriptorPath);
+      overlapClient = createRpcClient(staleDescriptorPath);
       await expect(overlapClient.appStatus()).resolves.toMatchObject({ running: true });
 
       vi.setSystemTime(Date.parse(firstDescriptor.expiresAt) + 1);
       await expect(establishedClient.appStatus()).resolves.toMatchObject({ running: true });
       await expect(overlapClient.appStatus()).resolves.toMatchObject({ running: true });
 
-      freshClients.push(...Array.from({ length: 12 }, () => new LocalRpcClient(descriptorPath)));
+      freshClients.push(...Array.from({ length: 12 }, () => createRpcClient(descriptorPath)));
       await expect(
         Promise.all(freshClients.map(async (client) => client.appStatus())),
       ).resolves.toEqual(
@@ -619,7 +897,7 @@ describe('authenticated local RPC', () => {
           expect.objectContaining({ running: true }),
         ),
       );
-      await expect(new LocalRpcClient(staleDescriptorPath).appStatus()).rejects.toMatchObject({
+      await expect(createRpcClient(staleDescriptorPath).appStatus()).rejects.toMatchObject({
         code: 'SERVICE_UNAVAILABLE',
       });
     } finally {
@@ -637,7 +915,7 @@ describe('authenticated local RPC', () => {
     const directory = await createTemporaryDirectory();
     const descriptorPath = path.join(directory, 'endpoint-v1.json');
     await expect(
-      startLocalRpcServer({
+      startTestRpcServer({
         service: createService(),
         descriptorPath,
         lifetimeMs: 300,
@@ -645,7 +923,7 @@ describe('authenticated local RPC', () => {
       }),
     ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
     await expect(
-      startLocalRpcServer({
+      startTestRpcServer({
         service: createService(),
         descriptorPath,
         lifetimeMs: 20_000,
@@ -679,7 +957,7 @@ describe('authenticated local RPC', () => {
         resolve();
       });
     });
-    const primaryServer = await startLocalRpcServer({
+    const primaryServer = await startTestRpcServer({
       service: createService(),
       descriptorPath: primaryDescriptorPath,
     });
@@ -687,7 +965,7 @@ describe('authenticated local RPC', () => {
     await writeFile(
       clientDescriptorPath,
       JSON.stringify({
-        protocolVersion: 1,
+        protocolVersion: 2,
         pipeName,
         secret: 'a'.repeat(64),
         instanceId: randomUUID(),
@@ -697,7 +975,7 @@ describe('authenticated local RPC', () => {
       }),
       'utf8',
     );
-    const client = new LocalRpcClient(clientDescriptorPath);
+    const client = createRpcClient(clientDescriptorPath);
     try {
       const status = client.appStatus();
       await accepted;
@@ -722,12 +1000,12 @@ describe('authenticated local RPC', () => {
     permissions.approvals.add(approvalId);
     permissions.canRead = vi.fn((candidate) => candidate === documentId);
     permissions.canEdit = vi.fn(() => false);
-    const server = await startLocalRpcServer({
+    const server = await startTestRpcServer({
       service: createService(),
       permissions,
       descriptorPath,
     });
-    const client = new LocalRpcClient(descriptorPath);
+    const client = createRpcClient(descriptorPath);
     try {
       await expect(client.canRead(documentId)).resolves.toBe(true);
       await expect(client.canEdit(documentId)).resolves.toBe(false);
@@ -737,8 +1015,14 @@ describe('authenticated local RPC', () => {
       await expect(
         client.consumeApproval({ approvalId, documentId, action: 'import' }),
       ).resolves.toBe(false);
-      expect(permissions.canRead).toHaveBeenCalledWith(documentId);
-      expect(permissions.canEdit).toHaveBeenCalledWith(documentId);
+      expect(permissions.canRead).toHaveBeenCalledWith(
+        documentId,
+        expect.objectContaining({ clientId: trustedClient.profile.clientId }),
+      );
+      expect(permissions.canEdit).toHaveBeenCalledWith(
+        documentId,
+        expect.objectContaining({ clientId: trustedClient.profile.clientId }),
+      );
     } finally {
       await client.close();
       await server.close();
@@ -748,8 +1032,8 @@ describe('authenticated local RPC', () => {
   it('fails closed when no permission gate is supplied', async () => {
     const directory = await createTemporaryDirectory();
     const descriptorPath = path.join(directory, 'endpoint-v1.json');
-    const server = await startLocalRpcServer({ service: createService(), descriptorPath });
-    const client = new LocalRpcClient(descriptorPath);
+    const server = await startTestRpcServer({ service: createService(), descriptorPath });
+    const client = createRpcClient(descriptorPath);
     try {
       await expect(client.canRead(documentId)).resolves.toBe(false);
       await expect(client.canEdit(documentId)).resolves.toBe(false);
@@ -767,12 +1051,12 @@ describe('authenticated local RPC', () => {
     const descriptorPath = path.join(directory, 'endpoint-v1.json');
     const permissions = createPermissions();
     permissions.canRead = vi.fn(() => true);
-    const server = await startLocalRpcServer({
+    const server = await startTestRpcServer({
       service: createService(),
       permissions,
       descriptorPath,
     });
-    const client = new LocalRpcClient(descriptorPath);
+    const client = createRpcClient(descriptorPath);
     const rawCall = (
       client as unknown as {
         call(method: string, params: unknown): Promise<unknown>;
@@ -804,12 +1088,12 @@ describe('authenticated local RPC', () => {
       throw new Error('sensitive permission backend details');
     };
     permissions.canEdit = (() => 'yes') as unknown as McpPermissionGate['canEdit'];
-    const server = await startLocalRpcServer({
+    const server = await startTestRpcServer({
       service: createService(),
       permissions,
       descriptorPath,
     });
-    const client = new LocalRpcClient(descriptorPath);
+    const client = createRpcClient(descriptorPath);
     try {
       await expect(client.canRead(documentId)).rejects.toMatchObject({
         code: 'SERVICE_UNAVAILABLE',
@@ -830,12 +1114,12 @@ describe('authenticated local RPC', () => {
     const service = createService();
     const permissions = createPermissions();
     permissions.approvals.add(approvalId);
-    const rpcServer = await startLocalRpcServer({
+    const rpcServer = await startTestRpcServer({
       service,
       permissions,
       descriptorPath,
     });
-    const rpcClient = new LocalRpcClient(descriptorPath);
+    const rpcClient = createRpcClient(descriptorPath);
     const { server, client } = await connectMcp(rpcClient, rpcClient);
     try {
       const first = await client.callTool({
@@ -870,12 +1154,12 @@ describe('authenticated local RPC', () => {
           releaseStatus = resolve;
         }),
     );
-    const rpcServer = await startLocalRpcServer({
+    const rpcServer = await startTestRpcServer({
       service,
       permissions: createPermissions(),
       descriptorPath,
     });
-    const client = new LocalRpcClient(descriptorPath);
+    const client = createRpcClient(descriptorPath);
     await client.connect();
     await client.close();
     await client.close();
@@ -887,7 +1171,10 @@ describe('authenticated local RPC', () => {
     stdout.on('data', (chunk: Buffer) => {
       stdoutText += chunk.toString('utf8');
     });
-    const bridge = runHtmllelujahMcpStdioFromDescriptor(descriptorPath, { stdin, stdout });
+    const bridge = runHtmllelujahMcpStdioFromDescriptor(descriptorPath, trustedClient.credential, {
+      stdin,
+      stdout,
+    });
     stdin.write(
       `${JSON.stringify({
         jsonrpc: '2.0',
@@ -934,7 +1221,7 @@ describe('authenticated local RPC', () => {
     expect(stdoutMessages).toHaveLength(2);
     expect(stdoutMessages.every((message) => message.jsonrpc === '2.0')).toBe(true);
 
-    const pendingClient = new LocalRpcClient(descriptorPath);
+    const pendingClient = createRpcClient(descriptorPath);
     const pendingStatus = pendingClient.appStatus();
     const pendingRejection = expect(pendingStatus).rejects.toMatchObject({
       code: 'SERVICE_UNAVAILABLE',

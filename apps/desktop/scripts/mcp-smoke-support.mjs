@@ -37,14 +37,15 @@ export const SAFE_MCP_ERROR_CODES = Object.freeze([
 
 const SAFE_ERROR_CODE_SET = new Set(SAFE_MCP_ERROR_CODES);
 const FORBIDDEN_EVIDENCE_KEYS =
-  /(?:approval|capability|descriptor|documentId|nonce|path|pipe|proposalId|revision|secret|sessionId|transactionId|userData)/iu;
+  /(?:approval|capability|clientId|credential|descriptor|documentId|nonce|path|pipe|privateKey|proposalId|publicKey|revision|secret|sessionId|signature|transactionId|userData)/iu;
 const FORBIDDEN_EVIDENCE_TEXT = [
   /(?:^|\s)[a-z]:[\\/]/iu,
   /\\\\\.\\pipe\\/iu,
   /\/(?:home|users)\//iu,
   /approval-[a-z0-9_-]{16,}/iu,
 ];
-const FORBIDDEN_SAFE_RESULT_KEYS = /^(?:bytes|filePath|html|nonce|path|pipeName|secret|url)$/iu;
+const FORBIDDEN_SAFE_RESULT_KEYS =
+  /^(?:bytes|credential|filePath|html|nonce|path|pipeName|privateKey|publicKey|secret|signature|url)$/iu;
 
 const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 

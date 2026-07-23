@@ -6,6 +6,7 @@ import {
   canonicalDocumentBytes,
   createNeutralDemoDeck,
   type DeckDocument,
+  type IconElement,
   type TransactionMetadata,
 } from '@htmllelujah/document-core';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -485,6 +486,51 @@ describe('.hdeck archive', () => {
     expect(parsed.manifest.documentId).toBe(document.id);
     expect(parsed.manifest.assets).toEqual([]);
     expect(parsed.archiveSha256).toBe(sha256(first));
+  });
+
+  it('preserves closed catalog identities without embedding SVG in the document', () => {
+    const source = createNeutralDemoDeck();
+    const catalogIcons: readonly IconElement[] = [
+      {
+        id: '48000000-0000-4000-8000-000000000001',
+        name: 'Twemoji',
+        type: 'icon',
+        iconSet: 'twemoji',
+        iconName: '1f600',
+        color: '#172033',
+        frame: { xPt: 20, yPt: 20, widthPt: 48, heightPt: 48, rotationDeg: 0 },
+        opacity: 1,
+        visible: true,
+        locked: false,
+      },
+      {
+        id: '48000000-0000-4000-8000-000000000002',
+        name: 'Circular flag',
+        type: 'icon',
+        iconSet: 'circle-flags',
+        iconName: 'fr',
+        color: '#172033',
+        frame: { xPt: 80, yPt: 20, widthPt: 48, heightPt: 48, rotationDeg: 0 },
+        opacity: 1,
+        visible: true,
+        locked: false,
+      },
+    ];
+    const document: DeckDocument = {
+      ...source,
+      slides: source.slides.map((slide, index) =>
+        index === 0 ? { ...slide, elements: [...slide.elements, ...catalogIcons] } : slide,
+      ),
+    };
+    const archive = createHdeckArchive({ document });
+    const reopened = parseHdeckArchive(archive).document;
+    const reopenedIcons = reopened.slides[0]?.elements.filter(
+      (element): element is IconElement => element.type === 'icon',
+    );
+
+    expect(reopened.schemaVersion).toBe(2);
+    expect(reopenedIcons).toEqual(catalogIcons);
+    expect(Buffer.from(canonicalDocumentBytes(reopened)).toString('utf8')).not.toContain('<svg');
   });
 
   it('distinguishes future container and document schema versions', () => {

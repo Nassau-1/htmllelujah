@@ -115,6 +115,7 @@ describe('packaged MCP smoke protocol oracle', () => {
     expect(() => assertSafeProjection({ nested: { html: '<script />' } })).toThrow(
       /forbidden field/u,
     );
+    expect(() => assertSafeProjection({ privateKey: 'not-safe' })).toThrow(/forbidden field/u);
   });
 
   it('checks proposal non-mutation and opaque revision advancement', () => {

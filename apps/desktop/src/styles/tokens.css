@@ -144,4 +144,14 @@
   --thumbnail-border: var(--color-border-default);
   --thumbnail-border-selected: var(--color-accent);
   --thumbnail-radius: var(--primitive-radius-4);
+
+  --catalog-picker-bg: var(--color-surface-raised);
+  --catalog-picker-border: var(--color-border-default);
+  --catalog-picker-tab-bg-active: var(--color-accent-soft);
+  --catalog-picker-tab-text-active: var(--color-accent-pressed);
+  --catalog-picker-item-bg: var(--color-surface-subtle);
+  --catalog-picker-item-bg-hover: var(--color-accent-soft);
+  --catalog-picker-item-border: var(--color-border-subtle);
+  --catalog-picker-item-border-hover: var(--color-accent-border);
+  --catalog-picker-preview: var(--color-text-primary);
 }

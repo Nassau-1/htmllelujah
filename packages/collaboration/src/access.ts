@@ -12,6 +12,7 @@ export const deckNameKey = 'deck:name';
 export const deckSlideOrderKey = 'deck:slide-order';
 export const deckPageKey = 'deck:page';
 export const deckExportSettingsKey = 'deck:export-settings';
+export const deckDefaultBackgroundKey = 'deck:default-background';
 export const themeCollectionKey = 'deck:themes';
 export const masterCollectionKey = 'deck:masters';
 export const layoutCollectionKey = 'deck:layouts';
@@ -42,6 +43,7 @@ export const DOCUMENT_COMMAND_ACCESS_CLASSIFICATION = {
   'deck.set-export-options': 'deck',
   'theme.create': 'theme',
   'theme.update': 'theme',
+  'theme.enforce-deck': 'theme',
   'theme.delete': 'theme',
   'master.create': 'master',
   'master.update': 'master',
@@ -250,6 +252,30 @@ export const analyzeCommandAccess = (
         reads.add(themeEntityKey(command.themeId));
         writes.add(themeEntityKey(command.themeId));
         writes.add(themeEntityKey(command.replacement.id));
+        break;
+
+      case 'theme.enforce-deck':
+        reads.add(themeEntityKey(command.themeId));
+        reads.add(masterCollectionKey);
+        reads.add(layoutCollectionKey);
+        reads.add(deckSlideOrderKey);
+        writes.add(deckDefaultBackgroundKey);
+        writes.add(themeReferenceKey);
+        if (document === undefined) {
+          writes.add(masterCollectionKey);
+          writes.add(layoutCollectionKey);
+          writes.add(deckSlideOrderKey);
+        } else {
+          document.masters.forEach((master) => {
+            writes.add(masterEntityKey(master.id));
+            master.elements.forEach((element) => addElementTreeEntityWrites(element, writes));
+          });
+          document.layouts.forEach((layout) => {
+            writes.add(layoutEntityKey(layout.id));
+            layout.elements.forEach((element) => addElementTreeEntityWrites(element, writes));
+          });
+          document.slides.forEach((slide) => addSlideTreeWrites(slide, writes));
+        }
         break;
 
       case 'theme.delete': {

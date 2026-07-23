@@ -1180,7 +1180,7 @@ const runSmoke = async () => {
   const metrics = { processCount: 0, protocolFrameCount: 0 };
   const activeClients = new Set();
   const userData = await mkdtemp(path.join(tmpdir(), 'htmllelujah-mcp-v1-'));
-  const descriptorPath = path.join(userData, 'mcp', 'endpoint-v1.json');
+  const descriptorPath = path.join(userData, 'mcp', 'endpoint-v2.json');
   let application;
   let applicationSpawnError;
   let applicationError = '';

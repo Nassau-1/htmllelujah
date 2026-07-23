@@ -9,3 +9,4 @@
 **/out/
 **/coverage/
 pnpm-lock.yaml
+packages/renderer/src/catalog/generated/

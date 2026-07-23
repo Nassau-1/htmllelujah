@@ -522,6 +522,13 @@ const collectElementIds = (
   return output;
 };
 
+const cloneElementValue = (element: Element, preservePlaceholderBinding: boolean): Element => {
+  const cloned = structuredClone(element);
+  if (preservePlaceholderBinding || cloned.placeholderBinding === undefined) return cloned;
+  const { placeholderBinding: _placeholderBinding, ...detached } = cloned;
+  return detached as Element;
+};
+
 const cloneElement = (
   element: Element,
   ids: ReadonlyMap<string, string>,
@@ -529,21 +536,22 @@ const cloneElement = (
 ): Element => {
   const nextId = ids.get(element.id);
   if (nextId === undefined) throw new Error('Could not duplicate an object identifier.');
+  const cloned = cloneElementValue(element, preserveGeometryAndName);
   const common = {
     id: nextId,
-    name: preserveGeometryAndName ? element.name : `${element.name} copy`,
+    name: preserveGeometryAndName ? cloned.name : `${cloned.name} copy`,
     frame: preserveGeometryAndName
-      ? { ...element.frame }
-      : { ...element.frame, xPt: element.frame.xPt + 18, yPt: element.frame.yPt + 18 },
+      ? { ...cloned.frame }
+      : { ...cloned.frame, xPt: cloned.frame.xPt + 18, yPt: cloned.frame.yPt + 18 },
   };
-  switch (element.type) {
+  switch (cloned.type) {
     case 'text':
-      return { ...structuredClone(element), ...common, content: cloneContent(element.content) };
+      return { ...cloned, ...common, content: cloneContent(cloned.content) };
     case 'table':
       return {
-        ...structuredClone(element),
+        ...cloned,
         ...common,
-        cells: element.cells.map((cell) => ({
+        cells: cloned.cells.map((cell) => ({
           ...structuredClone(cell),
           id: id(),
           content: cloneContent(cell.content),
@@ -553,34 +561,37 @@ const cloneElement = (
       const rebind = (elementId: string | undefined): string | undefined =>
         elementId === undefined ? undefined : (ids.get(elementId) ?? elementId);
       return {
-        ...structuredClone(element),
+        ...cloned,
         ...common,
         start: {
-          ...element.start,
-          binding: { ...element.start.binding, elementId: rebind(element.start.binding.elementId) },
+          ...cloned.start,
+          binding: { ...cloned.start.binding, elementId: rebind(cloned.start.binding.elementId) },
         },
         end: {
-          ...element.end,
-          binding: { ...element.end.binding, elementId: rebind(element.end.binding.elementId) },
+          ...cloned.end,
+          binding: { ...cloned.end.binding, elementId: rebind(cloned.end.binding.elementId) },
         },
       };
     }
     case 'group':
       return {
-        ...structuredClone(element),
+        ...cloned,
         ...common,
-        children: element.children.map((child) =>
-          cloneElement(child, ids, preserveGeometryAndName),
-        ),
+        children: cloned.children.map((child) => cloneElement(child, ids, preserveGeometryAndName)),
       };
     case 'image':
     case 'shape':
     case 'icon':
     case 'placeholder':
-      return { ...structuredClone(element), ...common };
+      return { ...cloned, ...common };
   }
 };
 
+/**
+ * Clones ordinary authored objects for duplication or paste. Placeholder-bound
+ * content is deliberately detached because one slide cannot bind two local
+ * objects to the same inherited placeholder.
+ */
 export const duplicateElements = (elements: readonly Element[]): readonly Element[] => {
   const ids = collectElementIds(elements);
   return elements.map((element) => cloneElement(element, ids, false));

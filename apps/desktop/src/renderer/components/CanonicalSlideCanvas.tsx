@@ -70,6 +70,9 @@ type CanonicalSlideCanvasProps = {
     frames: readonly { readonly elementId: string; readonly frame: Frame }[],
   ) => void;
   readonly onEditText: (elementId: string) => void;
+  readonly onContextMenu?:
+    | ((elementId: string, position: Readonly<{ clientX: number; clientY: number }>) => void)
+    | undefined;
   readonly onInlineTextChange?: ((value: string) => void) | undefined;
   readonly onInlineTextPaste?:
     ((event: ReactClipboardEvent<HTMLTextAreaElement>) => void) | undefined;
@@ -525,6 +528,7 @@ export function CanonicalSlideCanvas({
   onSelect,
   onTransform,
   onEditText,
+  onContextMenu,
   onInlineTextChange,
   onInlineTextPaste,
   onInlineTextCommit,
@@ -891,6 +895,21 @@ export function CanonicalSlideCanvas({
                   aria-pressed={selected}
                   data-canvas-element-id={localElement.id}
                   onPointerDown={(event) => beginMove(event, editable)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const open = (): void =>
+                      onContextMenu?.(localElement.id, {
+                        clientX: event.clientX,
+                        clientY: event.clientY,
+                      });
+                    if (selectedIds.includes(localElement.id)) open();
+                    else {
+                      void requestSelection([localElement.id]).then((authorized) => {
+                        if (authorized) open();
+                      });
+                    }
+                  }}
                   onDoubleClick={(event) => {
                     event.stopPropagation();
                     if (localElement.type === 'text') onEditText(localElement.id);
@@ -904,6 +923,21 @@ export function CanonicalSlideCanvas({
                     } else if (event.key === ' ') {
                       event.preventDefault();
                       void requestSelection([localElement.id]);
+                    } else if (
+                      event.key === 'ContextMenu' ||
+                      (event.key === 'F10' && event.shiftKey)
+                    ) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      const bounds = event.currentTarget.getBoundingClientRect();
+                      void requestSelection([localElement.id]).then((authorized) => {
+                        if (authorized) {
+                          onContextMenu?.(localElement.id, {
+                            clientX: bounds.left + bounds.width / 2,
+                            clientY: bounds.top + bounds.height / 2,
+                          });
+                        }
+                      });
                     }
                   }}
                 >

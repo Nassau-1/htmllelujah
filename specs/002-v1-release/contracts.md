@@ -404,6 +404,10 @@ no formula semantics and remain literal.
 
 The MCP executable uses stdio JSON-RPC framing. Stdout contains protocol only; stderr
 contains redacted diagnostics. Maximum frame size and request concurrency are bounded.
+ADR-014 upgrades the local desktop leg to RPC v2: the rotating endpoint secret proves
+the current desktop, and a persisted Ed25519 client credential proves the registered
+local client. The server injects that client identity and actor; no MCP input may
+select either value.
 
 ### Read tools
 
@@ -413,6 +417,7 @@ documents_list
 documents_get_outline
 slides_get
 documents_get_styles
+documents_get_design_context
 documents_validate
 collaboration_status
 ```
@@ -421,6 +426,7 @@ collaboration_status
 
 ```text
 documents_propose_commands
+documents_propose_design_operations
 documents_commit_proposal
 documents_undo_agent_transaction
 assets_request_import
@@ -429,8 +435,23 @@ documents_request_export
 
 `documents_propose_commands` accepts at most 100 typed commands and creates a
 revision-bound proposal. Delete, full replacement, layout/reset, and other classified
-destructive batches require an unexpired `commit-destructive` approval at commit;
-agent undo, imports, and exports require their own unexpired single-purpose approval.
+destructive batches require an unexpired `commit-destructive` approval at commit.
+Validated full theme/master/layout/element replacements that preserve resources,
+nested structure, table structure, and placeholder bindings are ordinary reversible
+edits and do not require per-edit approval. Agent undo, imports, and exports require
+their own unexpired single-purpose approval. Grants and receipts are bound to the
+authenticated client as well as document, action, revision, expiry, and use.
+`documents_get_design_context` returns the authoritative theme → master → layout →
+slide chain plus paginated provenance, placeholders, effective locks, constraints,
+bounded asset metadata, and validation state. `documents_propose_design_operations`
+accepts at most 20 strict page/theme/master/layout/slide-layout/theme-enforcement
+operations, expands them through the canonical command engine, and refuses the
+proposal if expansion exceeds 100 commands. It has no arbitrary HTML, CSS, SVG, URL,
+shell, or filesystem-path field.
+Deck-wide enforcement maps to exactly one strict `theme.enforce-deck` command. The
+command requires an existing theme, preserves resource and element identity without
+deletion or remapping, and remains an ordinary reversible transaction regardless of
+the number of styled objects.
 V1 exposes no MCP save tool. Tool results return IDs, revisions, counts, dimensions,
 warnings, and safe error codes, not paths or complete asset bytes.
 

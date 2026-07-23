@@ -11,9 +11,11 @@ import {
   analyzeCommandAccess,
   assetEntityKey,
   assetReferenceKey,
+  deckDefaultBackgroundKey,
   DOCUMENT_COMMAND_ACCESS_CLASSIFICATION,
   elementEntityKey,
   layoutEntityKey,
+  masterEntityKey,
   slideEntityKey,
 } from '../src/index.js';
 
@@ -134,6 +136,22 @@ describe('V2 command access classification', () => {
       expect(access.writeSet).toContain(slideEntityKey(slide.id));
       expect(access.writeSet).toContain(elementEntityKey(bound.id));
     });
+  });
+
+  it('serializes deck-wide theme enforcement against every affected design surface', () => {
+    const deck = createDefaultDeck({ idFactory: deterministicIds() });
+    const theme = deck.themes[0]!;
+    const master = deck.masters[0]!;
+    const layout = deck.layouts[0]!;
+    const slide = deck.slides[0]!;
+    const element = slide.elements[0]!;
+    const access = analyzeCommandAccess([{ type: 'theme.enforce-deck', themeId: theme.id }], deck);
+
+    expect(access.writeSet).toContain(deckDefaultBackgroundKey);
+    expect(access.writeSet).toContain(masterEntityKey(master.id));
+    expect(access.writeSet).toContain(layoutEntityKey(layout.id));
+    expect(access.writeSet).toContain(slideEntityKey(slide.id));
+    expect(access.writeSet).toContain(elementEntityKey(element.id));
   });
 
   it('keeps independent element commands independent while serializing table mutations', () => {

@@ -1,6 +1,14 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 
-import { DocumentCommandError } from '@htmllelujah/document-core';
+import {
+  applyTransaction,
+  DOCUMENT_LIMITS,
+  DocumentCommandError,
+  resolveSlideFromValidatedDocument,
+  type Element,
+  type ResolvedElement,
+  type ResolvedElementSource,
+} from '@htmllelujah/document-core';
 import {
   DocumentRuntimeError,
   DocumentSessionManager,
@@ -9,18 +17,22 @@ import {
 import {
   affectedSlideIds,
   commandsRequireApproval,
+  designOperationsToCommands,
   MCP_LIMITS,
   McpSafeError,
   type CommitProposalInput,
   type CommitProposalResult,
+  type DesignContextInput,
   type ExportDocumentInput,
   type HtmllelujahMcpService,
   type ImportAssetInput,
   type McpPermissionGate,
   type ProposalResult,
   type ProposeCommandsInput,
+  type ProposeDesignOperationsInput,
   type SafeRecord,
   type TransactionTargetInput,
+  type TrustedClientContext,
 } from '@htmllelujah/mcp-server';
 
 export type McpApprovalAction = Parameters<McpPermissionGate['consumeApproval']>[0]['action'];
@@ -41,7 +53,11 @@ export interface DesktopMcpBridgeOptions {
     readonly connectedPeers: number;
     readonly discoveryEnabled: boolean;
   };
-  readonly importAsset: (sessionId: string, expectedRevision: string) => Promise<SafeRecord>;
+  readonly importAsset: (
+    sessionId: string,
+    expectedRevision: string,
+    client: TrustedClientContext,
+  ) => Promise<SafeRecord>;
   readonly exportDocument: (sessionId: string, input: ExportDocumentInput) => Promise<SafeRecord>;
   readonly now?: (() => Date) | undefined;
 }
@@ -49,6 +65,7 @@ export interface DesktopMcpBridgeOptions {
 interface PendingProposal {
   readonly sessionId: string;
   readonly documentId: string;
+  readonly clientId: string;
   readonly requiresApproval: boolean;
   readonly commandCount: number;
   readonly expiresAtMs: number;
@@ -56,6 +73,7 @@ interface PendingProposal {
 
 interface ApprovalGrant {
   readonly documentId: string;
+  readonly clientId: string;
   readonly action: McpApprovalAction;
   readonly baseRevision: string;
   readonly expiresAtMs: number;
@@ -67,6 +85,94 @@ interface ApprovalReceipt extends ApprovalGrant {
 
 const APPROVAL_TTL_MS = 2 * 60_000;
 const RECEIPT_TTL_MS = 30_000;
+
+interface DesignElementSummaryContext {
+  readonly source: ResolvedElementSource;
+  readonly containerId: string;
+  readonly parentId?: string | undefined;
+  readonly placeholder?: ResolvedElement['placeholder'] | undefined;
+  readonly resolvedTextStyle?: ResolvedElement['resolvedTextStyle'] | undefined;
+}
+
+const designElementSummary = (
+  element: Element,
+  context: DesignElementSummaryContext,
+): SafeRecord => ({
+  id: element.id,
+  name: element.name,
+  type: element.type,
+  source: context.source,
+  containerId: context.containerId,
+  ...(context.parentId === undefined ? {} : { parentId: context.parentId }),
+  frame: element.frame,
+  opacity: element.opacity,
+  visible: element.visible,
+  locked: element.locked,
+  effectiveLockedInSelectedSlide:
+    element.locked || context.source !== 'slide' || context.placeholder?.locked === true,
+  inherited: context.source !== 'slide',
+  ...(element.placeholderBinding === undefined
+    ? {}
+    : {
+        placeholderBinding: element.placeholderBinding,
+        inheritedPlaceholder:
+          context.placeholder === undefined
+            ? undefined
+            : {
+                id: context.placeholder.id,
+                role: context.placeholder.role,
+                locked: context.placeholder.locked,
+              },
+      }),
+  ...(element.type === 'placeholder'
+    ? {
+        placeholder: {
+          role: element.role,
+          accepts: element.accepts,
+          prompt: element.prompt,
+          defaultTextStyle: element.defaultTextStyle,
+        },
+      }
+    : {}),
+  ...(element.type === 'text'
+    ? {
+        styleRole: element.styleRole,
+        localStyleFields: Object.keys(element.style ?? {}),
+        resolvedTextStyle: context.resolvedTextStyle,
+      }
+    : {}),
+  ...(element.type === 'icon'
+    ? { catalogIdentity: { iconSet: element.iconSet, iconName: element.iconName } }
+    : {}),
+  ...(element.type === 'image' ? { assetId: element.assetId } : {}),
+  ...(element.type === 'group' ? { childCount: element.children.length } : {}),
+});
+
+const flattenDesignElements = (
+  elements: readonly Element[],
+  context: Omit<DesignElementSummaryContext, 'parentId'>,
+  output: SafeRecord[],
+  parentId?: string | undefined,
+): void => {
+  for (const element of elements) {
+    output.push(
+      designElementSummary(element, {
+        ...context,
+        ...(parentId === undefined ? {} : { parentId }),
+      }),
+    );
+    if (element.type === 'group') {
+      flattenDesignElements(element.children, context, output, element.id);
+    }
+  }
+};
+
+const countElements = (elements: readonly Element[]): number =>
+  elements.reduce(
+    (total, element) =>
+      total + 1 + (element.type === 'group' ? countElements(element.children) : 0),
+    0,
+  );
 
 const asSafeError = (error: unknown): never => {
   if (error instanceof McpSafeError) throw error;
@@ -171,12 +277,16 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     approvalId: string | undefined,
     documentId: string,
     action: McpApprovalAction,
+    clientId: string,
   ): ApprovalReceipt {
     this.#purgeExpired();
     const receiptEntry =
       approvalId === undefined
         ? [...this.#receipts].find(
-            ([, candidate]) => candidate.documentId === documentId && candidate.action === action,
+            ([, candidate]) =>
+              candidate.documentId === documentId &&
+              candidate.action === action &&
+              candidate.clientId === clientId,
           )
         : ([approvalId, this.#receipts.get(approvalId)] as const);
     const receiptId = receiptEntry?.[0];
@@ -189,6 +299,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
       receipt === undefined ||
       receipt.documentId !== documentId ||
       receipt.action !== action ||
+      receipt.clientId !== clientId ||
       receipt.consumedAtMs + RECEIPT_TTL_MS <= this.#nowMs()
     ) {
       throw new McpSafeError('APPROVAL_EXPIRED', 'The desktop approval is invalid or expired.');
@@ -200,7 +311,11 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     return receipt;
   }
 
-  public issueApproval(documentId: string, action: McpApprovalAction): McpApprovalCapability {
+  public issueApproval(
+    documentId: string,
+    action: McpApprovalAction,
+    clientId: string,
+  ): McpApprovalCapability {
     const snapshot = this.#assertEditable(documentId);
     this.#purgeExpired();
     if (this.#approvals.size >= MCP_LIMITS.maxPendingApprovals) {
@@ -213,6 +328,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     const expiresAtMs = this.#nowMs() + APPROVAL_TTL_MS;
     this.#approvals.set(approvalId, {
       documentId,
+      clientId,
       action,
       baseRevision: snapshot.revision,
       expiresAtMs,
@@ -230,12 +346,28 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     this.#receipts.clear();
   }
 
+  public revokeClient(clientId: string): void {
+    for (const [proposalId, proposal] of this.#proposals) {
+      if (proposal.clientId === clientId) this.#proposals.delete(proposalId);
+    }
+    for (const [approvalId, approval] of this.#approvals) {
+      if (approval.clientId === clientId) this.#approvals.delete(approvalId);
+    }
+    for (const [receiptId, receipt] of this.#receipts) {
+      if (receipt.clientId === clientId) this.#receipts.delete(receiptId);
+    }
+  }
+
   public pendingApprovalCount(): number {
     this.#purgeExpired();
     return this.#approvals.size;
   }
 
-  public async canRead(documentId: string): Promise<boolean> {
+  public async canRead(
+    documentId: string,
+    client?: TrustedClientContext | undefined,
+  ): Promise<boolean> {
+    if (client === undefined) return false;
     try {
       this.#sessionForDocument(documentId);
       return true;
@@ -244,7 +376,11 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     }
   }
 
-  public async canEdit(documentId: string): Promise<boolean> {
+  public async canEdit(
+    documentId: string,
+    client?: TrustedClientContext | undefined,
+  ): Promise<boolean> {
+    if (client === undefined) return false;
     try {
       this.#assertEditable(documentId);
       return true;
@@ -253,17 +389,22 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     }
   }
 
-  public async consumeApproval(input: {
-    readonly approvalId: string;
-    readonly documentId: string;
-    readonly action: McpApprovalAction;
-  }): Promise<boolean> {
+  public async consumeApproval(
+    input: {
+      readonly approvalId: string;
+      readonly documentId: string;
+      readonly action: McpApprovalAction;
+    },
+    client?: TrustedClientContext | undefined,
+  ): Promise<boolean> {
+    if (client === undefined) return false;
     this.#purgeExpired();
     const grant = this.#approvals.get(input.approvalId);
     if (
       grant === undefined ||
       grant.documentId !== input.documentId ||
       grant.action !== input.action ||
+      grant.clientId !== client.clientId ||
       grant.expiresAtMs <= this.#nowMs()
     ) {
       return false;
@@ -335,6 +476,145 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     };
   }
 
+  public async getDesignContext(input: DesignContextInput): Promise<SafeRecord> {
+    const snapshot = this.#sessionForDocument(input.documentId);
+    const document = snapshot.document;
+    const slide =
+      input.slideId === undefined
+        ? document.slides[0]
+        : document.slides.find((candidate) => candidate.id === input.slideId);
+    if (slide === undefined) {
+      throw new McpSafeError('NOT_FOUND', 'The requested slide does not exist.');
+    }
+    const projection = resolveSlideFromValidatedDocument(document, slide.id, {
+      includePlaceholders: true,
+    });
+    const elementSummaries: SafeRecord[] = [];
+    if (input.elementScope === 'selected-projection') {
+      for (const entry of projection.elements) {
+        const containerId =
+          entry.source === 'master'
+            ? projection.master.id
+            : entry.source === 'layout'
+              ? projection.layout.id
+              : projection.slide.id;
+        flattenDesignElements(
+          [entry.element],
+          {
+            source: entry.source,
+            containerId,
+            placeholder: entry.placeholder,
+            resolvedTextStyle: entry.resolvedTextStyle,
+          },
+          elementSummaries,
+        );
+      }
+    } else {
+      for (const master of document.masters) {
+        flattenDesignElements(
+          master.elements,
+          { source: 'master', containerId: master.id },
+          elementSummaries,
+        );
+      }
+      for (const layout of document.layouts) {
+        flattenDesignElements(
+          layout.elements,
+          { source: 'layout', containerId: layout.id },
+          elementSummaries,
+        );
+      }
+      for (const candidate of document.slides) {
+        flattenDesignElements(
+          candidate.elements,
+          { source: 'slide', containerId: candidate.id },
+          elementSummaries,
+        );
+      }
+    }
+    const validation = this.#runtime.validate(snapshot.sessionId);
+    const pagedElements = elementSummaries.slice(
+      input.elementOffset,
+      input.elementOffset + input.elementLimit,
+    );
+    const pagedAssets = document.assets.slice(
+      input.assetOffset,
+      input.assetOffset + input.assetLimit,
+    );
+    return {
+      documentId: document.id,
+      revision: snapshot.revision,
+      name: document.name,
+      page: document.page,
+      selectedSlideId: slide.id,
+      inheritance: {
+        themeId: projection.theme.id,
+        masterId: projection.master.id,
+        layoutId: projection.layout.id,
+        slideId: projection.slide.id,
+        background: projection.background,
+        guides: projection.guides,
+      },
+      themes: document.themes,
+      masters: document.masters.map((master) => ({
+        id: master.id,
+        name: master.name,
+        themeId: master.themeId,
+        background: master.background,
+        guideCount: master.guides.length,
+        elementCount: countElements(master.elements),
+      })),
+      layouts: document.layouts.map((layout) => ({
+        id: layout.id,
+        name: layout.name,
+        masterId: layout.masterId,
+        background: layout.background,
+        guideCount: layout.guides.length,
+        elementCount: countElements(layout.elements),
+      })),
+      slides: document.slides.map((candidate, index) => ({
+        id: candidate.id,
+        index,
+        name: candidate.name,
+        layoutId: candidate.layoutId,
+        hidden: candidate.hidden,
+        background: candidate.background,
+        elementCount: countElements(candidate.elements),
+      })),
+      elements: {
+        scope: input.elementScope,
+        offset: input.elementOffset,
+        limit: input.elementLimit,
+        total: elementSummaries.length,
+        hasMore: input.elementOffset + pagedElements.length < elementSummaries.length,
+        items: pagedElements,
+      },
+      assets: {
+        offset: input.assetOffset,
+        limit: input.assetLimit,
+        total: document.assets.length,
+        hasMore: input.assetOffset + pagedAssets.length < document.assets.length,
+        items: pagedAssets,
+      },
+      constraints: {
+        document: DOCUMENT_LIMITS,
+        proposal: {
+          maxCommands: MCP_LIMITS.maxCommands,
+          maxDesignOperations: MCP_LIMITS.maxDesignOperations,
+          expectedRevisionRequired: true,
+          arbitraryMarkupAccepted: false,
+          arbitraryUrlsAccepted: false,
+          arbitraryFilesystemPathsAccepted: false,
+        },
+      },
+      validation: {
+        valid: validation.valid,
+        issueCount: validation.issues.length,
+        issues: validation.issues,
+      },
+    };
+  }
+
   public async validateDocument(documentId: string): Promise<SafeRecord> {
     const snapshot = this.#sessionForDocument(documentId);
     const validation = this.#runtime.validate(snapshot.sessionId);
@@ -347,22 +627,34 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     };
   }
 
-  public async proposeCommands(input: ProposeCommandsInput): Promise<ProposalResult> {
+  public async proposeCommands(
+    input: ProposeCommandsInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<ProposalResult> {
     try {
+      const trustedClient = this.#requireClient(client);
       const snapshot = this.#assertEditable(input.documentId);
       this.#reserveProposalSlot();
       try {
-        const requiresApproval = commandsRequireApproval(input.commands);
+        const metadata = {
+          transactionId: randomUUID(),
+          actorId: trustedClient.actorId,
+          origin: 'agent' as const,
+          label: input.label,
+          timestamp: new Date(this.#nowMs()).toISOString(),
+        };
+        const preview = applyTransaction(snapshot.document, input.commands, {
+          expectedRevision: input.expectedRevision,
+          metadata,
+        });
+        const requiresApproval = commandsRequireApproval(input.commands, {
+          before: snapshot.document,
+          after: preview.document,
+        });
         const proposal = this.#runtime.propose(snapshot.sessionId, {
           expectedRevision: input.expectedRevision,
           commands: input.commands,
-          metadata: {
-            transactionId: randomUUID(),
-            actorId: 'mcp-local-agent',
-            origin: 'agent',
-            label: input.label,
-            timestamp: new Date(this.#nowMs()).toISOString(),
-          },
+          metadata,
         });
         const expiresAtMs = Date.parse(proposal.expiresAt);
         const now = this.#nowMs();
@@ -376,6 +668,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
         this.#proposals.set(proposal.proposalId, {
           sessionId: snapshot.sessionId,
           documentId: input.documentId,
+          clientId: trustedClient.clientId,
           requiresApproval,
           commandCount: input.commands.length,
           expiresAtMs,
@@ -399,15 +692,49 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     }
   }
 
-  public async commitProposal(input: CommitProposalInput): Promise<CommitProposalResult> {
+  public async proposeDesignOperations(
+    input: ProposeDesignOperationsInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<ProposalResult> {
+    try {
+      const trustedClient = this.#requireClient(client);
+      const snapshot = this.#assertEditable(input.documentId);
+      const commands = designOperationsToCommands(snapshot.document, input.operations);
+      return await this.proposeCommands(
+        {
+          documentId: input.documentId,
+          expectedRevision: input.expectedRevision,
+          label: input.label,
+          commands: [...commands],
+        },
+        trustedClient,
+      );
+    } catch (error) {
+      return asSafeError(error);
+    }
+  }
+
+  public async commitProposal(
+    input: CommitProposalInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<CommitProposalResult> {
+    const trustedClient = this.#requireClient(client);
     this.#purgeExpired();
     const proposal = this.#proposals.get(input.proposalId);
     if (proposal === undefined)
       throw new McpSafeError('NOT_FOUND', 'Proposal is missing or expired.');
+    if (proposal.clientId !== trustedClient.clientId) {
+      throw new McpSafeError('MCP_UNAUTHORIZED', 'The proposal belongs to another client.');
+    }
     try {
       this.#assertEditable(proposal.documentId);
       if (proposal.requiresApproval) {
-        this.#takeReceipt(input.approvalId, proposal.documentId, 'commit-destructive');
+        this.#takeReceipt(
+          input.approvalId,
+          proposal.documentId,
+          'commit-destructive',
+          trustedClient.clientId,
+        );
       }
       const before = this.#runtime.getSnapshot(proposal.sessionId);
       const after = await this.#runtime.commitProposal(proposal.sessionId, input.proposalId);
@@ -430,16 +757,23 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     }
   }
 
-  public async undoAgentTransaction(input: TransactionTargetInput): Promise<CommitProposalResult> {
+  public async undoAgentTransaction(
+    input: TransactionTargetInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<CommitProposalResult> {
     try {
+      const trustedClient = this.#requireClient(client);
       const snapshot = this.#assertEditable(input.documentId);
-      this.#takeReceipt(undefined, input.documentId, 'undo');
+      this.#takeReceipt(undefined, input.documentId, 'undo', trustedClient.clientId);
       if (snapshot.revision !== input.expectedRevision) {
         throw new McpSafeError('REVISION_CONFLICT', 'The presentation changed before undo.');
       }
       const audit = this.#runtime
         .getAgentAudit(snapshot.sessionId)
         .find((entry) => entry.transactionId === input.transactionId);
+      if (audit === undefined || audit.actorId !== trustedClient.actorId) {
+        throw new McpSafeError('MCP_UNAUTHORIZED', 'The transaction belongs to another client.');
+      }
       const after = await this.#runtime.undoAgentTransaction(
         snapshot.sessionId,
         input.transactionId,
@@ -447,7 +781,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
           expectedRevision: input.expectedRevision,
           metadata: {
             transactionId: randomUUID(),
-            actorId: 'mcp-local-agent',
+            actorId: trustedClient.actorId,
             origin: 'agent',
             label: 'Undo agent transaction',
             timestamp: new Date(this.#nowMs()).toISOString(),
@@ -466,22 +800,40 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     }
   }
 
-  public async importAsset(input: ImportAssetInput): Promise<SafeRecord> {
+  public async importAsset(
+    input: ImportAssetInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<SafeRecord> {
     try {
-      const receipt = this.#takeReceipt(input.approvalId, input.documentId, 'import');
+      const trustedClient = this.#requireClient(client);
+      const receipt = this.#takeReceipt(
+        input.approvalId,
+        input.documentId,
+        'import',
+        trustedClient.clientId,
+      );
       const snapshot = this.#assertEditable(input.documentId);
-      return await this.#options.importAsset(snapshot.sessionId, receipt.baseRevision);
+      return await this.#options.importAsset(
+        snapshot.sessionId,
+        receipt.baseRevision,
+        trustedClient,
+      );
     } catch (error) {
       return asSafeError(error);
     }
   }
 
-  public async exportDocument(input: ExportDocumentInput): Promise<SafeRecord> {
+  public async exportDocument(
+    input: ExportDocumentInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<SafeRecord> {
     try {
+      const trustedClient = this.#requireClient(client);
       this.#takeReceipt(
         input.approvalId,
         input.documentId,
         input.format === 'html' ? 'export-html' : 'export-pdf',
+        trustedClient.clientId,
       );
       const snapshot = this.#sessionForDocument(input.documentId);
       if (snapshot.revision !== input.expectedRevision) {
@@ -503,5 +855,12 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
       discoveryEnabled: status.discoveryEnabled,
       sharedFileWriter: status.mode === 'host',
     };
+  }
+
+  #requireClient(client: TrustedClientContext | undefined): TrustedClientContext {
+    if (client === undefined) {
+      throw new McpSafeError('MCP_UNAUTHORIZED', 'A trusted MCP client is required.');
+    }
+    return client;
   }
 }

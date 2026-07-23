@@ -8,7 +8,6 @@ import {
   SlideSurface,
   formatNumber,
   formatPoint,
-  isoCountryCodeToFlag,
   normalizeResolvedSlide,
   resolveConnectorGeometries,
   resolveConnectorGeometry,
@@ -39,6 +38,8 @@ describe('SlideSurface', () => {
     expect(first).toContain('First bullet');
     expect(first).toContain('First step');
     expect(first).toContain('Nested group content');
+    expect(first).toContain('data-catalog-icon="twemoji:1f600"');
+    expect(first).toContain('data-catalog-icon="circle-flags:fr"');
     expect(first).not.toContain('MUST_NOT_RENDER');
     if (mode === 'editor') {
       expect(first).toContain('Drop media &lt;here&gt;');
@@ -122,7 +123,7 @@ describe('SlideSurface', () => {
     expect(html).toContain('d="M 400 270 L 380 270 L 380 171 L 360 171"');
     expect(html).toContain('data-element-id="group-inner"');
     expect(html).toContain('data-element-id="nested-shape"');
-    expect(html).toContain(isoCountryCodeToFlag('FR'));
+    expect(html).toContain('data-catalog-icon="circle-flags:fr"');
     expect(html).toContain('data-render-warning="ICON_UNKNOWN"');
   });
 

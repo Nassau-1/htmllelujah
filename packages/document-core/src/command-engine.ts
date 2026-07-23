@@ -32,6 +32,7 @@ import {
   type ResolvedDocumentConnectorGeometry,
 } from './connector-geometry.js';
 import { createRevisionToken } from './revision.js';
+import { enforceThemeAcrossDeck } from './design-authority.js';
 import { parseTsv, TsvParseError } from './tsv.js';
 import { DocumentValidationError, parseDeck, validateDeck } from './validation.js';
 
@@ -1124,6 +1125,11 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
         ),
       };
     }
+    case 'theme.enforce-deck':
+      if (!document.themes.some((theme) => theme.id === command.themeId)) {
+        throw new DocumentCommandError('NOT_FOUND', `Theme ${command.themeId} does not exist.`);
+      }
+      return enforceThemeAcrossDeck(document, command.themeId);
     case 'theme.delete': {
       if (document.themes.length === 1) {
         throw new DocumentCommandError('LAST_RESOURCE', 'A deck must retain at least one theme.');
