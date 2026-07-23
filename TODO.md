@@ -1,10 +1,86 @@
 # Roadmap and TODO
 
-Status: **V1 release candidate**, last reviewed 2026-07-21.
+Status: **V1 usability remediation in progress**, last reviewed 2026-07-23.
 
-The usable V1 implementation is present. Publication remains gated by observed
-release evidence for the exact Windows installer; unchecked items below must not be
-reported as passed until their results are recorded.
+The installed preview is available for hands-on feedback, but the reported authoring
+and agent-access gaps below block a usable V1. Publication and another long
+release-candidate campaign remain deferred until this remediation converges.
+
+## Hands-on authoring and agent remediation
+
+Authoritative scope, sequencing, and acceptance evidence:
+[`specs/003-editor-authoring-and-agent-access/`](specs/003-editor-authoring-and-agent-access/spec.md).
+
+### Blocking interactions
+
+- [ ] Add a contextual object menu on right-click with cut, copy, paste, duplicate,
+      delete, lock, visibility, layer, grouping, and relevant insert commands.
+- [ ] Add object-level `Ctrl+C`, `Ctrl+X`, and `Ctrl+V`, including safe external text,
+      rich-text, image, and TSV routing.
+- [ ] Fix duplication of placeholder-bound text boxes by detaching copied bindings,
+      generating every nested identifier afresh, and updating selection only after a
+      successful transaction.
+- [ ] Separate the application menu from the authoring toolbar so Edit, View, Insert,
+      Arrange, and Help expose real command groups and shortcut discovery rather than
+      repeating the same insertion buttons.
+
+### Slides, layouts, and masters
+
+- [ ] Make the full valid insertion palette available on slides, layouts, and masters:
+      text, shape, image, table, connector, local icon, Twemoji, and circular flag.
+- [ ] Make transform, align, distribute, layer, duplicate, delete, visibility, and lock
+      operate consistently on the active slide/layout/master surface.
+- [ ] Make layout and master updates authoritative for every inheriting slide while
+      preserving explicit supported local overrides.
+- [ ] Expose persistent locks for layout and master furniture; locked inherited
+      objects must not be editable from slide mode.
+
+### Themes and page furniture
+
+- [ ] Add explicit creation of blank and derived themes rather than hiding creation
+      behind a copy-only action.
+- [ ] Add one-transaction theme enforcement so switching theme changes all managed
+      fonts and colors across text, shapes, connectors, icons, tables, backgrounds,
+      masters, layouts, and slides.
+- [ ] Distinguish inherited, theme-managed, and local style values and add reset to
+      theme/layout actions.
+- [ ] Enable bounded custom page width and height.
+- [ ] Add dynamic current-page, page-count, deck-title, date, and time fields.
+- [ ] Add master-level page numbering with left, center, and right placement.
+- [ ] Add editable text and image watermarks that default to locked master furniture.
+
+### Direct content choice and offline catalogs
+
+- [ ] Replace rectangle-first shape insertion with a visual pre-insertion shape
+      chooser.
+- [ ] Add a searchable pre-insertion local-icon chooser.
+- [ ] Bundle a searchable offline Twemoji catalog with stable Unicode/code-point
+      identity and required attribution.
+- [ ] Replace operating-system Unicode flags with bundled searchable Circle Flags SVG
+      artwork and stable two-letter country codes.
+- [ ] Keep catalog rendering deterministic across editor, thumbnail, presentation,
+      standalone HTML, PDF, save/reopen, and collaboration without any CDN fallback.
+
+### Persistent trusted local agents
+
+- [ ] Replace per-edit one-time approval with persisted current-user trusted-client
+      grants scoped to read-only, ordinary reversible editing, or extended actions.
+- [ ] Let trusted local agents inspect the authoritative page, theme, master, layout,
+      placeholder, lock, asset-metadata, slide, revision, constraint, and validation
+      context.
+- [ ] Add design-aware typed operations for themes, masters, layouts, page furniture,
+      and ordinary slide editing.
+- [ ] Keep explicit approval for imports, exports, overwrites, destructive bulk
+      replacement, trust changes, and external targets.
+- [ ] Show and revoke trusted clients and retain attributable transaction-level undo.
+
+### Verification discipline
+
+- [ ] Run focused unit/integration checks for each completed remediation checkpoint.
+- [ ] Run one consolidated opened-Electron smoke covering all reported flows.
+- [ ] Run one final complete `pnpm verify` after the implementation has converged.
+- [ ] Do not repeat the 30-minute LAN or complete Windows candidate campaign between
+      individual fixes; run them once on the final candidate.
 
 ## V1 implementation
 
