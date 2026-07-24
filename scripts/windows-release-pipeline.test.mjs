@@ -120,7 +120,20 @@ const withTemporaryRoot = async (prefix, operation) => {
 
 test('workspace packages are complete and topologically ordered', async () => {
   const packages = await discoverWorkspacePackages(repositoryRoot);
-  assert.equal(packages.length, 8);
+  assert.deepEqual(
+    packages.map((entry) => entry.name),
+    [
+      '@htmllelujah/document-core',
+      '@htmllelujah/geometry',
+      '@htmllelujah/pptx-importer',
+      '@htmllelujah/collaboration',
+      '@htmllelujah/hdeck',
+      '@htmllelujah/mcp-server',
+      '@htmllelujah/renderer',
+      '@htmllelujah/document-runtime',
+      '@htmllelujah/exporter',
+    ],
+  );
   const positions = new Map(packages.map((entry, index) => [entry.name, index]));
   for (const entry of packages) {
     for (const dependency of entry.dependencyNames) {
