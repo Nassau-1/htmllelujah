@@ -13,11 +13,13 @@ import {
 } from '@htmllelujah/document-runtime';
 import { createPrintHtml, createStandaloneHtml, ExporterError } from '@htmllelujah/exporter';
 import { startLocalRpcServer, type LocalRpcServerHandle } from '@htmllelujah/mcp-server';
+import { PresentationImportError } from '@htmllelujah/pptx-importer';
 import {
   app,
   BrowserWindow,
   dialog,
   ipcMain,
+  Menu,
   nativeImage,
   protocol,
   session,
@@ -27,11 +29,12 @@ import {
 import { z } from 'zod';
 
 import { BoundedShutdownAdmission, settleShutdownTasks } from './bounded-shutdown.js';
+import { clipboardImageImportSourceSchema } from './clipboard-image-import.js';
 import { DesktopCollaborationCoordinator } from './collaboration-service.js';
 import {
-  assertDecodedDimensions,
   ImageImportValidationError,
-  inspectImageBeforeDecode,
+  MAX_DESKTOP_IMAGE_BYTES,
+  validateImageImportBytes,
 } from './image-import-validation.js';
 import {
   imageImportPresetSchema,
@@ -41,13 +44,25 @@ import {
 } from './image-import-target.js';
 import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
 import { mcpSafeErrorToDesktopResult } from './mcp-desktop-result.js';
-import { TrustedMcpClientStore } from './mcp-trusted-clients.js';
+import { summarizeTrustedMcpClients } from './mcp-trusted-client-summary.js';
+import { TrustedMcpClientStore, TrustedMcpClientStoreError } from './mcp-trusted-clients.js';
+import {
+  previewPresentationDesignFile,
+  PresentationDesignPreviewSourceError,
+} from './presentation-design-preview.js';
 import { isTrustedRendererUrl, resolveRendererEntryUrl } from './renderer-entry.js';
 import {
   buildSaveDialogDefaultPath,
   neutralizeWindowsReservedFileName,
 } from './save-dialog-default-path.js';
 import { resolveSaveTarget } from './save-target.js';
+import {
+  editableContextMenuItems,
+  isBoundedSpellcheckLanguage,
+  normalizeSpellcheckLanguageRequest,
+  resolveSupportedSpellcheckLanguages,
+  SPELLCHECK_LIMITS,
+} from './spellcheck.js';
 import {
   runSerializedStandaloneCollaborationTransition,
   StandaloneSaveQueue,
@@ -68,14 +83,19 @@ import {
   DESKTOP_API_VERSION,
   DESKTOP_IPC,
   type AppInfo,
+  type ClipboardImageMediaType,
   type CollaborationStatus,
   type CollaborationTextLeaseStatus,
   type DesktopResult,
   type ExportResult,
   type InitializeResult,
   type McpStatus,
+  type McpTrustedClientRevokeResult,
+  type McpTrustedClientSummary,
+  type PreviewPresentationDesignImportResult,
   type WindowCloseRelease,
   type SessionView,
+  type SpellcheckLanguagesResult,
 } from '../shared/desktop-api.js';
 
 protocol.registerSchemesAsPrivileged([
@@ -96,7 +116,6 @@ protocol.registerSchemesAsPrivileged([
 app.setName('HTMLlelujah');
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const PDF_READINESS_DEADLINE_MS = 15_000;
 
 const runtime = new DocumentSessionManager({
@@ -448,6 +467,24 @@ const collaborationDisplayName = z
   .refine((value) => !/[\p{Cc}\p{Cf}]/u.test(value));
 const sessionInputSchema = z.object({ sessionId: identifier }).strict();
 const historyInputSchema = sessionInputSchema.extend({ expectedRevision: revision }).strict();
+const spellcheckLanguagesInputSchema = sessionInputSchema
+  .extend({
+    languages: z
+      .array(z.string().trim().min(1).max(64).refine(isBoundedSpellcheckLanguage))
+      .min(1)
+      .max(SPELLCHECK_LIMITS.maxLanguages)
+      .superRefine((languages, context) => {
+        try {
+          normalizeSpellcheckLanguageRequest(languages);
+        } catch {
+          context.addIssue({
+            code: 'custom',
+            message: 'Spellchecker languages must be unique canonical BCP-47 tags.',
+          });
+        }
+      }),
+  })
+  .strict();
 const collaborationTextLeaseInputSchema = sessionInputSchema
   .extend({ slideId: identifier, elementId: identifier })
   .strict();
@@ -456,6 +493,12 @@ const importImageInputSchema = historyInputSchema
     target: imageImportTargetSchema,
     replaceElementId: identifier.optional(),
     preset: imageImportPresetSchema.optional(),
+  })
+  .strict();
+const importClipboardImageInputSchema = historyInputSchema
+  .extend({
+    target: imageImportTargetSchema,
+    ...clipboardImageImportSourceSchema.shape,
   })
   .strict();
 const executeInputSchema = historyInputSchema
@@ -504,6 +547,7 @@ const mcpApprovalInputSchema = sessionInputSchema
     action: z.enum(['commit-destructive', 'undo', 'import', 'export-html', 'export-pdf']),
   })
   .strict();
+const mcpTrustedClientInputSchema = sessionInputSchema.extend({ id: identifier }).strict();
 
 const metadataFor = (event: IpcMainInvokeEvent, label: string): TransactionMetadata => ({
   transactionId: randomUUID(),
@@ -516,6 +560,65 @@ const metadataFor = (event: IpcMainInvokeEvent, label: string): TransactionMetad
 const findWindow = (webContents: WebContents): BrowserWindow | undefined =>
   BrowserWindow.fromWebContents(webContents) ?? undefined;
 
+const applySpellcheckLanguages = (
+  webContents: WebContents,
+  languages: readonly string[],
+): SpellcheckLanguagesResult => {
+  const resolution = resolveSupportedSpellcheckLanguages(
+    languages,
+    webContents.session.availableSpellCheckerLanguages,
+  );
+  webContents.session.setSpellCheckerLanguages([...resolution.appliedLanguages]);
+  return resolution;
+};
+
+const attachEditableTextContextMenu = (window: BrowserWindow): void => {
+  window.webContents.on('context-menu', (_event, parameters) => {
+    const items = editableContextMenuItems({
+      isEditable: parameters.isEditable,
+      misspelledWord: parameters.misspelledWord,
+      dictionarySuggestions: parameters.dictionarySuggestions,
+      canCut: parameters.editFlags.canCut,
+      canCopy: parameters.editFlags.canCopy,
+      canPaste: parameters.editFlags.canPaste,
+      // Electron has no non-persistent ignore-word API. The capability stays
+      // absent instead of writing an "ignored" word into the user dictionary.
+      canIgnoreForSession: false,
+    });
+    if (items === null || window.isDestroyed() || window.webContents.isDestroyed()) return;
+
+    const template: Electron.MenuItemConstructorOptions[] = items.map((item) => {
+      switch (item.kind) {
+        case 'suggestion':
+          return {
+            label: item.label,
+            click: () => {
+              if (!window.webContents.isDestroyed()) {
+                window.webContents.replaceMisspelling(item.replacement);
+              }
+            },
+          };
+        case 'add-to-dictionary':
+          return {
+            label: item.label,
+            click: () => {
+              if (!window.webContents.isDestroyed()) {
+                window.webContents.session.addWordToSpellCheckerDictionary(item.word);
+              }
+            },
+          };
+        case 'ignore-for-session':
+          return { label: item.label, enabled: false };
+        case 'separator':
+          return { type: 'separator' };
+        case 'role':
+          return { role: item.role, enabled: item.enabled };
+      }
+    });
+    Menu.buildFromTemplate(template).popup({ window });
+  });
+};
+
 const saveDialog = (
   parent: BrowserWindow | undefined,
   options: Electron.SaveDialogOptions,
@@ -527,6 +630,91 @@ const openDialog = (
   options: Electron.OpenDialogOptions,
 ): Promise<Electron.OpenDialogReturnValue> =>
   parent === undefined ? dialog.showOpenDialog(options) : dialog.showOpenDialog(parent, options);
+
+const presentationDesignPreviewError = (error: unknown): DesktopMainError => {
+  if (error instanceof DesktopMainError) return error;
+  if (error instanceof PresentationDesignPreviewSourceError) {
+    switch (error.code) {
+      case 'INVALID_EXTENSION':
+      case 'INVALID_SOURCE':
+        return new DesktopMainError(
+          'INVALID_IMPORT_SOURCE',
+          'Choose a regular .pptx or .potx presentation file.',
+        );
+      case 'SOURCE_LIMIT_EXCEEDED':
+        return new DesktopMainError(
+          'IMPORT_LIMIT_EXCEEDED',
+          'Choose a non-empty presentation smaller than 64 MB.',
+        );
+      case 'SOURCE_CHANGED':
+        return new DesktopMainError(
+          'IMPORT_SOURCE_CHANGED',
+          'The selected presentation changed. Choose it again.',
+        );
+      case 'SOURCE_READ_FAILED':
+        return new DesktopMainError(
+          'IMPORT_READ_FAILED',
+          'The selected presentation could not be read.',
+        );
+    }
+  }
+  if (error instanceof PresentationImportError) {
+    switch (error.code) {
+      case 'INPUT_LIMIT_EXCEEDED':
+      case 'ZIP_LIMIT_EXCEEDED':
+      case 'XML_LIMIT_EXCEEDED':
+        return new DesktopMainError(
+          'IMPORT_LIMIT_EXCEEDED',
+          'The presentation exceeds the safe preview limits.',
+        );
+      case 'UNSAFE_PACKAGE':
+      case 'XML_UNSAFE':
+      case 'RELATIONSHIP_UNSAFE':
+        return new DesktopMainError(
+          'UNSAFE_IMPORT_SOURCE',
+          'The presentation contains content that cannot be previewed safely.',
+        );
+      case 'ZIP_UNSUPPORTED':
+      case 'UNSUPPORTED_DOCUMENT':
+        return new DesktopMainError(
+          'UNSUPPORTED_IMPORT_SOURCE',
+          'This presentation format is not supported by design import.',
+        );
+      case 'ZIP_INVALID':
+      case 'CRC_MISMATCH':
+      case 'XML_INVALID':
+      case 'MISSING_PART':
+      case 'INVALID_PRESENTATIONML':
+        return new DesktopMainError(
+          'INVALID_IMPORT_SOURCE',
+          'The selected presentation is damaged or invalid.',
+        );
+    }
+  }
+  return new DesktopMainError(
+    'IMPORT_PREVIEW_FAILED',
+    'The presentation design preview could not be created.',
+  );
+};
+
+const selectPresentationDesignImportPreview = async (
+  parent: BrowserWindow | undefined,
+): Promise<PreviewPresentationDesignImportResult> => {
+  const result = await openDialog(parent, {
+    title: 'Preview presentation design',
+    filters: [{ name: 'Presentation designs', extensions: ['pptx', 'potx'] }],
+    properties: ['openFile'],
+  });
+  const targetPath = result.filePaths[0];
+  if (result.canceled || targetPath === undefined) {
+    throw new DesktopMainError('CANCELLED', 'The operation was cancelled.');
+  }
+  try {
+    return await previewPresentationDesignFile(targetPath);
+  } catch (error) {
+    throw presentationDesignPreviewError(error);
+  }
+};
 
 const messageBox = (
   parent: BrowserWindow | undefined,
@@ -1310,6 +1498,7 @@ const assignSession = async (
   windowSessions.set(event.sender.id, snapshot.sessionId);
   const window = findWindow(event.sender);
   window?.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
+  applySpellcheckLanguages(event.sender, [snapshot.document.metadata.locale]);
   event.sender.send(DESKTOP_IPC.documentChanged, {
     sessionId: snapshot.sessionId,
     revision: snapshot.revision,
@@ -1328,11 +1517,45 @@ const openPathInEditorWindow = async (window: BrowserWindow, targetPath: string)
 
 interface SelectedImageFile {
   readonly bytes: Uint8Array;
-  readonly mediaType: 'image/png' | 'image/jpeg' | 'image/webp';
+  readonly mediaType: ClipboardImageMediaType;
   readonly fileName: string;
   readonly widthPx: number;
   readonly heightPx: number;
 }
+
+const validateSelectedImageBytes = (
+  bytes: Uint8Array,
+  fileName: string,
+  declaredMediaType?: ClipboardImageMediaType,
+): SelectedImageFile => {
+  try {
+    const header = validateImageImportBytes(
+      bytes,
+      (candidateBytes) => {
+        const decoded = nativeImage.createFromBuffer(Buffer.from(candidateBytes));
+        const dimensions = decoded.getSize();
+        return {
+          empty: decoded.isEmpty(),
+          widthPx: dimensions.width,
+          heightPx: dimensions.height,
+        };
+      },
+      declaredMediaType,
+    );
+    return {
+      bytes: Uint8Array.from(bytes),
+      mediaType: header.mediaType,
+      fileName,
+      widthPx: header.widthPx,
+      heightPx: header.heightPx,
+    };
+  } catch (error) {
+    if (error instanceof ImageImportValidationError) {
+      throw new DesktopMainError('INVALID_ASSET', error.message);
+    }
+    throw error;
+  }
+};
 
 const selectImageFile = async (parent: BrowserWindow | undefined): Promise<SelectedImageFile> => {
   const result = await openDialog(parent, {
@@ -1349,7 +1572,7 @@ const selectImageFile = async (parent: BrowserWindow | undefined): Promise<Selec
     !targetStat.isFile() ||
     targetStat.isSymbolicLink() ||
     targetStat.size <= 0 ||
-    targetStat.size > MAX_IMAGE_BYTES
+    targetStat.size > MAX_DESKTOP_IMAGE_BYTES
   ) {
     throw new DesktopMainError(
       'INVALID_ASSET',
@@ -1357,43 +1580,14 @@ const selectImageFile = async (parent: BrowserWindow | undefined): Promise<Selec
     );
   }
   const bytes = await readFile(targetPath);
-  if (bytes.byteLength === 0 || bytes.byteLength > MAX_IMAGE_BYTES) {
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_DESKTOP_IMAGE_BYTES) {
     throw new DesktopMainError(
       'INVALID_ASSET',
       'Choose a PNG, JPEG, or WebP image smaller than 25 MB.',
     );
   }
-  let header;
-  try {
-    // Header parsing is bounded and happens before Chromium is asked to decode any pixels.
-    header = inspectImageBeforeDecode(bytes);
-  } catch (error) {
-    if (error instanceof ImageImportValidationError) {
-      throw new DesktopMainError('INVALID_ASSET', error.message);
-    }
-    throw error;
-  }
-  const decoded = nativeImage.createFromBuffer(bytes);
-  const dimensions = decoded.getSize();
-  try {
-    assertDecodedDimensions(header, {
-      empty: decoded.isEmpty(),
-      widthPx: dimensions.width,
-      heightPx: dimensions.height,
-    });
-  } catch (error) {
-    if (error instanceof ImageImportValidationError) {
-      throw new DesktopMainError('INVALID_ASSET', error.message);
-    }
-    throw error;
-  }
-  return {
-    bytes,
-    mediaType: header.mediaType,
-    fileName: path.basename(targetPath).slice(0, 255),
-    widthPx: header.widthPx,
-    heightPx: header.heightPx,
-  };
+  // The header is inspected before Chromium decodes pixels; the filename is never authoritative.
+  return validateSelectedImageBytes(bytes, path.basename(targetPath).slice(0, 255));
 };
 
 const importImageAssetForSession = async (input: {
@@ -1414,6 +1608,57 @@ const importImageAssetForSession = async (input: {
   return { snapshot: imported.snapshot, assetId: imported.assetId };
 };
 
+const commitImageForSession = async (input: {
+  readonly sessionId: string;
+  readonly expectedRevision: string;
+  readonly target:
+    | Readonly<{ surface: 'slide'; slideId: string }>
+    | Readonly<{ surface: 'layout'; layoutId: string }>
+    | Readonly<{ surface: 'master'; masterId: string }>;
+  readonly replaceElementId?: string | undefined;
+  readonly preset?: 'watermark' | undefined;
+  readonly selected: SelectedImageFile;
+  readonly metadata: TransactionMetadata;
+}): Promise<{
+  readonly snapshot: DocumentSessionSnapshot;
+  readonly assetId: string;
+  readonly elementId: string;
+}> => {
+  collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
+  const current = runtime.getSnapshot(input.sessionId);
+  const assetId = randomUUID();
+  let mutation: ReturnType<typeof prepareImageImportMutation>;
+  try {
+    mutation = prepareImageImportMutation({
+      document: current.document,
+      target: input.target,
+      assetId,
+      widthPx: input.selected.widthPx,
+      heightPx: input.selected.heightPx,
+      ...(input.replaceElementId === undefined ? {} : { replaceElementId: input.replaceElementId }),
+      ...(input.preset === undefined ? {} : { preset: input.preset }),
+      createElementId: randomUUID,
+    });
+  } catch (error) {
+    if (error instanceof ImageImportMutationError) {
+      throw new DesktopMainError('INVALID_REQUEST', error.message);
+    }
+    throw error;
+  }
+  const imported = await runtime.importAssetAndExecute(input.sessionId, {
+    id: assetId,
+    ...input.selected,
+    expectedRevision: input.expectedRevision,
+    metadata: input.metadata,
+    commands: mutation.commands,
+  });
+  return {
+    snapshot: imported.snapshot,
+    assetId: imported.assetId,
+    elementId: mutation.element.id,
+  };
+};
+
 const importImageForSession = async (input: {
   readonly sessionId: string;
   readonly expectedRevision: string;
@@ -1432,38 +1677,42 @@ const importImageForSession = async (input: {
 }> => {
   collaboration.assertStandaloneOperation(input.sessionId, 'Image import');
   const selected = await selectImageFile(input.parent);
-  const current = runtime.getSnapshot(input.sessionId);
-  const assetId = randomUUID();
-  let mutation: ReturnType<typeof prepareImageImportMutation>;
-  try {
-    mutation = prepareImageImportMutation({
-      document: current.document,
-      target: input.target,
-      assetId,
-      widthPx: selected.widthPx,
-      heightPx: selected.heightPx,
-      ...(input.replaceElementId === undefined ? {} : { replaceElementId: input.replaceElementId }),
-      ...(input.preset === undefined ? {} : { preset: input.preset }),
-      createElementId: randomUUID,
-    });
-  } catch (error) {
-    if (error instanceof ImageImportMutationError) {
-      throw new DesktopMainError('INVALID_REQUEST', error.message);
-    }
-    throw error;
-  }
-  const imported = await runtime.importAssetAndExecute(input.sessionId, {
-    id: assetId,
-    ...selected,
+  return commitImageForSession({
+    sessionId: input.sessionId,
     expectedRevision: input.expectedRevision,
+    target: input.target,
+    ...(input.replaceElementId === undefined ? {} : { replaceElementId: input.replaceElementId }),
+    ...(input.preset === undefined ? {} : { preset: input.preset }),
+    selected,
     metadata: input.metadata,
-    commands: mutation.commands,
   });
-  return {
-    snapshot: imported.snapshot,
-    assetId: imported.assetId,
-    elementId: mutation.element.id,
-  };
+};
+
+const importClipboardImageForSession = async (input: {
+  readonly sessionId: string;
+  readonly expectedRevision: string;
+  readonly target:
+    | Readonly<{ surface: 'slide'; slideId: string }>
+    | Readonly<{ surface: 'layout'; layoutId: string }>
+    | Readonly<{ surface: 'master'; masterId: string }>;
+  readonly bytes: Uint8Array;
+  readonly mediaType: ClipboardImageMediaType;
+  readonly fileName: string;
+  readonly metadata: TransactionMetadata;
+}): Promise<{
+  readonly snapshot: DocumentSessionSnapshot;
+  readonly assetId: string;
+  readonly elementId: string;
+}> => {
+  collaboration.assertStandaloneOperation(input.sessionId, 'Clipboard image import');
+  const selected = validateSelectedImageBytes(input.bytes, input.fileName, input.mediaType);
+  return commitImageForSession({
+    sessionId: input.sessionId,
+    expectedRevision: input.expectedRevision,
+    target: input.target,
+    selected,
+    metadata: input.metadata,
+  });
 };
 
 const visibleEditorSessionIds = (): readonly string[] => [
@@ -1566,9 +1815,11 @@ const createEditorWindow = async (initialPath?: string): Promise<BrowserWindow> 
       createdSessionId = snapshot.sessionId;
       window.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
 
+      applySpellcheckLanguages(window.webContents, [snapshot.document.metadata.locale]);
       window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
       window.webContents.on('will-navigate', (event) => event.preventDefault());
       window.webContents.on('will-attach-webview', (event) => event.preventDefault());
+      attachEditableTextContextMenu(window);
       window.webContents.on('destroyed', () => {
         revokeWebContentsTokens(webContentsId);
         windowModes.delete(webContentsId);
@@ -1980,6 +2231,26 @@ const configureIpc = (): void => {
     };
   });
 
+  handle(
+    DESKTOP_IPC.previewPresentationDesignImport,
+    sessionInputSchema,
+    async (event, input): Promise<PreviewPresentationDesignImportResult> => {
+      assertSessionAccess(event, input.sessionId);
+      return selectPresentationDesignImportPreview(
+        findWindow(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined,
+      );
+    },
+  );
+
+  handle(
+    DESKTOP_IPC.spellcheckSetLanguages,
+    spellcheckLanguagesInputSchema,
+    (event, input): SpellcheckLanguagesResult => {
+      assertSessionAccess(event, input.sessionId);
+      return applySpellcheckLanguages(event.sender, input.languages);
+    },
+  );
+
   handle(DESKTOP_IPC.createDocument, z.undefined(), async (event) => {
     if (windowModes.get(event.sender.id) !== 'editor')
       throw new DesktopMainError('READ_ONLY', 'Presentation windows are read-only.');
@@ -2078,6 +2349,28 @@ const configureIpc = (): void => {
       elementId: imported.elementId,
     };
   });
+
+  handle(
+    DESKTOP_IPC.importClipboardImage,
+    importClipboardImageInputSchema,
+    async (event, input) => {
+      assertSessionAccess(event, input.sessionId);
+      const imported = await importClipboardImageForSession({
+        sessionId: input.sessionId,
+        expectedRevision: input.expectedRevision,
+        target: input.target,
+        bytes: input.bytes,
+        mediaType: input.mediaType,
+        fileName: input.fileName,
+        metadata: metadataFor(event, 'Paste image'),
+      });
+      return {
+        session: sessionView(event.sender.id, imported.snapshot),
+        assetId: imported.assetId,
+        elementId: imported.elementId,
+      };
+    },
+  );
 
   handle(DESKTOP_IPC.listRecovery, z.undefined(), () => runtime.listRecoveryCandidatesMainOnly());
 
@@ -2279,6 +2572,51 @@ const configureIpc = (): void => {
     pendingApprovals: mcpBridge.pendingApprovalCount(),
     transport: 'local-stdio',
   }));
+  handle(
+    DESKTOP_IPC.mcpListTrustedClients,
+    sessionInputSchema,
+    (event, input): readonly McpTrustedClientSummary[] => {
+      assertSessionAccess(event, input.sessionId);
+      return summarizeTrustedMcpClients(
+        trustedMcpClients.list(),
+        trustedMcpClients.bootstrapClientId,
+        mcpRpcServer?.connectedClientIds ?? [],
+      );
+    },
+  );
+  handle(
+    DESKTOP_IPC.mcpRevokeTrustedClient,
+    mcpTrustedClientInputSchema,
+    async (event, input): Promise<McpTrustedClientRevokeResult> => {
+      assertSessionAccess(event, input.sessionId);
+      let revoked: boolean;
+      try {
+        revoked = await trustedMcpClients.revoke(input.id);
+      } catch (error) {
+        if (
+          error instanceof TrustedMcpClientStoreError &&
+          error.code === 'BOOTSTRAP_CLIENT_PROTECTED'
+        ) {
+          throw new DesktopMainError(
+            'MCP_BOOTSTRAP_CLIENT_PROTECTED',
+            'The built-in local MCP launcher must remain trusted.',
+            false,
+          );
+        }
+        throw error;
+      }
+      if (!revoked) {
+        throw new DesktopMainError(
+          'MCP_TRUSTED_CLIENT_NOT_ACTIVE',
+          'That MCP client is missing or already revoked.',
+          false,
+        );
+      }
+      mcpBridge.revokeClient(input.id);
+      mcpRpcServer?.disconnectClient(input.id);
+      return { id: input.id, revoked: true };
+    },
+  );
   handle(DESKTOP_IPC.mcpCreateApproval, mcpApprovalInputSchema, (event, input) => {
     assertSessionAccess(event, input.sessionId);
     const snapshot = runtime.getSnapshot(input.sessionId);
@@ -2322,6 +2660,7 @@ runtime.subscribe((event) => {
       });
       if (windowModes.get(window.webContents.id) === 'editor') {
         const snapshot = runtime.getSnapshot(event.sessionId);
+        applySpellcheckLanguages(window.webContents, [snapshot.document.metadata.locale]);
         window.setTitle(`${snapshot.document.name}${snapshot.dirty ? ' •' : ''} — HTMLlelujah`);
       }
     }

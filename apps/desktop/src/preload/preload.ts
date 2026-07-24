@@ -16,6 +16,7 @@ import {
   type ExportInput,
   type ExportResult,
   type HistoryInput,
+  type ImportClipboardImageInput,
   type ImportImageInput,
   type ImageImportTarget,
   type HtmllelujahDesktopApi,
@@ -26,16 +27,24 @@ import {
   type McpStatus,
   type McpApproval,
   type McpApprovalInput,
+  type McpTrustedClientInput,
+  type McpTrustedClientRevokeResult,
+  type McpTrustedClientSummary,
   type PresentationChangedEvent,
   type PresentationInput,
+  type PreviewPresentationDesignImportResult,
   type SafeDocumentChangedEvent,
   type SessionInput,
   type SessionView,
+  type SpellcheckLanguagesInput,
+  type SpellcheckLanguagesResult,
   settleWindowCloseListeners,
   type WindowCloseReleaseListener,
   type WindowCloseRequestListener,
 } from '../shared/desktop-api.js';
 import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
+
+import { clipboardImageInputForIpc } from './clipboard-image-bridge.js';
 
 const invoke = <T>(channel: string, input?: unknown): Promise<DesktopResult<T>> =>
   ipcRenderer.invoke(channel, input) as Promise<DesktopResult<T>>;
@@ -161,6 +170,23 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
       ...(input.replaceElementId === undefined ? {} : { replaceElementId: input.replaceElementId }),
       ...(input.preset === undefined ? {} : { preset: input.preset }),
     } satisfies ImportImageInput),
+  setSpellcheckLanguages: (
+    input: SpellcheckLanguagesInput,
+  ): Promise<DesktopResult<SpellcheckLanguagesResult>> =>
+    invoke(DESKTOP_IPC.spellcheckSetLanguages, {
+      sessionId: input.sessionId,
+      languages: [...input.languages],
+    } satisfies SpellcheckLanguagesInput),
+  importClipboardImage: (
+    input: ImportClipboardImageInput,
+  ): Promise<DesktopResult<ImportImageResult>> =>
+    invoke(DESKTOP_IPC.importClipboardImage, clipboardImageInputForIpc(input)),
+  previewPresentationDesignImport: (
+    input: SessionInput,
+  ): Promise<DesktopResult<PreviewPresentationDesignImportResult>> =>
+    invoke(DESKTOP_IPC.previewPresentationDesignImport, {
+      sessionId: input.sessionId,
+    } satisfies SessionInput),
   listRecovery: (): Promise<DesktopResult<readonly RecoveryCandidate[]>> =>
     invoke(DESKTOP_IPC.listRecovery),
   recover: (candidateId: string): Promise<DesktopResult<SessionView>> =>
@@ -204,6 +230,19 @@ const desktopApi: HtmllelujahDesktopApi = Object.freeze({
   mcpStatus: (): Promise<DesktopResult<McpStatus>> => invoke(DESKTOP_IPC.mcpStatus),
   mcpCreateApproval: (input: McpApprovalInput): Promise<DesktopResult<McpApproval>> =>
     invoke(DESKTOP_IPC.mcpCreateApproval, input),
+  mcpListTrustedClients: (
+    input: SessionInput,
+  ): Promise<DesktopResult<readonly McpTrustedClientSummary[]>> =>
+    invoke(DESKTOP_IPC.mcpListTrustedClients, {
+      sessionId: input.sessionId,
+    } satisfies SessionInput),
+  mcpRevokeTrustedClient: (
+    input: McpTrustedClientInput,
+  ): Promise<DesktopResult<McpTrustedClientRevokeResult>> =>
+    invoke(DESKTOP_IPC.mcpRevokeTrustedClient, {
+      sessionId: input.sessionId,
+      id: input.id,
+    } satisfies McpTrustedClientInput),
   onWindowCloseReleased,
   onWindowCloseRequested,
   onDocumentChanged,

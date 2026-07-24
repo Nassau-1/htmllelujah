@@ -135,6 +135,8 @@ export interface TextElement extends BaseElement {
   readonly verticalAlignment: 'top' | 'middle' | 'bottom';
   readonly content: RichTextDocument;
   readonly style?: TextStyleOverrides | undefined;
+  /** Optional BCP-47 override; the exported document language remains the fallback. */
+  readonly locale?: string | undefined;
 }
 
 export interface ImageElement extends BaseElement {
@@ -225,6 +227,22 @@ export interface ShadowStyle {
   readonly opacity: number;
 }
 
+export interface ShapeTextMargins {
+  readonly topPt: number;
+  readonly rightPt: number;
+  readonly bottomPt: number;
+  readonly leftPt: number;
+}
+
+export interface ShapeText {
+  readonly content: RichTextDocument;
+  readonly styleRole: TextStyleRole;
+  readonly style?: TextStyleOverrides | undefined;
+  readonly verticalAlignment: 'top' | 'middle' | 'bottom';
+  readonly margins: ShapeTextMargins;
+  readonly locale?: string | undefined;
+}
+
 export interface ShapeElement extends BaseElement {
   readonly type: 'shape';
   readonly shape: ShapeKind;
@@ -232,6 +250,7 @@ export interface ShapeElement extends BaseElement {
   readonly stroke: StrokeStyle;
   readonly cornerRadiusPt: number;
   readonly shadow?: ShadowStyle | undefined;
+  readonly text?: ShapeText | undefined;
 }
 
 export type PathCommand =
@@ -277,7 +296,7 @@ export interface ConnectorElement extends BaseElement {
       anchor?: 'top' | 'right' | 'bottom' | 'left' | 'center' | undefined;
     }>;
   };
-  readonly routing: 'straight' | 'elbow';
+  readonly routing: 'straight' | 'elbow' | 'curved';
   readonly stroke: StrokeStyle;
   readonly startCap: 'none' | 'arrow';
   readonly endCap: 'none' | 'arrow';

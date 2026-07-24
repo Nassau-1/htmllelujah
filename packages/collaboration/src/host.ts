@@ -6,7 +6,7 @@ import type {
   TransactionOptions,
   TransactionResult,
 } from '@htmllelujah/document-core';
-import { canonicalSerialize } from '@htmllelujah/document-core';
+import { canonicalSerialize, shapeSupportsText } from '@htmllelujah/document-core';
 
 import { analyzeCommandAccess, elementEntityKey, slideEntityKey } from './access.js';
 import {
@@ -133,6 +133,9 @@ const findElementInSlide = (
   const slide = document.slides.find((candidate) => candidate.id === slideId);
   return slide === undefined ? undefined : findElement(slide.elements, elementId);
 };
+
+const elementHostsEditableText = (element: Element | undefined): boolean =>
+  element?.type === 'text' || (element?.type === 'shape' && shapeSupportsText(element.shape));
 
 const parseRequest = <T>(
   schema: { parse(value: unknown): T },
@@ -733,10 +736,10 @@ export class AuthoritativeSessionHost {
     if (element === undefined) {
       throw new CollaborationError('NOT_FOUND', 'The requested text element does not exist.');
     }
-    if (element.type !== 'text') {
+    if (!elementHostsEditableText(element)) {
       throw new CollaborationError(
         'NOT_TEXT_ELEMENT',
-        'Only text elements may receive a text lease.',
+        'Only text boxes and text-compatible shapes may receive a text lease.',
       );
     }
   }
@@ -766,7 +769,7 @@ export class AuthoritativeSessionHost {
   private removeInvalidTextLeases(document: DeckDocument): void {
     this.textLeases.forEach((lease, elementId) => {
       const element = findElementInSlide(document, lease.slideId, lease.elementId);
-      if (element?.type !== 'text') this.textLeases.delete(elementId);
+      if (!elementHostsEditableText(element)) this.textLeases.delete(elementId);
     });
   }
 

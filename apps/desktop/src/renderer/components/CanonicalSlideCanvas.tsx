@@ -1,9 +1,15 @@
 import type {
+  ConnectorElement,
   DeckDocument,
   Element,
   Frame,
+  ImageCrop,
+  ImageElement,
+  PathCommand,
+  PathElement,
   ResolvedElementSource,
   ResolvedSlide,
+  ShapeElement,
   Slide,
   TextAlignment,
   TextElement,
@@ -32,10 +38,32 @@ import {
   type CSSProperties,
   type ClipboardEvent as ReactClipboardEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 
 import { inlineTextEditorKeyAction, rotationFrameForKeyboard } from '../editor/editor-interactions';
+import {
+  beginImageCropDrag,
+  imageCropFromDrag,
+  IMAGE_CROP_HANDLES,
+  type ImageCropDrag,
+  type ImageCropHandle,
+} from '../editor/image-crop-tools';
+import {
+  appendDistinctCanvasPoint,
+  canFinishFreeform,
+  clampCanvasPoint,
+  connectorAnchorCandidates,
+  pathPointHandles,
+  slidePointToFrameLocal,
+  snapConnectorEndpoint,
+  updatePathPoint,
+  type CanvasPoint,
+  type CanvasVectorTool,
+  type ConnectorAnchorCandidate,
+  type PathPointRole,
+} from '../editor/vector-canvas-tools';
 
 export type InlineTextCanvasEditor = Readonly<{
   elementId: string;
@@ -52,6 +80,17 @@ export type InlineTextCanvasEditor = Readonly<{
   lineHeight: number;
   letterSpacingPt: number;
   alignment: TextAlignment;
+  locale: string;
+  shapeText?: boolean | undefined;
+  verticalAlignment?: 'top' | 'middle' | 'bottom' | undefined;
+  margins?:
+    | Readonly<{
+        topPt: number;
+        rightPt: number;
+        bottomPt: number;
+        leftPt: number;
+      }>
+    | undefined;
 }>;
 
 type CanonicalSlideCanvasProps = {
@@ -64,12 +103,31 @@ type CanonicalSlideCanvasProps = {
   readonly editableSource?: 'slide' | 'layout' | 'master' | undefined;
   readonly includeTemplatePlaceholders?: boolean | undefined;
   readonly inlineTextEditor?: InlineTextCanvasEditor | null | undefined;
+  readonly imageCropElementId?: string | null | undefined;
   readonly selectedIds: readonly string[];
   readonly onSelect: (ids: readonly string[]) => boolean | Promise<boolean>;
   readonly onTransform: (
     frames: readonly { readonly elementId: string; readonly frame: Frame }[],
   ) => void;
+  readonly vectorTool?: CanvasVectorTool | undefined;
+  readonly onCreatePath?:
+    ((points: readonly CanvasPoint[], closed: boolean) => void | Promise<void>) | undefined;
+  readonly onUpdatePathCommands?:
+    ((elementId: string, commands: readonly PathCommand[]) => void | Promise<void>) | undefined;
+  readonly onUpdateConnectorEndpoint?:
+    | ((
+        connectorId: string,
+        endpoint: 'start' | 'end',
+        value: ConnectorElement['start'],
+      ) => void | Promise<void>)
+    | undefined;
+  readonly onVectorToolDone?: (() => void) | undefined;
   readonly onEditText: (elementId: string) => void;
+  readonly onEditShapeText?: ((elementId: string) => void) | undefined;
+  readonly onEditImageCrop?: ((elementId: string) => void) | undefined;
+  readonly onUpdateImageCrop?:
+    ((elementId: string, crop: ImageCrop) => void | Promise<void>) | undefined;
+  readonly onImageCropDone?: (() => void) | undefined;
   readonly onContextMenu?:
     | ((elementId: string, position: Readonly<{ clientX: number; clientY: number }>) => void)
     | undefined;
@@ -220,6 +278,48 @@ type RotateGesture = {
 };
 
 type Gesture = MoveGesture | ResizeGesture | RotateGesture;
+
+type PathPointGesture = {
+  readonly kind: 'path-point';
+  readonly pointerId: number;
+  readonly element: PathElement;
+  readonly commandIndex: number;
+  readonly role: PathPointRole;
+};
+
+type ConnectorEndpointGesture = {
+  readonly kind: 'connector-endpoint';
+  readonly pointerId: number;
+  readonly connectorId: string;
+  readonly endpoint: 'start' | 'end';
+  readonly candidates: readonly ConnectorAnchorCandidate[];
+};
+
+type ImageCropGesture = {
+  readonly kind: 'image-crop';
+  readonly pointerId: number;
+  readonly elementId: string;
+  readonly drag: ImageCropDrag;
+};
+
+type DirectGesture = PathPointGesture | ConnectorEndpointGesture | ImageCropGesture;
+
+type DraftPath = Readonly<{
+  elementId: string;
+  commands: readonly PathCommand[];
+}>;
+
+type DraftConnectorEndpoint = Readonly<{
+  connectorId: string;
+  endpoint: 'start' | 'end';
+  value: ConnectorElement['start'];
+  snap?: ConnectorAnchorCandidate | undefined;
+}>;
+
+type DraftImageCrop = Readonly<{
+  elementId: string;
+  crop: ImageCrop;
+}>;
 
 export const sameCanvasSelection = (left: readonly string[], right: readonly string[]): boolean =>
   left.length === right.length && left.every((id, index) => id === right[index]);
@@ -425,7 +525,7 @@ export function InlineTextCanvasEditorOverlay({
   onCancel,
   onFocus,
 }: Readonly<{
-  element: TextElement;
+  element: TextElement | ShapeElement;
   editor: InlineTextCanvasEditor;
   onChange: (value: string) => void;
   onPaste: (event: ReactClipboardEvent<HTMLTextAreaElement>) => void;
@@ -445,22 +545,38 @@ export function InlineTextCanvasEditorOverlay({
 
   const conflictId = `inline-text-conflict-${element.id}`;
   const helpId = `inline-text-help-${element.id}`;
+  const margins = editor.margins;
+  const shapeEditorStyle: CSSProperties | undefined = editor.shapeText
+    ? {
+        alignItems:
+          editor.verticalAlignment === 'bottom'
+            ? 'flex-end'
+            : editor.verticalAlignment === 'middle'
+              ? 'center'
+              : 'flex-start',
+        padding:
+          margins === undefined
+            ? undefined
+            : `${margins.topPt}pt ${margins.rightPt}pt ${margins.bottomPt}pt ${margins.leftPt}pt`,
+      }
+    : undefined;
   return (
     <div
-      className={`canonical-inline-text-editor${editor.conflict ? ' has-conflict' : ''}`}
-      style={frameStyle(element.frame)}
+      className={`canonical-inline-text-editor${editor.shapeText ? ' is-shape-text' : ''}${editor.conflict ? ' has-conflict' : ''}`}
+      style={{ ...frameStyle(element.frame), ...shapeEditorStyle }}
       data-inline-text-element-id={element.id}
       onPointerDown={(event) => event.stopPropagation()}
     >
       <textarea
         ref={textareaRef}
         autoFocus={!editor.disabled}
-        aria-label={`Edit ${element.name} on slide`}
+        aria-label={`Edit ${element.name} on canvas`}
         aria-describedby={`${helpId}${editor.conflict ? ` ${conflictId}` : ''}`}
         aria-invalid={editor.conflict || undefined}
         aria-busy={editor.pending || undefined}
         className="canonical-inline-text-input"
         disabled={editor.disabled}
+        lang={editor.locale}
         maxLength={editor.maxLength}
         spellCheck
         value={editor.value}
@@ -473,6 +589,9 @@ export function InlineTextCanvasEditorOverlay({
           letterSpacing: `${editor.letterSpacingPt}pt`,
           lineHeight: editor.lineHeight,
           textAlign: editor.alignment,
+          ...(editor.shapeText
+            ? { height: 'auto', minHeight: `${editor.fontSizePt * 1.5}pt` }
+            : {}),
         }}
         onBlur={(event) => onCommit(event.currentTarget, false, event.relatedTarget)}
         onChange={(event) => onChange(event.currentTarget.value)}
@@ -524,10 +643,20 @@ export function CanonicalSlideCanvas({
   editableSource = 'slide',
   includeTemplatePlaceholders = false,
   inlineTextEditor,
+  imageCropElementId,
   selectedIds,
   onSelect,
   onTransform,
+  vectorTool = { kind: 'select' },
+  onCreatePath,
+  onUpdatePathCommands,
+  onUpdateConnectorEndpoint,
+  onVectorToolDone,
   onEditText,
+  onEditShapeText,
+  onEditImageCrop,
+  onUpdateImageCrop,
+  onImageCropDone,
   onContextMenu,
   onInlineTextChange,
   onInlineTextPaste,
@@ -536,9 +665,22 @@ export function CanonicalSlideCanvas({
   onInlineTextFocus,
 }: CanonicalSlideCanvasProps) {
   const gesture = useRef<Gesture | null>(null);
+  const directGesture = useRef<DirectGesture | null>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const draftFramesRef = useRef<DraftFrames>({});
+  const draftPathRef = useRef<DraftPath | null>(null);
+  const draftConnectorEndpointRef = useRef<DraftConnectorEndpoint | null>(null);
+  const draftImageCropRef = useRef<DraftImageCrop | null>(null);
+  const freeformPointsRef = useRef<readonly CanvasPoint[]>([]);
   const [draftFrames, setDraftFrames] = useState<DraftFrames>({});
+  const [draftPath, setDraftPath] = useState<DraftPath | null>(null);
+  const [draftConnectorEndpoint, setDraftConnectorEndpoint] =
+    useState<DraftConnectorEndpoint | null>(null);
+  const [draftImageCrop, setDraftImageCrop] = useState<DraftImageCrop | null>(null);
+  const [connectorAnchorPreview, setConnectorAnchorPreview] = useState<
+    readonly ConnectorAnchorCandidate[]
+  >([]);
+  const [freeformPoints, setFreeformPoints] = useState<readonly CanvasPoint[]>([]);
   const [smartGuides, setSmartGuides] = useState<readonly SmartGuide[]>([]);
   const requestSelection = (ids: readonly string[]): Promise<boolean> =>
     Promise.resolve(onSelect(ids)).catch(() => false);
@@ -603,9 +745,52 @@ export function CanonicalSlideCanvas({
       }),
     };
   }, [baseProjection, draftFrames, editableSource, localById, localElements]);
+  const interactiveProjection = useMemo(() => {
+    if (draftPath === null && draftConnectorEndpoint === null && draftImageCrop === null)
+      return projection;
+    return {
+      ...projection,
+      elements: projection.elements.map((entry) => {
+        if (
+          draftPath !== null &&
+          entry.element.id === draftPath.elementId &&
+          entry.element.type === 'path'
+        ) {
+          return { ...entry, element: { ...entry.element, commands: draftPath.commands } };
+        }
+        if (
+          draftConnectorEndpoint !== null &&
+          entry.element.id === draftConnectorEndpoint.connectorId &&
+          entry.element.type === 'connector'
+        ) {
+          return {
+            ...entry,
+            element: {
+              ...entry.element,
+              [draftConnectorEndpoint.endpoint]: draftConnectorEndpoint.value,
+            },
+          };
+        }
+        if (
+          draftImageCrop !== null &&
+          entry.element.id === draftImageCrop.elementId &&
+          entry.element.type === 'image'
+        ) {
+          return {
+            ...entry,
+            element: {
+              ...entry.element,
+              crop: draftImageCrop.crop,
+            },
+          };
+        }
+        return entry;
+      }),
+    };
+  }, [draftConnectorEndpoint, draftImageCrop, draftPath, projection]);
   const editableProjection = useMemo(
-    () => resolveCanvasEditableElements(projection, editableSource, localElements),
-    [editableSource, localElements, projection],
+    () => resolveCanvasEditableElements(interactiveProjection, editableSource, localElements),
+    [editableSource, interactiveProjection, localElements],
   );
   const editableProjectionByLocalId = useMemo(
     () => new Map(editableProjection.map((entry) => [entry.localElement.id, entry] as const)),
@@ -617,6 +802,26 @@ export function CanonicalSlideCanvas({
     setDraftFrames(next);
   };
 
+  const updateDraftPath = (next: DraftPath | null): void => {
+    draftPathRef.current = next;
+    setDraftPath(next);
+  };
+
+  const updateDraftConnectorEndpoint = (next: DraftConnectorEndpoint | null): void => {
+    draftConnectorEndpointRef.current = next;
+    setDraftConnectorEndpoint(next);
+  };
+
+  const updateDraftImageCrop = (next: DraftImageCrop | null): void => {
+    draftImageCropRef.current = next;
+    setDraftImageCrop(next);
+  };
+
+  const updateFreeformPoints = (next: readonly CanvasPoint[]): void => {
+    freeformPointsRef.current = next;
+    setFreeformPoints(next);
+  };
+
   const pointFromClient = (clientX: number, clientY: number) => {
     const bounds = wrapperRef.current?.getBoundingClientRect();
     return {
@@ -624,6 +829,161 @@ export function CanonicalSlideCanvas({
       yPt: bounds === undefined ? 0 : (clientY - bounds.top) / Math.max(scale, 0.01),
     };
   };
+
+  useEffect(() => {
+    updateFreeformPoints([]);
+    updateDraftPath(null);
+    updateDraftConnectorEndpoint(null);
+    updateDraftImageCrop(null);
+    setConnectorAnchorPreview([]);
+    directGesture.current = null;
+  }, [
+    imageCropElementId,
+    slide.id,
+    vectorTool.kind,
+    vectorTool.kind === 'freeform' ? vectorTool.closed : undefined,
+    vectorTool.kind === 'edit-path' ? vectorTool.elementId : undefined,
+  ]);
+
+  useEffect(() => {
+    const onMove = (event: PointerEvent): void => {
+      const active = directGesture.current;
+      if (active === null || event.pointerId !== active.pointerId) return;
+      if (active.kind === 'image-crop') {
+        updateDraftImageCrop({
+          elementId: active.elementId,
+          crop: imageCropFromDrag(active.drag, {
+            xPx: event.clientX,
+            yPx: event.clientY,
+          }),
+        });
+        return;
+      }
+      const slidePoint = clampCanvasPoint(
+        pointFromClient(event.clientX, event.clientY),
+        document.page,
+      );
+      if (active.kind === 'path-point') {
+        updateDraftPath({
+          elementId: active.element.id,
+          commands: updatePathPoint(
+            active.element,
+            active.commandIndex,
+            active.role,
+            slidePointToFrameLocal(slidePoint, active.element.frame),
+          ),
+        });
+        return;
+      }
+      const snapped = snapConnectorEndpoint(
+        slidePoint,
+        active.candidates,
+        12 / Math.max(scale, 0.25),
+      );
+      updateDraftConnectorEndpoint({
+        connectorId: active.connectorId,
+        endpoint: active.endpoint,
+        value: snapped.endpoint,
+        snap: snapped.candidate,
+      });
+    };
+
+    const finish = (event: PointerEvent, commit: boolean): void => {
+      const active = directGesture.current;
+      if (active === null || event.pointerId !== active.pointerId) return;
+      const pathDraft = draftPathRef.current;
+      const connectorDraft = draftConnectorEndpointRef.current;
+      const imageCropDraft = draftImageCropRef.current;
+      directGesture.current = null;
+      updateDraftPath(null);
+      updateDraftConnectorEndpoint(null);
+      updateDraftImageCrop(null);
+      setConnectorAnchorPreview([]);
+      if (!commit) return;
+      if (
+        active.kind === 'path-point' &&
+        pathDraft !== null &&
+        pathDraft.elementId === active.element.id
+      ) {
+        void onUpdatePathCommands?.(pathDraft.elementId, pathDraft.commands);
+      } else if (
+        active.kind === 'connector-endpoint' &&
+        connectorDraft !== null &&
+        connectorDraft.connectorId === active.connectorId &&
+        connectorDraft.endpoint === active.endpoint
+      ) {
+        void onUpdateConnectorEndpoint?.(
+          connectorDraft.connectorId,
+          connectorDraft.endpoint,
+          connectorDraft.value,
+        );
+      } else if (
+        active.kind === 'image-crop' &&
+        imageCropDraft !== null &&
+        imageCropDraft.elementId === active.elementId
+      ) {
+        void onUpdateImageCrop?.(imageCropDraft.elementId, imageCropDraft.crop);
+      }
+    };
+
+    const onUp = (event: PointerEvent): void => finish(event, true);
+    const onCancel = (event: PointerEvent): void => finish(event, false);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+    };
+  }, [document.page, onUpdateConnectorEndpoint, onUpdateImageCrop, onUpdatePathCommands, scale]);
+
+  useEffect(() => {
+    if (vectorTool.kind !== 'freeform') return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (
+        event.defaultPrevented ||
+        (event.target instanceof HTMLElement &&
+          (event.target.isContentEditable ||
+            ['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName)))
+      ) {
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        updateFreeformPoints([]);
+        onVectorToolDone?.();
+      } else if (event.key === 'Enter' && canFinishFreeform(freeformPoints, vectorTool.closed)) {
+        event.preventDefault();
+        const points = freeformPoints;
+        updateFreeformPoints([]);
+        void onCreatePath?.(points, vectorTool.closed);
+        onVectorToolDone?.();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [freeformPoints, onCreatePath, onVectorToolDone, vectorTool]);
+
+  useEffect(() => {
+    if (imageCropElementId === null || imageCropElementId === undefined) return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (
+        event.defaultPrevented ||
+        (event.target instanceof HTMLElement &&
+          (event.target.isContentEditable ||
+            ['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName)))
+      )
+        return;
+      if (event.key !== 'Escape' && event.key !== 'Enter') return;
+      event.preventDefault();
+      updateDraftImageCrop(null);
+      directGesture.current = null;
+      onImageCropDone?.();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [imageCropElementId, onImageCropDone]);
 
   useEffect(() => {
     const onMove = (event: PointerEvent): void => {
@@ -836,6 +1196,117 @@ export function CanonicalSlideCanvas({
     if (transforms.length > 0) onTransform(transforms);
   };
 
+  const beginPathPoint = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    element: PathElement,
+    commandIndex: number,
+    role: PathPointRole,
+  ): void => {
+    if (event.button !== 0 || element.locked) return;
+    event.preventDefault();
+    event.stopPropagation();
+    directGesture.current = {
+      kind: 'path-point',
+      pointerId: event.pointerId,
+      element,
+      commandIndex,
+      role,
+    };
+  };
+
+  const beginConnectorEndpoint = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    connector: ConnectorElement,
+    endpoint: 'start' | 'end',
+  ): void => {
+    if (event.button !== 0 || connector.locked) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const candidates = connectorAnchorCandidates(
+      editableProjection.map((entry) => entry.effectiveElement),
+      connector.id,
+    );
+    setConnectorAnchorPreview(candidates);
+    directGesture.current = {
+      kind: 'connector-endpoint',
+      pointerId: event.pointerId,
+      connectorId: connector.id,
+      endpoint,
+      candidates,
+    };
+  };
+
+  const beginImageCrop = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    image: ImageElement,
+    handle: ImageCropHandle,
+  ): void => {
+    if (event.button !== 0 || image.locked) return;
+    event.preventDefault();
+    event.stopPropagation();
+    directGesture.current = {
+      kind: 'image-crop',
+      pointerId: event.pointerId,
+      elementId: image.id,
+      drag: beginImageCropDrag(
+        image,
+        handle,
+        { xPx: event.clientX, yPx: event.clientY },
+        { canvasScale: scale },
+      ),
+    };
+  };
+
+  const addFreeformPoint = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (vectorTool.kind !== 'freeform' || event.button !== 0) return;
+    if (event.target !== event.currentTarget) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = clampCanvasPoint(pointFromClient(event.clientX, event.clientY), document.page);
+    const next = appendDistinctCanvasPoint(freeformPoints, point, 2 / Math.max(scale, 0.25));
+    updateFreeformPoints(next);
+  };
+
+  const finishFreeformFromDoubleClick = (event: ReactMouseEvent<HTMLDivElement>): void => {
+    if (vectorTool.kind !== 'freeform' || event.target !== event.currentTarget) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const points = freeformPointsRef.current;
+    if (!canFinishFreeform(points, vectorTool.closed)) return;
+    updateFreeformPoints([]);
+    void onCreatePath?.(points, vectorTool.closed);
+    onVectorToolDone?.();
+  };
+
+  const connectorGeometries = useMemo(
+    () => resolveConnectorGeometries(interactiveProjection.elements.map((entry) => entry.element)),
+    [interactiveProjection],
+  );
+  const primaryEditable = editableProjectionByLocalId.get(selectedIds.at(-1) ?? '');
+  const editablePath =
+    vectorTool.kind === 'edit-path'
+      ? editableProjectionByLocalId.get(vectorTool.elementId)
+      : undefined;
+  const effectivePath =
+    editablePath?.localElement.type === 'path' && editablePath.effectiveElement.type === 'path'
+      ? editablePath.effectiveElement
+      : undefined;
+  const effectiveConnector =
+    primaryEditable?.localElement.type === 'connector' &&
+    primaryEditable.effectiveElement.type === 'connector'
+      ? primaryEditable.effectiveElement
+      : undefined;
+  const connectorGeometry =
+    effectiveConnector === undefined ? undefined : connectorGeometries.get(effectiveConnector.id);
+  const cropEditable =
+    imageCropElementId === null || imageCropElementId === undefined
+      ? undefined
+      : editableProjectionByLocalId.get(imageCropElementId);
+  const effectiveCropImage =
+    cropEditable?.localElement.type === 'image' && cropEditable.effectiveElement.type === 'image'
+      ? cropEditable.effectiveElement
+      : undefined;
+
   const wrapperStyle = {
     width: `${document.page.widthPt * scale}px`,
     height: `${document.page.heightPt * scale}px`,
@@ -870,12 +1341,21 @@ export function CanonicalSlideCanvas({
         }}
       >
         <SlideSurface
-          slide={projection}
+          slide={interactiveProjection}
           mode="editor"
           resolveAsset={(assetId) => assetUrls[assetId] ?? null}
           className="canonical-slide-surface"
         />
-        <div className="canvas-hit-layer" aria-label="Editable slide objects">
+        <div
+          className={`canvas-hit-layer${vectorTool.kind === 'freeform' ? ' is-drawing-freeform' : ''}`}
+          aria-label={
+            vectorTool.kind === 'freeform'
+              ? `Draw ${vectorTool.closed ? 'closed' : 'open'} freeform`
+              : 'Editable slide objects'
+          }
+          onPointerDown={addFreeformPoint}
+          onDoubleClick={finishFreeformFromDoubleClick}
+        >
           {editableProjection
             .filter((editable) => editable.effectiveElement.visible)
             .map((editable) => {
@@ -896,6 +1376,12 @@ export function CanonicalSlideCanvas({
                   data-canvas-element-id={localElement.id}
                   onPointerDown={(event) => beginMove(event, editable)}
                   onContextMenu={(event) => {
+                    if (
+                      event.target instanceof HTMLElement &&
+                      event.target.closest('[contenteditable="true"], input, textarea') !== null
+                    ) {
+                      return;
+                    }
                     event.preventDefault();
                     event.stopPropagation();
                     const open = (): void =>
@@ -913,12 +1399,17 @@ export function CanonicalSlideCanvas({
                   onDoubleClick={(event) => {
                     event.stopPropagation();
                     if (localElement.type === 'text') onEditText(localElement.id);
+                    else if (localElement.type === 'shape') onEditShapeText?.(localElement.id);
+                    else if (localElement.type === 'image') onEditImageCrop?.(localElement.id);
                   }}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter') {
                       event.preventDefault();
                       void requestSelection([localElement.id]).then((authorized) => {
-                        if (authorized && localElement.type === 'text') onEditText(localElement.id);
+                        if (!authorized) return;
+                        if (localElement.type === 'text') onEditText(localElement.id);
+                        else if (localElement.type === 'shape') onEditShapeText?.(localElement.id);
+                        else if (localElement.type === 'image') onEditImageCrop?.(localElement.id);
                       });
                     } else if (event.key === ' ') {
                       event.preventDefault();
@@ -941,7 +1432,11 @@ export function CanonicalSlideCanvas({
                     }
                   }}
                 >
-                  {selected && primary && !localElement.locked
+                  {selected &&
+                  primary &&
+                  !localElement.locked &&
+                  !(vectorTool.kind === 'edit-path' && vectorTool.elementId === localElement.id) &&
+                  imageCropElementId !== localElement.id
                     ? [
                         <span
                           key="rotation-stem"
@@ -973,11 +1468,126 @@ export function CanonicalSlideCanvas({
                 </div>
               );
             })}
+          {effectiveCropImage !== undefined && !effectiveCropImage.locked ? (
+            <div
+              className="image-crop-overlay"
+              style={frameStyle(effectiveCropImage.frame)}
+              data-image-crop-id={effectiveCropImage.id}
+              aria-label={`Crop ${effectiveCropImage.name}`}
+            >
+              {IMAGE_CROP_HANDLES.map((handle) => (
+                <button
+                  key={handle}
+                  type="button"
+                  className={`image-crop-handle crop-${handle}`}
+                  aria-label={`Crop ${handle.replace('-', ' ')}`}
+                  onPointerDown={(event) => beginImageCrop(event, effectiveCropImage, handle)}
+                />
+              ))}
+              <span className="image-crop-help">
+                Drag black handles to crop · Enter or Esc to finish
+              </span>
+            </div>
+          ) : null}
+          {effectivePath !== undefined && !effectivePath.locked ? (
+            <div
+              className="path-point-overlay"
+              style={frameStyle(effectivePath.frame)}
+              data-path-editing-id={effectivePath.id}
+            >
+              {pathPointHandles(effectivePath).map((handle) => (
+                <button
+                  key={`${handle.commandIndex}-${handle.role}`}
+                  type="button"
+                  className={`path-point-handle role-${handle.role}`}
+                  style={{
+                    left: `${handle.point.xPt}pt`,
+                    top: `${handle.point.yPt}pt`,
+                  }}
+                  aria-label={`Move ${handle.role === 'anchor' ? 'path point' : `${handle.role.replace('control', 'control point ')}`} ${handle.commandIndex + 1}`}
+                  onPointerDown={(event) =>
+                    beginPathPoint(event, effectivePath, handle.commandIndex, handle.role)
+                  }
+                />
+              ))}
+            </div>
+          ) : null}
+          {vectorTool.kind !== 'freeform' &&
+          effectiveConnector !== undefined &&
+          connectorGeometry !== undefined &&
+          !effectiveConnector.locked ? (
+            <>
+              {(['start', 'end'] as const).map((endpoint) => {
+                const point =
+                  endpoint === 'start'
+                    ? connectorGeometry.startInSlide
+                    : connectorGeometry.endInSlide;
+                const bound = effectiveConnector[endpoint].binding.elementId !== undefined;
+                return (
+                  <button
+                    key={endpoint}
+                    type="button"
+                    className={`connector-endpoint-handle endpoint-${endpoint}${bound ? ' is-bound' : ''}`}
+                    style={{ left: `${point.xPt}pt`, top: `${point.yPt}pt` }}
+                    aria-label={`Move connector ${endpoint} endpoint${bound ? ', currently attached' : ''}`}
+                    onPointerDown={(event) =>
+                      beginConnectorEndpoint(event, effectiveConnector, endpoint)
+                    }
+                  />
+                );
+              })}
+            </>
+          ) : null}
+          {connectorAnchorPreview.map((candidate) => {
+            const active =
+              draftConnectorEndpoint?.snap?.elementId === candidate.elementId &&
+              draftConnectorEndpoint.snap.anchor === candidate.anchor;
+            return (
+              <span
+                key={`${candidate.elementId}-${candidate.anchor}`}
+                className={`connector-anchor-target${active ? ' is-active' : ''}`}
+                style={{
+                  left: `${candidate.point.xPt}pt`,
+                  top: `${candidate.point.yPt}pt`,
+                }}
+                title={`${candidate.elementName}: ${candidate.anchor}`}
+                aria-hidden="true"
+              />
+            );
+          })}
+          {vectorTool.kind === 'freeform' ? (
+            <div className="freeform-draft-overlay" aria-hidden="true">
+              {freeformPoints.length > 0 ? (
+                <svg
+                  viewBox={`0 0 ${document.page.widthPt} ${document.page.heightPt}`}
+                  preserveAspectRatio="none"
+                >
+                  <polyline
+                    points={freeformPoints.map((point) => `${point.xPt},${point.yPt}`).join(' ')}
+                  />
+                </svg>
+              ) : null}
+              {freeformPoints.map((point, index) => (
+                <span
+                  key={`${point.xPt}-${point.yPt}-${index}`}
+                  className="freeform-draft-point"
+                  style={{ left: `${point.xPt}pt`, top: `${point.yPt}pt` }}
+                />
+              ))}
+              <span className="freeform-draft-help">
+                Click to add points · {vectorTool.closed ? '3 points minimum' : '2 points minimum'}{' '}
+                · Enter or double-click to finish · Esc to cancel
+              </span>
+            </div>
+          ) : null}
           {inlineTextEditor !== null && inlineTextEditor !== undefined
             ? (() => {
                 const editable = editableProjectionByLocalId.get(inlineTextEditor.elementId);
-                return editable?.localElement.type === 'text' &&
-                  editable.effectiveElement.type === 'text' &&
+                return (editable?.localElement.type === 'text' ||
+                  editable?.localElement.type === 'shape') &&
+                  (editable.effectiveElement.type === 'text' ||
+                    editable.effectiveElement.type === 'shape') &&
+                  editable.localElement.type === editable.effectiveElement.type &&
                   onInlineTextChange !== undefined &&
                   onInlineTextPaste !== undefined &&
                   onInlineTextCommit !== undefined &&

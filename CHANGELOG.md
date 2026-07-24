@@ -5,6 +5,34 @@ and releases use semantic versions.
 
 ## [Unreleased]
 
+### 2026-07-24 — Useful authoring parity checkpoint
+
+- Made the complete offline visual libraries reachable: the default Twemoji view is a
+  reviewed business collection, the explicit complete scope retains all 3,720 vectors,
+  and all 265 circular flags are searchable and grouped without the former 72-card cap.
+- Added the bounded business-shape catalog, direct straight/elbow/curved connector
+  endpoints with five-point snap/detach and independent caps, plus open/closed
+  freeform creation and edit-points mode. Compatible shapes now host directly editable
+  theme-managed text, and Union, Combine, Intersect, Subtract, and Fragment commit as
+  atomic native-path operations with explicit no-loss rejection.
+- Added bounded PNG/JPEG/WebP clipboard import and deterministic non-destructive
+  background-color removal with presets, eyedropper, tolerance, live preview, apply,
+  reset, and shared-renderer parity. Eight direct crop handles now support zoom,
+  rotation, existing crops, bounded visibility, and one normalized commit.
+- Added canonical deck and per-text language, native editable-text spelling suggestions,
+  replacement, session ignore, and local dictionary support without replacing the
+  object context menu.
+- Added persistent slide/object comment threads and review actions, strict copy/paste LAN
+  invitations, and in-app bounded MCP trusted-client listing/revocation. Comments
+  synchronize and persist but do not render in presentation, HTML, PDF, or print.
+- Added a bounded preview-first `.pptx`/`.potx` Phase 1 design path with hostile ZIP/XML
+  rejection, fidelity accounting, and an atomic native plan for page, theme, master,
+  layout, placeholder, background, numbering, and supported furniture. Importing slide
+  content remains Phase 2 and is not claimed by this checkpoint.
+- Added one-transaction `Swap positions` and `Match size to primary` actions for slides,
+  layouts, and masters, plus lossless vector/path/connector flips and compatible
+  text/vector/image/table format painting with atomic refusal of unsupported targets.
+
 ### Changed
 
 - Reworked the visual picker around paged, exhaustive offline discovery. The default

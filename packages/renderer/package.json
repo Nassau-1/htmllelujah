@@ -23,6 +23,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@htmllelujah/geometry": "workspace:*",
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },

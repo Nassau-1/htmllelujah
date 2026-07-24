@@ -7,6 +7,7 @@ import {
   ArrowDown,
   ArrowUp,
   Bold,
+  Briefcase,
   BringToFront,
   Check,
   ChevronDown,
@@ -28,10 +29,12 @@ import {
   List,
   ListOrdered,
   Lock,
+  MessageSquare,
   Minus,
   MoreHorizontal,
   MousePointer2,
   Palette,
+  PenTool,
   Play,
   Plus,
   Redo2,
@@ -39,13 +42,13 @@ import {
   Save,
   Scissors,
   SendToBack,
-  Share2,
   SlidersHorizontal,
-  Smile,
   Sparkles,
+  Spline,
   Square,
   Table2,
   Trash2,
+  TriangleDashed,
   Type,
   Underline,
   Undo2,
@@ -63,7 +66,9 @@ import {
   resetElementThemeStyles,
   resolveSlide,
   resolveSlideFromValidatedDocument,
+  shapeSupportsText,
   STANDARD_PAGE_SIZES,
+  type CommentAnchor,
   type DeckDocument,
   type DocumentCommand,
   type Element,
@@ -73,8 +78,12 @@ import {
   type ConnectorElement,
   type Layout,
   type Master,
+  type PathCommand,
+  type PathElement,
   type PlaceholderElement,
   type RichTextDocument,
+  type ShapeElement,
+  type ShapeText,
   type Slide,
   type TableElement,
   type TextStyle,
@@ -85,7 +94,12 @@ import {
   type Theme,
 } from '@htmllelujah/document-core';
 import { alignItems, distributeItems } from '@htmllelujah/geometry';
-import { SlideSurface, type CatalogId, type ContentCatalogEntry } from '@htmllelujah/renderer';
+import {
+  SHAPE_CATALOG,
+  SlideSurface,
+  type CatalogId,
+  type ContentCatalogEntry,
+} from '@htmllelujah/renderer';
 import type { RecoveryCandidate } from '@htmllelujah/document-runtime';
 import {
   useCallback,
@@ -104,8 +118,12 @@ import type {
   CollaborationTextLeaseInput,
   CollaborationTextLeaseStatus,
   DesktopResult,
+  ImageImportTarget,
   McpStatus,
+  McpTrustedClientSummary,
+  PreviewPresentationDesignImportResult,
   SessionView,
+  SpellcheckLanguagesResult,
 } from '../shared/desktop-api';
 import htmllelujahAppIcon from '../../assets/htmllelujah-app-icon.svg';
 import { reconcileHostAddressSelection } from './collaboration-host-address';
@@ -113,16 +131,32 @@ import { EditorButton } from './components/EditorButton';
 import { CanonicalSlideCanvas, sameCanvasSelection } from './components/CanonicalSlideCanvas';
 import { CollaborationParticipants } from './components/CollaborationParticipants';
 import { ContentCatalogPicker } from './components/ContentCatalogPicker';
+import { ImageColorKeyEditor } from './components/ImageColorKeyEditor';
+import { PresentationImportDialog } from './components/PresentationImportDialog';
+import { ReviewPanel } from './components/ReviewPanel';
 import {
   applyCanonicalTableMutation,
   type TableCommandFactory,
 } from './editor/canonical-table-mutations';
+import { matchElementSizes, swapElementPositions } from './editor/arrange-actions';
+import {
+  applyElementFormat,
+  captureElementFormat,
+  type ElementFormat,
+} from './editor/format-painter';
+import { flipElementsAroundSelectionBounds, type ElementFlipAxis } from './editor/element-flip';
+import {
+  performShapeBooleanOperation,
+  type ShapeBooleanInput,
+  type ShapeBooleanOperation,
+} from './editor/shape-boolean-geometry';
 import {
   contentFromPlainText,
   contentToPlainText,
   createConnectorElement,
   createIconElement,
   createShapeElement,
+  createShapeText,
   createSlide,
   createTableElement,
   createTextElement,
@@ -176,6 +210,31 @@ import {
   stepCanvasZoom,
   type CanvasZoom,
 } from './editor/editor-viewport';
+import { resolveAgentAccessStatus, resolveDocumentSaveStatus } from './editor/editor-chrome-status';
+import {
+  createPathElementFromCanvasPoints,
+  directConnectorEndpointCommands,
+  type CanvasPoint,
+  type CanvasVectorTool,
+} from './editor/vector-canvas-tools';
+import {
+  createCommentCommand,
+  markCommentReadCommand,
+  replyCommentCommand,
+  setCommentResolvedCommand,
+  topLevelSelectionForCommentAnchor,
+  type ReviewCommandContext,
+} from './editor/review-actions';
+import {
+  extractExternalImageFromClipboardEvent,
+  type ExternalClipboardImage,
+} from './editor/external-image-clipboard';
+import { previewImageColorKey, type ImageColorKeyPreviewTarget } from './editor/image-color-key';
+import {
+  encodeCollaborationInvitation,
+  parseCollaborationInvitation,
+} from './editor/collaboration-invitation';
+import { planPresentationDesignImport } from './editor/presentation-design-plan';
 import {
   replaceRichTextRange,
   RICH_CLIPBOARD_LIMITS,
@@ -189,7 +248,14 @@ import {
   validateObjectClipboardPaste,
 } from './editor/object-clipboard';
 
-const menuItems = ['File', 'Edit', 'View', 'Insert', 'Arrange', 'Help'] as const;
+const menuItems = ['File', 'Edit', 'View', 'Insert', 'Arrange', 'Review', 'Help'] as const;
+const shapeBooleanLabels: Readonly<Record<ShapeBooleanOperation, string>> = {
+  union: 'Union',
+  combine: 'Combine',
+  intersect: 'Intersect',
+  subtract: 'Subtract',
+  fragment: 'Fragment',
+};
 const themeTextStyleRoles: readonly TextStyleRole[] = [
   'title',
   'subtitle',
@@ -198,8 +264,18 @@ const themeTextStyleRoles: readonly TextStyleRole[] = [
   'label',
   'quote',
 ];
+const BUSINESS_LANGUAGE_OPTIONS = [
+  ['en-US', 'English (United States)'],
+  ['en-GB', 'English (United Kingdom)'],
+  ['fr-FR', 'Français (France)'],
+  ['de-DE', 'Deutsch'],
+  ['es-ES', 'Español'],
+  ['it-IT', 'Italiano'],
+  ['nl-NL', 'Nederlands'],
+  ['pt-PT', 'Português'],
+] as const;
 type MenuItem = (typeof menuItems)[number];
-type InspectorTab = 'properties' | 'design';
+type InspectorTab = 'properties' | 'design' | 'review';
 type Toast = { readonly kind: 'success' | 'error' | 'info'; readonly message: string };
 type ObjectContextMenu = Readonly<{ x: number; y: number; elementId: string }>;
 type ContentPickerState = Readonly<{
@@ -240,6 +316,12 @@ type TextDraft = {
   readonly listLevel: number;
 };
 
+type ShapeTextDraft = Readonly<{
+  elementId: string;
+  text: string;
+  baseline: ShapeText;
+}>;
+
 type CommandSource =
   readonly DocumentCommand[] | ((document: DeckDocument) => readonly DocumentCommand[]);
 
@@ -249,6 +331,17 @@ const clamp = (value: number, minimum: number, maximum: number): number =>
 const isTypingTarget = (target: EventTarget | null): boolean =>
   target instanceof HTMLElement &&
   (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+
+const clipboardHasSupportedExternalImage = (
+  clipboardData: Pick<DataTransfer, 'items' | 'files'>,
+): boolean =>
+  [...Array.from(clipboardData.items), ...Array.from(clipboardData.files)].some(
+    (candidate) =>
+      ('kind' in candidate ? candidate.kind === 'file' : true) &&
+      (candidate.type === 'image/png' ||
+        candidate.type === 'image/jpeg' ||
+        candidate.type === 'image/webp'),
+  );
 
 const firstMarks = (content: RichTextDocument): TextMarks => {
   const block = content.blocks[0];
@@ -612,6 +705,9 @@ function EditorApp() {
   const sessionRef = useRef<SessionView | null>(null);
   const [activeSlideId, setActiveSlideId] = useState('');
   const [selectedIds, setSelectedIds] = useState<readonly string[]>([]);
+  const [canvasVectorTool, setCanvasVectorTool] = useState<CanvasVectorTool>({
+    kind: 'select',
+  });
   const [zoom, setZoom] = useState<CanvasZoom>({ mode: 'fit' });
   const [fitScale, setFitScale] = useState(0.72);
   const [gridEnabled, setGridEnabled] = useState(true);
@@ -651,15 +747,30 @@ function EditorApp() {
   const [joinEndpoint, setJoinEndpoint] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [joinFingerprint, setJoinFingerprint] = useState('');
+  const [joinInvitation, setJoinInvitation] = useState('');
   const [startingCollaboration, setStartingCollaboration] = useState(false);
   const startingCollaborationRef = useRef(false);
   const [joiningCollaboration, setJoiningCollaboration] = useState(false);
   const joiningCollaborationRef = useRef(false);
   const [mcpOpen, setMcpOpen] = useState(false);
   const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
+  const [mcpTrustedClients, setMcpTrustedClients] = useState<readonly McpTrustedClientSummary[]>(
+    [],
+  );
+  const [mcpClientBusyId, setMcpClientBusyId] = useState<string | null>(null);
+  const [presentationImportPreview, setPresentationImportPreview] =
+    useState<PreviewPresentationDesignImportResult | null>(null);
+  const [spellcheckLanguages, setSpellcheckLanguages] = useState<SpellcheckLanguagesResult | null>(
+    null,
+  );
+  const [documentTitleEditing, setDocumentTitleEditing] = useState(false);
+  const [documentTitleDraft, setDocumentTitleDraft] = useState('');
+  const documentTitleEditCancelledRef = useRef(false);
   const [recoveryCandidates, setRecoveryCandidates] = useState<readonly RecoveryCandidate[]>([]);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
+  const [shapeTextDraft, setShapeTextDraft] = useState<ShapeTextDraft | null>(null);
+  const [shapeTextApplyPending, setShapeTextApplyPending] = useState(false);
   const [textDraftDirty, setTextDraftDirty] = useState(false);
   const [textDraftConflict, setTextDraftConflict] = useState(false);
   const [textApplyPending, setTextApplyPending] = useState(false);
@@ -669,6 +780,9 @@ function EditorApp() {
   const [textLeasePending, setTextLeasePending] = useState(false);
   const textBaselineRef = useRef<{ readonly id: string; readonly value: string } | null>(null);
   const textDraftRef = useRef<TextDraft | null>(null);
+  const shapeTextDraftRef = useRef<ShapeTextDraft | null>(null);
+  const shapeTextCommitInFlightRef = useRef<Promise<boolean> | null>(null);
+  const allowExecuteDuringShapeTextCommitRef = useRef(false);
   const textDraftDirtyRef = useRef(false);
   const textDraftConflictRef = useRef(false);
   const inlineTextElementIdRef = useRef<string | null>(null);
@@ -682,6 +796,13 @@ function EditorApp() {
   const textEditorFocusedRef = useRef(false);
   const objectClipboardRef = useRef<string | null>(null);
   const objectClipboardPlainTextRef = useRef<string | null>(null);
+  const [formatPainterFormat, setFormatPainterFormat] = useState<ElementFormat | null>(null);
+  const clipboardImageImportInFlightRef = useRef(false);
+  const [imageCropElementId, setImageCropElementId] = useState<string | null>(null);
+  const [imageColorKeyPreview, setImageColorKeyPreview] = useState<Readonly<{
+    elementId: string;
+    value: ImageElement['colorKey'];
+  }> | null>(null);
   const textDraftVersionRef = useRef(0);
   const textDraftAutosaveFailedVersionRef = useRef<number | null>(null);
   const [tableTsv, setTableTsv] = useState('');
@@ -727,6 +848,12 @@ function EditorApp() {
     [],
   );
 
+  const activateCanvasVectorTool = useCallback((tool: CanvasVectorTool): void => {
+    void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+      if (canLeave) setCanvasVectorTool(tool);
+    });
+  }, []);
+
   const restoreBlurValue = useCallback(
     (
       target: HTMLInputElement | HTMLTextAreaElement,
@@ -748,6 +875,11 @@ function EditorApp() {
   const updateTextDraft = useCallback((draft: TextDraft | null): void => {
     textDraftRef.current = draft;
     setTextDraft(draft);
+  }, []);
+
+  const updateShapeTextDraft = useCallback((draft: ShapeTextDraft | null): void => {
+    shapeTextDraftRef.current = draft;
+    setShapeTextDraft(draft);
   }, []);
 
   const updateTextDraftConflict = useCallback((conflict: boolean): void => {
@@ -855,6 +987,11 @@ function EditorApp() {
   }, [shareOpen, shareStatus?.pendingJoins.length]);
 
   const document = session?.snapshot.document;
+  useEffect(() => {
+    if (!documentTitleEditing && document !== undefined) {
+      setDocumentTitleDraft(document.name);
+    }
+  }, [document?.name, documentTitleEditing]);
   const activeSlide = useMemo(
     () => document?.slides.find((slide) => slide.id === activeSlideId) ?? document?.slides[0],
     [activeSlideId, document],
@@ -893,7 +1030,16 @@ function EditorApp() {
     [activeSurfaceElements, selectedIds],
   );
   const primaryElement = selectedElements.at(-1);
+  useEffect(() => {
+    if (
+      canvasVectorTool.kind === 'edit-path' &&
+      (primaryElement?.type !== 'path' || primaryElement.id !== canvasVectorTool.elementId)
+    ) {
+      setCanvasVectorTool({ kind: 'select' });
+    }
+  }, [canvasVectorTool, primaryElement]);
   const primaryText = primaryElement?.type === 'text' ? primaryElement : undefined;
+  const activeTextHostElementId = shapeTextDraft?.elementId ?? primaryText?.id;
   const primaryThemeReset = useMemo(
     () =>
       primaryElement === undefined ||
@@ -924,7 +1070,48 @@ function EditorApp() {
   const hasOrphanedTextDraft = textDraft !== null && textDraftDirty && !textDraftMatchesPrimary;
   const renderedTextDraftVersion = textDraftVersionRef.current;
   const primaryImage = primaryElement?.type === 'image' ? primaryElement : undefined;
+  const primaryShape = primaryElement?.type === 'shape' ? primaryElement : undefined;
+  const primaryShapeText =
+    primaryShape !== undefined && shapeSupportsText(primaryShape.shape)
+      ? (primaryShape.text ?? createShapeText('', 'body'))
+      : undefined;
+  const primaryShapeTextRoleStyle =
+    primaryShapeText === undefined || activeAuthoringTheme === undefined
+      ? undefined
+      : themeRoleStyle(activeAuthoringTheme, primaryShapeText.styleRole);
+  const primaryShapeTextResolvedStyle =
+    primaryShapeTextRoleStyle === undefined
+      ? undefined
+      : { ...primaryShapeTextRoleStyle, ...primaryShapeText?.style };
+  const primaryShapeTextMarks =
+    primaryShapeText === undefined ? emptyMarks() : firstMarks(primaryShapeText.content);
+  const primaryShapeTextFirstBlock = primaryShapeText?.content.blocks[0];
+  const primaryShapeTextAlignment: TextAlignment =
+    primaryShapeTextFirstBlock !== undefined && primaryShapeTextFirstBlock.type !== 'list'
+      ? primaryShapeTextFirstBlock.alignment
+      : (primaryShapeText?.style?.alignment ?? 'left');
+  const shapeTextDraftMatchesPrimary =
+    primaryShape !== undefined && shapeTextDraft?.elementId === primaryShape.id;
+  const activeShapeText =
+    shapeTextDraftMatchesPrimary && shapeTextDraft !== null
+      ? (primaryShape?.text ?? shapeTextDraft.baseline)
+      : undefined;
+  const shapeTextThemeStyle =
+    activeShapeText === undefined || activeAuthoringTheme === undefined
+      ? undefined
+      : themeRoleStyle(activeAuthoringTheme, activeShapeText.styleRole);
+  const resolvedShapeTextStyle =
+    shapeTextThemeStyle === undefined
+      ? undefined
+      : { ...shapeTextThemeStyle, ...activeShapeText?.style };
+  const shapeTextFirstBlock = activeShapeText?.content.blocks[0];
+  const shapeTextAlignment: TextAlignment =
+    shapeTextFirstBlock !== undefined && shapeTextFirstBlock.type !== 'list'
+      ? shapeTextFirstBlock.alignment
+      : (activeShapeText?.style?.alignment ?? 'left');
   const primaryTable = primaryElement?.type === 'table' ? primaryElement : undefined;
+  const spellcheckSessionId = session?.snapshot.sessionId;
+  const deckLocale = document?.metadata.locale;
   const selectedTableCell = primaryTable?.cells.find((cell) => cell.id === selectedTableCellId);
   const designSelectedElement =
     designSurface === 'master'
@@ -934,6 +1121,41 @@ function EditorApp() {
         : undefined;
   const canvasScale = resolveCanvasScale(zoom, fitScale);
   const zoomPercent = effectiveZoomPercent(zoom, fitScale);
+
+  useEffect(() => {
+    setImageColorKeyPreview(null);
+  }, [primaryImage?.id]);
+
+  useEffect(() => {
+    if (imageCropElementId !== null && primaryImage?.id !== imageCropElementId) {
+      setImageCropElementId(null);
+    }
+  }, [imageCropElementId, primaryImage?.id]);
+
+  useEffect(() => {
+    if (spellcheckSessionId === undefined || deckLocale === undefined) return;
+    let active = true;
+    const languages = [
+      deckLocale,
+      ...(primaryText?.locale === undefined ? [] : [primaryText.locale]),
+      ...(primaryShapeText?.locale === undefined ? [] : [primaryShapeText.locale]),
+    ];
+    void window.htmllelujah
+      .setSpellcheckLanguages({
+        sessionId: spellcheckSessionId,
+        languages,
+      })
+      .then((result) => {
+        if (!active) return;
+        setSpellcheckLanguages(result.ok ? result.value : null);
+      })
+      .catch(() => {
+        if (active) setSpellcheckLanguages(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [deckLocale, primaryShapeText?.locale, primaryText?.locale, spellcheckSessionId]);
 
   useEffect(() => {
     if (document === undefined) return;
@@ -970,9 +1192,14 @@ function EditorApp() {
           sessionId: session.snapshot.sessionId,
           slideId: activeSlide.id,
           selectedElementIds: selectedIds.slice(0, 100),
-          ...(inlineTextElementId === null && !(textDraftDirty && primaryText !== undefined)
+          ...(inlineTextElementId === null &&
+          shapeTextDraft === null &&
+          !(textDraftDirty && primaryText !== undefined)
             ? {}
-            : { editingElementId: inlineTextElementId ?? primaryText?.id }),
+            : {
+                editingElementId:
+                  shapeTextDraft?.elementId ?? inlineTextElementId ?? primaryText?.id,
+              }),
         })
         .then((result) => {
           if (!cancelled && result.ok) acceptShareStatus(result.value);
@@ -991,6 +1218,7 @@ function EditorApp() {
     primaryText,
     selectedIds,
     session,
+    shapeTextDraft,
     shareStatus?.mode,
     textDraftDirty,
   ]);
@@ -1146,7 +1374,7 @@ function EditorApp() {
       current === null ||
       activeAuthoringSurface !== 'slide' ||
       activeSlide === undefined ||
-      primaryText === undefined ||
+      activeTextHostElementId === undefined ||
       shareStatus?.mode === undefined ||
       shareStatus.mode === 'offline'
     ) {
@@ -1158,7 +1386,7 @@ function EditorApp() {
     const requested: CollaborationTextLeaseInput = {
       sessionId: current.snapshot.sessionId,
       slideId: activeSlide.id,
-      elementId: primaryText.id,
+      elementId: activeTextHostElementId,
     };
     if (
       sameTextLeaseRequest(textLeaseRequestRef.current, requested) &&
@@ -1228,9 +1456,9 @@ function EditorApp() {
   }, [
     activeAuthoringSurface,
     activeSlide,
+    activeTextHostElementId,
     acceptShareStatus,
     notify,
-    primaryText,
     releaseTextLease,
     shareStatus?.mode,
     showFailure,
@@ -1314,6 +1542,107 @@ function EditorApp() {
     [acceptSession, busy, notify, showFailure],
   );
 
+  const executeReviewCommand = useCallback(
+    async (
+      label: string,
+      commands: readonly DocumentCommand[],
+      successMessage?: string,
+    ): Promise<void> => {
+      const succeeded = await execute(label, commands, {
+        ...(successMessage === undefined ? {} : { message: successMessage }),
+      });
+      if (!succeeded) {
+        throw new Error('The review change could not be applied.');
+      }
+    },
+    [execute],
+  );
+
+  const currentReviewCommandContext = useCallback((): ReviewCommandContext => {
+    const current = sessionRef.current;
+    if (current === null) throw new Error('The presentation session is unavailable.');
+    return {
+      actorId: current.actorId,
+      actorName: displayName,
+      createId: () => crypto.randomUUID(),
+      now: () => new Date().toISOString(),
+    };
+  }, [displayName]);
+
+  const createReviewComment = useCallback(
+    async (anchor: CommentAnchor, body: string): Promise<void> => {
+      await executeReviewCommand(
+        'Add comment',
+        [createCommentCommand(currentReviewCommandContext(), anchor, body)],
+        'Comment added.',
+      );
+    },
+    [currentReviewCommandContext, executeReviewCommand],
+  );
+
+  const replyToReviewComment = useCallback(
+    async (threadId: string, body: string): Promise<void> => {
+      await executeReviewCommand(
+        'Reply to comment',
+        [replyCommentCommand(currentReviewCommandContext(), threadId, body)],
+        'Reply added.',
+      );
+    },
+    [currentReviewCommandContext, executeReviewCommand],
+  );
+
+  const setReviewCommentResolved = useCallback(
+    async (threadId: string, resolved: boolean): Promise<void> => {
+      await executeReviewCommand(
+        resolved ? 'Resolve comment' : 'Reopen comment',
+        [setCommentResolvedCommand(currentReviewCommandContext(), threadId, resolved)],
+        resolved ? 'Comment resolved.' : 'Comment reopened.',
+      );
+    },
+    [currentReviewCommandContext, executeReviewCommand],
+  );
+
+  const markReviewCommentRead = useCallback(
+    async (threadId: string): Promise<void> => {
+      await executeReviewCommand('Mark comment read', [
+        markCommentReadCommand(currentReviewCommandContext(), threadId),
+      ]);
+    },
+    [currentReviewCommandContext, executeReviewCommand],
+  );
+
+  const openReviewPanel = useCallback((): void => {
+    void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+      if (!canLeave) return;
+      if (designSurface !== 'slide') {
+        setDesignSurface('slide');
+        setSelectedIds([]);
+      }
+      setInspectorTab('review');
+    });
+  }, [designSurface]);
+
+  const selectReviewAnchor = useCallback(
+    (anchor: CommentAnchor): void => {
+      void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+        if (!canLeave) return;
+        const current = sessionRef.current;
+        const slide = current?.snapshot.document.slides.find(
+          (candidate) => candidate.id === anchor.slideId,
+        );
+        if (slide === undefined) {
+          notify('The slide linked to this comment no longer exists.', 'error');
+          return;
+        }
+        setActiveSlideId(slide.id);
+        setDesignSurface('slide');
+        setInspectorTab('review');
+        setSelectedIds(topLevelSelectionForCommentAnchor(slide.elements, anchor.elementId));
+      });
+    },
+    [notify],
+  );
+
   const save = useCallback(
     async (saveAs = false): Promise<void> => {
       if (!(await canLeaveInlineTextEditorRef.current())) return;
@@ -1321,7 +1650,8 @@ function EditorApp() {
       if (current === null || busy) return;
       setBusy(true);
       try {
-        const result = saveAs
+        const savingAs = saveAs || resolveDocumentSaveStatus(current.snapshot).requiresSaveAs;
+        const result = savingAs
           ? await window.htmllelujah.saveAs({ sessionId: current.snapshot.sessionId })
           : await window.htmllelujah.save({ sessionId: current.snapshot.sessionId });
         if (!result.ok) {
@@ -1329,7 +1659,7 @@ function EditorApp() {
           return;
         }
         acceptSession(result.value);
-        notify('Saved locally.', 'success');
+        notify(savingAs ? 'Saved as a local presentation.' : 'Saved locally.', 'success');
       } finally {
         setBusy(false);
       }
@@ -1518,6 +1848,57 @@ function EditorApp() {
       activeAuthoringSurface,
       activeSlide,
       busy,
+      designLayout,
+      designMaster,
+      notify,
+      showFailure,
+    ],
+  );
+
+  const importExternalClipboardImage = useCallback(
+    async (image: ExternalClipboardImage): Promise<void> => {
+      const current = sessionRef.current;
+      if (current === null || clipboardImageImportInFlightRef.current) return;
+      const target: ImageImportTarget | null =
+        activeAuthoringSurface === 'master'
+          ? designMaster === undefined
+            ? null
+            : { surface: 'master', masterId: designMaster.id }
+          : activeAuthoringSurface === 'layout'
+            ? designLayout === undefined
+              ? null
+              : { surface: 'layout', layoutId: designLayout.id }
+            : activeSlide === undefined
+              ? null
+              : { surface: 'slide', slideId: activeSlide.id };
+      if (target === null) return;
+      clipboardImageImportInFlightRef.current = true;
+      setBusy(true);
+      try {
+        const imported = await window.htmllelujah.importClipboardImage({
+          sessionId: current.snapshot.sessionId,
+          expectedRevision: current.snapshot.revision,
+          target,
+          bytes: image.bytes,
+          mediaType: image.mediaType,
+          fileName: image.fileName,
+        });
+        if (!imported.ok) {
+          showFailure(imported);
+          return;
+        }
+        acceptSession(imported.value.session);
+        setSelectedIds([imported.value.elementId]);
+        notify('Clipboard image added.', 'success');
+      } finally {
+        clipboardImageImportInFlightRef.current = false;
+        setBusy(false);
+      }
+    },
+    [
+      acceptSession,
+      activeAuthoringSurface,
+      activeSlide,
       designLayout,
       designMaster,
       notify,
@@ -1842,6 +2223,298 @@ function EditorApp() {
     ],
   );
 
+  const swapSelectionPositions = useCallback((): void => {
+    if (document === undefined || selectedElements.length !== 2) return;
+    if (selectedElements.some((element) => element.locked)) {
+      notify('Unlock both objects before swapping their positions.', 'error');
+      return;
+    }
+    transform(swapElementPositions(selectedElements, document.page));
+  }, [document, notify, selectedElements, transform]);
+
+  const matchSelectionSizes = useCallback((): void => {
+    if (document === undefined || selectedElements.length < 2) return;
+    if (selectedElements.some((element) => element.locked)) {
+      notify('Unlock the selected objects before matching their size.', 'error');
+      return;
+    }
+    transform(matchElementSizes(selectedElements, document.page));
+  }, [document, notify, selectedElements, transform]);
+
+  const copyPrimaryFormat = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
+    const primaryId = primaryElement?.id;
+    const current = sessionRef.current;
+    if (primaryId === undefined || current === null) {
+      notify('Select one text box, shape, image, table, or path to copy its format.', 'error');
+      return;
+    }
+    const latestElements =
+      activeAuthoringSurface === 'master'
+        ? (current.snapshot.document.masters.find((master) => master.id === designMaster?.id)
+            ?.elements ?? [])
+        : activeAuthoringSurface === 'layout'
+          ? (current.snapshot.document.layouts.find((layout) => layout.id === designLayout?.id)
+              ?.elements ?? [])
+          : (current.snapshot.document.slides.find((slide) => slide.id === activeSlide?.id)
+              ?.elements ?? []);
+    const latestPrimary = latestElements.find((element) => element.id === primaryId);
+    if (latestPrimary === undefined) return;
+    const captured = captureElementFormat(latestPrimary);
+    if (!captured.ok) {
+      notify(captured.message, 'error');
+      return;
+    }
+    setFormatPainterFormat(captured.format);
+    notify(`Copied ${captured.format.kind} formatting. Select a target and apply it.`, 'success');
+  }, [
+    activeAuthoringSurface,
+    activeSlide?.id,
+    designLayout?.id,
+    designMaster?.id,
+    notify,
+    primaryElement?.id,
+  ]);
+
+  const applyCopiedFormat = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
+    if (formatPainterFormat === null) {
+      notify('Copy formatting from a source object first.', 'error');
+      return;
+    }
+    const current = sessionRef.current;
+    if (current === null || selectedIds.length === 0) {
+      notify('Select at least one compatible target object.', 'error');
+      return;
+    }
+    const latestElements =
+      activeAuthoringSurface === 'master'
+        ? (current.snapshot.document.masters.find((master) => master.id === designMaster?.id)
+            ?.elements ?? [])
+        : activeAuthoringSurface === 'layout'
+          ? (current.snapshot.document.layouts.find((layout) => layout.id === designLayout?.id)
+              ?.elements ?? [])
+          : (current.snapshot.document.slides.find((slide) => slide.id === activeSlide?.id)
+              ?.elements ?? []);
+    const selectedSet = new Set(selectedIds);
+    const targets = latestElements.filter((element) => selectedSet.has(element.id));
+    if (targets.length !== selectedIds.length) {
+      notify('The selected targets changed before formatting could be applied.', 'error');
+      return;
+    }
+    const applications = targets.map((target) => applyElementFormat(formatPainterFormat, target));
+    const failure = applications.find((application) => !application.ok);
+    if (failure !== undefined && !failure.ok) {
+      notify(failure.message, 'error');
+      return;
+    }
+    const replacements = new Map(
+      applications.flatMap((application) =>
+        application.ok ? [[application.element.id, application.element] as const] : [],
+      ),
+    );
+    if (replacements.size !== targets.length) return;
+    const label = `Apply ${formatPainterFormat.kind} formatting`;
+    const applied =
+      activeAuthoringSurface === 'slide'
+        ? activeSlide !== undefined &&
+          (await execute(
+            label,
+            targets.map((target): DocumentCommand => ({
+              type: 'element.update',
+              slideId: activeSlide.id,
+              elementId: target.id,
+              replacement: replacements.get(target.id) ?? target,
+            })),
+          ))
+        : await mutateActiveTemplateElements(label, (elements) =>
+            elements.map((element) => replacements.get(element.id) ?? element),
+          );
+    if (applied) {
+      notify(
+        `Formatting applied to ${targets.length} object${targets.length === 1 ? '' : 's'}.`,
+        'success',
+      );
+    }
+  }, [
+    activeAuthoringSurface,
+    activeSlide,
+    designLayout?.id,
+    designMaster?.id,
+    execute,
+    formatPainterFormat,
+    mutateActiveTemplateElements,
+    notify,
+    selectedIds,
+  ]);
+
+  const flipSelection = useCallback(
+    async (axis: ElementFlipAxis): Promise<void> => {
+      if (!(await canLeaveInlineTextEditorRef.current())) return;
+      const current = sessionRef.current;
+      if (current === null || selectedIds.length === 0) return;
+      const latestElements =
+        activeAuthoringSurface === 'master'
+          ? (current.snapshot.document.masters.find((master) => master.id === designMaster?.id)
+              ?.elements ?? [])
+          : activeAuthoringSurface === 'layout'
+            ? (current.snapshot.document.layouts.find((layout) => layout.id === designLayout?.id)
+                ?.elements ?? [])
+            : (current.snapshot.document.slides.find((slide) => slide.id === activeSlide?.id)
+                ?.elements ?? []);
+      const selectedSet = new Set(selectedIds);
+      const targets = latestElements.filter((element) => selectedSet.has(element.id));
+      if (targets.length !== selectedIds.length) return;
+      const result = flipElementsAroundSelectionBounds(targets, axis);
+      if (!result.ok) {
+        notify(result.message, 'error');
+        return;
+      }
+      const replacements = new Map(result.elements.map((element) => [element.id, element]));
+      const label = axis === 'horizontal' ? 'Flip objects horizontally' : 'Flip objects vertically';
+      const flipped =
+        activeAuthoringSurface === 'slide'
+          ? activeSlide !== undefined &&
+            (await execute(
+              label,
+              result.elements.map((element): DocumentCommand => ({
+                type: 'element.update',
+                slideId: activeSlide.id,
+                elementId: element.id,
+                replacement: element,
+              })),
+            ))
+          : await mutateActiveTemplateElements(label, (elements) =>
+              elements.map((element) => replacements.get(element.id) ?? element),
+            );
+      if (flipped) notify(label, 'success');
+    },
+    [
+      activeAuthoringSurface,
+      activeSlide,
+      designLayout?.id,
+      designMaster?.id,
+      execute,
+      mutateActiveTemplateElements,
+      notify,
+      selectedIds,
+    ],
+  );
+
+  const shapeBooleanSelectionAvailable =
+    selectedElements.length >= 2 &&
+    selectedElements.every(
+      (element): element is ShapeElement | PathElement =>
+        element.type === 'shape' || element.type === 'path',
+    );
+
+  const mergeShapeSelection = useCallback(
+    async (operation: ShapeBooleanOperation): Promise<void> => {
+      if (!(await canLeaveInlineTextEditorRef.current())) return;
+      const current = sessionRef.current;
+      if (current === null || selectedIds.length < 2) return;
+      const latestElements =
+        activeAuthoringSurface === 'master'
+          ? (current.snapshot.document.masters.find((master) => master.id === designMaster?.id)
+              ?.elements ?? [])
+          : activeAuthoringSurface === 'layout'
+            ? (current.snapshot.document.layouts.find((layout) => layout.id === designLayout?.id)
+                ?.elements ?? [])
+            : (current.snapshot.document.slides.find((slide) => slide.id === activeSlide?.id)
+                ?.elements ?? []);
+      const selectedSet = new Set(selectedIds);
+      const selected = latestElements.filter(
+        (element): element is ShapeBooleanInput =>
+          selectedSet.has(element.id) && (element.type === 'shape' || element.type === 'path'),
+      );
+      if (selected.length !== selectedIds.length || selected.length < 2) {
+        notify('Select at least two native shapes or closed freeform paths.', 'error');
+        return;
+      }
+      const primaryId =
+        primaryElement !== undefined && selectedSet.has(primaryElement.id)
+          ? primaryElement.id
+          : selected.at(-1)?.id;
+      const primary = selected.find((element) => element.id === primaryId);
+      if (primary === undefined) return;
+      const ordered = [primary, ...selected.filter((element) => element.id !== primary.id)];
+      const result = performShapeBooleanOperation(ordered, operation, {
+        idFactory: () => crypto.randomUUID(),
+      });
+      if (!result.ok) {
+        notify(result.message, 'error');
+        return;
+      }
+
+      const sourceIds = new Set(result.sourceIds);
+      const primaryIndex = latestElements.findIndex((element) => element.id === primary.id);
+      const removedBeforePrimary = latestElements
+        .slice(0, Math.max(0, primaryIndex))
+        .filter((element) => sourceIds.has(element.id)).length;
+      const insertionIndex = Math.max(0, primaryIndex - removedBeforePrimary);
+      const outputIds = result.elements.map((element) => element.id);
+      const label = `${shapeBooleanLabels[operation]} shapes`;
+
+      if (activeAuthoringSurface === 'slide') {
+        if (activeSlide === undefined) return;
+        const merged = await execute(
+          label,
+          [
+            {
+              type: 'element.delete',
+              slideId: activeSlide.id,
+              elementIds: result.sourceIds,
+            },
+            ...result.elements.map((element, index): DocumentCommand => ({
+              type: 'element.insert',
+              slideId: activeSlide.id,
+              element,
+              index: insertionIndex + index,
+            })),
+          ],
+          {
+            select: outputIds,
+            message: `${shapeBooleanLabels[operation]} created as native path${
+              outputIds.length === 1 ? '' : 's'
+            }.`,
+          },
+        );
+        if (!merged) return;
+      } else {
+        const merged = await mutateActiveTemplateElements(label, (elements) => {
+          if (!result.sourceIds.every((id) => elements.some((element) => element.id === id))) {
+            return elements;
+          }
+          const remaining = elements.filter((element) => !sourceIds.has(element.id));
+          return [
+            ...remaining.slice(0, insertionIndex),
+            ...result.elements,
+            ...remaining.slice(insertionIndex),
+          ];
+        });
+        if (!merged) return;
+        setSelectedIds(outputIds);
+        notify(
+          `${shapeBooleanLabels[operation]} created as native path${
+            outputIds.length === 1 ? '' : 's'
+          }.`,
+          'success',
+        );
+      }
+    },
+    [
+      activeAuthoringSurface,
+      activeSlide,
+      designLayout?.id,
+      designMaster?.id,
+      execute,
+      mutateActiveTemplateElements,
+      notify,
+      primaryElement,
+      selectedIds,
+    ],
+  );
+
   const groupSelection = useCallback(async (): Promise<void> => {
     if (activeAuthoringSurface !== 'slide' || activeSlide === undefined || selectedIds.length < 2)
       return;
@@ -1991,6 +2664,135 @@ function EditorApp() {
       mutateActiveTemplateElements,
       notify,
     ],
+  );
+
+  const beginShapeTextEditing = useCallback(
+    (elementId: string): void => {
+      const shape = activeSurfaceElements.find(
+        (element): element is ShapeElement => element.id === elementId && element.type === 'shape',
+      );
+      if (shape === undefined) return;
+      if (!shapeSupportsText(shape.shape)) {
+        notify('This line-like shape does not host text. Add a separate text box instead.', 'info');
+        return;
+      }
+      if (shape.locked) {
+        notify('Unlock the shape before editing its text.', 'error');
+        return;
+      }
+      const baseline = shape.text ?? createShapeText('', 'body');
+      setImageCropElementId(null);
+      setSelectedIds([shape.id]);
+      setInspectorTab('properties');
+      updateShapeTextDraft({
+        elementId: shape.id,
+        text: contentToPlainText(baseline.content),
+        baseline,
+      });
+    },
+    [activeSurfaceElements, notify, updateShapeTextDraft],
+  );
+
+  const commitShapeText = useCallback((): Promise<boolean> => {
+    const inFlight = shapeTextCommitInFlightRef.current;
+    if (inFlight !== null) return inFlight;
+    const operation = (async (): Promise<boolean> => {
+      const draft = shapeTextDraftRef.current;
+      if (draft === null) return true;
+      const shape = activeSurfaceElements.find(
+        (element): element is ShapeElement =>
+          element.id === draft.elementId && element.type === 'shape',
+      );
+      if (shape === undefined || shape.locked || !shapeSupportsText(shape.shape)) {
+        notify('The shape text draft could not be applied and remains open.', 'error');
+        return false;
+      }
+      const currentText = shape.text ?? draft.baseline;
+      if (contentToPlainText(currentText.content) === draft.text) {
+        updateShapeTextDraft(null);
+        textEditorFocusedRef.current = false;
+        await releaseTextLease();
+        return true;
+      }
+      setShapeTextApplyPending(true);
+      allowExecuteDuringShapeTextCommitRef.current = true;
+      try {
+        const applied = await patchElement(
+          {
+            ...shape,
+            text: {
+              ...currentText,
+              content: replacePlainTextPreservingStyles(currentText.content, draft.text),
+            },
+          },
+          'Edit shape text',
+        );
+        if (applied) {
+          updateShapeTextDraft(null);
+          textEditorFocusedRef.current = false;
+          await releaseTextLease();
+        } else notify('The shape text draft could not be applied and remains open.', 'error');
+        return applied;
+      } finally {
+        allowExecuteDuringShapeTextCommitRef.current = false;
+        setShapeTextApplyPending(false);
+      }
+    })();
+    shapeTextCommitInFlightRef.current = operation;
+    void operation.finally(() => {
+      if (shapeTextCommitInFlightRef.current === operation)
+        shapeTextCommitInFlightRef.current = null;
+    });
+    return operation;
+  }, [activeSurfaceElements, notify, patchElement, releaseTextLease, updateShapeTextDraft]);
+
+  const cancelShapeTextEditing = useCallback((): void => {
+    if (shapeTextApplyPending) return;
+    updateShapeTextDraft(null);
+    textEditorFocusedRef.current = false;
+    void releaseTextLease();
+  }, [releaseTextLease, shapeTextApplyPending, updateShapeTextDraft]);
+
+  const pasteShapeText = useCallback(
+    (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
+      const draft = shapeTextDraftRef.current;
+      if (draft === null) return;
+      event.preventDefault();
+      const target = event.currentTarget;
+      const pasted = event.clipboardData.getData('text/plain').replace(/\r\n?/gu, '\n');
+      const start = target.selectionStart ?? draft.text.length;
+      const end = target.selectionEnd ?? start;
+      const next = `${draft.text.slice(0, start)}${pasted}${draft.text.slice(end)}`.slice(
+        0,
+        RICH_CLIPBOARD_LIMITS.maxTextLength,
+      );
+      updateShapeTextDraft({ ...draft, text: next });
+      window.requestAnimationFrame(() => {
+        const cursor = Math.min(start + pasted.length, next.length);
+        target.setSelectionRange(cursor, cursor);
+      });
+    },
+    [updateShapeTextDraft],
+  );
+
+  const updatePrimaryShapeText = useCallback(
+    (updater: (text: ShapeText) => ShapeText, label: string): Promise<boolean> => {
+      if (
+        primaryShape === undefined ||
+        primaryShape.locked ||
+        !shapeSupportsText(primaryShape.shape) ||
+        shapeTextDraftMatchesPrimary
+      )
+        return Promise.resolve(false);
+      return patchElement(
+        {
+          ...primaryShape,
+          text: updater(primaryShape.text ?? createShapeText('', 'body')),
+        },
+        label,
+      );
+    },
+    [patchElement, primaryShape, shapeTextDraftMatchesPrimary],
   );
 
   const resetPrimaryElementToTheme = useCallback(async (): Promise<void> => {
@@ -2552,6 +3354,13 @@ function EditorApp() {
   );
   const canLeaveInlineTextEditor = useCallback(async (): Promise<boolean> => {
     if (
+      !allowExecuteDuringShapeTextCommitRef.current &&
+      (shapeTextDraftRef.current !== null || shapeTextCommitInFlightRef.current !== null)
+    ) {
+      const shapeTextApplied = await commitShapeText();
+      if (!shapeTextApplied) return false;
+    }
+    if (
       inlineTextElementIdRef.current !== null ||
       inlineCommitPromiseRef.current !== null ||
       textDraftDirtyRef.current
@@ -2562,7 +3371,7 @@ function EditorApp() {
       return false;
     }
     return true;
-  }, [commitInlineText, notify]);
+  }, [commitInlineText, commitShapeText, notify]);
   useLayoutEffect(() => {
     canLeaveInlineTextEditorRef.current = canLeaveInlineTextEditor;
   }, [canLeaveInlineTextEditor]);
@@ -2796,7 +3605,7 @@ function EditorApp() {
         activeAuthoringSurface !== 'slide' ||
         current.snapshot.sessionId !== requested.sessionId ||
         activeSlide?.id !== requested.slideId ||
-        primaryText?.id !== requested.elementId)
+        activeTextHostElementId !== requested.elementId)
     ) {
       textEditorFocusedRef.current = false;
       void releaseTextLease(requested);
@@ -2804,7 +3613,7 @@ function EditorApp() {
   }, [
     activeAuthoringSurface,
     activeSlide?.id,
-    primaryText?.id,
+    activeTextHostElementId,
     releaseTextLease,
     session?.snapshot.sessionId,
   ]);
@@ -2888,6 +3697,34 @@ function EditorApp() {
     [patchElement, primaryImage],
   );
 
+  const beginCanvasImageCrop = useCallback(
+    (elementId: string): void => {
+      const image = activeSurfaceElements.find(
+        (element): element is ImageElement => element.id === elementId && element.type === 'image',
+      );
+      if (image === undefined) return;
+      if (image.locked) {
+        notify('Unlock the image before cropping it.', 'error');
+        return;
+      }
+      setSelectedIds([image.id]);
+      setInspectorTab('properties');
+      setImageCropElementId(image.id);
+    },
+    [activeSurfaceElements, notify],
+  );
+
+  const updateCanvasImageCrop = useCallback(
+    (elementId: string, crop: ImageElement['crop']): void => {
+      const image = activeSurfaceElements.find(
+        (element): element is ImageElement => element.id === elementId && element.type === 'image',
+      );
+      if (image === undefined || image.locked) return;
+      void patchElement({ ...image, crop }, 'Crop image directly');
+    },
+    [activeSurfaceElements, patchElement],
+  );
+
   const updateConnectorEndpoint = useCallback(
     (
       connector: ConnectorElement,
@@ -2912,6 +3749,53 @@ function EditorApp() {
       ]);
     },
     [activeAuthoringSurface, activeSlide, execute, patchElement],
+  );
+
+  const createCanvasPath = useCallback(
+    async (points: readonly CanvasPoint[], closed: boolean): Promise<void> => {
+      try {
+        await addElement(createPathElementFromCanvasPoints(points, closed, crypto.randomUUID()));
+      } catch (error) {
+        notify(
+          error instanceof Error ? error.message : 'The freeform could not be created.',
+          'error',
+        );
+      }
+    },
+    [addElement, notify],
+  );
+
+  const updateCanvasPathCommands = useCallback(
+    (elementId: string, commands: readonly PathCommand[]): void => {
+      const element = activeSurfaceElements.find((candidate) => candidate.id === elementId);
+      if (element?.type !== 'path' || element.locked) return;
+      void patchElement({ ...element, commands }, 'Edit freeform points');
+    },
+    [activeSurfaceElements, patchElement],
+  );
+
+  const updateCanvasConnectorEndpoint = useCallback(
+    (connectorId: string, endpoint: 'start' | 'end', value: ConnectorElement['start']): void => {
+      const connector = activeSurfaceElements.find(
+        (candidate): candidate is ConnectorElement =>
+          candidate.id === connectorId && candidate.type === 'connector',
+      );
+      if (connector === undefined || connector.locked) return;
+      if (
+        activeAuthoringSurface === 'slide' &&
+        activeSlide !== undefined &&
+        connector[endpoint].binding.elementId !== undefined &&
+        value.binding.elementId === undefined
+      ) {
+        void execute(
+          'Detach and move connector endpoint',
+          directConnectorEndpointCommands(activeSlide.id, connector, endpoint, value),
+        );
+        return;
+      }
+      void updateConnectorEndpoint(connector, endpoint, value);
+    },
+    [activeAuthoringSurface, activeSlide, activeSurfaceElements, execute, updateConnectorEndpoint],
   );
 
   const updateTheme = useCallback(
@@ -3187,12 +4071,35 @@ function EditorApp() {
     );
   }, [activeAuthoringSurface, activeSlide, execute, patchElement, primaryElement]);
 
-  const renameDocument = useCallback((): void => {
+  const beginDocumentRename = useCallback((): void => {
     if (document === undefined) return;
-    const name = window.prompt('Presentation name', document.name)?.trim();
-    if (name !== undefined && name !== '' && name !== document.name)
-      void execute('Rename presentation', [{ type: 'deck.rename', name }]);
-  }, [document, execute]);
+    documentTitleEditCancelledRef.current = false;
+    setDocumentTitleDraft(document.name);
+    setDocumentTitleEditing(true);
+  }, [document]);
+
+  const cancelDocumentRename = useCallback((): void => {
+    documentTitleEditCancelledRef.current = true;
+    setDocumentTitleEditing(false);
+    setDocumentTitleDraft(document?.name ?? '');
+  }, [document?.name]);
+
+  const commitDocumentRename = useCallback(async (): Promise<void> => {
+    if (documentTitleEditCancelledRef.current) {
+      documentTitleEditCancelledRef.current = false;
+      return;
+    }
+    setDocumentTitleEditing(false);
+    if (document === undefined) return;
+    const name = documentTitleDraft.trim();
+    if (name === '') {
+      setDocumentTitleDraft(document.name);
+      notify('Presentation name cannot be empty.', 'error');
+      return;
+    }
+    if (name === document.name) return;
+    await execute('Rename presentation', [{ type: 'deck.rename', name }]);
+  }, [document, documentTitleDraft, execute, notify]);
 
   const renameSlide = useCallback((): void => {
     if (activeSlide === undefined) return;
@@ -3238,12 +4145,117 @@ function EditorApp() {
     if (!result.ok) showFailure(result);
   }, [activeSlide, busy, showFailure]);
 
+  const openPresentationDesignPreview = useCallback(async (): Promise<void> => {
+    if (!(await canLeaveInlineTextEditorRef.current())) return;
+    const current = sessionRef.current;
+    if (current === null || busy) return;
+    setBusy(true);
+    try {
+      const result = await window.htmllelujah.previewPresentationDesignImport({
+        sessionId: current.snapshot.sessionId,
+      });
+      if (!result.ok) {
+        showFailure(result);
+        return;
+      }
+      setPresentationImportPreview(result.value);
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, showFailure]);
+
+  const importPresentationDesign = useCallback(
+    async (preview: PreviewPresentationDesignImportResult['preview']): Promise<void> => {
+      const current = sessionRef.current;
+      const selectedPreview = presentationImportPreview;
+      if (current === null || selectedPreview === null) {
+        throw new Error('The presentation or import preview is no longer available.');
+      }
+      if (selectedPreview.preview.source.sha256 !== preview.source.sha256) {
+        throw new Error('The selected import preview changed. Please choose the file again.');
+      }
+      const plan = planPresentationDesignImport(current.snapshot.document, preview, {
+        idFactory: () => crypto.randomUUID(),
+      });
+      const applied = await execute('Import PowerPoint design', plan.commands);
+      if (!applied) throw new Error('The design import was not applied.');
+
+      setPresentationImportPreview(null);
+      setInspectorTab('design');
+      setDesignSurface('layout');
+      setDesignThemeId(plan.themes[0]?.id ?? '');
+      setDesignMasterId(plan.masters[0]?.id ?? '');
+      setDesignLayoutId(plan.layouts[0]?.id ?? '');
+      setSelectedIds([]);
+      notify(
+        `Imported ${plan.themes.length} theme${plan.themes.length === 1 ? '' : 's'}, ${
+          plan.masters.length
+        } master${plan.masters.length === 1 ? '' : 's'} and ${plan.layouts.length} layout${
+          plan.layouts.length === 1 ? '' : 's'
+        }.`,
+        'success',
+      );
+    },
+    [execute, notify, presentationImportPreview],
+  );
+
   const openMcp = useCallback(async (): Promise<void> => {
     setMcpOpen(true);
-    const result = await window.htmllelujah.mcpStatus();
-    if (result.ok) setMcpStatus(result.value);
-    else showFailure(result);
+    const current = sessionRef.current;
+    const [statusResult, clientsResult] = await Promise.all([
+      window.htmllelujah.mcpStatus(),
+      current === null
+        ? Promise.resolve<DesktopResult<readonly McpTrustedClientSummary[]>>({
+            ok: true,
+            value: [],
+          })
+        : window.htmllelujah.mcpListTrustedClients({
+            sessionId: current.snapshot.sessionId,
+          }),
+    ]);
+    if (statusResult.ok) setMcpStatus(statusResult.value);
+    else showFailure(statusResult);
+    if (clientsResult.ok) setMcpTrustedClients(clientsResult.value);
+    else showFailure(clientsResult);
   }, [showFailure]);
+
+  const revokeMcpTrustedClient = useCallback(
+    async (client: McpTrustedClientSummary): Promise<void> => {
+      const current = sessionRef.current;
+      if (current === null || !client.revocable || mcpClientBusyId !== null) return;
+      if (
+        !window.confirm(
+          `Revoke persistent MCP access for “${client.label}”? The client will be disconnected immediately.`,
+        )
+      )
+        return;
+      setMcpClientBusyId(client.id);
+      try {
+        const result = await window.htmllelujah.mcpRevokeTrustedClient({
+          sessionId: current.snapshot.sessionId,
+          id: client.id,
+        });
+        if (!result.ok) {
+          showFailure(result);
+          return;
+        }
+        const [statusResult, clientsResult] = await Promise.all([
+          window.htmllelujah.mcpStatus(),
+          window.htmllelujah.mcpListTrustedClients({
+            sessionId: current.snapshot.sessionId,
+          }),
+        ]);
+        if (statusResult.ok) setMcpStatus(statusResult.value);
+        else showFailure(statusResult);
+        if (clientsResult.ok) setMcpTrustedClients(clientsResult.value);
+        else showFailure(clientsResult);
+        notify(`MCP access revoked for “${client.label}”.`, 'success');
+      } finally {
+        setMcpClientBusyId(null);
+      }
+    },
+    [mcpClientBusyId, notify, showFailure],
+  );
 
   const openShare = useCallback(async (): Promise<void> => {
     const current = sessionRef.current;
@@ -3282,6 +4294,42 @@ function EditorApp() {
       setStartingCollaboration(false);
     }
   }, [acceptSession, acceptShareStatus, discovery, displayName, hostAddress, showFailure]);
+
+  const copyCollaborationInvitation = useCallback(async (): Promise<void> => {
+    if (
+      shareStatus?.endpoint === undefined ||
+      shareStatus.sessionCode === undefined ||
+      shareStatus.hostFingerprint === undefined
+    )
+      return;
+    try {
+      const invitation = encodeCollaborationInvitation({
+        endpoint: shareStatus.endpoint,
+        sessionCode: shareStatus.sessionCode,
+        hostFingerprint: shareStatus.hostFingerprint,
+      });
+      setJoinInvitation(invitation);
+      await navigator.clipboard.writeText(invitation);
+      notify('LAN invitation copied. Send it to a collaborator on the same network.', 'success');
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : 'The LAN invitation could not be copied.',
+        'error',
+      );
+    }
+  }, [notify, shareStatus]);
+
+  const applyCollaborationInvitation = useCallback((): void => {
+    try {
+      const invitation = parseCollaborationInvitation(joinInvitation.trim());
+      setJoinEndpoint(invitation.endpoint);
+      setJoinCode(invitation.sessionCode);
+      setJoinFingerprint(invitation.hostFingerprint);
+      notify('Invitation verified. You can now join the LAN session.', 'success');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'The LAN invitation is invalid.', 'error');
+    }
+  }, [joinInvitation, notify]);
 
   const joinCollaboration = useCallback(async (): Promise<void> => {
     if (!(await canLeaveInlineTextEditorRef.current())) return;
@@ -3416,6 +4464,21 @@ function EditorApp() {
     const onPaste = (event: ClipboardEvent): void => {
       if (event.defaultPrevented || isTypingTarget(event.target) || event.clipboardData === null)
         return;
+      if (clipboardHasSupportedExternalImage(event.clipboardData)) {
+        event.preventDefault();
+        void extractExternalImageFromClipboardEvent(event)
+          .then((image) => {
+            if (image !== null) return importExternalClipboardImage(image);
+            return undefined;
+          })
+          .catch((error: unknown) => {
+            notify(
+              error instanceof Error ? error.message : 'The clipboard image could not be pasted.',
+              'error',
+            );
+          });
+        return;
+      }
       const privateSerialized = event.clipboardData.getData(OBJECT_CLIPBOARD_MIME);
       const serialized =
         privateSerialized !== ''
@@ -3438,6 +4501,7 @@ function EditorApp() {
     };
   }, [
     deleteSelection,
+    importExternalClipboardImage,
     notify,
     pasteSerializedObjects,
     selectedElements.length,
@@ -3551,6 +4615,7 @@ function EditorApp() {
         );
       } else if (event.key === 'Escape') {
         setActiveMenu(null);
+        setCanvasVectorTool({ kind: 'select' });
         dismissObjectContextMenu(true);
       }
     };
@@ -3591,12 +4656,43 @@ function EditorApp() {
   if (session === null || document === undefined || activeSlide === undefined)
     return <LoadingScreen message="Opening your local workspace…" />;
 
+  const documentSaveStatus = resolveDocumentSaveStatus(session.snapshot);
+  const agentAccessStatus = resolveAgentAccessStatus(mcpStatus);
+  const imagePreviewTarget: ImageColorKeyPreviewTarget | null =
+    activeAuthoringSurface === 'master'
+      ? designMaster === undefined
+        ? null
+        : { surface: 'master', id: designMaster.id }
+      : activeAuthoringSurface === 'layout'
+        ? designLayout === undefined
+          ? null
+          : { surface: 'layout', id: designLayout.id }
+        : { surface: 'slide', id: activeSlide.id };
+  const previewDocument =
+    imageColorKeyPreview === null || imagePreviewTarget === null
+      ? document
+      : previewImageColorKey(
+          document,
+          imagePreviewTarget,
+          imageColorKeyPreview.elementId,
+          imageColorKeyPreview.value,
+        );
+  const previewActiveSlide =
+    previewDocument.slides.find((slide) => slide.id === activeSlide.id) ?? activeSlide;
+  const previewDesignLayout =
+    designLayout === undefined
+      ? undefined
+      : previewDocument.layouts.find((layout) => layout.id === designLayout.id);
+  const previewDesignMaster =
+    designMaster === undefined
+      ? undefined
+      : previewDocument.masters.find((master) => master.id === designMaster.id);
   const canvasContext = createDesignCanvasContext(
-    document,
-    activeSlide,
+    previewDocument,
+    previewActiveSlide,
     designSurface,
-    designLayout,
-    designMaster,
+    previewDesignLayout,
+    previewDesignMaster,
   );
   const canvasDocument = canvasContext.document;
   const canvasSlide = canvasContext.slide;
@@ -3608,12 +4704,12 @@ function EditorApp() {
     activeAuthoringSurface === 'slide' &&
     (shareStatus?.mode === 'host' || shareStatus?.mode === 'guest');
   const currentTextLeaseRequest: CollaborationTextLeaseInput | null =
-    activeAuthoringSurface !== 'slide' || primaryText === undefined
+    activeAuthoringSurface !== 'slide' || activeTextHostElementId === undefined
       ? null
       : {
           sessionId: session.snapshot.sessionId,
           slideId: activeSlide.id,
-          elementId: primaryText.id,
+          elementId: activeTextHostElementId,
         };
   const currentTextLeaseOwned =
     textLeaseStatus?.status === 'owned' &&
@@ -3652,6 +4748,12 @@ function EditorApp() {
             </MenuButton>
             <MenuButton onClick={closeThen(() => void replaceDocument('open'))}>
               Open… <kbd>Ctrl O</kbd>
+            </MenuButton>
+            <MenuButton
+              disabled={busy}
+              onClick={closeThen(() => void openPresentationDesignPreview())}
+            >
+              Import PowerPoint design…
             </MenuButton>
             <span className="menu-separator" />
             <MenuButton onClick={closeThen(() => void save())}>
@@ -3714,6 +4816,25 @@ function EditorApp() {
             >
               Duplicate <kbd>Ctrl D</kbd>
             </MenuButton>
+            <span className="menu-separator" />
+            <MenuButton
+              disabled={primaryElement === undefined}
+              onClick={closeThen(() => void copyPrimaryFormat())}
+            >
+              Copy object formatting
+            </MenuButton>
+            <MenuButton
+              disabled={formatPainterFormat === null || selectedIds.length === 0}
+              onClick={closeThen(() => void applyCopiedFormat())}
+            >
+              Apply copied formatting
+            </MenuButton>
+            {formatPainterFormat !== null ? (
+              <MenuButton onClick={closeThen(() => setFormatPainterFormat(null))}>
+                Clear copied formatting
+              </MenuButton>
+            ) : null}
+            <span className="menu-separator" />
             <MenuButton
               disabled={selectedIds.length === 0}
               onClick={closeThen(() => void deleteSelection())}
@@ -3783,6 +4904,20 @@ function EditorApp() {
             <MenuButton onClick={closeThen(() => void addElement(createConnectorElement()))}>
               Connector
             </MenuButton>
+            <MenuButton
+              onClick={closeThen(() =>
+                activateCanvasVectorTool({ kind: 'freeform', closed: false }),
+              )}
+            >
+              Open freeform
+            </MenuButton>
+            <MenuButton
+              onClick={closeThen(() =>
+                activateCanvasVectorTool({ kind: 'freeform', closed: true }),
+              )}
+            >
+              Closed freeform
+            </MenuButton>
           </>
         ) : null}
         {activeMenu === 'Arrange' ? (
@@ -3800,6 +4935,37 @@ function EditorApp() {
               Ungroup <kbd>Ctrl Shift G</kbd>
             </MenuButton>
             <span className="menu-separator" />
+            <MenuButton
+              disabled={!shapeBooleanSelectionAvailable}
+              onClick={closeThen(() => void mergeShapeSelection('union'))}
+            >
+              Merge shapes: Union
+            </MenuButton>
+            <MenuButton
+              disabled={!shapeBooleanSelectionAvailable}
+              onClick={closeThen(() => void mergeShapeSelection('combine'))}
+            >
+              Merge shapes: Combine
+            </MenuButton>
+            <MenuButton
+              disabled={!shapeBooleanSelectionAvailable}
+              onClick={closeThen(() => void mergeShapeSelection('intersect'))}
+            >
+              Merge shapes: Intersect
+            </MenuButton>
+            <MenuButton
+              disabled={!shapeBooleanSelectionAvailable}
+              onClick={closeThen(() => void mergeShapeSelection('subtract'))}
+            >
+              Merge shapes: Subtract from primary
+            </MenuButton>
+            <MenuButton
+              disabled={!shapeBooleanSelectionAvailable}
+              onClick={closeThen(() => void mergeShapeSelection('fragment'))}
+            >
+              Merge shapes: Fragment
+            </MenuButton>
+            <span className="menu-separator" />
             <MenuButton disabled={selectedIds.length < 2} onClick={closeThen(() => align('left'))}>
               Align left
             </MenuButton>
@@ -3808,6 +4974,34 @@ function EditorApp() {
               onClick={closeThen(() => distribute('horizontal'))}
             >
               Distribute horizontally
+            </MenuButton>
+            <MenuButton
+              disabled={
+                selectedElements.length !== 2 || selectedElements.some((element) => element.locked)
+              }
+              onClick={closeThen(swapSelectionPositions)}
+            >
+              Swap positions
+            </MenuButton>
+            <MenuButton
+              disabled={
+                selectedElements.length < 2 || selectedElements.some((element) => element.locked)
+              }
+              onClick={closeThen(matchSelectionSizes)}
+            >
+              Match size to primary
+            </MenuButton>
+            <MenuButton
+              disabled={selectedIds.length === 0}
+              onClick={closeThen(() => void flipSelection('horizontal'))}
+            >
+              Flip horizontally
+            </MenuButton>
+            <MenuButton
+              disabled={selectedIds.length === 0}
+              onClick={closeThen(() => void flipSelection('vertical'))}
+            >
+              Flip vertically
             </MenuButton>
             <MenuButton
               disabled={primaryElement === undefined}
@@ -3823,6 +5017,13 @@ function EditorApp() {
             </MenuButton>
           </>
         ) : null}
+        {activeMenu === 'Review' ? (
+          <MenuButton onClick={closeThen(openReviewPanel)}>
+            {activeAuthoringSurface === 'slide' && primaryElement !== undefined
+              ? 'Comment on selected object'
+              : 'Comment on this slide'}
+          </MenuButton>
+        ) : null}
         {activeMenu === 'Help' ? (
           <>
             <MenuButton
@@ -3836,7 +5037,9 @@ function EditorApp() {
               Editing tips
             </MenuButton>
             <MenuButton
-              onClick={closeThen(() => notify('HTMLlelujah V1 · local-first · AI-native.', 'info'))}
+              onClick={closeThen(() =>
+                notify('HTMLlelujah V1 · local-first presentation editor.', 'info'),
+              )}
             >
               About HTMLlelujah
             </MenuButton>
@@ -3860,39 +5063,72 @@ function EditorApp() {
             />
             <span className="brand-name">HTMLlelujah</span>
           </div>
-          <button
-            type="button"
-            className="document-title"
-            title="Rename presentation"
-            onClick={renameDocument}
-          >
-            <span>{document.name}</span>
-            <ChevronDown size={13} aria-hidden="true" />
-          </button>
+          {documentTitleEditing ? (
+            <input
+              className="document-title document-title-input"
+              aria-label="Presentation name"
+              value={documentTitleDraft}
+              maxLength={256}
+              autoFocus
+              onFocus={(event) => event.currentTarget.select()}
+              onChange={(event) => setDocumentTitleDraft(event.currentTarget.value)}
+              onBlur={() => void commitDocumentRename()}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  event.currentTarget.blur();
+                } else if (event.key === 'Escape') {
+                  event.preventDefault();
+                  cancelDocumentRename();
+                }
+              }}
+            />
+          ) : (
+            <button
+              type="button"
+              className="document-title"
+              title="Rename presentation"
+              aria-label={`Rename presentation. Current name: ${document.name}`}
+              onClick={beginDocumentRename}
+            >
+              <span>{document.name}</span>
+            </button>
+          )}
           <span
-            className={`save-state${session.snapshot.dirty ? '' : ' is-saved'}`}
+            className={`save-state tone-${documentSaveStatus.tone}`}
             aria-live="polite"
+            title={documentSaveStatus.detail}
           >
-            {session.snapshot.dirty ? (
-              <span className="save-dot" />
-            ) : (
+            {documentSaveStatus.tone === 'safe' ? (
               <Check size={13} aria-hidden="true" />
+            ) : (
+              <span className="save-dot" aria-hidden="true" />
             )}
-            {session.snapshot.dirty
-              ? session.snapshot.durability === 'journaled'
-                ? 'Recovered locally'
-                : 'Local changes'
-              : 'Saved locally'}
+            {documentSaveStatus.label}
           </span>
           <div className="title-actions">
-            <EditorButton label="Save locally" onClick={() => void save()} disabled={busy}>
+            <EditorButton
+              label={documentSaveStatus.requiresSaveAs ? 'Save as a local file' : 'Save locally'}
+              onClick={() => void save()}
+              disabled={busy}
+            >
               <Save size={16} />
             </EditorButton>
-            <button type="button" className="share-button" onClick={() => void openMcp()}>
-              <Code2 size={15} aria-hidden="true" /> Codex
+            <button
+              type="button"
+              className="share-button"
+              aria-label="Open agent access through MCP"
+              onClick={() => void openMcp()}
+            >
+              <Code2 size={15} aria-hidden="true" /> MCP
             </button>
-            <button type="button" className="share-button" onClick={() => void openShare()}>
-              <Share2 size={15} aria-hidden="true" /> Share
+            <button
+              type="button"
+              className="share-button"
+              aria-label="Open LAN collaboration"
+              onClick={() => void openShare()}
+            >
+              <Users size={15} aria-hidden="true" /> Collaborate
             </button>
             <button
               type="button"
@@ -3920,9 +5156,6 @@ function EditorApp() {
             ))}
             {renderMenu()}
           </nav>
-          <span className="local-badge">
-            <Sparkles size={11} aria-hidden="true" /> AI-NATIVE · LOCAL
-          </span>
         </div>
         <div className="toolbar" role="toolbar" aria-label="Editing tools">
           <div className="toolbar-group">
@@ -3944,7 +5177,11 @@ function EditorApp() {
             </EditorButton>
           </div>
           <div className="toolbar-group">
-            <EditorButton label="Select" active>
+            <EditorButton
+              label="Select"
+              active={canvasVectorTool.kind === 'select'}
+              onClick={() => setCanvasVectorTool({ kind: 'select' })}
+            >
               <MousePointer2 size={17} />
             </EditorButton>
           </div>
@@ -3987,10 +5224,10 @@ function EditorApp() {
               <ChevronDown size={11} />
             </EditorButton>
             <EditorButton
-              label="Add emoji"
+              label="Add business symbol"
               onClick={() => setContentPicker({ initialCatalog: 'twemoji', catalogs: ['twemoji'] })}
             >
-              <Smile size={17} />
+              <Briefcase size={17} />
               <ChevronDown size={11} />
             </EditorButton>
             <EditorButton
@@ -4010,6 +5247,32 @@ function EditorApp() {
               onClick={() => void addElement(createConnectorElement())}
             >
               <Link2 size={17} />
+            </EditorButton>
+            <EditorButton
+              label="Draw open freeform"
+              active={canvasVectorTool.kind === 'freeform' && !canvasVectorTool.closed}
+              onClick={() =>
+                activateCanvasVectorTool(
+                  canvasVectorTool.kind === 'freeform' && !canvasVectorTool.closed
+                    ? { kind: 'select' }
+                    : { kind: 'freeform', closed: false },
+                )
+              }
+            >
+              <PenTool size={17} />
+            </EditorButton>
+            <EditorButton
+              label="Draw closed freeform"
+              active={canvasVectorTool.kind === 'freeform' && canvasVectorTool.closed}
+              onClick={() =>
+                activateCanvasVectorTool(
+                  canvasVectorTool.kind === 'freeform' && canvasVectorTool.closed
+                    ? { kind: 'select' }
+                    : { kind: 'freeform', closed: true },
+                )
+              }
+            >
+              <TriangleDashed size={17} />
             </EditorButton>
           </div>
           <div className="toolbar-group">
@@ -4194,9 +5457,41 @@ function EditorApp() {
                     lineHeight: textDraft.lineHeight,
                     letterSpacingPt: textDraft.letterSpacingPt,
                     alignment: textDraft.alignment,
+                    locale: primaryText.locale ?? document.metadata.locale,
                   }
-                : null
+                : shapeTextDraftMatchesPrimary &&
+                    shapeTextDraft !== null &&
+                    activeShapeText !== undefined &&
+                    shapeTextThemeStyle !== undefined &&
+                    resolvedShapeTextStyle !== undefined
+                  ? {
+                      elementId: shapeTextDraft.elementId,
+                      value: shapeTextDraft.text,
+                      disabled:
+                        primaryShape?.locked === true || shapeTextApplyPending || textLeaseBlocked,
+                      pending: shapeTextApplyPending,
+                      conflict: false,
+                      maxLength: RICH_CLIPBOARD_LIMITS.maxTextLength,
+                      fontFamily:
+                        resolvedShapeTextStyle.fontFamily ?? shapeTextThemeStyle.fontFamily,
+                      fontSizePt:
+                        resolvedShapeTextStyle.fontSizePt ?? shapeTextThemeStyle.fontSizePt,
+                      fontWeight:
+                        resolvedShapeTextStyle.fontWeight ?? shapeTextThemeStyle.fontWeight,
+                      italic: resolvedShapeTextStyle.italic ?? shapeTextThemeStyle.italic,
+                      color: resolvedShapeTextStyle.color ?? shapeTextThemeStyle.color,
+                      lineHeight:
+                        resolvedShapeTextStyle.lineHeight ?? shapeTextThemeStyle.lineHeight,
+                      letterSpacingPt: resolvedShapeTextStyle.letterSpacingPt ?? 0,
+                      alignment: shapeTextAlignment,
+                      locale: activeShapeText.locale ?? document.metadata.locale,
+                      shapeText: true,
+                      verticalAlignment: activeShapeText.verticalAlignment,
+                      margins: activeShapeText.margins,
+                    }
+                  : null
             }
+            imageCropElementId={imageCropElementId}
             selectedIds={selectedIds}
             onSelect={(ids) => {
               if (sameCanvasSelection(ids, selectedIds)) {
@@ -4209,6 +5504,11 @@ function EditorApp() {
               });
             }}
             onTransform={transformCanvasElements}
+            vectorTool={canvasVectorTool}
+            onCreatePath={createCanvasPath}
+            onUpdatePathCommands={updateCanvasPathCommands}
+            onUpdateConnectorEndpoint={updateCanvasConnectorEndpoint}
+            onVectorToolDone={() => setCanvasVectorTool({ kind: 'select' })}
             onEditText={(elementId) => {
               const beginEditing = (): void => {
                 setSelectedIds([elementId]);
@@ -4231,6 +5531,21 @@ function EditorApp() {
                 if (canLeave) beginEditing();
               });
             }}
+            onEditShapeText={(elementId) => {
+              const beginEditing = (): void => beginShapeTextEditing(elementId);
+              if (
+                shapeTextDraftRef.current?.elementId === elementId &&
+                sameCanvasSelection(selectedIds, [elementId])
+              ) {
+                return;
+              }
+              void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                if (canLeave) beginEditing();
+              });
+            }}
+            onEditImageCrop={beginCanvasImageCrop}
+            onUpdateImageCrop={updateCanvasImageCrop}
+            onImageCropDone={() => setImageCropElementId(null)}
             onContextMenu={(elementId, position) => {
               setActiveMenu(null);
               setObjectContextMenu({
@@ -4240,6 +5555,11 @@ function EditorApp() {
               });
             }}
             onInlineTextChange={(text) => {
+              const shapeDraft = shapeTextDraftRef.current;
+              if (shapeDraft !== null) {
+                updateShapeTextDraft({ ...shapeDraft, text });
+                return;
+              }
               if (textDraft === null) return;
               editTextDraft({
                 ...textDraft,
@@ -4250,8 +5570,13 @@ function EditorApp() {
                     : replacePlainTextPreservingStyles(textDraft.contentOverride, text),
               });
             }}
-            onInlineTextPaste={pasteRichText}
+            onInlineTextPaste={shapeTextDraftMatchesPrimary ? pasteShapeText : pasteRichText}
             onInlineTextCommit={(target, confirmConflict, relatedTarget) => {
+              if (shapeTextDraftRef.current !== null) {
+                if (confirmConflict) void commitShapeText();
+                else void commitOnBlur(target, commitShapeText);
+                return;
+              }
               if (!confirmConflict) {
                 if (consumeInlineTextBlurSuppression(suppressNextInlineBlurRef)) {
                   void commitOnBlur(target, () => true);
@@ -4265,9 +5590,15 @@ function EditorApp() {
               }
               void commitOnBlur(target, () => commitInlineText({ confirmConflict }));
             }}
-            onInlineTextCancel={revertTextDraft}
+            onInlineTextCancel={
+              shapeTextDraftMatchesPrimary ? cancelShapeTextEditing : revertTextDraft
+            }
             onInlineTextFocus={() => {
               textEditorFocusedRef.current = true;
+              if (shapeTextDraftRef.current !== null) {
+                if (collaborationTextActive) void beginTextLease();
+                return;
+              }
               if (collaborationTextActive) void beginTextLease();
             }}
           />
@@ -4310,6 +5641,15 @@ function EditorApp() {
             >
               <Palette size={14} /> Design
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={inspectorTab === 'review'}
+              className={inspectorTab === 'review' ? 'is-active' : ''}
+              onClick={openReviewPanel}
+            >
+              <MessageSquare size={14} /> Review
+            </button>
           </div>
           {hasOrphanedTextDraft && textDraft !== null ? (
             <section className="inspector-section text-draft-recovery" role="alert">
@@ -4338,7 +5678,22 @@ function EditorApp() {
               </button>
             </section>
           ) : null}
-          {inspectorTab === 'design' ? (
+          {inspectorTab === 'review' ? (
+            <ReviewPanel
+              document={document}
+              activeSlideId={activeSlide.id}
+              selectedElementId={
+                activeAuthoringSurface === 'slide' ? primaryElement?.id : undefined
+              }
+              actorId={session.actorId}
+              actorName={displayName.trim() || undefined}
+              onCreate={createReviewComment}
+              onReply={replyToReviewComment}
+              onSetResolved={setReviewCommentResolved}
+              onMarkRead={markReviewCommentRead}
+              onSelectAnchor={selectReviewAnchor}
+            />
+          ) : inspectorTab === 'design' ? (
             <div className="inspector-scroll" role="tabpanel">
               <nav className="design-breadcrumb" aria-label="Design editing scope">
                 {(['slide', 'layout', 'master'] as const).map((surface) => (
@@ -4359,6 +5714,55 @@ function EditorApp() {
                   </button>
                 ))}
               </nav>
+              <section className="inspector-section">
+                <div className="section-heading-row">
+                  <h3>PowerPoint design</h3>
+                  <span className="section-status">Preview first</span>
+                </div>
+                <p className="field-hint">
+                  Import page size, themes, masters and layouts from a local .pptx or .potx.
+                  Existing slide content and the source file stay unchanged.
+                </p>
+                <button
+                  type="button"
+                  className="primary-inspector-action"
+                  disabled={busy}
+                  onClick={() => void openPresentationDesignPreview()}
+                >
+                  Import design from PowerPoint…
+                </button>
+              </section>
+              <section className="inspector-section">
+                <div className="section-heading-row">
+                  <h3>Language</h3>
+                  <span className="section-status">Offline proofing</span>
+                </div>
+                <label className="stacked-field">
+                  <span>Presentation language</span>
+                  <select
+                    value={document.metadata.locale}
+                    onChange={(event) =>
+                      void execute('Change presentation language', [
+                        { type: 'deck.set-locale', locale: event.currentTarget.value },
+                      ])
+                    }
+                  >
+                    {!BUSINESS_LANGUAGE_OPTIONS.some(
+                      ([locale]) => locale === document.metadata.locale,
+                    ) ? (
+                      <option value={document.metadata.locale}>{document.metadata.locale}</option>
+                    ) : null}
+                    {BUSINESS_LANGUAGE_OPTIONS.map(([locale, label]) => (
+                      <option key={locale} value={locale}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                  <small>
+                    Text boxes inherit this language unless they have an explicit override.
+                  </small>
+                </label>
+              </section>
               <section className="inspector-section">
                 <div className="section-heading-row">
                   <h3>Theme</h3>
@@ -6212,12 +7616,51 @@ function EditorApp() {
                         <option value="numbered">Numbered list</option>
                       </select>
                     </label>
+                    <label className="stacked-field">
+                      <span>Proofing language</span>
+                      <select
+                        value={primaryText.locale ?? ''}
+                        onChange={(event) => {
+                          const locale = event.currentTarget.value;
+                          if (locale === '') {
+                            const { locale: _locale, ...inheritingText } = primaryText;
+                            void _locale;
+                            void patchElement(inheritingText, 'Inherit presentation language');
+                          } else {
+                            void patchElement(
+                              { ...primaryText, locale },
+                              'Set text proofing language',
+                            );
+                          }
+                        }}
+                      >
+                        <option value="">Presentation language ({document.metadata.locale})</option>
+                        {!BUSINESS_LANGUAGE_OPTIONS.some(
+                          ([locale]) => locale === primaryText.locale,
+                        ) && primaryText.locale !== undefined ? (
+                          <option value={primaryText.locale}>{primaryText.locale}</option>
+                        ) : null}
+                        {BUSINESS_LANGUAGE_OPTIONS.map(([locale, label]) => (
+                          <option key={locale} value={locale}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                      <small>
+                        {spellcheckLanguages === null
+                          ? 'Using the dictionaries available on this computer.'
+                          : spellcheckLanguages.unsupportedLanguages.length === 0
+                            ? `Active: ${spellcheckLanguages.appliedLanguages.join(', ')}`
+                            : `No installed dictionary for ${spellcheckLanguages.unsupportedLanguages.join(', ')}.`}
+                      </small>
+                    </label>
                     <textarea
                       ref={textAreaRef}
                       className="text-content-editor"
                       aria-label="Text content"
                       value={textDraft.text}
                       maxLength={RICH_CLIPBOARD_LIMITS.maxTextLength}
+                      lang={primaryText.locale ?? document.metadata.locale}
                       spellCheck
                       onChange={(event) => {
                         const text = event.currentTarget.value;
@@ -6439,6 +7882,25 @@ function EditorApp() {
                       <option value="fill">Stretch</option>
                     </select>
                   </label>
+                  <button
+                    type="button"
+                    className={
+                      imageCropElementId === primaryImage.id
+                        ? 'primary-inspector-action'
+                        : 'secondary-action'
+                    }
+                    aria-pressed={imageCropElementId === primaryImage.id}
+                    disabled={primaryImage.locked}
+                    onClick={() => {
+                      if (imageCropElementId === primaryImage.id) setImageCropElementId(null);
+                      else beginCanvasImageCrop(primaryImage.id);
+                    }}
+                  >
+                    <Scissors size={14} />{' '}
+                    {imageCropElementId === primaryImage.id
+                      ? 'Finish direct crop'
+                      : 'Crop directly on canvas'}
+                  </button>
                   <div className="field-grid image-crop-grid">
                     {(['top', 'right', 'bottom', 'left'] as const).map((side) => (
                       <label key={side}>
@@ -6517,6 +7979,32 @@ function EditorApp() {
                   >
                     <Image size={14} /> Replace image…
                   </button>
+                  <ImageColorKeyEditor
+                    key={primaryImage.id}
+                    value={primaryImage.colorKey}
+                    disabled={primaryImage.locked || busy}
+                    onPreview={(value) =>
+                      setImageColorKeyPreview({ elementId: primaryImage.id, value })
+                    }
+                    onApply={async (value) => {
+                      const applied = await patchElement(
+                        { ...primaryImage, colorKey: value },
+                        'Apply transparent image color',
+                      );
+                      if (!applied) throw new Error('The transparent color was not applied.');
+                      setImageColorKeyPreview(null);
+                    }}
+                    onReset={async () => {
+                      const { colorKey, ...withoutColorKey } = primaryImage;
+                      void colorKey;
+                      const reset = await patchElement(
+                        withoutColorKey,
+                        'Reset transparent image color',
+                      );
+                      if (!reset) throw new Error('The original image was not restored.');
+                      setImageColorKeyPreview(null);
+                    }}
+                  />
                 </section>
               ) : null}
               {primaryElement?.type === 'shape' ? (
@@ -6529,29 +8017,382 @@ function EditorApp() {
                     <span>Shape</span>
                     <select
                       value={primaryElement.shape}
-                      onChange={(event) =>
-                        patchElement(
-                          {
-                            ...primaryElement,
-                            shape: event.currentTarget.value as typeof primaryElement.shape,
-                            cornerRadiusPt:
-                              event.currentTarget.value === 'rounded-rectangle'
-                                ? Math.max(primaryElement.cornerRadiusPt, 12)
-                                : primaryElement.cornerRadiusPt,
-                          },
+                      onChange={(event) => {
+                        const shape = event.currentTarget.value as typeof primaryElement.shape;
+                        const cornerRadiusPt =
+                          shape === 'rounded-rectangle'
+                            ? Math.max(primaryElement.cornerRadiusPt, 12)
+                            : primaryElement.cornerRadiusPt;
+                        if (primaryElement.text !== undefined && !shapeSupportsText(shape)) {
+                          if (
+                            !window.confirm(
+                              'This line-like shape cannot contain text. Change the shape and remove its text?',
+                            )
+                          )
+                            return;
+                          const { text: _removedText, ...withoutText } = primaryElement;
+                          void _removedText;
+                          void patchElement(
+                            { ...withoutText, shape, cornerRadiusPt },
+                            'Change shape type and remove text',
+                          );
+                          return;
+                        }
+                        void patchElement(
+                          { ...primaryElement, shape, cornerRadiusPt },
                           'Change shape type',
-                        )
-                      }
+                        );
+                      }}
                     >
-                      <option value="rectangle">Rectangle</option>
-                      <option value="rounded-rectangle">Rounded rectangle</option>
-                      <option value="ellipse">Ellipse</option>
-                      <option value="triangle">Triangle</option>
-                      <option value="diamond">Diamond</option>
-                      <option value="line">Line</option>
-                      <option value="arrow">Arrow</option>
+                      {SHAPE_CATALOG.map((entry) =>
+                        entry.insert.type === 'shape' ? (
+                          <option key={entry.id} value={entry.insert.shape}>
+                            {document.metadata.locale.toLowerCase().startsWith('fr')
+                              ? entry.localizedLabel
+                              : entry.label}
+                          </option>
+                        ) : null,
+                      )}
                     </select>
                   </label>
+                  {primaryShapeText !== undefined ? (
+                    <div className="shape-text-controls">
+                      <div className="section-heading-row">
+                        <h4>Text inside shape</h4>
+                        <span className="section-status">
+                          {primaryElement.text === undefined ? 'Not added' : 'Theme-aware'}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className={
+                          shapeTextDraftMatchesPrimary
+                            ? 'primary-inspector-action'
+                            : 'secondary-action'
+                        }
+                        disabled={primaryElement.locked || shapeTextApplyPending}
+                        onClick={() => {
+                          if (shapeTextDraftMatchesPrimary) void commitShapeText();
+                          else {
+                            void canLeaveInlineTextEditorRef.current().then((canLeave) => {
+                              if (canLeave) beginShapeTextEditing(primaryElement.id);
+                            });
+                          }
+                        }}
+                      >
+                        <Type size={14} />{' '}
+                        {shapeTextDraftMatchesPrimary
+                          ? 'Apply text editing'
+                          : primaryElement.text === undefined
+                            ? 'Add text on canvas'
+                            : 'Edit text on canvas'}
+                      </button>
+                      {shapeTextDraftMatchesPrimary && textLeaseBlocked ? (
+                        <button
+                          type="button"
+                          className="text-lease-gate"
+                          aria-busy={textLeasePending}
+                          onClick={() => void beginTextLease()}
+                        >
+                          <Lock size={13} aria-hidden="true" />
+                          <span>
+                            {textLeaseStatus?.status === 'held'
+                              ? `Editing by participant ${textLeaseStatus.ownerClientId.slice(0, 8)}`
+                              : 'Reserve this shape text to edit'}
+                          </span>
+                        </button>
+                      ) : null}
+                      <fieldset
+                        className="shape-text-fieldset"
+                        disabled={
+                          primaryElement.locked ||
+                          shapeTextDraftMatchesPrimary ||
+                          shapeTextApplyPending
+                        }
+                      >
+                        <label className="stacked-field">
+                          <span>Content</span>
+                          <textarea
+                            key={`${primaryElement.id}-shape-text-${session.snapshot.revision}`}
+                            rows={4}
+                            defaultValue={contentToPlainText(primaryShapeText.content)}
+                            maxLength={RICH_CLIPBOARD_LIMITS.maxTextLength}
+                            lang={primaryShapeText.locale ?? document.metadata.locale}
+                            spellCheck
+                            onBlur={(event) => {
+                              const target = event.currentTarget;
+                              void commitOnBlur(target, () => {
+                                const previous = contentToPlainText(primaryShapeText.content);
+                                if (target.value === previous) return true;
+                                return updatePrimaryShapeText(
+                                  (text) => ({
+                                    ...text,
+                                    content: replacePlainTextPreservingStyles(
+                                      text.content,
+                                      target.value,
+                                    ),
+                                  }),
+                                  'Edit shape text',
+                                );
+                              });
+                            }}
+                          />
+                        </label>
+                        <div className="rich-toolbar" role="toolbar" aria-label="Shape text format">
+                          {(
+                            [
+                              ['bold', Bold],
+                              ['italic', Italic],
+                              ['underline', Underline],
+                            ] as const
+                          ).map(([mark, Icon]) => (
+                            <button
+                              key={mark}
+                              type="button"
+                              className={primaryShapeTextMarks[mark] ? 'is-active' : ''}
+                              aria-pressed={primaryShapeTextMarks[mark]}
+                              onClick={() =>
+                                void updatePrimaryShapeText(
+                                  (text) => ({
+                                    ...text,
+                                    content: updateRichTextPresentation(text.content, {
+                                      marks: { [mark]: !primaryShapeTextMarks[mark] },
+                                    }),
+                                  }),
+                                  `Change shape text ${mark}`,
+                                )
+                              }
+                            >
+                              <Icon size={14} />
+                              <span className="sr-only">{mark}</span>
+                            </button>
+                          ))}
+                        </div>
+                        <label className="stacked-field">
+                          <span>Theme text style</span>
+                          <select
+                            value={primaryShapeText.styleRole}
+                            onChange={(event) =>
+                              void updatePrimaryShapeText(
+                                (text) => ({
+                                  ...text,
+                                  styleRole: event.currentTarget.value as TextStyleRole,
+                                }),
+                                'Change shape text style',
+                              )
+                            }
+                          >
+                            {themeTextStyleRoles.map((role) => (
+                              <option key={role} value={role}>
+                                {role.slice(0, 1).toUpperCase() + role.slice(1)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="field-grid">
+                          <label>
+                            <span>Alignment</span>
+                            <select
+                              value={primaryShapeTextAlignment}
+                              onChange={(event) => {
+                                const alignment = event.currentTarget.value as TextAlignment;
+                                void updatePrimaryShapeText(
+                                  (text) => ({
+                                    ...text,
+                                    content: updateRichTextPresentation(text.content, {
+                                      alignment,
+                                    }),
+                                    style: { ...text.style, alignment },
+                                  }),
+                                  'Align shape text',
+                                );
+                              }}
+                            >
+                              <option value="left">Left</option>
+                              <option value="center">Center</option>
+                              <option value="right">Right</option>
+                              <option value="justify">Justify</option>
+                            </select>
+                          </label>
+                          <label>
+                            <span>Vertical</span>
+                            <select
+                              value={primaryShapeText.verticalAlignment}
+                              onChange={(event) =>
+                                void updatePrimaryShapeText(
+                                  (text) => ({
+                                    ...text,
+                                    verticalAlignment: event.currentTarget
+                                      .value as ShapeText['verticalAlignment'],
+                                  }),
+                                  'Align shape text vertically',
+                                )
+                              }
+                            >
+                              <option value="top">Top</option>
+                              <option value="middle">Middle</option>
+                              <option value="bottom">Bottom</option>
+                            </select>
+                          </label>
+                        </div>
+                        <div className="field-grid">
+                          <label>
+                            <span>Size (pt)</span>
+                            <input
+                              key={`${primaryElement.id}-shape-font-size`}
+                              type="number"
+                              min="6"
+                              max="240"
+                              step="0.5"
+                              defaultValue={primaryShapeTextResolvedStyle?.fontSizePt ?? 18}
+                              onBlur={(event) => {
+                                const target = event.currentTarget;
+                                void commitOnBlur(target, () => {
+                                  const current = primaryShapeTextResolvedStyle?.fontSizePt ?? 18;
+                                  if (
+                                    target.value.trim() === '' ||
+                                    !Number.isFinite(target.valueAsNumber)
+                                  )
+                                    return restoreBlurValue(
+                                      target,
+                                      current,
+                                      'Enter a valid text size.',
+                                    );
+                                  const fontSizePt = clamp(target.valueAsNumber, 6, 240);
+                                  if (fontSizePt === current)
+                                    return restoreBlurValue(target, current);
+                                  target.value = String(fontSizePt);
+                                  return updatePrimaryShapeText(
+                                    (text) => ({
+                                      ...text,
+                                      style: { ...text.style, fontSizePt },
+                                    }),
+                                    'Change shape text size',
+                                  );
+                                });
+                              }}
+                            />
+                          </label>
+                          <label className="color-field compact-color-field">
+                            Text color
+                            <input
+                              type="color"
+                              value={primaryShapeTextResolvedStyle?.color ?? '#172033'}
+                              onChange={(event) =>
+                                void updatePrimaryShapeText(
+                                  (text) => ({
+                                    ...text,
+                                    style: { ...text.style, color: event.currentTarget.value },
+                                  }),
+                                  'Change shape text color',
+                                )
+                              }
+                            />
+                          </label>
+                        </div>
+                        <div className="field-grid shape-text-margin-grid">
+                          {(['topPt', 'rightPt', 'bottomPt', 'leftPt'] as const).map((side) => (
+                            <label key={side}>
+                              <span>{side.replace('Pt', '')} margin</span>
+                              <input
+                                key={`${primaryElement.id}-${side}`}
+                                type="number"
+                                min="0"
+                                max="1000"
+                                step="1"
+                                defaultValue={primaryShapeText.margins[side]}
+                                onBlur={(event) => {
+                                  const target = event.currentTarget;
+                                  void commitOnBlur(target, () => {
+                                    const previous = primaryShapeText.margins[side];
+                                    if (
+                                      target.value.trim() === '' ||
+                                      !Number.isFinite(target.valueAsNumber)
+                                    )
+                                      return restoreBlurValue(
+                                        target,
+                                        previous,
+                                        'Enter a valid shape text margin.',
+                                      );
+                                    const margin = clamp(target.valueAsNumber, 0, 1_000);
+                                    if (margin === previous)
+                                      return restoreBlurValue(target, previous);
+                                    target.value = String(margin);
+                                    return updatePrimaryShapeText(
+                                      (text) => ({
+                                        ...text,
+                                        margins: { ...text.margins, [side]: margin },
+                                      }),
+                                      'Change shape text margin',
+                                    );
+                                  });
+                                }}
+                              />
+                            </label>
+                          ))}
+                        </div>
+                        <label className="stacked-field">
+                          <span>Proofing language</span>
+                          <select
+                            value={primaryShapeText.locale ?? ''}
+                            onChange={(event) => {
+                              const locale = event.currentTarget.value;
+                              void updatePrimaryShapeText(
+                                (text) => {
+                                  if (locale !== '') return { ...text, locale };
+                                  const { locale: _locale, ...inheriting } = text;
+                                  void _locale;
+                                  return inheriting;
+                                },
+                                locale === ''
+                                  ? 'Inherit presentation language'
+                                  : 'Set shape text language',
+                              );
+                            }}
+                          >
+                            <option value="">
+                              Presentation language ({document.metadata.locale})
+                            </option>
+                            {BUSINESS_LANGUAGE_OPTIONS.map(([locale, label]) => (
+                              <option key={locale} value={locale}>
+                                {label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="object-actions">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void updatePrimaryShapeText((text) => {
+                                const { style: _style, ...themeManaged } = text;
+                                void _style;
+                                return themeManaged;
+                              }, 'Reset shape text to theme')
+                            }
+                          >
+                            Reset to theme
+                          </button>
+                          <button
+                            type="button"
+                            className="danger-action"
+                            disabled={primaryElement.text === undefined}
+                            onClick={() => {
+                              const { text: _text, ...withoutText } = primaryElement;
+                              void _text;
+                              void patchElement(withoutText, 'Remove shape text');
+                            }}
+                          >
+                            Remove text
+                          </button>
+                        </div>
+                      </fieldset>
+                    </div>
+                  ) : (
+                    <p className="field-hint">
+                      Line, arrow and arc shapes use a separate text box by design.
+                    </p>
+                  )}
                   <label className="color-field">
                     Fill
                     <input
@@ -6712,6 +8553,148 @@ function EditorApp() {
                   </label>
                 </section>
               ) : null}
+              {primaryElement?.type === 'path' ? (
+                <section className="inspector-section vector-editor-section">
+                  <div className="section-heading-row">
+                    <h3>Freeform</h3>
+                    <span className="section-status">
+                      {primaryElement.commands.filter((command) => command.type !== 'close').length}{' '}
+                      points
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className={`primary-inspector-action${
+                      canvasVectorTool.kind === 'edit-path' &&
+                      canvasVectorTool.elementId === primaryElement.id
+                        ? ' is-active'
+                        : ''
+                    }`}
+                    disabled={primaryElement.locked}
+                    onClick={() =>
+                      activateCanvasVectorTool(
+                        canvasVectorTool.kind === 'edit-path' &&
+                          canvasVectorTool.elementId === primaryElement.id
+                          ? { kind: 'select' }
+                          : { kind: 'edit-path', elementId: primaryElement.id },
+                      )
+                    }
+                  >
+                    <span>
+                      {canvasVectorTool.kind === 'edit-path' &&
+                      canvasVectorTool.elementId === primaryElement.id
+                        ? 'Finish editing points'
+                        : 'Edit points on canvas'}
+                    </span>
+                    <Spline size={15} />
+                  </button>
+                  <p className="field-hint">
+                    Drag the direct handles on the canvas. Every drag is one undoable edit.
+                  </p>
+                  <label className="color-field">
+                    Fill
+                    <input
+                      type="color"
+                      value={primaryElement.fill ?? '#ffffff'}
+                      onChange={(event) =>
+                        void patchElement(
+                          { ...primaryElement, fill: event.currentTarget.value },
+                          'Change freeform fill',
+                        )
+                      }
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="secondary-action compact-action"
+                    onClick={() =>
+                      patchElement({ ...primaryElement, fill: null }, 'Remove freeform fill')
+                    }
+                  >
+                    No fill
+                  </button>
+                  <label className="color-field">
+                    Stroke
+                    <input
+                      type="color"
+                      value={primaryElement.stroke.color}
+                      onChange={(event) =>
+                        void patchElement(
+                          {
+                            ...primaryElement,
+                            stroke: {
+                              ...primaryElement.stroke,
+                              color: event.currentTarget.value,
+                            },
+                          },
+                          'Change freeform stroke',
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="field-grid">
+                    <label>
+                      <span>Width</span>
+                      <input
+                        key={`${primaryElement.id}-path-width`}
+                        type="number"
+                        min="0"
+                        max="24"
+                        step="0.25"
+                        defaultValue={primaryElement.stroke.widthPt}
+                        onBlur={(event) => {
+                          const target = event.currentTarget;
+                          void commitOnBlur(target, () => {
+                            if (
+                              target.value.trim() === '' ||
+                              !Number.isFinite(target.valueAsNumber)
+                            )
+                              return restoreBlurValue(
+                                target,
+                                primaryElement.stroke.widthPt,
+                                'Enter a valid freeform width.',
+                              );
+                            const widthPt = clamp(target.valueAsNumber, 0, 24);
+                            if (widthPt === primaryElement.stroke.widthPt)
+                              return restoreBlurValue(target, primaryElement.stroke.widthPt);
+                            target.value = String(widthPt);
+                            return patchElement(
+                              {
+                                ...primaryElement,
+                                stroke: { ...primaryElement.stroke, widthPt },
+                              },
+                              'Change freeform width',
+                            );
+                          });
+                        }}
+                      />
+                    </label>
+                    <label>
+                      <span>Pattern</span>
+                      <select
+                        value={primaryElement.stroke.dash}
+                        onChange={(event) =>
+                          patchElement(
+                            {
+                              ...primaryElement,
+                              stroke: {
+                                ...primaryElement.stroke,
+                                dash: event.currentTarget
+                                  .value as typeof primaryElement.stroke.dash,
+                              },
+                            },
+                            'Change freeform pattern',
+                          )
+                        }
+                      >
+                        <option value="solid">Solid</option>
+                        <option value="dash">Dashed</option>
+                        <option value="dot">Dotted</option>
+                      </select>
+                    </label>
+                  </div>
+                </section>
+              ) : null}
               {primaryElement?.type === 'connector' ? (
                 <section className="inspector-section vector-editor-section">
                   <div className="section-heading-row">
@@ -6735,6 +8718,7 @@ function EditorApp() {
                       >
                         <option value="straight">Straight</option>
                         <option value="elbow">Elbow</option>
+                        <option value="curved">Curved</option>
                       </select>
                     </label>
                     <label className="stacked-field">
@@ -6813,6 +8797,24 @@ function EditorApp() {
                           });
                         }}
                       />
+                    </label>
+                    <label>
+                      <span>Start cap</span>
+                      <select
+                        value={primaryElement.startCap}
+                        onChange={(event) =>
+                          patchElement(
+                            {
+                              ...primaryElement,
+                              startCap: event.currentTarget.value as typeof primaryElement.startCap,
+                            },
+                            'Change connector start cap',
+                          )
+                        }
+                      >
+                        <option value="none">None</option>
+                        <option value="arrow">Arrow</option>
+                      </select>
                     </label>
                     <label>
                       <span>End cap</span>
@@ -7406,6 +9408,83 @@ function EditorApp() {
                     <Ungroup size={15} /> Ungroup
                   </button>
                 </div>
+                <div className="shape-merge-panel">
+                  <span>Merge native shapes</span>
+                  <small>The primary object supplies the style and subtraction base.</small>
+                  <div className="shape-merge-actions">
+                    {(['union', 'combine', 'intersect', 'subtract', 'fragment'] as const).map(
+                      (operation) => (
+                        <button
+                          type="button"
+                          key={operation}
+                          disabled={!shapeBooleanSelectionAvailable}
+                          onClick={() => void mergeShapeSelection(operation)}
+                        >
+                          {shapeBooleanLabels[operation]}
+                        </button>
+                      ),
+                    )}
+                  </div>
+                </div>
+                <div className="arrange-actions">
+                  <button
+                    type="button"
+                    disabled={selectedIds.length === 0}
+                    onClick={() => void flipSelection('horizontal')}
+                  >
+                    Flip horizontal
+                  </button>
+                  <button
+                    type="button"
+                    disabled={selectedIds.length === 0}
+                    onClick={() => void flipSelection('vertical')}
+                  >
+                    Flip vertical
+                  </button>
+                </div>
+                <div className="format-painter-actions">
+                  <button
+                    type="button"
+                    disabled={primaryElement === undefined}
+                    onClick={() => void copyPrimaryFormat()}
+                  >
+                    Copy format
+                  </button>
+                  <button
+                    type="button"
+                    disabled={formatPainterFormat === null || selectedIds.length === 0}
+                    onClick={() => void applyCopiedFormat()}
+                  >
+                    Apply {formatPainterFormat?.kind ?? 'format'}
+                  </button>
+                  {formatPainterFormat !== null ? (
+                    <button type="button" onClick={() => setFormatPainterFormat(null)}>
+                      Clear
+                    </button>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  disabled={
+                    selectedElements.length !== 2 ||
+                    selectedElements.some((element) => element.locked)
+                  }
+                  onClick={swapSelectionPositions}
+                >
+                  <Rows3 size={15} /> Swap positions
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  disabled={
+                    selectedElements.length < 2 ||
+                    selectedElements.some((element) => element.locked)
+                  }
+                  onClick={matchSelectionSizes}
+                >
+                  <Square size={15} /> Match size to primary
+                </button>
                 <div className="object-actions">
                   <button
                     type="button"
@@ -7457,9 +9536,9 @@ function EditorApp() {
             <Grid3X3 size={13} /> Grid {gridEnabled ? 'on' : 'off'}
           </button>
         </div>
-        <div className="status-center">
-          <span className={`durability-indicator state-${session.snapshot.durability}`} />
-          {session.snapshot.durability}
+        <div className="status-center" title={documentSaveStatus.detail}>
+          <span className={`durability-indicator tone-${documentSaveStatus.tone}`} />
+          {documentSaveStatus.label}
         </div>
         <div className="zoom-controls" role="group" aria-label="Canvas zoom">
           <button
@@ -7579,6 +9658,28 @@ function EditorApp() {
           <button
             type="button"
             role="menuitem"
+            disabled={primaryElement === undefined}
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void copyPrimaryFormat();
+            }}
+          >
+            <Palette size={15} /> Copy formatting
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={formatPainterFormat === null || selectedElements.length === 0}
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void applyCopiedFormat();
+            }}
+          >
+            <Palette size={15} /> Apply copied formatting
+          </button>
+          <button
+            type="button"
+            role="menuitem"
             disabled={primaryElement === undefined || primaryElement.locked}
             onClick={() => {
               dismissObjectContextMenu(true);
@@ -7652,6 +9753,54 @@ function EditorApp() {
             }}
           >
             <Ungroup size={15} /> Ungroup <kbd>Ctrl Shift G</kbd>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={
+              selectedElements.length !== 2 || selectedElements.some((element) => element.locked)
+            }
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              swapSelectionPositions();
+            }}
+          >
+            <Rows3 size={15} /> Swap positions
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={
+              selectedElements.length < 2 || selectedElements.some((element) => element.locked)
+            }
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              matchSelectionSizes();
+            }}
+          >
+            <Square size={15} /> Match size to primary
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={selectedElements.length === 0}
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void flipSelection('horizontal');
+            }}
+          >
+            <Columns3 size={15} /> Flip horizontally
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={selectedElements.length === 0}
+            onClick={() => {
+              dismissObjectContextMenu(false);
+              void flipSelection('vertical');
+            }}
+          >
+            <Rows3 size={15} /> Flip vertically
           </button>
           <span className="menu-separator" />
           <button
@@ -7734,6 +9883,18 @@ function EditorApp() {
         </div>
       ) : null}
 
+      {presentationImportPreview === null ? null : (
+        <PresentationImportDialog
+          sourceName={presentationImportPreview.displayName}
+          preview={presentationImportPreview.preview}
+          busy={busy}
+          onCancel={() => {
+            if (!busy) setPresentationImportPreview(null);
+          }}
+          onImportDesign={importPresentationDesign}
+        />
+      )}
+
       {mcpOpen ? (
         <div
           className="modal-backdrop"
@@ -7750,27 +9911,31 @@ function EditorApp() {
           >
             <header>
               <div>
-                <span className="eyebrow">LOCAL AGENT BRIDGE</span>
-                <h2 id="mcp-title">Work with Codex through MCP</h2>
+                <span className="eyebrow">AGENT ACCESS</span>
+                <h2 id="mcp-title">Connect an agent through MCP</h2>
               </div>
               <button type="button" aria-label="Close" onClick={() => setMcpOpen(false)}>
                 <X size={18} />
               </button>
             </header>
             <p>
-              The installed local agent has a persistent, revocable identity. Codex or Claude can
-              inspect the authoritative theme, masters, layouts and slides, then apply ordinary
-              typed edits without a new approval for every action.
+              An authenticated local MCP client can inspect the authoritative theme, masters,
+              layouts and slides, then apply ordinary typed edits without a new approval for every
+              action.
             </p>
-            <div className="collaboration-status">
+            <div className={`collaboration-status tone-${agentAccessStatus.tone}`}>
               <Code2 size={18} />
               <div>
-                <strong>{mcpStatus?.available ? 'Bridge ready' : 'Bridge unavailable'}</strong>
+                <strong>{agentAccessStatus.label}</strong>
                 <span>
-                  {mcpStatus?.visibleDocuments ?? 0} visible presentation
-                  {(mcpStatus?.visibleDocuments ?? 0) === 1 ? '' : 's'} ·{' '}
-                  {mcpStatus?.pendingApprovals ?? 0} pending approval
-                  {(mcpStatus?.pendingApprovals ?? 0) === 1 ? '' : 's'}
+                  {agentAccessStatus.detail}{' '}
+                  {mcpStatus === null
+                    ? null
+                    : `· ${mcpStatus.visibleDocuments} visible presentation${
+                        mcpStatus.visibleDocuments === 1 ? '' : 's'
+                      } · ${mcpStatus.pendingApprovals} pending approval${
+                        mcpStatus.pendingApprovals === 1 ? '' : 's'
+                      }`}
                 </span>
               </div>
             </div>
@@ -7782,6 +9947,53 @@ function EditorApp() {
                 arbitrary files, remote URLs and executable HTML remain inaccessible.
               </small>
             </div>
+            <section className="mcp-trusted-clients" aria-labelledby="mcp-trusted-clients-title">
+              <div className="section-heading-row">
+                <h3 id="mcp-trusted-clients-title">Trusted clients</h3>
+                <span className="section-status">{mcpTrustedClients.length}</span>
+              </div>
+              {mcpTrustedClients.length === 0 ? (
+                <p className="field-hint">No persistent MCP client is registered yet.</p>
+              ) : (
+                <div className="mcp-trusted-client-list">
+                  {mcpTrustedClients.map((client) => (
+                    <article key={client.id} className="mcp-trusted-client">
+                      <div>
+                        <strong>{client.label}</strong>
+                        <span>
+                          {client.isBootstrap
+                            ? 'Built-in launcher'
+                            : client.connected
+                              ? 'Connected now'
+                              : client.status === 'active'
+                                ? 'Trusted'
+                                : 'Revoked'}
+                          {' · '}
+                          added{' '}
+                          <time dateTime={client.createdAt}>
+                            {new Date(client.createdAt).toLocaleDateString()}
+                          </time>
+                        </span>
+                      </div>
+                      {client.revocable ? (
+                        <button
+                          type="button"
+                          className="secondary-action"
+                          disabled={mcpClientBusyId !== null}
+                          onClick={() => void revokeMcpTrustedClient(client)}
+                        >
+                          {mcpClientBusyId === client.id ? 'Revoking…' : 'Revoke'}
+                        </button>
+                      ) : (
+                        <span className={`client-status status-${client.status}`}>
+                          {client.status}
+                        </span>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
             <p className="dialog-footnote">
               Sensitive external operations such as importing a local file or exporting a
               deliverable stay under desktop control. Ordinary presentation authoring does not
@@ -7808,15 +10020,17 @@ function EditorApp() {
             <header>
               <div>
                 <span className="eyebrow">LOCAL COLLABORATION</span>
-                <h2 id="share-title">Edit together on your LAN</h2>
+                <h2 id="share-title">Collaborate on the same LAN</h2>
               </div>
               <button type="button" aria-label="Close" onClick={() => setShareOpen(false)}>
                 <X size={18} />
               </button>
             </header>
             <p>
-              Everyone opens the same <strong>.hdeck</strong> from the shared drive. One person
-              hosts the authoritative live session; only that host writes the shared file.
+              The host opens the authoritative <strong>.hdeck</strong> and starts a session on a
+              private network. Other people join from the desktop app using the address, session
+              code and fingerprint. Only the host writes the host file; cloud-synced copies do not
+              join automatically.
             </p>
             <div className="collaboration-status">
               <Users size={18} />
@@ -7914,11 +10128,40 @@ function EditorApp() {
                     <code>{shareStatus.sessionCode}</code>
                     <span>Fingerprint</span>
                     <code>{shareStatus.hostFingerprint}</code>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() => void copyCollaborationInvitation()}
+                    >
+                      Copy one-piece invitation
+                    </button>
                   </div>
                 ) : null}
               </div>
               <div>
                 <h3>Join</h3>
+                <label className="stacked-field">
+                  <span>Invitation</span>
+                  <textarea
+                    value={joinInvitation}
+                    disabled={joiningCollaboration}
+                    rows={4}
+                    placeholder="Paste an HTMLlelujah collaboration invitation"
+                    onChange={(event) => setJoinInvitation(event.currentTarget.value)}
+                  />
+                  <small>
+                    The invitation contains only the LAN endpoint, session code and verified host
+                    fingerprint.
+                  </small>
+                </label>
+                <button
+                  type="button"
+                  className="secondary-action apply-invitation-action"
+                  disabled={!joinInvitation.trim() || joiningCollaboration}
+                  onClick={applyCollaborationInvitation}
+                >
+                  Verify and fill connection details
+                </button>
                 <label className="stacked-field">
                   <span>Host address</span>
                   <input

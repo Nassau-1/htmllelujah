@@ -28,6 +28,7 @@
     "@htmllelujah/geometry": "workspace:*",
     "@htmllelujah/hdeck": "workspace:*",
     "@htmllelujah/mcp-server": "workspace:*",
+    "@htmllelujah/pptx-importer": "workspace:*",
     "@htmllelujah/renderer": "workspace:*",
     "lucide-react": "1.24.0",
     "react": "19.2.7",

@@ -1,8 +1,8 @@
 # Roadmap and TODO
 
-Status: **Installed V1 feedback build `ec1f83c` available; packaged MCP and functional
-opened-app validation passed; strict startup and public-release acceptance remain
-pending**, last reviewed 2026-07-24.
+Status: **Useful-authoring source checkpoint implemented; installed feedback build
+`ec1f83c` remains available while the refreshed Windows candidate, final opened-app
+campaign, and durable reinstall remain pending**, last reviewed 2026-07-24.
 
 The durable per-user installation is bound to clean source commit `ec1f83c` and includes
 the active-surface selection reconciliation. Its packaged MCP smoke passed MCP-001 through
@@ -22,21 +22,22 @@ Authoritative scope, sequencing, and acceptance evidence:
 
 ### Blocking interactions
 
-- [ ] Add a contextual object menu on right-click with cut, copy, paste, duplicate,
+- [x] Add a contextual object menu on right-click with cut, copy, paste, duplicate,
       delete, lock, visibility, layer, grouping, and relevant insert commands.
       Checkpoint complete: pointer right-click and the keyboard context-menu gesture
       open copy, cut, paste, duplicate, layer, lock, visibility, grouping, and delete;
       focus enters the menu, arrow/Home/End/Escape navigation works, and focus returns
-      to the canvas. Contextual insertion shortcuts remain an optional follow-up.
+      to the canvas. Creation remains in the dedicated Insert menu and toolbar.
 - [x] Add object-level `Ctrl+C`, `Ctrl+X`, and `Ctrl+V` with bounded private object
       serialization, fresh identifiers, plain-text fallback, and detached
       out-of-selection connector bindings.
-- [ ] Complete external clipboard routing for rich text, pasted images, and TSV, and
+- [x] Complete external clipboard routing for rich text, pasted images, and TSV, and
       wire the safe rejection path for cross-presentation images whose local asset
       bytes are not present in the destination deck.
-      Safe cross-presentation rejection is wired, including images nested in groups;
-      same-presentation images remain pasteable and connector bindings outside the
-      copied selection are detached. External image-byte routing remains open.
+      Image clipboard input accepts bounded PNG, JPEG, and WebP bytes only, registers
+      the embedded asset atomically on slides/layouts/masters, and never imports a path,
+      URL, or clipboard HTML. Cross-presentation image references without destination
+      bytes fail safely, including images nested in groups.
 - [x] Fix duplication of placeholder-bound text boxes by detaching copied bindings,
       generating every nested identifier afresh, and updating selection only after a
       successful transaction.
@@ -107,11 +108,12 @@ Authoritative scope, sequencing, and acceptance evidence:
 
 ### Persistent trusted local agents
 
-- [ ] Replace per-edit one-time approval with persisted current-user trusted-client
+- [x] Replace per-edit one-time approval with persisted current-user trusted-client
       grants scoped to read-only, ordinary reversible editing, or extended actions.
-      Checkpoint complete: the packaged compatibility client has a persistent Ed25519
-      identity, server-derived actor, and closed read/edit capability set. Explicit
-      user-approved named-profile enrollment and profile management remain.
+      The packaged launcher has a persistent Ed25519 current-user identity,
+      server-derived actor, and closed read/edit capability set. The desktop exposes
+      bounded trusted-client summaries and revocation; ordinary authoring no longer
+      requires per-edit approval.
 - [x] Let trusted local agents inspect the authoritative page, theme, master, layout,
       placeholder, lock, asset-metadata, slide, revision, constraint, and validation
       context.
@@ -129,9 +131,10 @@ Authoritative scope, sequencing, and acceptance evidence:
       replacement, trust changes, and external targets.
       Authenticated-client binding is complete for destructive commit, undo, import,
       and export. Overwrite, trust-change, and external-target UX remain to be closed.
-- [ ] Show and revoke trusted clients and retain attributable transaction-level undo.
-      Persistent backend revocation and `mcp-client:<uuid>` attribution are complete;
-      visible management and audit history remain.
+- [x] Show and revoke trusted clients and retain attributable transaction-level undo.
+      The Agent access panel exposes only bounded client summaries, protects the built-in
+      launcher profile, revokes eligible credentials persistently, disconnects an active
+      client, and purges its pending proposals/approvals without exposing key material.
 
 ## Hands-on feedback: useful PowerPoint parity
 
@@ -188,50 +191,59 @@ Authoritative scope, non-goals, current-product matrix, risks, and verification:
       parallelogram, trapezoid, pentagon/hexagon, chevron, brackets, and simple arcs.
       Do not add novelty shapes, stars/banners, callouts, equations, action buttons, or
       the complete PowerPoint catalog.
-- [ ] Allow double-click typing inside a compatible basic shape with theme-managed text,
+- [x] Allow double-click typing inside a compatible basic shape with theme-managed text,
       margins, horizontal/vertical alignment, save/reopen, and export parity; avoid
       forcing users to manually overlay and group a separate text box.
-- [ ] Close the scoped classic-editing baseline without rebuilding commands that already
+- [x] Close the scoped classic-editing baseline without rebuilding commands that already
       work: multi-select, nudge, resize, rotate, flip, group/ungroup, align/distribute,
       layer, lock/hide, copy/cut/paste, duplicate, match size, format painter, and
-      precise numeric geometry. Add `Swap positions` for exactly two selected objects as
-      one undoable transaction while preserving their content and styles.
-- [ ] Unify the line/arrow workflow: draw between two points, drag either endpoint, and
+      precise numeric geometry. Lossless vector/path/connector flips and compatible
+      text/vector/image/table format painting are atomic; unsupported or lossy targets
+      fail before mutation.
+- [x] Add one-transaction `Swap positions` for exactly two objects and
+      `Match size to primary` for a multi-selection on slides, layouts, and masters.
+      Flip and format painter remain open.
+- [x] Unify the line/arrow workflow: draw between two points, drag either endpoint, and
       expose independent start/end cap, line width, dash, and color. Converting a line
       to an arrow must not require deleting and reinserting it.
-- [ ] Expose the connector model's existing straight/elbow routing, start/end arrow
+- [x] Expose the connector model's existing straight/elbow routing, start/end arrow
       caps, and top/right/bottom/left/center bindings directly on the canvas. Endpoint
       dragging must reveal and snap to connection points; moving, resizing, or rotating
       the target must preserve the core's existing connection invariant; dragging away
-      detaches it. The model/renderer already support both caps, while the current
-      inspector exposes only the end-cap control.
-- [ ] Add curved connector routing after direct straight/elbow manipulation is stable.
-- [ ] Add open/closed freeform paths, bounded polyline/Bézier creation, finish/cancel,
+      detaches it.
+- [x] Add curved connector routing after direct straight/elbow manipulation is stable.
+      The canonical `curved` mode uses deterministic bounded cubic routing, including
+      bound-anchor direction and self-loops, in the shared renderer.
+- [x] Add open/closed freeform paths, bounded polyline/Bézier creation, finish/cancel,
       and post-creation edit-points mode. Keep path geometry identical across editor,
       thumbnail, presentation, HTML, PDF, save/reopen, collaboration, and MCP.
-- [ ] Add Union, Combine, Fragment, Intersect, and Subtract for compatible closed paths.
-      Preview before one atomic commit; Undo restores every original object exactly.
+- [x] Add Union, Combine, Fragment, Intersect, and Subtract for compatible closed paths.
+      Each direct operation is one atomic transaction and Undo restores every source
+      object. Results that would lose text, locks, unsupported curves, or path holes are
+      rejected explicitly rather than approximated.
 - [ ] Evaluate a lower-priority deterministic 2.5D extrusion with depth, direction, and
       side color. Do not introduce a full 3D engine, camera, mesh, or lighting model.
-- [ ] Add direct image crop handles while retaining numeric contain/cover/fill controls.
-- [ ] Add a proposed phase-one offline `Remove background color`: white/black presets or
+- [x] Add direct image crop handles while retaining numeric contain/cover/fill controls.
+      Eight canvas handles respect zoom, rotation, existing crop, visible-area limits,
+      Enter/Escape, and commit one normalized crop update.
+- [x] Add a proposed phase-one offline `Remove background color`: white/black presets or
       eyedropper, bounded tolerance, live transparency preview, non-destructive
       apply/reset, and identical output in editor, presentation, standalone HTML, and
       PDF. Review hands-on quality before considering broader segmentation; cloud
       processing remains out of scope.
-- [ ] Complete safe external clipboard image routing so an Excel range or chart can be
+- [x] Complete safe external clipboard image routing so an Excel range or chart can be
       pasted as a deterministic embedded image. Do not create a native or linked chart,
       preserve formulas, or depend on Excel after paste.
 
 ### P1 — Design workspace and semantic authoring
 
-- [ ] Reframe the `Design` tab as the primary workspace for theme gallery, theme
+- [x] Reframe the `Design` tab as the primary workspace for theme gallery, theme
       creation/enforcement, semantic colors, fonts, page format, masters, layouts,
       placeholders, page numbers, watermarks, and other page furniture.
-- [ ] Make every newly created text box visibly adopt a semantic style role: Title,
+- [x] Make every newly created text box visibly adopt a semantic style role: Title,
       Subtitle, Body, Caption, or Free text. Changing the active theme updates every
       managed role while preserving explicit local overrides.
-- [ ] Keep masters and layouts authoritative and visibly distinguish inherited, locked,
+- [x] Keep masters and layouts authoritative and visibly distinguish inherited, locked,
       theme-managed, and local objects throughout the Design workspace.
 
 ### P1 — Agent-native presentation skill
@@ -264,31 +276,34 @@ Authoritative scope, non-goals, current-product matrix, risks, and verification:
 - [x] Synchronize comments through the authoritative LAN host and persist them in the
       `.hdeck`, but exclude them from presentation, PDF, standalone HTML, and ordinary
       print unless a future explicit review export is requested.
-- [ ] Complete the partially enabled offline spellcheck UX. Chromium spellcheck and
+- [x] Complete the partially enabled offline spellcheck UX. Chromium spellcheck and
       `spellCheck` text areas already exist; add deck/text language, underlines, and a
       text-editing context menu with suggestions, replace, ignore, and add-to-dictionary.
       Canonical deck language and optional text overrides migrate, collaborate, and
       appear through MCP; personal dictionary additions remain local user preferences.
       The object context menu remains active outside text editing.
-- [ ] Simplify LAN joining with copyable invitation data and clear host approval.
-      Evaluate opt-in discovery by shared-file identity so two users opening the same
+- [x] Simplify LAN joining with versioned copyable invitation data containing only the
+      endpoint, session code, and host fingerprint. Paste validation is strict and does
+      not include a title, filename, path, slide content, or reusable credential.
+- [ ] Evaluate opt-in discovery by shared-file identity so two users opening the same
       `.hdeck` can find the authoritative host, without ever permitting two file writers
       or silently claiming cloud collaboration. OneDrive/Google Drive synchronized
       replicas are not a coherent shared filesystem and must not auto-join by path alone.
 
 ### P2 — PowerPoint template import
 
-- [ ] Add a preview-first, standalone `.pptx` import path using bounded ZIP/XML parsing,
+- [x] Add a preview-first, standalone `.pptx` import path using bounded ZIP/XML parsing,
       with an independent `Import design only` choice; evaluate `.potx` under the same
       contract. Never automate PowerPoint, execute macros, fetch external relationships,
       modify the source file, or silently omit unsupported content.
-- [ ] Phase 1: import page size, theme colors/fonts, slide masters, layouts,
+- [x] Phase 1: build the native, bounded design-import plan for page size, theme
+      colors/fonts, slide masters, layouts,
       placeholders, backgrounds, page numbers, and supported header/footer furniture.
-      The result becomes native authoritative HTMLlelujah design context for humans and
-      MCP clients.
+      The preview/plan and one-transaction canonical application path are implemented;
+      final integrated desktop acceptance remains in the converged-app verification.
 - [ ] Phase 2: import the supported slide subset — styled text/lists, basic
       shapes/lines/connectors, images, tables, groups, and z-order.
-- [ ] Produce a structured fidelity report listing imported, substituted, rasterized,
+- [x] Produce a structured fidelity report listing imported, substituted, rasterized,
       and unsupported items. The user can cancel, accept substitutions, or choose a
       bounded raster fallback; no source mutation or silent loss.
 - [ ] Build a public synthetic PPTX fixture corpus covering multiple masters/layouts,

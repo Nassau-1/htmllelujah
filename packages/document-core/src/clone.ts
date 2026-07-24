@@ -44,6 +44,19 @@ const cloneElement = (
       return { ...element, id, content: cloneRichText(element.content, idFactory) };
     case 'table':
       return { ...element, id, cells: element.cells.map((cell) => cloneCell(cell, idFactory)) };
+    case 'shape':
+      return {
+        ...element,
+        id,
+        ...(element.text === undefined
+          ? {}
+          : {
+              text: {
+                ...element.text,
+                content: cloneRichText(element.text.content, idFactory),
+              },
+            }),
+      };
     case 'connector': {
       const rebind = (elementId: string | undefined): string | undefined =>
         elementId === undefined ? undefined : (idMap.get(elementId) ?? elementId);
@@ -73,7 +86,6 @@ const cloneElement = (
         children: element.children.map((child) => cloneElement(child, idMap, idFactory)),
       };
     case 'image':
-    case 'shape':
     case 'path':
     case 'icon':
     case 'placeholder':

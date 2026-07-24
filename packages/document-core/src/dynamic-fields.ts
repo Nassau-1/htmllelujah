@@ -142,6 +142,13 @@ export const resolveElementDynamicFields = (
       });
       return changed ? { ...element, cells } : element;
     }
+    case 'shape': {
+      if (element.text === undefined) return element;
+      const content = resolveRichTextDynamicFields(element.text.content, values);
+      return content === element.text.content
+        ? element
+        : { ...element, text: { ...element.text, content } };
+    }
     case 'group': {
       const children = element.children.map((child) => resolveElementDynamicFields(child, values));
       return children.some((child, index) => child !== element.children[index])
@@ -149,7 +156,6 @@ export const resolveElementDynamicFields = (
         : element;
     }
     case 'image':
-    case 'shape':
     case 'path':
     case 'connector':
     case 'icon':

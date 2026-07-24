@@ -1,4 +1,5 @@
 import type { BaseElement, DeckDocument, Frame, RichTextDocument, TextElement } from './model.js';
+import { canonicalizeLanguageTag } from './language.js';
 import { STANDARD_PAGE_SIZES } from './model.js';
 import { createThemeFromCatalog, type IdFactory, type StyleCatalog } from './styles.js';
 
@@ -85,7 +86,7 @@ export const createDefaultDeck = (options: CreateDefaultDeckOptions = {}): DeckD
     metadata: {
       createdAt: timestamp,
       modifiedAt: timestamp,
-      locale: options.locale ?? 'en-US',
+      locale: canonicalizeLanguageTag(options.locale ?? 'en-US'),
       ...(options.creator === undefined ? {} : { creator: options.creator }),
       iconCatalogVersion: 'lucide-v1',
       flagCatalogVersion: 'round-flags-v1',

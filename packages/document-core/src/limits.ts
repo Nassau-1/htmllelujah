@@ -25,6 +25,7 @@ export const DOCUMENT_LIMITS = Object.freeze({
   maxTableCells: 40_000,
   maxPathCommands: 4_096,
   maxPathCoordinatePt: 100_000,
+  maxShapeTextMarginPt: 1_000,
   maxCommentThreads: 2_000,
   maxCommentMessagesPerThread: 256,
   maxCommentBodyLength: 20_000,

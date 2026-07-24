@@ -16,14 +16,23 @@ explicitly labelled unsigned.
 - direct slide and object editing with selection, multi-selection, drag, resize,
   rotation, keyboard nudging, snapping, smart guides, alignment, distribution,
   grouping, layers, lock, visibility, right-click actions, object clipboard,
-  duplicate, delete, undo, and redo;
-- typed rich text, headings and lists, font controls, colors, and paragraph alignment;
+  duplicate, vector flip, compatible format painting, shape merging, delete, undo,
+  and redo;
+- typed rich text, headings and lists, font controls, colors, paragraph alignment,
+  and directly editable theme-managed text inside compatible shapes;
 - themes with deck-wide enforcement, editable masters and layouts, placeholders,
   persistent template locks, custom page sizes, page fields, watermarks, backgrounds,
   hidden slides, and reusable style roles;
 - embedded images whose registration and placement or replacement commit atomically,
-  editable native tables with TSV paste, shapes, connectors, local vector icons, and
-  searchable offline Twemoji and circular country flags;
+  bounded clipboard-image paste, deterministic background-color removal, editable
+  direct canvas crop, native tables with TSV paste, business shapes, direct
+  straight/elbow/curved connectors, freeform paths, local vector icons, a reviewed
+  business Twemoji scope, and complete searchable offline Twemoji and circular
+  country-flag catalogs;
+- deck/text language and native spelling corrections, plus persisted slide/object review
+  comments that synchronize on LAN but stay outside presentation and ordinary exports;
+- preview-first `.pptx`/`.potx` design import for page settings, themes, masters, layouts,
+  placeholders, and supported page furniture, with an explicit fidelity report;
 - one shared DOM/SVG renderer for editor canvas, thumbnails, presentation,
   standalone HTML, and PDF;
 - versioned `.hdeck` files with bounded archive validation, content-addressed assets,
@@ -94,9 +103,10 @@ The MCP process receives no arbitrary shell, URL-fetch, HTML-injection, or files
 tool. Reads remain available during LAN collaboration, but V1 pauses MCP mutations
 while a collaboration session is active so the host's command sequence remains
 authoritative. Authentication to the model or agent client is outside HTMLlelujah;
-the application itself requires no model API credential. The current checkpoint uses
-one packaged-launcher compatibility profile; explicit named-client enrollment and
-in-app revocation controls remain tracked in specification 003.
+the application itself requires no model API credential. The Agent access panel lists
+bounded trusted-client summaries and can revoke eligible profiles; the built-in launcher
+profile is protected so ordinary local authoring remains recoverable. Explicit
+named-client enrollment beyond that profile remains follow-up work.
 
 ## Collaborate from a synchronized folder
 
@@ -105,10 +115,11 @@ used as the live-edit protocol.
 
 1. Each participant installs HTMLlelujah and opens the locally synchronized copy of
    the same `.hdeck`.
-2. One participant opens the collaboration panel, starts a host session, and shares
-   the endpoint, session code, and displayed certificate fingerprint through
-   a trusted channel.
-3. Other participants join from the same private LAN and verify the fingerprint.
+2. One participant opens the collaboration panel, starts a host session, copies the
+   versioned one-piece invitation, and shares it through a trusted channel. It contains
+   only the endpoint, session code, and displayed certificate fingerprint.
+3. Other participants paste the invitation on the same private LAN, verify the parsed
+   fingerprint, and join.
 4. Edit independent objects normally. Focusing a text editor requests an expiring
    soft lock; the inspector shows the reservation or peer owner and remains read-only
    while another participant owns that text element.
@@ -146,9 +157,10 @@ session, or expose the authenticated local MCP bridge. See
 
 - Windows 11 x64 is the supported desktop target.
 - Exported HTML is a standalone view, not an editable source format.
-- There is no import or export of third-party presentation formats.
-- There are no transitions, animations, speaker notes, comments, linked charts,
-  formulas, cloud accounts, hosted templates, or embedded chatbot.
+- Third-party presentation support is design-only `.pptx`/`.potx` import. Slide-content
+  import, third-party export, and round-trip editing are not supported.
+- There are no transitions, animations, speaker notes, linked charts, formulas, cloud
+  accounts, hosted templates, or embedded chatbot.
 - Collaboration is private-LAN only, uses one host and one shared-file writer, and
   does not merge edits made while disconnected.
 - Filesystem writer leases require a coherent shared filesystem. Consumer cloud-sync
@@ -156,8 +168,8 @@ session, or expose the authenticated local MCP bridge. See
 - The desktop editor is designed for a minimum 1080 CSS-pixel-wide workspace and is
   exercised at Windows display scaling from 100% through 200%; smaller viewports are
   not a supported V1 layout.
-- Advanced freeform paths, boolean vector operations, and simultaneous editing of one
-  text range are outside V1.
+- Boolean vector operations, curved connectors, 2.5D extrusion, direct crop handles, and
+  simultaneous editing of one text range remain outside the current checkpoint.
 
 ## Repository map
 

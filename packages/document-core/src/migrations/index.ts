@@ -1,4 +1,5 @@
 import type { DeckDocument, DeckDocumentV1 } from '../model.js';
+import { canonicalizeLanguageTag } from '../language.js';
 
 export const CURRENT_DOCUMENT_SCHEMA_VERSION = 2 as const;
 export const DETERMINISTIC_MIGRATION_TIMESTAMP = '1970-01-01T00:00:00.000Z';
@@ -31,7 +32,7 @@ export const migrateDeckV1ToV2 = (
     metadata: {
       createdAt: timestamp,
       modifiedAt: timestamp,
-      locale: options.locale ?? 'en-US',
+      locale: canonicalizeLanguageTag(options.locale ?? 'en-US'),
       iconCatalogVersion: 'lucide-v1',
       flagCatalogVersion: 'round-flags-v1',
     },

@@ -305,6 +305,11 @@ const registerElements = (
       case 'table':
         validateTable(context, element, elementPath);
         break;
+      case 'shape':
+        if (element.text !== undefined) {
+          registerRichTextIds(context, element.text.content, `${elementPath}.text.content`);
+        }
+        break;
       case 'path':
         validatePath(context, element, elementPath);
         break;
@@ -314,7 +319,6 @@ const registerElements = (
         );
         break;
       case 'image':
-      case 'shape':
       case 'connector':
       case 'icon':
       case 'placeholder':

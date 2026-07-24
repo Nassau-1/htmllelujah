@@ -11,6 +11,7 @@ import type { CommandAccess } from './contracts.js';
 export const deckNameKey = 'deck:name';
 export const deckSlideOrderKey = 'deck:slide-order';
 export const deckPageKey = 'deck:page';
+export const deckLocaleKey = 'deck:locale';
 export const deckExportSettingsKey = 'deck:export-settings';
 export const deckDefaultBackgroundKey = 'deck:default-background';
 export const themeCollectionKey = 'deck:themes';
@@ -42,6 +43,7 @@ export const elementCollectionKey = (slideId: string, containerId?: string): str
 export const DOCUMENT_COMMAND_ACCESS_CLASSIFICATION = {
   'deck.rename': 'deck',
   'deck.set-page': 'deck',
+  'deck.set-locale': 'deck',
   'deck.set-export-options': 'deck',
   'theme.create': 'theme',
   'theme.update': 'theme',
@@ -74,6 +76,7 @@ export const DOCUMENT_COMMAND_ACCESS_CLASSIFICATION = {
   'element.set-visible': 'element',
   'element.reorder': 'element',
   'text.replace-content': 'text',
+  'text.set-locale': 'text',
   'table.insert-row': 'table',
   'table.delete-row': 'table',
   'table.insert-column': 'table',
@@ -243,6 +246,10 @@ export const analyzeCommandAccess = (
 
       case 'deck.set-page':
         writes.add(deckPageKey);
+        break;
+
+      case 'deck.set-locale':
+        writes.add(deckLocaleKey);
         break;
 
       case 'deck.set-export-options':
@@ -602,6 +609,7 @@ export const analyzeCommandAccess = (
       }
 
       case 'text.replace-content':
+      case 'text.set-locale':
         addContainerReads(command.slideId, command.containerId, reads);
         reads.add(elementEntityKey(command.textId));
         writes.add(elementEntityKey(command.textId));

@@ -1,4 +1,5 @@
 import { createElement, type CSSProperties, type ReactElement, type ReactNode } from 'react';
+import { computeConnectorRoute } from '@htmllelujah/geometry';
 
 import { LocalIcon } from './icons.js';
 import { normalizeResolvedSlide } from './projection.js';
@@ -267,7 +268,9 @@ const defaultTextStyle = (role: TextElement['styleRole'], theme: RenderTheme): T
   letterSpacingPt: 0,
 });
 
-const resolveTextStyle = (element: TextElement, theme: RenderTheme): TextStyle => {
+type TextStyleSource = Pick<TextElement, 'styleRole' | 'style'>;
+
+const resolveTextStyle = (element: TextStyleSource, theme: RenderTheme): TextStyle => {
   const inherited =
     theme.textStyles.find((candidate) => candidate.role === element.styleRole) ??
     defaultTextStyle(element.styleRole, theme);
@@ -390,6 +393,7 @@ const TextContent = ({
   return (
     <div
       className="hl-text-content"
+      lang={element.locale}
       style={{
         alignSelf: verticalAlignment,
         fontFamily: textStyle.fontFamily,
@@ -641,7 +645,61 @@ const shadowFilter = (element: ShapeElement | PathElement): string | undefined =
 const polygonPoints = (points: readonly (readonly [number, number])[]): string =>
   points.map(([xPt, yPt]) => `${formatNumber(xPt)},${formatNumber(yPt)}`).join(' ');
 
-const ShapeContent = ({ element }: { element: ShapeElement }): ReactElement => {
+const MAX_RENDERED_SHAPE_TEXT_MARGIN_PT = 1_000;
+
+const shapeCanRenderText = (element: ShapeElement): boolean =>
+  element.text !== undefined && !['line', 'arrow', 'arc'].includes(element.shape);
+
+const renderedShapeTextMargin = (value: number): number =>
+  Math.min(MAX_RENDERED_SHAPE_TEXT_MARGIN_PT, Math.max(0, finiteOr(value, 0)));
+
+const ShapeTextContent = ({
+  element,
+  theme,
+}: {
+  element: ShapeElement;
+  theme: RenderTheme;
+}): ReactElement | null => {
+  if (!shapeCanRenderText(element) || element.text === undefined) return null;
+  const shapeText = element.text;
+  const textStyle = resolveTextStyle(shapeText, theme);
+  const justifyContent =
+    shapeText.verticalAlignment === 'middle'
+      ? 'center'
+      : shapeText.verticalAlignment === 'bottom'
+        ? 'flex-end'
+        : 'flex-start';
+  return (
+    <div
+      className="hl-shape-text"
+      lang={shapeText.locale}
+      style={{
+        justifyContent,
+        padding: `${formatPoint(renderedShapeTextMargin(shapeText.margins.topPt))} ${formatPoint(renderedShapeTextMargin(shapeText.margins.rightPt))} ${formatPoint(renderedShapeTextMargin(shapeText.margins.bottomPt))} ${formatPoint(renderedShapeTextMargin(shapeText.margins.leftPt))}`,
+        fontFamily: textStyle.fontFamily,
+        fontSize: formatPoint(textStyle.fontSizePt),
+        fontWeight: textStyle.fontWeight,
+        fontStyle: textStyle.italic ? 'italic' : 'normal',
+        color: textStyle.color,
+        lineHeight: textStyle.lineHeight,
+        letterSpacing: formatPoint(textStyle.letterSpacingPt ?? 0),
+        textAlign: textStyle.alignment,
+      }}
+    >
+      <div className="hl-text-content hl-shape-text-content">
+        {renderRichText(shapeText.content, `${element.id}-text`, textStyle.alignment)}
+      </div>
+    </div>
+  );
+};
+
+const ShapeContent = ({
+  element,
+  theme,
+}: {
+  element: ShapeElement;
+  theme: RenderTheme;
+}): ReactElement => {
   const width = Math.max(0.001, finiteOr(element.frame.widthPt, 0.001));
   const height = Math.max(0.001, finiteOr(element.frame.heightPt, 0.001));
   const stroke = safeColor(element.stroke.color, '#000000');
@@ -881,19 +939,24 @@ const ShapeContent = ({ element }: { element: ShapeElement }): ReactElement => {
       );
       break;
   }
+  const hasText = shapeCanRenderText(element);
   return (
-    <svg
-      className="hl-vector"
-      viewBox={`0 0 ${formatNumber(width)} ${formatNumber(height)}`}
-      width="100%"
-      height="100%"
-      aria-label={element.name}
-      role="img"
-      style={{ filter: shadowFilter(element) }}
-    >
-      {element.shape === 'arrow' ? <defs>{marker(markerId, stroke, false)}</defs> : null}
-      {shape}
-    </svg>
+    <>
+      <svg
+        className="hl-vector hl-shape-geometry"
+        viewBox={`0 0 ${formatNumber(width)} ${formatNumber(height)}`}
+        width="100%"
+        height="100%"
+        aria-label={hasText ? undefined : element.name}
+        aria-hidden={hasText ? true : undefined}
+        role={hasText ? undefined : 'img'}
+        style={{ filter: shadowFilter(element) }}
+      >
+        {element.shape === 'arrow' ? <defs>{marker(markerId, stroke, false)}</defs> : null}
+        {shape}
+      </svg>
+      <ShapeTextContent element={element} theme={theme} />
+    </>
   );
 };
 
@@ -964,11 +1027,22 @@ const ConnectorContent = ({
   const endId = `hl-end-${safeDomId(element.id)}`;
   const start = geometry?.startInContainer ?? element.start;
   const end = geometry?.endInContainer ?? element.end;
-  const midpointX = (start.xPt + end.xPt) / 2;
-  const path =
-    element.routing === 'elbow'
-      ? `M ${formatNumber(start.xPt)} ${formatNumber(start.yPt)} L ${formatNumber(midpointX)} ${formatNumber(start.yPt)} L ${formatNumber(midpointX)} ${formatNumber(end.yPt)} L ${formatNumber(end.xPt)} ${formatNumber(end.yPt)}`
-      : `M ${formatNumber(start.xPt)} ${formatNumber(start.yPt)} L ${formatNumber(end.xPt)} ${formatNumber(end.yPt)}`;
+  const route = computeConnectorRoute({
+    routing: element.routing,
+    start: {
+      xPt: start.xPt,
+      yPt: start.yPt,
+      binding: element.start.binding,
+    },
+    end: {
+      xPt: end.xPt,
+      yPt: end.yPt,
+      binding: element.end.binding,
+    },
+  });
+  const path = route.ok
+    ? route.route.pathData
+    : `M ${formatNumber(start.xPt)} ${formatNumber(start.yPt)} L ${formatNumber(end.xPt)} ${formatNumber(end.yPt)}`;
   return (
     <svg
       className="hl-element hl-connector"
@@ -1092,8 +1166,9 @@ const ElementRenderer = ({
     content = <ImageContent element={element} resolveAsset={resolveAsset} />;
   } else if (element.type === 'table') {
     content = <TableContent element={element} theme={theme} />;
-  } else if (element.type === 'shape') content = <ShapeContent element={element} />;
-  else if (element.type === 'path') content = <PathContent element={element} />;
+  } else if (element.type === 'shape') {
+    content = <ShapeContent element={element} theme={theme} />;
+  } else if (element.type === 'path') content = <PathContent element={element} />;
   else if (element.type === 'icon') {
     content = (
       <LocalIcon iconSet={element.iconSet} iconName={element.iconName} color={element.color} />

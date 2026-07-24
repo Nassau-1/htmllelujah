@@ -212,6 +212,32 @@ const shapes: readonly ShapeElement[] = shapeKinds.map((shape, index) => ({
         },
       }
     : {}),
+  ...(shape === 'rectangle'
+    ? {
+        text: {
+          content: {
+            blocks: [
+              {
+                id: 'shape-text-paragraph',
+                type: 'paragraph' as const,
+                alignment: 'center' as const,
+                runs: [
+                  {
+                    text: 'Shape text <script>unsafe()</script>',
+                    marks: marks({ bold: true }),
+                  },
+                ],
+              },
+            ],
+          },
+          styleRole: 'body' as const,
+          style: { fontSizePt: 12, alignment: 'center' as const },
+          verticalAlignment: 'middle' as const,
+          margins: { topPt: 3, rightPt: 4, bottomPt: 5, leftPt: 6 },
+          locale: 'fr-FR',
+        },
+      }
+    : {}),
 }));
 
 const connector = (

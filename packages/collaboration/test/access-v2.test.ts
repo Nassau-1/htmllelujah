@@ -12,6 +12,7 @@ import {
   assetEntityKey,
   assetReferenceKey,
   deckDefaultBackgroundKey,
+  deckLocaleKey,
   DOCUMENT_COMMAND_ACCESS_CLASSIFICATION,
   elementEntityKey,
   layoutEntityKey,
@@ -81,6 +82,21 @@ describe('V2 command access classification', () => {
     expect(insert.readSet).toContain(assetEntityKey(assetId));
     expect(insert.writeSet).toContain(assetReferenceKey);
     expect(remove.readSet).toContain(assetReferenceKey);
+  });
+
+  it('serializes deck and element language changes at the narrowest authority', () => {
+    const deck = createDefaultDeck({ idFactory: deterministicIds() });
+    const slide = deck.slides[0]!;
+    const text = slide.elements.find((element) => element.type === 'text')!;
+    const deckAccess = analyzeCommandAccess([{ type: 'deck.set-locale', locale: 'fr-FR' }], deck);
+    const textAccess = analyzeCommandAccess(
+      [{ type: 'text.set-locale', slideId: slide.id, textId: text.id, locale: 'en-GB' }],
+      deck,
+    );
+
+    expect(deckAccess.writeSet).toEqual([deckLocaleKey]);
+    expect(textAccess.writeSet).toEqual([elementEntityKey(text.id)]);
+    expect(textAccess.readSet).toContain(slideEntityKey(slide.id));
   });
 
   it('resolves indirect slide writes for layout deletion and placeholder reset', () => {

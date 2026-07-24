@@ -9,6 +9,7 @@ import {
   parseDeck,
   undoTransaction,
   validateDeck,
+  type ConnectorElement,
   type PathElement,
   type ShapeKind,
   type TransactionOptions,
@@ -61,6 +62,39 @@ const freeform = (): PathElement => ({
 });
 
 describe('business vectors and canonical freeform paths', () => {
+  it('round-trips the canonical curved connector routing mode', () => {
+    const source = createNeutralDemoDeck();
+    const curved: ConnectorElement = {
+      id: '71000000-0000-4000-8000-000000000099',
+      name: 'Curved connector',
+      type: 'connector',
+      geometryVersion: 2,
+      frame: { xPt: 20, yPt: 30, widthPt: 180, heightPt: 90, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 20, yPt: 30, binding: { anchor: 'right' } },
+      end: { xPt: 200, yPt: 120, binding: { anchor: 'left' } },
+      routing: 'curved',
+      stroke: { color: '#123456', widthPt: 2, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const document = {
+      ...source,
+      slides: source.slides.map((slide, index) =>
+        index === 0 ? { ...slide, elements: [...slide.elements, curved] } : slide,
+      ),
+    };
+
+    const result = validateDeck(document);
+    expect(result).toMatchObject({ success: true });
+    if (!result.success) throw new Error('Expected curved connector routing to validate.');
+    const reparsed = parseDeck(JSON.parse(canonicalSerialize(result.document)));
+    const connector = reparsed.slides[0]?.elements.find((element) => element.id === curved.id);
+    expect(connector?.type === 'connector' ? connector.routing : undefined).toBe('curved');
+  });
+
   it('accepts the complete bounded business shape set without a schema bump', () => {
     const shapeKinds: readonly ShapeKind[] = [
       'rectangle',

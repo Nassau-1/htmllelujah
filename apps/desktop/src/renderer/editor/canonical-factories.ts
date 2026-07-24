@@ -1,5 +1,7 @@
 import {
+  DEFAULT_SHAPE_TEXT_MARGINS,
   DOCUMENT_LIMITS,
+  shapeSupportsText,
   type ConnectorElement,
   type DeckDocument,
   type Element,
@@ -8,6 +10,7 @@ import {
   type RichTextDocument,
   type ShapeElement,
   type ShapeKind,
+  type ShapeText,
   type Slide,
   type TableCell,
   type TableElement,
@@ -342,13 +345,27 @@ export const createTextElement = (
   style: { alignment: 'left' },
 });
 
-export const createShapeElement = (shape: ShapeKind = 'rounded-rectangle'): ShapeElement => ({
+export const createShapeText = (
+  text = 'Type your text',
+  styleRole: TextStyleRole = 'body',
+): ShapeText => ({
+  content: plainParagraph(text),
+  styleRole,
+  verticalAlignment: 'middle',
+  margins: { ...DEFAULT_SHAPE_TEXT_MARGINS },
+});
+
+export const createShapeElement = (
+  shape: ShapeKind = 'rounded-rectangle',
+  text?: string,
+): ShapeElement => ({
   ...base('Shape', 120, 150, 220, 120),
   type: 'shape',
   shape,
   fill: '#DCE8FF',
   stroke: { color: '#295BC7', widthPt: 1.5, dash: 'solid' },
   cornerRadiusPt: shape === 'rounded-rectangle' ? 12 : 0,
+  ...(text === undefined || !shapeSupportsText(shape) ? {} : { text: createShapeText(text) }),
 });
 
 export const createImageElement = (
@@ -557,6 +574,19 @@ const cloneElement = (
           content: cloneContent(cell.content),
         })),
       };
+    case 'shape':
+      return {
+        ...cloned,
+        ...common,
+        ...(cloned.text === undefined
+          ? {}
+          : {
+              text: {
+                ...cloned.text,
+                content: cloneContent(cloned.text.content),
+              },
+            }),
+      };
     case 'connector': {
       const rebind = (elementId: string | undefined): string | undefined =>
         elementId === undefined ? undefined : (ids.get(elementId) ?? elementId);
@@ -580,7 +610,6 @@ const cloneElement = (
         children: cloned.children.map((child) => cloneElement(child, ids, preserveGeometryAndName)),
       };
     case 'image':
-    case 'shape':
     case 'path':
     case 'icon':
     case 'placeholder':

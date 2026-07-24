@@ -85,6 +85,38 @@ describe('SlideSurface', () => {
     expect(html).toContain('&lt;script&gt;globalThis.compromised = true&lt;/script&gt; &amp; safe');
   });
 
+  it('emits a text-level proofing language override while allowing document inheritance', () => {
+    const text = fixtureSlide.elements.find((element) => element.type === 'text');
+    if (text === undefined || text.type !== 'text') throw new Error('Fixture text is missing.');
+    const withOverride = renderToStaticMarkup(
+      <SlideSurface
+        slide={{
+          ...fixtureSlide,
+          elements: fixtureSlide.elements.map((element) =>
+            element.id === text.id ? { ...text, locale: 'fr-FR' } : element,
+          ),
+        }}
+        mode="presentation"
+      />,
+    );
+
+    expect(withOverride).toContain('class="hl-text-content" lang="fr-FR"');
+    expect(renderSlide('presentation')).not.toContain('class="hl-text-content" lang=');
+  });
+
+  it.each(MODES)('renders structured shape text consistently in %s mode', (mode) => {
+    const html = renderSlide(mode);
+
+    expect(html).toContain('class="hl-vector hl-shape-geometry"');
+    expect(html).toContain('aria-hidden="true"');
+    expect(html).toContain('class="hl-shape-text" lang="fr-FR"');
+    expect(html).toContain(
+      'justify-content:center;padding:3pt 4pt 5pt 6pt;font-family:Inter, sans-serif;font-size:12pt',
+    );
+    expect(html).toContain('Shape text &lt;script&gt;unsafe()&lt;/script&gt;');
+    expect(html).not.toContain('<script>unsafe()</script>');
+  });
+
   it('keeps h1-h6 semantic while neutralizing user-agent heading typography', () => {
     const html = renderSlide('editor');
     const inheritedHeadingStyle =
@@ -188,6 +220,38 @@ describe('SlideSurface', () => {
       endInSlide: { xPt: 35, yPt: 95 },
       boundsInSlide: { xPt: 35, yPt: -5, widthPt: 50, heightPt: 100 },
     });
+  });
+
+  it('renders curved connectors through the shared deterministic route in every mode', () => {
+    const curved: RenderElement = {
+      id: 'curved-connector',
+      name: 'Curved connector',
+      type: 'connector',
+      geometryVersion: 2,
+      frame: { xPt: 10, yPt: 20, widthPt: 130, heightPt: 60, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      start: { xPt: 10, yPt: 20, binding: { anchor: 'right' } },
+      end: { xPt: 140, yPt: 80, binding: { anchor: 'left' } },
+      routing: 'curved',
+      stroke: { color: '#123456', widthPt: 2, dash: 'solid' },
+      startCap: 'none',
+      endCap: 'arrow',
+    };
+    const renderConnector = (mode: 'editor' | 'thumbnail' | 'presentation'): string =>
+      renderToStaticMarkup(
+        <SlideSurface slide={{ ...fixtureSlide, elements: [curved] }} mode={mode} />,
+      );
+    const editor = renderConnector('editor');
+    const path = [...editor.matchAll(/<path d="([^"]+)"/g)]
+      .map((match) => match[1])
+      .find((candidate) => candidate?.startsWith('M 10 20 C '));
+
+    expect(path).toBeDefined();
+    expect(path).toContain(' 140 80');
+    expect(renderConnector('thumbnail')).toContain(`d="${path}"`);
+    expect(renderConnector('presentation')).toContain(`d="${path}"`);
   });
 
   it('resolves a bound endpoint from the effective rotated target frame', () => {
@@ -511,6 +575,7 @@ describe('safe static rendering primitives', () => {
   it('ships static CSS with no external reference', () => {
     expect(RENDERER_CSS).toContain('.hl-slide-surface');
     expect(RENDERER_CSS).toContain('.hl-editor-overlay');
+    expect(RENDERER_CSS).toContain('.hl-shape-text');
     expect(RENDERER_CSS).not.toMatch(/https?:\/\//i);
     expect(RENDERER_CSS).not.toMatch(/@import/i);
     expect(RENDERER_CSS).not.toMatch(/url\s*\(/i);

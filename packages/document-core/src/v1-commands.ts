@@ -25,6 +25,7 @@ import {
   commentAnchorSchema,
   commentMessageSchema,
   identifierSchema,
+  languageTagSchema,
   layoutSchema,
   masterSchema,
   richTextDocumentSchema,
@@ -46,6 +47,11 @@ export interface RenameDeckCommand {
 export interface SetDeckPageCommand {
   readonly type: 'deck.set-page';
   readonly page: PageSize;
+}
+
+export interface SetDeckLocaleCommand {
+  readonly type: 'deck.set-locale';
+  readonly locale: string;
 }
 
 export interface SetDeckExportOptionsCommand {
@@ -182,6 +188,14 @@ export interface ReplaceTextContentCommand extends ContainerTarget {
   readonly content: RichTextDocument;
 }
 
+export interface SetTextLocaleCommand extends ContainerTarget {
+  readonly type: 'text.set-locale';
+  readonly slideId: string;
+  readonly textId: string;
+  /** null restores inheritance from the deck's canonical locale. */
+  readonly locale: string | null;
+}
+
 interface TableTarget extends ContainerTarget {
   readonly slideId: string;
   readonly tableId: string;
@@ -281,6 +295,7 @@ export interface MarkCommentThreadReadCommand {
 export type V1DocumentCommand =
   | RenameDeckCommand
   | SetDeckPageCommand
+  | SetDeckLocaleCommand
   | SetDeckExportOptionsCommand
   | CreateThemeCommand
   | UpdateThemeCommand
@@ -302,6 +317,7 @@ export type V1DocumentCommand =
   | SetElementVisibleCommand
   | ReorderElementCommand
   | ReplaceTextContentCommand
+  | SetTextLocaleCommand
   | InsertTableRowCommand
   | DeleteTableRowCommand
   | InsertTableColumnCommand
@@ -448,6 +464,7 @@ const updateTableStyle = z
 export const v1DocumentCommandSchema: z.ZodType<V1DocumentCommand> = z.union([
   z.object({ type: z.literal('deck.rename'), name }).strict(),
   z.object({ type: z.literal('deck.set-page'), page: pageSchema }).strict(),
+  z.object({ type: z.literal('deck.set-locale'), locale: languageTagSchema }).strict(),
   z
     .object({
       type: z.literal('deck.set-export-options'),
@@ -541,6 +558,15 @@ export const v1DocumentCommandSchema: z.ZodType<V1DocumentCommand> = z.union([
       slideId: id,
       textId: id,
       content: richTextDocumentSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('text.set-locale'),
+      ...container,
+      slideId: id,
+      textId: id,
+      locale: languageTagSchema.nullable(),
     })
     .strict(),
   z

@@ -139,6 +139,15 @@ const enforceElement = (element: Element, theme: Theme): Element => {
         ...element,
         fill: element.fill === null ? null : theme.colors.surface,
         stroke: { ...element.stroke, color: theme.colors.accent },
+        ...(element.text === undefined
+          ? {}
+          : {
+              text: {
+                ...element.text,
+                content: enforceRichText(element.text.content),
+                style: stripThemeTextOverrides(element.text.style),
+              },
+            }),
         ...(element.shadow === undefined
           ? {}
           : { shadow: { ...element.shadow, color: theme.colors.mutedText } }),

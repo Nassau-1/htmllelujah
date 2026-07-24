@@ -435,6 +435,7 @@ describe('accessible editor interactions', () => {
           lineHeight: 1.2,
           letterSpacingPt: 0,
           alignment: 'left',
+          locale: 'fr-FR',
         },
         onSelect: () => true,
         onTransform: () => undefined,
@@ -452,6 +453,7 @@ describe('accessible editor interactions', () => {
     expect(markup).toContain(`data-canvas-element-id="${localText.id}"`);
     expect(markup).toContain(`class="canonical-inline-text-editor" style="${effectiveStyle}"`);
     expect(markup).toContain(`data-inline-text-element-id="${localText.id}"`);
+    expect(markup).toContain('lang="fr-FR"');
     expect(markup).toContain('data-rotation-placement="inside-top"');
   });
 
@@ -857,6 +859,7 @@ describe('accessible editor interactions', () => {
           lineHeight: 1.25,
           letterSpacingPt: 0,
           alignment: 'left',
+          locale: 'en-GB',
         },
         onSelect: () => true,
         onTransform: () => undefined,
@@ -872,6 +875,7 @@ describe('accessible editor interactions', () => {
     expect(markup).toContain(`data-inline-text-element-id="${text.id}"`);
     expect(markup).toContain('maxLength="500000"');
     expect(markup).toContain('aria-invalid="true"');
+    expect(markup).toContain('lang="en-GB"');
     expect(markup).toContain('transform:rotate(37deg)');
     expect(markup).toContain('transform:scale(1.125)');
     expect(markup).toContain('Remote change detected. Your draft is preserved');

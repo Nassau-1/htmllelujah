@@ -1,10 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   assertDecodedDimensions,
   ImageImportValidationError,
   imageFrameForPage,
   inspectImageBeforeDecode,
+  MAX_DESKTOP_IMAGE_BYTES,
+  validateImageImportBytes,
 } from '../src/main/image-import-validation.js';
 
 const onePixelPng = (): Buffer =>
@@ -37,6 +39,36 @@ describe('desktop image import validation', () => {
     ).toThrowError(
       expect.objectContaining<ImageImportValidationError>({ code: 'DECODE_MISMATCH' }),
     );
+  });
+
+  it('uses one bounded byte/header/decode pipeline for dialog and clipboard sources', () => {
+    const bytes = onePixelPng();
+    const decoder = vi.fn(() => ({ empty: false, widthPx: 1, heightPx: 1 }));
+
+    expect(validateImageImportBytes(bytes, decoder, 'image/png')).toEqual({
+      mediaType: 'image/png',
+      widthPx: 1,
+      heightPx: 1,
+    });
+    expect(decoder).toHaveBeenCalledOnce();
+    expect(() => validateImageImportBytes(bytes, decoder, 'image/jpeg')).toThrowError(
+      expect.objectContaining<ImageImportValidationError>({ code: 'INVALID_IMAGE' }),
+    );
+    expect(decoder).toHaveBeenCalledOnce();
+  });
+
+  it('rejects empty and over-budget bytes before attempting a pixel decode', () => {
+    const decoder = vi.fn(() => ({ empty: false, widthPx: 1, heightPx: 1 }));
+
+    expect(() => validateImageImportBytes(new Uint8Array(), decoder)).toThrowError(
+      expect.objectContaining<ImageImportValidationError>({ code: 'INVALID_IMAGE' }),
+    );
+    expect(() =>
+      validateImageImportBytes(new Uint8Array(MAX_DESKTOP_IMAGE_BYTES + 1), decoder),
+    ).toThrowError(
+      expect.objectContaining<ImageImportValidationError>({ code: 'IMAGE_LIMIT_EXCEEDED' }),
+    );
+    expect(decoder).not.toHaveBeenCalled();
   });
 
   it('fits new images inside narrow and minimal custom pages', () => {

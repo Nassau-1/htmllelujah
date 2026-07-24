@@ -33,6 +33,9 @@ export const RENDERER_CSS: string = `
 .hl-table table { width: 100%; height: 100%; border-collapse: collapse; table-layout: fixed; }
 .hl-table th, .hl-table td { overflow: hidden; }
 .hl-vector, .hl-connector { display: block; overflow: visible; }
+.hl-shape-geometry { position: absolute; inset: 0; }
+.hl-shape-text { position: absolute; inset: 0; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+.hl-shape-text-content { width: 100%; min-width: 0; }
 .hl-group { overflow: visible; }
 .hl-group-space { position: relative; transform-origin: top left; }
 .hl-icon { display: grid; place-items: center; overflow: hidden; container-type: size; }

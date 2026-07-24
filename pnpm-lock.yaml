@@ -51,6 +51,9 @@ importers:
       '@htmllelujah/mcp-server':
         specifier: workspace:*
         version: link:../../packages/mcp-server
+      '@htmllelujah/pptx-importer':
+        specifier: workspace:*
+        version: link:../../packages/pptx-importer
       '@htmllelujah/renderer':
         specifier: workspace:*
         version: link:../../packages/renderer
@@ -243,6 +246,9 @@ importers:
 
   packages/renderer:
     dependencies:
+      '@htmllelujah/geometry':
+        specifier: workspace:*
+        version: link:../geometry
       react:
         specifier: 19.2.7
         version: 19.2.7

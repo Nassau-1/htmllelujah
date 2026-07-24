@@ -145,6 +145,11 @@ export interface TextElement extends BaseElement {
   readonly verticalAlignment: 'top' | 'middle' | 'bottom';
   readonly content: RichTextDocument;
   readonly style?: TextStyleOverrides | undefined;
+  /**
+   * Optional canonical BCP-47 override for spellchecking and language-aware
+   * rendering. When absent, the deck's `metadata.locale` remains authoritative.
+   */
+  readonly locale?: string | undefined;
 }
 
 export interface ImageCrop {
@@ -249,6 +254,29 @@ export interface ShadowStyle {
   readonly opacity: number;
 }
 
+export interface ShapeTextMargins {
+  readonly topPt: number;
+  readonly rightPt: number;
+  readonly bottomPt: number;
+  readonly leftPt: number;
+}
+
+/**
+ * Structured text hosted by a compatible native shape.
+ *
+ * It deliberately reuses canonical rich text instead of accepting arbitrary
+ * HTML, so editor, thumbnail, presentation and export rendering share the same
+ * safe source of truth.
+ */
+export interface ShapeText {
+  readonly content: RichTextDocument;
+  readonly styleRole: TextStyleRole;
+  readonly style?: TextStyleOverrides | undefined;
+  readonly verticalAlignment: 'top' | 'middle' | 'bottom';
+  readonly margins: ShapeTextMargins;
+  readonly locale?: string | undefined;
+}
+
 export interface ShapeElement extends BaseElement {
   readonly type: 'shape';
   readonly shape: ShapeKind;
@@ -256,6 +284,7 @@ export interface ShapeElement extends BaseElement {
   readonly stroke: StrokeStyle;
   readonly cornerRadiusPt: number;
   readonly shadow?: ShadowStyle | undefined;
+  readonly text?: ShapeText | undefined;
 }
 
 /**
@@ -313,7 +342,7 @@ export interface ConnectorElement extends BaseElement {
   readonly geometryVersion?: 2 | undefined;
   readonly start: ConnectorEndpoint;
   readonly end: ConnectorEndpoint;
-  readonly routing: 'straight' | 'elbow';
+  readonly routing: 'straight' | 'elbow' | 'curved';
   readonly stroke: StrokeStyle;
   readonly startCap: 'none' | 'arrow';
   readonly endCap: 'none' | 'arrow';

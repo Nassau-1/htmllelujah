@@ -43,26 +43,34 @@ after the implementation has converged.
 ## Checkpoint 3 — Classic editing, vectors, and images
 
 - [x] Expand the useful basic-shape palette without adding novelty catalogs.
-- [ ] Unify line/arrow creation and expose both endpoint caps, width, dash, and color.
-- [ ] Add direct connector endpoint handles, anchor discovery/snap, detach, and curved
-      routing while preserving attachment under move/resize/rotation.
-- [ ] Add bounded open/closed freeform paths and edit-points mode.
-- [ ] Add preview-first Union, Combine, Fragment, Intersect, and Subtract as one undoable
-      transaction. Evaluate bounded 2.5D extrusion only after vector parity is stable.
-- [ ] Add direct image crop controls and non-destructive color-key transparency with
+- [x] Unify line/arrow creation and expose both endpoint caps, width, dash, and color.
+- [x] Add direct connector endpoint handles, five-point anchor discovery/snap, and
+      detach while preserving attachment under target move/resize/rotation.
+- [x] Add curved connector routing; straight, elbow, and bounded cubic routing now share
+      the canonical endpoint/binding model and renderer.
+- [x] Add bounded open/closed freeform paths and edit-points mode.
+- [x] Add Union, Combine, Fragment, Intersect, and Subtract as one undoable transaction,
+      with structured no-loss rejection for unsupported geometry and holes.
+- [ ] Evaluate bounded 2.5D extrusion only after vector parity is stable.
+- [x] Add direct image crop handles; numeric crop and contain/cover/fill remain available.
+- [x] Add non-destructive color-key transparency with
       white/black presets, eyedropper, tolerance, preview, apply, and reset.
-- [ ] Route safe external clipboard images, including pasted spreadsheet ranges/charts,
+- [x] Route safe external clipboard images, including pasted spreadsheet ranges/charts,
       into deterministic embedded assets.
+- [x] Add one-transaction `Swap positions` for two objects and `Match size to primary`
+      for a multi-selection on slides, layouts, and masters.
+- [x] Add lossless vector/path/connector flip and compatible text/vector/image/table
+      format painting; unsupported targets fail atomically.
 - Verification: geometry/property tests, model migration/save-reopen tests, renderer
   parity snapshots, clipboard budget rejects, and focused interaction smoke.
 
 ## Checkpoint 4 — Design authority
 
-- [ ] Consolidate theme gallery/creation/enforcement, semantic colors/fonts, page format,
+- [x] Consolidate theme gallery/creation/enforcement, semantic colors/fonts, page format,
       masters, layouts, placeholders, page furniture, numbers, and watermarks in Design.
-- [ ] Give each new text box a visible Title, Subtitle, Body, Caption, or Free text role.
-- [ ] Preserve explicit local overrides while theme-managed values update on theme switch.
-- [ ] Distinguish inherited, locked, theme-managed, and local objects in every relevant
+- [x] Give each new text box a visible Title, Subtitle, Body, Caption, or Free text role.
+- [x] Preserve explicit local overrides while theme-managed values update on theme switch.
+- [x] Distinguish inherited, locked, theme-managed, and local objects in every relevant
       surface.
 - Verification: theme-switch tests, master/layout inheritance tests, lock/undo tests,
   save-reopen tests, and renderer/export parity checks.
@@ -71,21 +79,28 @@ after the implementation has converged.
 
 - [x] Add slide- and object-anchored comment threads with replies, resolve/reopen, unread
       state, persistence, and LAN synchronization; exclude them from rendered outputs.
-- [ ] Add deck/text language and text-edit context-menu suggestions, replace, ignore, and
+- [x] Add deck/text language and text-edit context-menu suggestions, replace, ignore, and
       local dictionary operations without displacing the object context menu.
-- [ ] Add copyable LAN invitation data, clear host approval, and truthful shared-file
-      discovery boundaries with one authoritative writer.
+- [x] Add versioned copyable LAN invitation data containing only the endpoint, session
+      code, and host fingerprint, with strict paste validation and one authoritative
+      writer.
+- [ ] Evaluate opt-in discovery by shared-file identity; synchronized local replicas must
+      never auto-join by path alone.
 - Verification: comment migration/collaboration/export-exclusion tests, spellcheck IPC
   tests, and short two-instance collaboration checks.
 
 ## Checkpoint 6 — PowerPoint/POTX import
 
-- [ ] Add preview-first bounded ZIP/XML import with `Import design only`.
-- [ ] Import page size, theme colors/fonts, masters, layouts, placeholders, backgrounds,
-      page numbers, and supported page furniture into native design authority.
+- [x] Add bounded ZIP/XML parsing and a preview-first `.pptx`/`.potx` design inventory
+      that rejects active content, external relationships, DTDs, oversized input, and
+      unsafe archive structures.
+- [x] Build the native Phase 1 import plan for page size, theme colors/fonts, masters,
+      layouts, placeholders, backgrounds, page numbers, and supported page furniture.
+      Applying that plan is one bounded canonical transaction; final integrated desktop
+      acceptance remains part of the converged-app verification.
 - [ ] Import the supported slide subset: styled text/lists, basic vectors/connectors,
       images, tables, groups, and z-order.
-- [ ] Produce an explicit imported/substituted/rasterized/unsupported fidelity report and
+- [x] Produce an explicit imported/substituted/rasterized/unsupported fidelity report and
       never mutate the source or silently drop unsupported content.
 - [ ] Add synthetic public fixtures for multiple masters/layouts and hostile archive/XML
       limits.

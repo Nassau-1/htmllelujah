@@ -109,6 +109,7 @@ describe('DesktopMcpBridge', () => {
     ).resolves.toMatchObject({
       documentId: source.documentId,
       revision: source.revision,
+      locale: source.document.metadata.locale,
       inheritance: {
         themeId: source.document.themes[0]?.id,
         masterId: source.document.masters[0]?.id,
@@ -155,6 +156,46 @@ describe('DesktopMcpBridge', () => {
         transactionId: renamed.transactionId,
       }),
     ]);
+
+    const beforeLanguageEdit = runtime.getSnapshot(source.sessionId);
+    const languageSlide = beforeLanguageEdit.document.slides[0]!;
+    const languageText = languageSlide.elements.find((element) => element.type === 'text');
+    if (languageText?.type !== 'text') throw new Error('Missing default text element.');
+    const languageProposal = await bridge.proposeCommands(
+      {
+        documentId: source.documentId,
+        expectedRevision: beforeLanguageEdit.revision,
+        label: 'Set text language',
+        commands: [
+          {
+            type: 'text.set-locale',
+            slideId: languageSlide.id,
+            textId: languageText.id,
+            locale: 'fr-FR',
+          },
+        ],
+      },
+      trustedClient,
+    );
+    expect(languageProposal.requiresApproval).toBe(false);
+    await bridge.commitProposal({ proposalId: languageProposal.proposalId }, trustedClient);
+    await expect(
+      bridge.getDesignContext({
+        documentId: source.documentId,
+        slideId: languageSlide.id,
+        elementScope: 'selected-projection',
+        elementOffset: 0,
+        elementLimit: 250,
+        assetOffset: 0,
+        assetLimit: 100,
+      }),
+    ).resolves.toMatchObject({
+      elements: {
+        items: expect.arrayContaining([
+          expect.objectContaining({ id: languageText.id, locale: 'fr-FR' }),
+        ]),
+      },
+    });
 
     const beforeDesignEdit = runtime.getSnapshot(source.sessionId);
     const designTheme = beforeDesignEdit.document.themes[0];

@@ -19,6 +19,16 @@ const MAX_REGISTRY_BYTES = 64 * 1024;
 const MAX_CREDENTIAL_BYTES = 16 * 1024;
 const MAX_TRUSTED_CLIENTS = 32;
 
+export class TrustedMcpClientStoreError extends Error {
+  public constructor(
+    public readonly code: 'BOOTSTRAP_CLIENT_PROTECTED',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'TrustedMcpClientStoreError';
+  }
+}
+
 const registrySchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -166,8 +176,19 @@ export class TrustedMcpClientStore {
     return structuredClone(this.#requireRegistry().clients);
   }
 
+  /**
+   * The bootstrap identity is the installed launcher's only credential. It
+   * cannot be revoked until a replacement/rotation workflow exists, otherwise
+   * the documented persistent launcher would be irrecoverably disconnected.
+   */
   public async revoke(clientId: string): Promise<boolean> {
     const registry = this.#requireRegistry();
+    if (clientId === registry.bootstrapClientId) {
+      throw new TrustedMcpClientStoreError(
+        'BOOTSTRAP_CLIENT_PROTECTED',
+        'The bootstrap MCP client is required by the local launcher.',
+      );
+    }
     const existing = registry.clients.find((candidate) => candidate.clientId === clientId);
     if (existing === undefined || existing.revokedAt !== undefined) return false;
     const replacement = registrySchema.parse({

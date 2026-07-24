@@ -147,6 +147,7 @@ const designElementSummary = (
   ...(element.type === 'text'
     ? {
         styleRole: element.styleRole,
+        ...(element.locale === undefined ? {} : { locale: element.locale }),
         localStyleFields: Object.keys(element.style ?? {}),
         resolvedTextStyle: context.resolvedTextStyle,
       }
@@ -446,6 +447,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
       documentId: snapshot.documentId,
       revision: snapshot.revision,
       name: snapshot.document.name,
+      locale: snapshot.document.metadata.locale,
       slideCount: snapshot.document.slides.length,
       dirty: snapshot.dirty,
       hasSaveTarget: snapshot.hasSaveTarget,
@@ -460,6 +462,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
       documentId,
       revision: snapshot.revision,
       name: snapshot.document.name,
+      locale: snapshot.document.metadata.locale,
       page: snapshot.document.page,
       slides: this.#runtime.outline(snapshot.sessionId),
     };
@@ -479,6 +482,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
     return {
       documentId,
       revision: snapshot.revision,
+      locale: snapshot.document.metadata.locale,
       page: snapshot.document.page,
       themes: snapshot.document.themes,
       masters: snapshot.document.masters,
@@ -555,6 +559,7 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
       documentId: document.id,
       revision: snapshot.revision,
       name: document.name,
+      locale: document.metadata.locale,
       page: document.page,
       selectedSlideId: slide.id,
       inheritance: {

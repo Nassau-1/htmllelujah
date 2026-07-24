@@ -1166,9 +1166,15 @@ const resetPlaceholderElements = (
       opacity: placeholder.opacity,
       placeholderBinding: { placeholderId: placeholder.id, overrides: [] },
     };
-    if (common.type !== 'text') return common;
-    const { style: _style, ...withoutStyle } = common;
-    return withoutStyle;
+    if (common.type === 'text') {
+      const { style: _style, ...withoutStyle } = common;
+      return withoutStyle;
+    }
+    if (common.type === 'shape' && common.text !== undefined) {
+      const { style: _style, ...textWithoutStyle } = common.text;
+      return { ...common, text: textWithoutStyle };
+    }
+    return common;
   };
   const result = elements.map(visit);
   return found ? result : elements;
@@ -1214,6 +1220,11 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
       return { ...document, name: command.name };
     case 'deck.set-page':
       return { ...document, page: command.page };
+    case 'deck.set-locale':
+      return {
+        ...document,
+        metadata: { ...document.metadata, locale: command.locale },
+      };
     case 'deck.set-export-options':
       return {
         ...document,
@@ -1581,6 +1592,26 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
             );
           }
           return { ...element, content: command.content };
+        },
+      );
+    case 'text.set-locale':
+      return updateTargetElement(
+        document,
+        command.slideId,
+        command.containerId,
+        command.textId,
+        (element) => {
+          if (element.type !== 'text') {
+            throw new DocumentCommandError(
+              'TYPE_MISMATCH',
+              `Element ${command.textId} is not text.`,
+            );
+          }
+          if (command.locale === null) {
+            const { locale: _locale, ...inherited } = element;
+            return inherited;
+          }
+          return { ...element, locale: command.locale };
         },
       );
     case 'table.insert-row':

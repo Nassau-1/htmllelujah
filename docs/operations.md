@@ -226,7 +226,10 @@ Windows 11 x64:
 - open a `.hdeck` from both the app and Windows Explorer;
 - recover a deliberately interrupted edit as an independent candidate;
 - text, table TSV paste, image, shape, connector, icon, flag, grouping, layers,
-  snapping, alignment, lock, visibility, theme, layout, and master controls;
+  clipboard image, color-key background removal, freeform path, snapping, alignment,
+  lock, visibility, theme, layout, master, comment, language, and spelling controls;
+- `.pptx`/`.potx` design preview, fidelity counts, cancel-without-mutation, and one
+  accepted Phase 1 import followed by save/reopen;
 - presentation start, slide navigation, hidden-slide behavior, Escape, and return to
   unchanged editor state;
 - standalone HTML opened offline and PDF opened in an independent viewer;
@@ -351,8 +354,11 @@ as SMB/NAS. With a consumer-synchronized local folder, designate one host out of
 and have everyone else join it. Do not start two host sessions: both local replicas
 can acquire a lease before the synchronization service propagates either sidecar.
 
-- Share the endpoint, session code, and certificate fingerprint through a trusted
-  channel; treat all three as sensitive session data.
+- Copy the one-piece invitation and share it through a trusted channel. It contains only
+  the endpoint, session code, and certificate fingerprint; treat all three as sensitive
+  session data.
+- A guest pastes the invitation, reviews the parsed values, and then explicitly joins.
+  Do not add titles, filenames, paths, deck content, or reusable credentials to it.
 - Verify the fingerprint before joining. Do not accept a changed fingerprint without
   restarting and reconfirming the session.
 - Select the named private-network adapter that participants actually share. If that
@@ -431,11 +437,23 @@ If the bridge reports unavailable:
 
 Do not hand-edit `endpoint-v2.json`, `trusted-clients-v1.json`, or client credential
 files, and do not relax their validation. Deleting or corrupting the persistent
-credential does not create a new trusted identity; the bridge fails closed. The first
-checkpoint has one packaged-launcher compatibility profile and backend revocation;
-explicit named-client enrollment and recovery controls remain specification-003
-follow-up work. Agent mutations are intentionally unavailable during an active LAN
-session in V1.
+credential does not create a new trusted identity; the bridge fails closed. Use the
+Agent access panel to inspect bounded client labels/status and revoke eligible profiles.
+Revocation disconnects an active client and invalidates its pending work; the built-in
+launcher profile is protected. Explicit named-client enrollment and recovery controls
+remain follow-up work. Agent mutations are intentionally unavailable during an active
+LAN session in V1.
+
+## PowerPoint design import operations
+
+Use **File > Import PowerPoint design** for a `.pptx` or `.potx` source. Review the page,
+theme, master, layout, placeholder, furniture, warning, and fidelity counts before
+accepting. Cancel must leave the open `.hdeck` unchanged; acceptance applies one native
+transaction that can be undone and does not modify the source file.
+
+The importer is design-only. It does not automate Office, execute macros, fetch external
+relationships, or import slide content. A macro-enabled, active, malformed, externally
+linked, unsupported, or oversized source must fail closed with a bounded error.
 
 ## Dependency, notice, and asset review
 

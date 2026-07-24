@@ -10,7 +10,9 @@ import type {
   Frame,
   Slide,
 } from './model.js';
+import { canonicalizeLanguageTag } from './language.js';
 import { DOCUMENT_LIMITS } from './limits.js';
+import { shapeSupportsText } from './shape-text.js';
 
 const identifierSchema = z.string().uuid();
 const nonEmptyStringSchema = z.string().trim().min(1).max(DOCUMENT_LIMITS.maxNameLength);
@@ -24,6 +26,20 @@ const frameCoordinateSchema = z
   .min(-DOCUMENT_LIMITS.maxFrameCoordinatePt)
   .max(DOCUMENT_LIMITS.maxFrameCoordinatePt);
 const frameDimensionSchema = positiveFiniteSchema.max(DOCUMENT_LIMITS.maxFrameDimensionPt);
+
+export const languageTagSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(DOCUMENT_LIMITS.maxLocaleLength)
+  .transform((value, context) => {
+    try {
+      return canonicalizeLanguageTag(value);
+    } catch {
+      context.addIssue({ code: 'custom', message: 'A valid BCP-47 language tag is required.' });
+      return z.NEVER;
+    }
+  });
 
 export const frameSchema: z.ZodType<Frame> = z
   .object({
@@ -152,6 +168,7 @@ const textElementSchema = z
     verticalAlignment: z.enum(['top', 'middle', 'bottom']),
     content: richTextDocumentSchema,
     style: textStyleOverridesSchema.optional(),
+    locale: languageTagSchema.optional(),
   })
   .strict();
 
@@ -226,6 +243,26 @@ const shadowStyleSchema = z
   })
   .strict();
 
+const shapeTextMarginsSchema = z
+  .object({
+    topPt: nonNegativeFiniteSchema.max(DOCUMENT_LIMITS.maxShapeTextMarginPt),
+    rightPt: nonNegativeFiniteSchema.max(DOCUMENT_LIMITS.maxShapeTextMarginPt),
+    bottomPt: nonNegativeFiniteSchema.max(DOCUMENT_LIMITS.maxShapeTextMarginPt),
+    leftPt: nonNegativeFiniteSchema.max(DOCUMENT_LIMITS.maxShapeTextMarginPt),
+  })
+  .strict();
+
+const shapeTextSchema = z
+  .object({
+    content: richTextDocumentSchema,
+    styleRole: textStyleRoleSchema,
+    style: textStyleOverridesSchema.optional(),
+    verticalAlignment: z.enum(['top', 'middle', 'bottom']),
+    margins: shapeTextMarginsSchema,
+    locale: languageTagSchema.optional(),
+  })
+  .strict();
+
 const tableElementSchema = z
   .object({
     ...baseElementShape,
@@ -288,8 +325,18 @@ const shapeElementSchema = z
     stroke: strokeStyleSchema,
     cornerRadiusPt: nonNegativeFiniteSchema,
     shadow: shadowStyleSchema.optional(),
+    text: shapeTextSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((element, context) => {
+    if (element.text !== undefined && !shapeSupportsText(element.shape)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['text'],
+        message: `${element.shape} shapes cannot host text.`,
+      });
+    }
+  });
 
 const pathCoordinateSchema = z.number().finite().min(0).max(DOCUMENT_LIMITS.maxPathCoordinatePt);
 
@@ -390,7 +437,7 @@ const connectorElementSchema = z
     geometryVersion: z.literal(2).optional(),
     start: connectorEndpointSchema,
     end: connectorEndpointSchema,
-    routing: z.enum(['straight', 'elbow']),
+    routing: z.enum(['straight', 'elbow', 'curved']),
     stroke: strokeStyleSchema,
     startCap: z.enum(['none', 'arrow']),
     endCap: z.enum(['none', 'arrow']),
@@ -643,7 +690,7 @@ export const deckDocumentSchema: z.ZodType<DeckDocument> = z
       .object({
         createdAt: z.string().datetime({ offset: true }),
         modifiedAt: z.string().datetime({ offset: true }),
-        locale: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxLocaleLength),
+        locale: languageTagSchema,
         creator: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxNameLength).optional(),
         iconCatalogVersion: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxCatalogVersionLength),
         flagCatalogVersion: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxCatalogVersionLength),
@@ -675,6 +722,8 @@ export {
   layoutSchema,
   masterSchema,
   richTextDocumentSchema,
+  shapeTextMarginsSchema,
+  shapeTextSchema,
   tableCellSchema,
   textStyleOverridesSchema,
   themeSchema,

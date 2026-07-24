@@ -1,5 +1,6 @@
 import type { DeckDocument, DocumentCommand, PageSize } from '@htmllelujah/document-core';
 import type { DocumentSessionSnapshot, RecoveryCandidate } from '@htmllelujah/document-runtime';
+import type { PresentationImportPreview } from '@htmllelujah/pptx-importer';
 
 export const DESKTOP_API_VERSION = 1 as const;
 
@@ -14,6 +15,9 @@ export const DESKTOP_IPC = Object.freeze({
   save: 'htmllelujah:v1:document-save',
   saveAs: 'htmllelujah:v1:document-save-as',
   importImage: 'htmllelujah:v1:asset-import-image',
+  spellcheckSetLanguages: 'htmllelujah:v1:spellcheck-set-languages',
+  importClipboardImage: 'htmllelujah:v1:asset-import-clipboard-image',
+  previewPresentationDesignImport: 'htmllelujah:v1:presentation-design-import-preview',
   listRecovery: 'htmllelujah:v1:recovery-list',
   recover: 'htmllelujah:v1:recovery-open',
   present: 'htmllelujah:v1:presentation-open',
@@ -30,6 +34,8 @@ export const DESKTOP_IPC = Object.freeze({
   collaborationTextLeaseEnd: 'htmllelujah:v1:collaboration-text-lease-end',
   mcpStatus: 'htmllelujah:v1:mcp-status',
   mcpCreateApproval: 'htmllelujah:v1:mcp-create-approval',
+  mcpListTrustedClients: 'htmllelujah:v1:mcp-trusted-clients-list',
+  mcpRevokeTrustedClient: 'htmllelujah:v1:mcp-trusted-client-revoke',
   windowCloseRequested: 'htmllelujah:v1:event-window-close-requested',
   windowCloseResponse: 'htmllelujah:v1:window-close-response',
   windowCloseReleased: 'htmllelujah:v1:event-window-close-released',
@@ -99,14 +105,44 @@ export interface ImportImageInput extends HistoryInput {
   readonly preset?: ImageImportPreset | undefined;
 }
 
+export type ClipboardImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp';
+
+/**
+ * Renderer-originated clipboard import. Only owned bytes and display metadata cross IPC:
+ * filesystem paths, browser URLs and clipboard HTML are intentionally absent.
+ */
+export interface ImportClipboardImageInput extends HistoryInput {
+  readonly target: ImageImportTarget;
+  readonly bytes: Uint8Array;
+  readonly mediaType: ClipboardImageMediaType;
+  readonly fileName: string;
+}
+
 export interface SessionInput {
   readonly sessionId: string;
+}
+
+export interface SpellcheckLanguagesInput extends SessionInput {
+  /** One deck locale plus, while editing, an optional text-element override. */
+  readonly languages: readonly string[];
+}
+
+export interface SpellcheckLanguagesResult {
+  readonly requestedLanguages: readonly string[];
+  readonly appliedLanguages: readonly string[];
+  readonly unsupportedLanguages: readonly string[];
 }
 
 export interface ImportImageResult {
   readonly session: SessionView;
   readonly assetId: string;
   readonly elementId: string;
+}
+
+export interface PreviewPresentationDesignImportResult {
+  /** Basename only. The selected local path never crosses the main-process boundary. */
+  readonly displayName: string;
+  readonly preview: PresentationImportPreview;
 }
 
 export type ExportFormat = 'html' | 'pdf';
@@ -230,6 +266,28 @@ export interface McpStatus {
   readonly transport: 'local-stdio';
 }
 
+/** Renderer-safe projection of one persisted MCP trust record. */
+export interface McpTrustedClientSummary {
+  /** Opaque identity used only by the revoke operation. */
+  readonly id: string;
+  readonly label: string;
+  readonly createdAt: string;
+  readonly revokedAt?: string | undefined;
+  readonly status: 'active' | 'revoked';
+  readonly connected: boolean;
+  readonly isBootstrap: boolean;
+  readonly revocable: boolean;
+}
+
+export interface McpTrustedClientInput extends SessionInput {
+  readonly id: string;
+}
+
+export interface McpTrustedClientRevokeResult {
+  readonly id: string;
+  readonly revoked: true;
+}
+
 export type McpApprovalAction =
   'commit-destructive' | 'undo' | 'import' | 'export-html' | 'export-pdf';
 
@@ -346,6 +404,13 @@ export interface HtmllelujahDesktopApi {
   save(input: SessionInput): Promise<DesktopResult<SessionView>>;
   saveAs(input: SessionInput): Promise<DesktopResult<SessionView>>;
   importImage(input: ImportImageInput): Promise<DesktopResult<ImportImageResult>>;
+  setSpellcheckLanguages(
+    input: SpellcheckLanguagesInput,
+  ): Promise<DesktopResult<SpellcheckLanguagesResult>>;
+  importClipboardImage(input: ImportClipboardImageInput): Promise<DesktopResult<ImportImageResult>>;
+  previewPresentationDesignImport(
+    input: SessionInput,
+  ): Promise<DesktopResult<PreviewPresentationDesignImportResult>>;
   listRecovery(): Promise<DesktopResult<readonly RecoveryCandidate[]>>;
   recover(candidateId: string): Promise<DesktopResult<SessionView>>;
   present(input: PresentationInput): Promise<DesktopResult<null>>;
@@ -374,6 +439,12 @@ export interface HtmllelujahDesktopApi {
   ): Promise<DesktopResult<CollaborationTextLeaseStatus>>;
   mcpStatus(): Promise<DesktopResult<McpStatus>>;
   mcpCreateApproval(input: McpApprovalInput): Promise<DesktopResult<McpApproval>>;
+  mcpListTrustedClients(
+    input: SessionInput,
+  ): Promise<DesktopResult<readonly McpTrustedClientSummary[]>>;
+  mcpRevokeTrustedClient(
+    input: McpTrustedClientInput,
+  ): Promise<DesktopResult<McpTrustedClientRevokeResult>>;
   onWindowCloseRequested(listener: WindowCloseRequestListener): () => void;
   onDocumentChanged(listener: (event: SafeDocumentChangedEvent) => void): () => void;
   onWindowCloseReleased(listener: WindowCloseReleaseListener): () => void;

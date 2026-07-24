@@ -735,6 +735,57 @@ describe('authoritative collaboration host', () => {
     expect(afterExpiry.clientId).toBe(CLIENT_A);
   });
 
+  it('leases text-compatible shapes while rejecting line-like shapes', () => {
+    const baseDocument = createNeutralDemoDeck();
+    const slide = baseDocument.slides[0]!;
+    const textShape: Element = {
+      id: '92000000-0000-4000-8000-000000000101',
+      name: 'Text shape',
+      type: 'shape',
+      shape: 'rectangle',
+      frame: { xPt: 80, yPt: 80, widthPt: 180, heightPt: 90, rotationDeg: 0 },
+      opacity: 1,
+      visible: true,
+      locked: false,
+      fill: '#DCE8FF',
+      stroke: { color: '#295BC7', widthPt: 1, dash: 'solid' },
+      cornerRadiusPt: 0,
+    };
+    const lineShape: Element = {
+      ...textShape,
+      id: '92000000-0000-4000-8000-000000000102',
+      name: 'Line shape',
+      shape: 'line',
+    };
+    const document: DeckDocument = {
+      ...baseDocument,
+      slides: baseDocument.slides.map((candidate) =>
+        candidate.id === slide.id
+          ? { ...candidate, elements: [...candidate.elements, textShape, lineShape] }
+          : candidate,
+      ),
+    };
+    const adapter = new InMemoryDocumentAdapter(document);
+    const host = new AuthoritativeSessionHost(adapter, {
+      sessionId: SESSION_ID,
+      idFactory: deterministicIdFactory(),
+    });
+    const request = {
+      protocolVersion: COLLABORATION_PROTOCOL_VERSION,
+      sessionId: host.sessionId,
+      documentId: host.documentId,
+      clientId: CLIENT_A,
+      slideId: slide.id,
+      elementId: textShape.id,
+    } as const;
+
+    expect(host.acquireTextLease(request).elementId).toBe(textShape.id);
+    expectCollaborationError(
+      () => host.acquireTextLease({ ...request, elementId: lineShape.id }),
+      'NOT_TEXT_ELEMENT',
+    );
+  });
+
   it('rejects malformed and oversized command requests', () => {
     const { host } = createHost({ maxCommandPayloadBytes: 900 });
     expectCollaborationError(

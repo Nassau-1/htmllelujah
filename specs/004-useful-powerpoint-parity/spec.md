@@ -1,6 +1,6 @@
 # Useful PowerPoint Parity
 
-Status: **Planned from hands-on feedback**, last reviewed 2026-07-24.
+Status: **In progress**, last reviewed 2026-07-24.
 
 ## Objective
 
@@ -35,18 +35,18 @@ HTMLlelujah theme/master/layout.
 
 ## Current product truth
 
-| Surface           | Current behavior                                                                                                                                                                                           | Gap to close                                                                                                                                                      |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Emoji             | 3,720 pinned Twemoji vectors are bundled and searchable, but the picker renders only the first 72 results.                                                                                                 | Browse a curated business set and search or navigate every eligible entry without a silent cap.                                                                   |
-| Flags             | 265 pinned circular flags are bundled and searchable, but the picker renders only the first 72 results.                                                                                                    | Browse all flags, grouped by region, with an accurate total.                                                                                                      |
-| Shapes            | Seven native kinds exist: rectangle, rounded rectangle, ellipse, triangle, diamond, line, and arrow.                                                                                                       | Add a small business-oriented basic-shape set, freeform paths, edit-points, Boolean merge operations, and optional simple extrusion.                              |
-| Connectors        | The model/renderer support straight/elbow routing, both arrow caps, binding to five anchors, and movement with the target. Binding is configured in the inspector, which exposes only the end-cap control. | Make connection points and endpoint dragging direct on the canvas; add curved routing and complete cap controls while preserving the existing geometry invariant. |
-| Images            | Embedded images support replace, contain/cover/fill, numeric crop, transforms, and opacity.                                                                                                                | Add direct crop controls and deterministic remove-color-to-transparency.                                                                                          |
-| Design            | Themes, masters, layouts, locks, page size, page furniture, and style roles exist in the inspector.                                                                                                        | Make Design a coherent workspace and make new text boxes visibly adopt a named design role.                                                                       |
-| Review            | No comment model exists.                                                                                                                                                                                   | Add slide- and object-anchored comment threads that synchronize but never render in the presentation/export.                                                      |
-| Spelling          | Chromium spellcheck is enabled on editor text areas.                                                                                                                                                       | Expose language, correction suggestions, and a usable text-editor context menu.                                                                                   |
-| PowerPoint import | No `.pptx` reader exists.                                                                                                                                                                                  | Import theme/master/layout first, then the supported slide subset, with a fidelity report.                                                                        |
-| Agent guidance    | MCP exposes authoritative design context and typed edits, but the repo contains no presentation-authoring skill.                                                                                           | Ship a vendor-neutral HTMLlelujah authoring skill and MCP onboarding for Codex, Claude, and compatible clients.                                                   |
+| Surface           | Implemented checkpoint                                                                                                                                       | Remaining gap                                                         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| Emoji             | Paged Business/All scopes expose the complete 3,720-vector catalog; Business excludes faces, animals, food, and sport by default.                            | Final installed-candidate interaction check.                          |
+| Flags             | All 265 circular flags are pageable, searchable, and grouped by region.                                                                                      | Final installed-candidate interaction check.                          |
+| Shapes            | The bounded business catalog, hosted shape text, open/closed freeform editing, and five guarded Boolean operations are implemented.                          | Optional deterministic extrusion evaluation.                          |
+| Connectors        | Straight/elbow/curved endpoints, both caps, five anchors, canvas snap/detach, and target-following bindings are directly editable.                           | Final installed-candidate interaction check.                          |
+| Images            | Embedded images support bounded clipboard import, direct crop handles, and deterministic non-destructive color-key removal in the shared renderer.           | Final installed-candidate interaction check.                          |
+| Design            | Theme enforcement, masters, layouts, locks, page size/furniture, semantic roles, hosted shape text, and Phase 1 import share native authority.               | Final installed-candidate interaction check.                          |
+| Review            | Persisted slide/object comment threads support replies, unread state, resolve/reopen, LAN synchronization, and render/export exclusion.                      | Final integrated interaction check.                                   |
+| Spelling          | Deck/text language and the native editable-text correction menu support replace, session ignore, and the local personal dictionary.                          | Final installed-candidate interaction check.                          |
+| PowerPoint import | Bounded `.pptx`/`.potx` ZIP/XML preview, fidelity report, and atomic native Phase 1 design plan are implemented without source mutation.                     | Phase 2 slide-content import and final integrated desktop acceptance. |
+| Agent guidance    | The repository skill and persistent MCP workflow include authoritative design context, bounded save, protected launcher identity, summaries, and revocation. | Final packaged-launcher interaction check.                            |
 
 ## Affected surfaces
 
@@ -187,7 +187,9 @@ HTMLlelujah theme/master/layout.
 6. Add open and closed freeform paths with click-to-add points, optional Bézier handles,
    finish/cancel semantics, and post-creation edit-points mode.
 7. Add Union, Combine, Fragment, Intersect, and Subtract for compatible selected closed
-   paths. Preview the result and commit once; Undo restores every original object exactly.
+   paths. Commit once with explicit no-loss validation; Undo restores every original
+   object exactly. Unsupported holes, content-bearing shapes, locks, and unrepresentable
+   curves fail before mutation rather than receiving a lossy preview.
 8. Evaluate a deterministic 2.5D extrusion effect with depth, direction, and side color.
    It is lower priority than freeform, connectors, and Boolean operations and must render
    identically in every output.

@@ -4,6 +4,8 @@
  * tie-breaking where more than one snapping result is possible.
  */
 
+export * from './connector-route.js';
+
 export interface Point {
   readonly xPt: number;
   readonly yPt: number;

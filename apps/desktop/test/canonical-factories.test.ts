@@ -16,6 +16,7 @@ import {
   createConnectorElement,
   createSlide,
   createShapeElement,
+  createShapeText,
   createTextElement,
   duplicateElements,
   duplicateTemplateElements,
@@ -268,6 +269,33 @@ describe('ordinary object duplication', () => {
         slides: [{ ...slide, elements: [...slide.elements, copy] }],
       }).success,
     ).toBe(true);
+  });
+
+  it('creates shape text only on compatible shapes and freshens its rich-text identifiers', () => {
+    const standaloneText = createShapeText('Board update', 'label');
+    expect(standaloneText).toMatchObject({
+      styleRole: 'label',
+      verticalAlignment: 'middle',
+      margins: { topPt: 6, rightPt: 6, bottomPt: 6, leftPt: 6 },
+    });
+
+    const source = createShapeElement('rectangle', 'Board update');
+    const original = structuredClone(source);
+    const copy = duplicateElements([source])[0];
+    if (copy?.type !== 'shape' || copy.text === undefined || source.text === undefined) {
+      throw new Error('Expected duplicated shape text.');
+    }
+
+    expect(createShapeElement()).not.toHaveProperty('text');
+    expect(createShapeElement('line', 'Not supported')).not.toHaveProperty('text');
+    expect(contentToPlainText(source.text.content)).toBe(
+      contentToPlainText(standaloneText.content),
+    );
+    expect(copy.text.content.blocks[0]?.id).not.toBe(source.text.content.blocks[0]?.id);
+    expect(copy.text.content.blocks[0]?.type).toBe('paragraph');
+    expect(elementSchema.safeParse(source).success).toBe(true);
+    expect(elementSchema.safeParse(copy).success).toBe(true);
+    expect(source).toEqual(original);
   });
 });
 

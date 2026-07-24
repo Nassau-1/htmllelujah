@@ -75,9 +75,9 @@ document resources are denied.
 
 The core entities are `DeckDocument`, `Theme`, `Master`, `Layout`, `Slide`,
 `Element`, and `AssetRef`. Stable UUIDs identify mutable entities. Elements are a
-closed discriminated union for text, image, table, shape, connector, icon, group, and
-placeholder objects. Unknown fields and unknown element types fail validation rather
-than becoming executable extension points.
+closed discriminated union for text, image, table, shape, bounded freeform path,
+connector, icon, group, and placeholder objects. Unknown fields and unknown element
+types fail validation rather than becoming executable extension points.
 
 Geometry uses points. The complete page scales as one coordinate space at different
 editor zoom levels and presentation viewport sizes. Style resolution is deterministic:
@@ -93,10 +93,12 @@ materializes and releases the affected bindings atomically. The full invariant a
 rejected alternatives are recorded in
 [`ADR-009`](decisions/ADR-009-canonical-connector-geometry.md).
 
-Rich text is represented as typed blocks, spans, and marks. Tables persist native
-rows, columns, cells, and style data. Images reference embedded content-addressed
-assets. The model never stores arbitrary HTML, JavaScript, active remote URLs,
-unrestricted CSS, or shell instructions.
+Rich text is represented as typed blocks, spans, and marks. Deck metadata carries a
+canonical BCP-47 language and text or compatible shape text may carry a bounded
+override. Tables persist native rows, columns, cells, and style data. Images reference
+embedded content-addressed assets and may retain one deterministic color-key operation;
+the source bytes remain unchanged. The model never stores arbitrary HTML, JavaScript,
+active remote URLs, unrestricted CSS, or shell instructions.
 
 Validation also enforces the byte size of the complete canonical document before a
 transaction commits. Component limits for text, tables, commands, assets, and other
@@ -109,6 +111,14 @@ Human image import validates a bounded header before pixel decode, verifies deco
 dimensions, then registers the content-addressed bytes and inserts or replaces the
 image in one runtime transaction. The document revision, recovery journal, asset
 reference, and undo history therefore advance together or not at all.
+
+Clipboard image import follows the same transaction and byte-validation boundary. It
+accepts bounded PNG, JPEG, or WebP bytes, never a clipboard path, URL, or HTML fragment.
+The deterministic color-key operation is resolved by the shared renderer, so editor,
+presentation, standalone HTML, and PDF retain the same transparency result.
+Direct crop gestures remain non-destructive canonical crop updates: eight canvas handles
+produce one normalized transaction after enforcing finite geometry and a minimum visible
+area.
 
 The runtime derives one opaque validation proof from the private immutable bytes of
 each asset. Later transactions, undo, redo, and save preparation can reuse that proof
@@ -128,6 +138,16 @@ Editor canvas, thumbnails, full-screen presentation, standalone HTML, and PDF pr
 surfaces consume the same renderer contract. Differences are explicit mode, scale,
 slide filtering, and overlay inclusion. Export waits for fonts, images, and layout
 readiness before printing.
+
+Straight, elbow, and curved connectors retain canonical endpoint bindings while their
+canvas handles expose five target anchors and explicit detach. The curved route is a
+bounded deterministic cubic calculation in `packages/geometry`, consumed by the shared
+renderer in every output mode and independent of editor zoom. Open and closed freeform
+paths store bounded move/line/cubic/close commands rather than arbitrary SVG path
+strings. Compatible closed shapes and paths support Union, Combine, Intersect, Subtract,
+and Fragment as one replacement transaction; results requiring multiple subpaths/holes,
+unsupported geometry, or content loss fail explicitly. Deterministic extrusion remains
+an optional later evaluation rather than a V1 claim.
 
 Twemoji and circular country flags are closed, searchable, bundled vector catalogs
 with stable document identities and no runtime network fallback. Interface icons come
@@ -234,6 +254,12 @@ while a peer owns it. V1 does not queue disconnected edits, elect a new writer, 
 merge divergent text. If the host becomes unavailable, the guest becomes non-editing
 until an explicit rejoin or independent copy flow.
 
+The collaboration panel can serialize a strict, versioned invitation containing only
+the endpoint, session code, and ephemeral host-certificate fingerprint. Parsing rejects
+extra or malformed data and does not infer identity from a synchronized local path.
+Review comments are canonical commands synchronized by the host, but the shared renderer
+does not include them in slides or ordinary exports.
+
 ## Local MCP architecture
 
 The installed `HTMLlelujah-MCP.cmd` starts the packaged MCP entrypoint as a console
@@ -293,6 +319,25 @@ packaged executable as a same-user Node runtime. This grants no elevation, but i
 an explicit V1 tradeoff; a dedicated signed helper should be evaluated for a later
 release. ADR-008 records the transport decision and ADR-014 records persistent
 trusted-client identity, attribution, revocation, and approval ownership.
+
+The desktop exposes only bounded trusted-client summaries to the renderer. Revoking an
+eligible client persists the grant change, removes its credential, disconnects an active
+session, and clears that client's pending proposals and approvals. Private keys,
+capabilities, endpoint material, and local credential paths never cross this boundary;
+the built-in launcher profile is not revocable.
+
+## Presentation design import
+
+The `.pptx`/`.potx` importer is a standalone bounded PresentationML reader. It validates
+the ZIP structure and XML limits, rejects macros, ActiveX/OLE content, DTDs, external
+relationships, and oversized input, and performs no Office automation or network fetch.
+Its preview reports imported, substituted, rasterized, and unsupported records before
+the document changes.
+
+Phase 1 maps page size, theme colors and fonts, masters, layouts, placeholders,
+backgrounds, page numbering, and supported furniture into native canonical commands.
+Accepting the preview applies one bounded transaction and leaves the source unchanged.
+Phase 2 slide-content import is not implemented.
 
 ## Packaged startup evidence
 
