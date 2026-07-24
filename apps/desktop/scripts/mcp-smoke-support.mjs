@@ -22,6 +22,7 @@ export const EXPECTED_MCP_TOOL_NAMES = Object.freeze([
   'documents_propose_commands',
   'documents_propose_design_operations',
   'documents_request_export',
+  'documents_save',
   'documents_undo_agent_transaction',
   'documents_validate',
   'slides_get',

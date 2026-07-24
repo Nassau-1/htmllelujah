@@ -12,6 +12,7 @@ import {
   MCP_LIMITS,
   proposeCommandsSchema,
   proposeDesignOperationsSchema,
+  saveDocumentSchema,
   slideTargetSchema,
   transactionTargetSchema,
   type CommitProposalInput,
@@ -22,6 +23,8 @@ import {
   type ProposalResult,
   type ProposeCommandsInput,
   type ProposeDesignOperationsInput,
+  type SaveDocumentInput,
+  type SaveDocumentResult,
   type TransactionTargetInput,
 } from './contracts.js';
 import type { TrustedClientContext } from './trusted-client.js';
@@ -52,6 +55,10 @@ export interface HtmllelujahMcpService {
     input: TransactionTargetInput,
     client?: TrustedClientContext | undefined,
   ): Promise<CommitProposalResult>;
+  saveDocument(
+    input: SaveDocumentInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<SaveDocumentResult>;
   importAsset(
     input: ImportAssetInput,
     client?: TrustedClientContext | undefined,
@@ -416,6 +423,22 @@ export const createHtmllelujahMcpServer = (
           action: 'undo',
         });
         return service.undoAgentTransaction(input);
+      }),
+  );
+
+  server.registerTool(
+    'documents_save',
+    {
+      title: 'Save the current presentation revision',
+      description:
+        'Persist the exact current revision to its existing desktop-authorized .hdeck target. This accepts no path, never opens Save As, and requires no one-time approval.',
+      inputSchema: saveDocumentSchema,
+    },
+    (input) =>
+      toolResult(async () => {
+        await assertRead(permissions, input.documentId);
+        await assertEdit(permissions, input.documentId);
+        return service.saveDocument(input);
       }),
   );
 

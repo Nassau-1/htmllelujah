@@ -56,9 +56,16 @@ export interface AppInfo {
 
 export interface SessionView {
   readonly snapshot: DocumentSessionSnapshot;
+  /**
+   * Stable for the lifetime of this desktop window and intentionally non-secret.
+   * Typed document commands use it for review attribution.
+   */
+  readonly actorId: string;
   /** Opaque, revocable URLs. They never reveal a filesystem path. */
   readonly assetUrls: Readonly<Record<string, string>>;
 }
+
+export const actorIdForWebContents = (webContentsId: number): string => `desktop-${webContentsId}`;
 
 export interface InitializeResult {
   readonly session: SessionView;

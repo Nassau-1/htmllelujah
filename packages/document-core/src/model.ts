@@ -154,12 +154,23 @@ export interface ImageCrop {
   readonly left: number;
 }
 
+/**
+ * Offline, non-destructive chroma-key effect. The source asset is never rewritten;
+ * removing this metadata restores the original image exactly.
+ */
+export interface ImageColorKey {
+  readonly color: string;
+  /** Perceptual threshold in the familiar 0-255 channel range. */
+  readonly tolerance: number;
+}
+
 export interface ImageElement extends BaseElement {
   readonly type: 'image';
   readonly assetId: string;
   readonly altText: string;
   readonly fit: 'contain' | 'cover' | 'fill';
   readonly crop: ImageCrop;
+  readonly colorKey?: ImageColorKey | undefined;
 }
 
 export interface TableCellStyle {
@@ -204,7 +215,25 @@ export interface TableElement extends BaseElement {
 }
 
 export type ShapeKind =
-  'rectangle' | 'rounded-rectangle' | 'ellipse' | 'triangle' | 'diamond' | 'line' | 'arrow';
+  | 'rectangle'
+  | 'rounded-rectangle'
+  | 'ellipse'
+  | 'triangle'
+  | 'right-triangle'
+  | 'diamond'
+  | 'parallelogram'
+  | 'trapezoid'
+  | 'pentagon'
+  | 'hexagon'
+  | 'octagon'
+  | 'chevron'
+  | 'cross'
+  | 'donut'
+  | 'left-bracket'
+  | 'right-bracket'
+  | 'arc'
+  | 'line'
+  | 'arrow';
 
 export interface StrokeStyle {
   readonly color: string;
@@ -226,6 +255,36 @@ export interface ShapeElement extends BaseElement {
   readonly fill: string | null;
   readonly stroke: StrokeStyle;
   readonly cornerRadiusPt: number;
+  readonly shadow?: ShadowStyle | undefined;
+}
+
+/**
+ * Canonical freeform geometry expressed only through bounded local coordinates.
+ *
+ * A path starts with exactly one move command, continues with line/cubic commands,
+ * and can end with one close command. Arbitrary SVG path strings are deliberately
+ * excluded from the document model.
+ */
+export type PathCommand =
+  | Readonly<{ type: 'move'; xPt: number; yPt: number }>
+  | Readonly<{ type: 'line'; xPt: number; yPt: number }>
+  | Readonly<{
+      type: 'cubic';
+      control1XPt: number;
+      control1YPt: number;
+      control2XPt: number;
+      control2YPt: number;
+      xPt: number;
+      yPt: number;
+    }>
+  | Readonly<{ type: 'close' }>;
+
+export interface PathElement extends BaseElement {
+  readonly type: 'path';
+  readonly commands: readonly PathCommand[];
+  readonly fill: string | null;
+  readonly stroke: StrokeStyle;
+  readonly fillRule: 'nonzero' | 'evenodd';
   readonly shadow?: ShadowStyle | undefined;
 }
 
@@ -273,7 +332,7 @@ export type PlaceholderRole =
 export interface PlaceholderElement extends BaseElement {
   readonly type: 'placeholder';
   readonly role: PlaceholderRole;
-  readonly accepts: readonly ('text' | 'image' | 'table' | 'shape' | 'icon')[];
+  readonly accepts: readonly ('text' | 'image' | 'table' | 'shape' | 'path' | 'icon')[];
   readonly prompt: string;
   readonly defaultTextStyle?: TextStyleOverrides | undefined;
 }
@@ -293,6 +352,7 @@ export type Element =
   | ImageElement
   | TableElement
   | ShapeElement
+  | PathElement
   | ConnectorElement
   | IconElement
   | PlaceholderElement
@@ -355,6 +415,33 @@ export interface GridSettings {
   readonly snapToObjects: boolean;
 }
 
+export interface CommentAnchor {
+  readonly slideId: string;
+  readonly elementId?: string | undefined;
+}
+
+export interface CommentMessage {
+  readonly id: string;
+  readonly authorId: string;
+  readonly authorName?: string | undefined;
+  readonly createdAt: string;
+  readonly body: string;
+}
+
+export interface CommentThread {
+  readonly id: string;
+  readonly anchor: CommentAnchor;
+  readonly messages: readonly CommentMessage[];
+  readonly resolved: boolean;
+  readonly resolvedAt?: string | undefined;
+  readonly resolvedBy?: string | undefined;
+  /**
+   * Actor identifiers that have read the current thread state. Adding a reply or
+   * changing resolution resets this list to the actor who made that change.
+   */
+  readonly readBy: readonly string[];
+}
+
 export interface DocumentSettings {
   readonly grid: GridSettings;
   readonly defaultBackground: BackgroundStyle;
@@ -370,6 +457,11 @@ interface DeckDocumentBase {
   readonly layouts: readonly Layout[];
   readonly slides: readonly Slide[];
   readonly assets: readonly AssetRef[];
+  /**
+   * Review metadata is optional for backward-compatible schema-V2 files. It is
+   * never projected into a slide or ordinary rendered export.
+   */
+  readonly comments?: readonly CommentThread[] | undefined;
 }
 
 export interface DeckDocumentV1 extends DeckDocumentBase {
@@ -403,6 +495,14 @@ export interface ShapeElementStylePatch extends CommonElementStylePatch {
   readonly shadow?: ShadowStyle | null | undefined;
 }
 
+export interface PathElementStylePatch extends CommonElementStylePatch {
+  readonly kind: 'path';
+  readonly fill?: string | null | undefined;
+  readonly stroke?: StrokeStyle | undefined;
+  readonly fillRule?: PathElement['fillRule'] | undefined;
+  readonly shadow?: ShadowStyle | null | undefined;
+}
+
 export interface TableElementStylePatch extends CommonElementStylePatch {
   readonly kind: 'table';
   readonly border?: TableBorder | undefined;
@@ -410,7 +510,7 @@ export interface TableElementStylePatch extends CommonElementStylePatch {
 }
 
 export type ElementStylePatch =
-  TextElementStylePatch | ShapeElementStylePatch | TableElementStylePatch;
+  TextElementStylePatch | ShapeElementStylePatch | PathElementStylePatch | TableElementStylePatch;
 
 export const STANDARD_PAGE_SIZES = {
   widescreen: { widthPt: 960, heightPt: 540 },

@@ -1266,6 +1266,9 @@ export class DocumentSessionManager implements DocumentRuntimeService {
     }
     const state = this.#requireSession(sessionId);
     return this.#enqueue(state, async () => {
+      if (options.expectedRevision !== undefined && state.revision !== options.expectedRevision) {
+        throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
+      }
       if (state.autosaveTimer !== undefined) {
         clearTimeout(state.autosaveTimer);
         state.autosaveTimer = undefined;

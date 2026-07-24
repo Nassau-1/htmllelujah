@@ -155,6 +155,185 @@ describe('schema V2 and migration', () => {
   });
 });
 
+describe('review comments', () => {
+  const commentIds = {
+    thread: 'cccccccc-cccc-4ccc-8ccc-000000000001',
+    first: 'cccccccc-cccc-4ccc-8ccc-000000000002',
+    reply: 'cccccccc-cccc-4ccc-8ccc-000000000003',
+  } as const;
+
+  it('creates, replies to, resolves, reopens, and marks a thread read transactionally', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[0]!;
+    const element = slide.elements[0]!;
+
+    const created = applyTransaction(
+      source,
+      [
+        {
+          type: 'comment.create',
+          threadId: commentIds.thread,
+          anchor: { slideId: slide.id, elementId: element.id },
+          message: {
+            id: commentIds.first,
+            authorId: 'v2-test-user',
+            authorName: 'Author',
+            createdAt: '2026-07-15T12:00:01.000Z',
+            body: 'Tighten this headline.',
+          },
+        },
+        {
+          type: 'comment.reply',
+          threadId: commentIds.thread,
+          message: {
+            id: commentIds.reply,
+            authorId: 'v2-test-user',
+            createdAt: '2026-07-15T12:00:02.000Z',
+            body: 'Proposed copy is ready.',
+          },
+        },
+        {
+          type: 'comment.set-resolved',
+          threadId: commentIds.thread,
+          resolved: true,
+          actorId: 'v2-test-user',
+          timestamp: '2026-07-15T12:00:03.000Z',
+        },
+      ],
+      metadata('1'),
+    );
+
+    expect(created.document.comments).toHaveLength(1);
+    expect(created.document.comments?.[0]).toMatchObject({
+      id: commentIds.thread,
+      resolved: true,
+      resolvedBy: 'v2-test-user',
+      readBy: ['v2-test-user'],
+    });
+    expect(created.document.comments?.[0]?.messages).toHaveLength(2);
+
+    const read = applyTransaction(
+      created.document,
+      [
+        {
+          type: 'comment.mark-read',
+          threadId: commentIds.thread,
+          actorId: 'reviewer',
+        },
+      ],
+      {
+        expectedRevision: created.revision,
+        metadata: {
+          transactionId: '99000000-0000-4000-8000-000000000090',
+          actorId: 'reviewer',
+          origin: 'remote',
+          label: 'Read comment',
+          timestamp: '2026-07-15T12:00:04.000Z',
+        },
+      },
+    );
+    expect(read.document.comments?.[0]?.readBy).toEqual(['v2-test-user', 'reviewer']);
+
+    const reopened = applyTransaction(
+      read.document,
+      [
+        {
+          type: 'comment.set-resolved',
+          threadId: commentIds.thread,
+          resolved: false,
+          actorId: 'reviewer',
+          timestamp: '2026-07-15T12:00:05.000Z',
+        },
+      ],
+      {
+        expectedRevision: read.revision,
+        metadata: {
+          transactionId: '99000000-0000-4000-8000-000000000091',
+          actorId: 'reviewer',
+          origin: 'remote',
+          label: 'Reopen comment',
+          timestamp: '2026-07-15T12:00:05.000Z',
+        },
+      },
+    );
+    expect(reopened.document.comments?.[0]).toMatchObject({
+      resolved: false,
+      readBy: ['reviewer'],
+    });
+    expect(reopened.document.comments?.[0]?.resolvedAt).toBeUndefined();
+    expect(reopened.document.comments?.[0]?.resolvedBy).toBeUndefined();
+    expect(undoTransaction(reopened.document, reopened)).toEqual(read.document);
+  });
+
+  it('enforces transaction attribution and prunes comments with deleted anchors', () => {
+    const source = createNeutralDemoDeck();
+    const slide = source.slides[0]!;
+    const element = slide.elements[0]!;
+    const create = {
+      type: 'comment.create' as const,
+      threadId: commentIds.thread,
+      anchor: { slideId: slide.id, elementId: element.id },
+      message: {
+        id: commentIds.first,
+        authorId: 'v2-test-user',
+        createdAt: '2026-07-15T12:00:01.000Z',
+        body: 'Remove with its anchor.',
+      },
+    };
+
+    expect(() =>
+      applyTransaction(
+        source,
+        [{ ...create, message: { ...create.message, authorId: 'spoofed' } }],
+        {
+          metadata: metadata('1').metadata,
+        },
+      ),
+    ).toThrowError(expect.objectContaining({ code: 'ATTRIBUTION_MISMATCH' }));
+
+    const created = applyTransaction(source, [create], metadata('1'));
+    const deleted = applyTransaction(
+      created.document,
+      [
+        {
+          type: 'element.delete',
+          slideId: slide.id,
+          elementIds: [element.id],
+        },
+      ],
+      metadata('2'),
+    );
+    expect(deleted.document.comments).toEqual([]);
+    expect(validateDeck(deleted.document)).toMatchObject({ success: true });
+  });
+
+  it('rejects comment anchors that are outside the authoritative slide', () => {
+    const source = createNeutralDemoDeck();
+    expect(() =>
+      applyTransaction(
+        source,
+        [
+          {
+            type: 'comment.create',
+            threadId: commentIds.thread,
+            anchor: {
+              slideId: source.slides[0]!.id,
+              elementId: 'dddddddd-dddd-4ddd-8ddd-000000000001',
+            },
+            message: {
+              id: commentIds.first,
+              authorId: 'v2-test-user',
+              createdAt: '2026-07-15T12:00:01.000Z',
+              body: 'Missing anchor.',
+            },
+          },
+        ],
+        metadata('1'),
+      ),
+    ).toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+  });
+});
+
 describe('projection and placeholders', () => {
   it('keeps the trusted-document resolver exactly in parity with the validating boundary', () => {
     const source = createNeutralDemoDeck();
@@ -960,6 +1139,7 @@ describe('element, text, table, asset, and connector commands', () => {
       altText: 'Test',
       fit: 'contain',
       crop: { top: 0, right: 0, bottom: 0, left: 0 },
+      colorKey: { color: '#ffffff', tolerance: 24 },
     };
     const used = applyCommand(
       registered.document,
@@ -969,6 +1149,24 @@ describe('element, text, table, asset, and connector commands', () => {
     expect(() =>
       applyCommand(used.document, { type: 'asset.remove', assetId: asset.id }, metadata('3')),
     ).toThrowError(expect.objectContaining({ code: 'DEPENDENCY_IN_USE' }));
+    expect(
+      used.document.slides[2]?.elements.find((element) => element.id === image.id),
+    ).toMatchObject({ colorKey: { color: '#ffffff', tolerance: 24 } });
+    expect(() =>
+      applyCommand(
+        registered.document,
+        {
+          type: 'element.insert',
+          slideId: slide.id,
+          element: {
+            ...image,
+            id: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000302',
+            colorKey: { color: '#ffffff', tolerance: 256 },
+          },
+        },
+        metadata('3'),
+      ),
+    ).toThrow();
     const removed = applyCommand(
       registered.document,
       { type: 'asset.remove', assetId: asset.id },

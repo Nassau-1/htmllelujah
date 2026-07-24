@@ -15,6 +15,7 @@ import type {
   ImportAssetInput,
   ProposeCommandsInput,
   ProposeDesignOperationsInput,
+  SaveDocumentInput,
   TransactionTargetInput,
 } from './contracts.js';
 import {
@@ -26,6 +27,7 @@ import {
   importAssetSchema,
   proposeCommandsSchema,
   proposeDesignOperationsSchema,
+  saveDocumentSchema,
   slideTargetSchema,
   transactionTargetSchema,
 } from './contracts.js';
@@ -91,6 +93,7 @@ type RpcMethod =
   | 'proposeDesignOperations'
   | 'commitProposal'
   | 'undoAgentTransaction'
+  | 'saveDocument'
   | 'importAsset'
   | 'exportDocument'
   | 'collaborationStatus'
@@ -125,6 +128,7 @@ const allowedMethods = new Set<RpcMethod>([
   'proposeDesignOperations',
   'commitProposal',
   'undoAgentTransaction',
+  'saveDocument',
   'importAsset',
   'exportDocument',
   'collaborationStatus',
@@ -315,6 +319,10 @@ const dispatch = async (
     case 'undoAgentTransaction': {
       requireClientCapability(client, 'documents.edit.ordinary');
       return service.undoAgentTransaction(parseParams(transactionTargetSchema, params), client);
+    }
+    case 'saveDocument': {
+      requireClientCapability(client, 'documents.edit.ordinary');
+      return service.saveDocument(parseParams(saveDocumentSchema, params), client);
     }
     case 'importAsset': {
       requireClientCapability(client, 'documents.edit.ordinary');
@@ -1125,6 +1133,11 @@ export class LocalRpcClient implements HtmllelujahMcpService, McpPermissionGate 
   public async undoAgentTransaction(input: TransactionTargetInput) {
     return (await this.call('undoAgentTransaction', input)) as Awaited<
       ReturnType<HtmllelujahMcpService['undoAgentTransaction']>
+    >;
+  }
+  public async saveDocument(input: SaveDocumentInput) {
+    return (await this.call('saveDocument', input)) as Awaited<
+      ReturnType<HtmllelujahMcpService['saveDocument']>
     >;
   }
   public async importAsset(input: ImportAssetInput): Promise<SafeRecord> {

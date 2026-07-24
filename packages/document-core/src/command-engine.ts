@@ -17,6 +17,8 @@ import type {
   Frame,
   GroupElement,
   PageSize,
+  PathCommand,
+  PathElement,
   PlaceholderElement,
   RichTextDocument,
   TableCell,
@@ -49,7 +51,8 @@ export type DocumentCommandErrorCode =
   | 'DEPENDENCY_IN_USE'
   | 'TYPE_MISMATCH'
   | 'UNSUPPORTED_OPERATION'
-  | 'LIMIT_EXCEEDED';
+  | 'LIMIT_EXCEEDED'
+  | 'ATTRIBUTION_MISMATCH';
 
 export class DocumentCommandError extends Error {
   public readonly code: DocumentCommandErrorCode;
@@ -105,6 +108,72 @@ const findGroup = (elements: readonly Element[], groupId: string): GroupElement 
     if (nested !== undefined) return nested;
   }
   return undefined;
+};
+
+const findElement = (elements: readonly Element[], elementId: string): Element | undefined => {
+  for (const element of elements) {
+    if (element.id === elementId) return element;
+    if (element.type === 'group') {
+      const nested = findElement(element.children, elementId);
+      if (nested !== undefined) return nested;
+    }
+  }
+  return undefined;
+};
+
+const requireCommentAnchor = (
+  document: DeckDocument,
+  anchor: { readonly slideId: string; readonly elementId?: string | undefined },
+): void => {
+  const slide = document.slides.find((candidate) => candidate.id === anchor.slideId);
+  if (slide === undefined) {
+    throw new DocumentCommandError('NOT_FOUND', `Comment slide ${anchor.slideId} does not exist.`);
+  }
+  if (
+    anchor.elementId !== undefined &&
+    findElement(slide.elements, anchor.elementId) === undefined
+  ) {
+    throw new DocumentCommandError(
+      'NOT_FOUND',
+      `Comment element ${anchor.elementId} does not exist on slide ${anchor.slideId}.`,
+    );
+  }
+};
+
+const commentIdExists = (document: DeckDocument, id: string): boolean =>
+  (document.comments ?? []).some(
+    (thread) => thread.id === id || thread.messages.some((message) => message.id === id),
+  );
+
+const pruneOrphanedComments = (document: DeckDocument): DeckDocument => {
+  if (document.comments === undefined) return document;
+  const comments = document.comments.filter((thread) => {
+    const slide = document.slides.find((candidate) => candidate.id === thread.anchor.slideId);
+    if (slide === undefined) return false;
+    return (
+      thread.anchor.elementId === undefined ||
+      findElement(slide.elements, thread.anchor.elementId) !== undefined
+    );
+  });
+  return comments.length === document.comments.length ? document : { ...document, comments };
+};
+
+const requireCommentCommandAttribution = (
+  command: DocumentCommand,
+  metadata: TransactionMetadata,
+): void => {
+  const actorId =
+    command.type === 'comment.create' || command.type === 'comment.reply'
+      ? command.message.authorId
+      : command.type === 'comment.set-resolved' || command.type === 'comment.mark-read'
+        ? command.actorId
+        : undefined;
+  if (actorId !== undefined && actorId !== metadata.actorId) {
+    throw new DocumentCommandError(
+      'ATTRIBUTION_MISMATCH',
+      'Comment attribution must match the transaction actor.',
+    );
+  }
 };
 
 const updateContainer = (
@@ -296,6 +365,33 @@ const containerBounds = (slide: Slide, containerId: string | undefined, page: Pa
   };
 };
 
+const pathAfterFrameTransform = (element: PathElement, frame: Frame): PathElement => {
+  const scaleX = frame.widthPt / element.frame.widthPt;
+  const scaleY = frame.heightPt / element.frame.heightPt;
+  const x = (value: number): number => Math.min(frame.widthPt, Math.max(0, value * scaleX));
+  const y = (value: number): number => Math.min(frame.heightPt, Math.max(0, value * scaleY));
+  const scaleCommand = (command: PathCommand): PathCommand => {
+    switch (command.type) {
+      case 'move':
+      case 'line':
+        return { ...command, xPt: x(command.xPt), yPt: y(command.yPt) };
+      case 'cubic':
+        return {
+          ...command,
+          control1XPt: x(command.control1XPt),
+          control1YPt: y(command.control1YPt),
+          control2XPt: x(command.control2XPt),
+          control2YPt: y(command.control2YPt),
+          xPt: x(command.xPt),
+          yPt: y(command.yPt),
+        };
+      case 'close':
+        return command;
+    }
+  };
+  return { ...element, frame, commands: element.commands.map(scaleCommand) };
+};
+
 const replaceFrames = (
   elements: readonly Element[],
   frames: ReadonlyMap<string, Frame>,
@@ -303,6 +399,9 @@ const replaceFrames = (
   elements.map((element) => {
     const frame = frames.get(element.id);
     if (frame === undefined) return element;
+    if (element.type === 'path') {
+      return withPlaceholderOverride(pathAfterFrameTransform(element, frame), 'frame');
+    }
     if (element.type !== 'connector') {
       return withPlaceholderOverride({ ...element, frame }, 'frame');
     }
@@ -718,6 +817,9 @@ const ungroupElements = (document: DeckDocument, command: UngroupElementsCommand
       const frame = childFrameAfterUngroup(child, element);
       const opacity = child.opacity * element.opacity;
       const visible = child.visible && element.visible;
+      if (child.type === 'path') {
+        return { ...pathAfterFrameTransform(child, frame), opacity, visible };
+      }
       if (child.type !== 'connector') return { ...child, frame, opacity, visible };
       return {
         ...child,
@@ -801,6 +903,23 @@ const applyStylePatch = (element: Element, patch: ElementStylePatch): Element =>
           ...(patch.fill === undefined ? {} : { fill: patch.fill }),
           ...(patch.stroke === undefined ? {} : { stroke: patch.stroke }),
           ...(patch.cornerRadiusPt === undefined ? {} : { cornerRadiusPt: patch.cornerRadiusPt }),
+          ...(patch.shadow === undefined || patch.shadow === null ? {} : { shadow: patch.shadow }),
+        },
+        'style',
+      );
+      return patch.opacity === undefined ? updated : withPlaceholderOverride(updated, 'visibility');
+    }
+    case 'path': {
+      if (element.type !== 'path') return element;
+      const { shadow: currentShadow, ...withoutShadow } = element;
+      const base = patch.shadow === null ? withoutShadow : element;
+      const updated = withPlaceholderOverride(
+        {
+          ...base,
+          ...(patch.opacity === undefined ? {} : { opacity: patch.opacity }),
+          ...(patch.fill === undefined ? {} : { fill: patch.fill }),
+          ...(patch.stroke === undefined ? {} : { stroke: patch.stroke }),
+          ...(patch.fillRule === undefined ? {} : { fillRule: patch.fillRule }),
           ...(patch.shadow === undefined || patch.shadow === null ? {} : { shadow: patch.shadow }),
         },
         'style',
@@ -1753,6 +1872,119 @@ const executeCommand = (document: DeckDocument, command: DocumentCommand): DeckD
         },
       );
     }
+    case 'comment.create':
+      requireCommentAnchor(document, command.anchor);
+      if (commentIdExists(document, command.threadId)) {
+        throw new DocumentCommandError(
+          'ID_MISMATCH',
+          `Comment identifier ${command.threadId} is already in use.`,
+        );
+      }
+      if (commentIdExists(document, command.message.id)) {
+        throw new DocumentCommandError(
+          'ID_MISMATCH',
+          `Comment message identifier ${command.message.id} is already in use.`,
+        );
+      }
+      if ((document.comments?.length ?? 0) >= DOCUMENT_LIMITS.maxCommentThreads) {
+        throw new DocumentCommandError('LIMIT_EXCEEDED', 'The comment thread limit was reached.');
+      }
+      return {
+        ...document,
+        comments: [
+          ...(document.comments ?? []),
+          {
+            id: command.threadId,
+            anchor: command.anchor,
+            messages: [command.message],
+            resolved: false,
+            readBy: [command.message.authorId],
+          },
+        ],
+      };
+    case 'comment.reply': {
+      const comments = document.comments ?? [];
+      const target = comments.find((thread) => thread.id === command.threadId);
+      if (target === undefined) {
+        throw new DocumentCommandError(
+          'NOT_FOUND',
+          `Comment thread ${command.threadId} does not exist.`,
+        );
+      }
+      if (target.messages.length >= DOCUMENT_LIMITS.maxCommentMessagesPerThread) {
+        throw new DocumentCommandError('LIMIT_EXCEEDED', 'The comment reply limit was reached.');
+      }
+      if (commentIdExists(document, command.message.id)) {
+        throw new DocumentCommandError(
+          'ID_MISMATCH',
+          `Comment message identifier ${command.message.id} is already in use.`,
+        );
+      }
+      return {
+        ...document,
+        comments: comments.map((thread) =>
+          thread.id === command.threadId
+            ? {
+                ...thread,
+                messages: [...thread.messages, command.message],
+                readBy: [command.message.authorId],
+              }
+            : thread,
+        ),
+      };
+    }
+    case 'comment.set-resolved': {
+      const comments = document.comments ?? [];
+      if (!comments.some((thread) => thread.id === command.threadId)) {
+        throw new DocumentCommandError(
+          'NOT_FOUND',
+          `Comment thread ${command.threadId} does not exist.`,
+        );
+      }
+      return {
+        ...document,
+        comments: comments.map((thread) => {
+          if (thread.id !== command.threadId) return thread;
+          if (command.resolved) {
+            return {
+              ...thread,
+              resolved: true,
+              resolvedAt: command.timestamp,
+              resolvedBy: command.actorId,
+              readBy: [command.actorId],
+            };
+          }
+          const { resolvedAt: _resolvedAt, resolvedBy: _resolvedBy, ...openThread } = thread;
+          return {
+            ...openThread,
+            resolved: false,
+            readBy: [command.actorId],
+          };
+        }),
+      };
+    }
+    case 'comment.mark-read': {
+      const comments = document.comments ?? [];
+      const target = comments.find((thread) => thread.id === command.threadId);
+      if (target === undefined) {
+        throw new DocumentCommandError(
+          'NOT_FOUND',
+          `Comment thread ${command.threadId} does not exist.`,
+        );
+      }
+      if (target.readBy.includes(command.actorId)) return document;
+      if (target.readBy.length >= DOCUMENT_LIMITS.maxCommentReadersPerThread) {
+        throw new DocumentCommandError('LIMIT_EXCEEDED', 'The comment reader limit was reached.');
+      }
+      return {
+        ...document,
+        comments: comments.map((thread) =>
+          thread.id === command.threadId
+            ? { ...thread, readBy: [...thread.readBy, command.actorId] }
+            : thread,
+        ),
+      };
+    }
     case 'slide.create': {
       const index = command.index ?? document.slides.length;
       if (index > document.slides.length) {
@@ -1903,8 +2135,10 @@ export const applyTransaction = (
   const parsedCommands = commands.map((command) => documentCommandSchema.parse(command));
   let workingDocument = startingDocument;
   for (const command of parsedCommands) {
+    requireCommentCommandAttribution(command, metadata);
     workingDocument = executeCommand(workingDocument, command);
   }
+  workingDocument = pruneOrphanedComments(workingDocument);
   workingDocument = {
     ...workingDocument,
     metadata: { ...workingDocument.metadata, modifiedAt: metadata.timestamp },

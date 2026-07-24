@@ -143,6 +143,15 @@ const enforceElement = (element: Element, theme: Theme): Element => {
           ? {}
           : { shadow: { ...element.shadow, color: theme.colors.mutedText } }),
       };
+    case 'path':
+      return {
+        ...element,
+        fill: element.fill === null ? null : theme.colors.surface,
+        stroke: { ...element.stroke, color: theme.colors.accent },
+        ...(element.shadow === undefined
+          ? {}
+          : { shadow: { ...element.shadow, color: theme.colors.mutedText } }),
+      };
     case 'connector':
       return {
         ...element,

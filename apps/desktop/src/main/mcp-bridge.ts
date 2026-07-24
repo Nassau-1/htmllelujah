@@ -31,6 +31,8 @@ import {
   type ProposeCommandsInput,
   type ProposeDesignOperationsInput,
   type SafeRecord,
+  type SaveDocumentInput,
+  type SaveDocumentResult,
   type TransactionTargetInput,
   type TrustedClientContext,
 } from '@htmllelujah/mcp-server';
@@ -58,6 +60,14 @@ export interface DesktopMcpBridgeOptions {
     expectedRevision: string,
     client: TrustedClientContext,
   ) => Promise<SafeRecord>;
+  /**
+   * Persists only to the session's already-authorized target. The callback
+   * must never select a path or fall back to Save As.
+   */
+  readonly saveDocument: (
+    sessionId: string,
+    expectedRevision: string,
+  ) => Promise<DocumentSessionSnapshot>;
   readonly exportDocument: (sessionId: string, input: ExportDocumentInput) => Promise<SafeRecord>;
   readonly now?: (() => Date) | undefined;
 }
@@ -818,6 +828,47 @@ export class DesktopMcpBridge implements HtmllelujahMcpService, McpPermissionGat
         receipt.baseRevision,
         trustedClient,
       );
+    } catch (error) {
+      return asSafeError(error);
+    }
+  }
+
+  public async saveDocument(
+    input: SaveDocumentInput,
+    client?: TrustedClientContext | undefined,
+  ): Promise<SaveDocumentResult> {
+    try {
+      this.#requireClient(client);
+      const snapshot = this.#assertEditable(input.documentId);
+      if (snapshot.revision !== input.expectedRevision) {
+        throw new McpSafeError('REVISION_CONFLICT', 'The presentation changed before save.');
+      }
+      if (!snapshot.hasSaveTarget) {
+        throw new McpSafeError(
+          'INVALID_REQUEST',
+          'This presentation has no existing authorized save target. Use desktop Save As first.',
+        );
+      }
+      const saved = await this.#options.saveDocument(snapshot.sessionId, input.expectedRevision);
+      if (
+        saved.documentId !== input.documentId ||
+        saved.revision !== input.expectedRevision ||
+        saved.dirty ||
+        saved.durability !== 'clean'
+      ) {
+        throw new McpSafeError(
+          'SERVICE_UNAVAILABLE',
+          'The desktop did not confirm durable persistence of the requested revision.',
+        );
+      }
+      return {
+        documentId: saved.documentId,
+        revision: saved.revision,
+        saved: true,
+        dirty: false,
+        durability: 'clean',
+        target: 'existing-authorized-target',
+      };
     } catch (error) {
       return asSafeError(error);
     }

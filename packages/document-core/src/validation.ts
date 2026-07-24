@@ -8,6 +8,7 @@ import type {
   DeckDocument,
   DeckDocumentV1,
   Element,
+  PathElement,
   PlaceholderElement,
   RichTextDocument,
   TableElement,
@@ -23,6 +24,7 @@ export type ValidationIssueCode =
   | 'TABLE_CELL_OUT_OF_BOUNDS'
   | 'TABLE_CELL_OVERLAP'
   | 'TABLE_CELL_MISSING'
+  | 'PATH_COORDINATE_OUT_OF_BOUNDS'
   | 'PLACEHOLDER_BINDING_INVALID'
   | 'LIMIT_EXCEEDED'
   | 'ASSET_DIMENSION_INVALID';
@@ -234,6 +236,41 @@ const validateTable = (
   }
 };
 
+const validatePath = (
+  context: StructuralValidationContext,
+  element: PathElement,
+  path: string,
+): void => {
+  const check = (commandIndex: number, field: string, value: number, maximum: number): void => {
+    if (value <= maximum) return;
+    addIssue(context, {
+      code: 'PATH_COORDINATE_OUT_OF_BOUNDS',
+      path: `${path}.commands.${commandIndex}.${field}`,
+      message: `Path coordinate ${field} must stay within its local frame.`,
+    });
+  };
+
+  element.commands.forEach((command, commandIndex) => {
+    switch (command.type) {
+      case 'move':
+      case 'line':
+        check(commandIndex, 'xPt', command.xPt, element.frame.widthPt);
+        check(commandIndex, 'yPt', command.yPt, element.frame.heightPt);
+        break;
+      case 'cubic':
+        check(commandIndex, 'control1XPt', command.control1XPt, element.frame.widthPt);
+        check(commandIndex, 'control1YPt', command.control1YPt, element.frame.heightPt);
+        check(commandIndex, 'control2XPt', command.control2XPt, element.frame.widthPt);
+        check(commandIndex, 'control2YPt', command.control2YPt, element.frame.heightPt);
+        check(commandIndex, 'xPt', command.xPt, element.frame.widthPt);
+        check(commandIndex, 'yPt', command.yPt, element.frame.heightPt);
+        break;
+      case 'close':
+        break;
+    }
+  });
+};
+
 const registerElements = (
   context: StructuralValidationContext,
   elements: readonly Element[],
@@ -267,6 +304,9 @@ const registerElements = (
         break;
       case 'table':
         validateTable(context, element, elementPath);
+        break;
+      case 'path':
+        validatePath(context, element, elementPath);
         break;
       case 'group':
         element.children.forEach((child, childIndex) =>
@@ -527,6 +567,7 @@ const structuralIssues = (
     );
   });
 
+  const slideElementIds = new Map<string, ReadonlySet<string>>();
   document.slides.forEach((slide, slideIndex) => {
     const slidePath = `$.slides.${slideIndex}`;
     registerId(context, slide.id, `${slidePath}.id`);
@@ -538,6 +579,7 @@ const structuralIssues = (
       });
     }
     const elementIds = registerElements(context, slide.elements, `${slidePath}.elements`);
+    slideElementIds.set(slide.id, elementIds);
     validateConnectorReferences(context, slide.elements, elementIds, `${slidePath}.elements`);
     validateImageReferences(context, slide.elements, imageAssetIds, `${slidePath}.elements`);
     validateBackgroundReference(
@@ -556,6 +598,30 @@ const structuralIssues = (
       if (master !== undefined) collectPlaceholders(master.elements, placeholders);
       collectPlaceholders(layout.elements, placeholders);
       validatePlaceholderBindings(context, slide.elements, placeholders, `${slidePath}.elements`);
+    }
+  });
+
+  (document.comments ?? []).forEach((thread, threadIndex) => {
+    const threadPath = `$.comments.${threadIndex}`;
+    registerId(context, thread.id, `${threadPath}.id`);
+    thread.messages.forEach((message, messageIndex) =>
+      registerId(context, message.id, `${threadPath}.messages.${messageIndex}.id`),
+    );
+    const elementIds = slideElementIds.get(thread.anchor.slideId);
+    if (elementIds === undefined) {
+      addIssue(context, {
+        code: 'REFERENCE_MISSING',
+        path: `${threadPath}.anchor.slideId`,
+        message: `Comment slide ${thread.anchor.slideId} does not exist.`,
+      });
+      return;
+    }
+    if (thread.anchor.elementId !== undefined && !elementIds.has(thread.anchor.elementId)) {
+      addIssue(context, {
+        code: 'REFERENCE_MISSING',
+        path: `${threadPath}.anchor.elementId`,
+        message: `Comment element ${thread.anchor.elementId} does not exist on its slide.`,
+      });
     }
   });
 

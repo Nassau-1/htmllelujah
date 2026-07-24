@@ -17,6 +17,7 @@ export const themeCollectionKey = 'deck:themes';
 export const masterCollectionKey = 'deck:masters';
 export const layoutCollectionKey = 'deck:layouts';
 export const assetCollectionKey = 'deck:assets';
+export const commentCollectionKey = 'deck:comments';
 export const themeReferenceKey = 'references:themes';
 export const masterReferenceKey = 'references:masters';
 export const layoutReferenceKey = 'references:layouts';
@@ -28,6 +29,7 @@ export const themeEntityKey = (themeId: string): string => `theme:${themeId}`;
 export const masterEntityKey = (masterId: string): string => `master:${masterId}`;
 export const layoutEntityKey = (layoutId: string): string => `layout:${layoutId}`;
 export const assetEntityKey = (assetId: string): string => `asset:${assetId}`;
+export const commentThreadEntityKey = (threadId: string): string => `comment:${threadId}`;
 export const elementCollectionKey = (slideId: string, containerId?: string): string =>
   `elements:${slideId}:${containerId ?? 'root'}`;
 
@@ -82,6 +84,10 @@ export const DOCUMENT_COMMAND_ACCESS_CLASSIFICATION = {
   'asset.register': 'asset',
   'asset.remove': 'asset',
   'connector.update-endpoint': 'connector',
+  'comment.create': 'comment',
+  'comment.reply': 'comment',
+  'comment.set-resolved': 'comment',
+  'comment.mark-read': 'comment',
 } as const satisfies Readonly<
   Record<
     DocumentCommand['type'],
@@ -95,6 +101,7 @@ export const DOCUMENT_COMMAND_ACCESS_CLASSIFICATION = {
     | 'table'
     | 'asset'
     | 'connector'
+    | 'comment'
   >
 >;
 
@@ -420,6 +427,10 @@ export const analyzeCommandAccess = (
         writes.add(slideEntityKey(command.slideId));
         writes.add(layoutReferenceKey);
         writes.add(assetReferenceKey);
+        writes.add(commentCollectionKey);
+        document?.comments
+          ?.filter((thread) => thread.anchor.slideId === command.slideId)
+          .forEach((thread) => writes.add(commentThreadEntityKey(thread.id)));
         const slide = findSlide(document, command.slideId);
         slide?.elements.forEach((element) => addElementTreeWrites(element, slide.id, writes));
         break;
@@ -519,6 +530,13 @@ export const analyzeCommandAccess = (
         addElementReads(command.elementIds, reads);
         writes.add(collectionKey);
         writes.add(assetReferenceKey);
+        writes.add(commentCollectionKey);
+        document?.comments
+          ?.filter(
+            (thread) =>
+              thread.anchor.slideId === command.slideId && thread.anchor.elementId !== undefined,
+          )
+          .forEach((thread) => writes.add(commentThreadEntityKey(thread.id)));
         addElementWrites(command.elementIds, writes);
         addExistingElementTreeWrites(document, command.slideId, command.elementIds, writes);
         break;
@@ -622,6 +640,23 @@ export const analyzeCommandAccess = (
           reads.add(elementEntityKey(command.value.binding.elementId));
         }
         writes.add(elementEntityKey(command.connectorId));
+        break;
+
+      case 'comment.create':
+        reads.add(slideEntityKey(command.anchor.slideId));
+        if (command.anchor.elementId !== undefined) {
+          reads.add(elementEntityKey(command.anchor.elementId));
+        }
+        reads.add(commentCollectionKey);
+        writes.add(commentCollectionKey);
+        writes.add(commentThreadEntityKey(command.threadId));
+        break;
+
+      case 'comment.reply':
+      case 'comment.set-resolved':
+      case 'comment.mark-read':
+        reads.add(commentThreadEntityKey(command.threadId));
+        writes.add(commentThreadEntityKey(command.threadId));
         break;
 
       default:

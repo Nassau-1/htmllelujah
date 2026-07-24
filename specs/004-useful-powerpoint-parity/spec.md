@@ -117,11 +117,12 @@ HTMLlelujah theme/master/layout.
    ID, country name/code, and category. Normalize case, accents, Unicode forms, and
    whitespace; treat multi-term queries consistently and use stable score/source-order/ID
    tie-breaking.
-5. Default emoji browsing to a reviewed `Business` collection covering people and teams,
-   communication, status and alerts, documents and tools, data and technology, travel and
-   locations, finance, and common symbols. Use stable product-owned category IDs; an entry
-   may belong to multiple categories and skin/gender variants inherit the base entry's
-   categories.
+5. Default emoji browsing to a reviewed `Business` collection covering transport,
+   travel, places and buildings, office objects, documents, tools, cameras, finance,
+   data and technology, clocks, status and alerts, arrows, operators, geometric markers,
+   and common symbols. Exclude faces, animals, food, and sport from this default scope.
+   Keep those entries reachable only through the explicit `All` scope. Use stable
+   product-owned category IDs; an entry may belong to multiple categories.
 6. Group flags with a deterministic ISO 3166/UN M49-derived region map and an explicit
    `Territories and organizations` fallback while keeping country-name and two-letter-code
    search exhaustive.

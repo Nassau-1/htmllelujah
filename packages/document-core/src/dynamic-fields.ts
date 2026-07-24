@@ -150,6 +150,7 @@ export const resolveElementDynamicFields = (
     }
     case 'image':
     case 'shape':
+    case 'path':
     case 'connector':
     case 'icon':
     case 'placeholder':

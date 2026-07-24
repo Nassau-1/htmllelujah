@@ -7,6 +7,36 @@ and releases use semantic versions.
 
 ### Changed
 
+- Reworked the visual picker around paged, exhaustive offline discovery. The default
+  symbol view is now a reviewed business collection that excludes faces, animals,
+  food, and sport; all 3,720 Twemoji remain available through the explicit complete
+  scope, and all 265 circular flags are searchable, pageable, and grouped by region.
+
+- Expanded the native vector model and renderer with a bounded business-shape set and
+  canonical open/closed freeform paths. The same validated SVG geometry now survives
+  duplication, resize, theme processing, save/reopen, collaboration, presentation,
+  HTML, and PDF rendering.
+
+- Added persisted slide- and object-anchored review threads with attributed replies,
+  resolve/reopen and unread state, navigation back to the reviewed object, LAN command
+  synchronization, undo, and explicit exclusion from presentation and ordinary export.
+
+- Replaced internal editor chrome with user-facing save/recovery states, inline deck
+  naming, factual MCP status, and explicit LAN collaboration wording.
+
+- Added a standalone bounded PresentationML preview package for `.pptx` and `.potx`
+  design import. It parses ZIP/XML without Office automation or network access, rejects
+  active/external content, inventories themes, masters, layouts, placeholders, page
+  furniture and fidelity, and leaves the live deck unchanged until a future UI accepts
+  the preview.
+
+- Added a persistent-client `documents_save` MCP operation that saves only the exact
+  visible revision to its existing desktop-authorized target, with no path or Save As
+  capability and no one-time approval. Runtime queue revision fencing, target
+  fingerprinting, writer reservations, offline-mode enforcement, strict RPC schemas,
+  and the repository-owned presentation skill keep the operation bounded and
+  accurately documented.
+
 - Added a planning-only specification and ordered TODO for the next hands-on feedback
   cycle: complete business visual discovery, truthful editor chrome, useful vector/image
   parity, design/review UX, PowerPoint design import, and vendor-neutral MCP authoring

@@ -59,7 +59,7 @@ export const createDefaultDeck = (options: CreateDefaultDeckOptions = {}): DeckD
     type: 'text',
     styleRole: 'title',
     verticalAlignment: 'middle',
-    content: paragraph(idFactory(), 'Untitled presentation'),
+    content: paragraph(idFactory(), ''),
     placeholderBinding: { placeholderId: titlePlaceholderId, overrides: [] },
   };
   const body: TextElement = {
@@ -152,5 +152,6 @@ export const createDefaultDeck = (options: CreateDefaultDeckOptions = {}): DeckD
       },
     ],
     assets: [],
+    comments: [],
   };
 };

@@ -87,6 +87,7 @@
   --color-danger: var(--primitive-red-600);
   --color-danger-soft: var(--primitive-red-50);
   --color-success-soft: var(--primitive-mint-100);
+  --color-warning: var(--primitive-warm-700);
   --color-warm-soft: var(--primitive-warm-100);
   --color-ink-fill: var(--primitive-slate-800);
   --font-ui: var(--primitive-font-sans);

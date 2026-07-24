@@ -1,0 +1,14 @@
+interface:
+  display_name: "HTMLlelujah Presentations"
+  short_description: "Build and revise governed HTMLlelujah decks"
+  default_prompt: "Use $htmllelujah-presentations to turn my outline into a polished, validated presentation."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "htmllelujah"
+      description: "Local typed bridge to the running HTMLlelujah desktop editor"
+      transport: "stdio"
+
+policy:
+  allow_implicit_invocation: true

@@ -161,6 +161,62 @@ describe('runtime persistence commit authority', () => {
     expect(saveTargets).toEqual([firstTarget, secondTarget]);
   });
 
+  it('checks an expected Save revision inside the serialized session queue', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-runtime-revision-fence-'));
+    directories.push(directory);
+    const target = path.join(directory, 'authorized.hdeck');
+    let saveCount = 0;
+    const archive: ArchiveDurabilityCapability = {
+      open: async () => {
+        throw new Error('open is not used by this test');
+      },
+      fingerprint: async () => null,
+      save: async (_target, bytes) => {
+        saveCount += 1;
+        return {
+          status: 'saved',
+          fingerprint: saveCount.toString(16).padStart(64, '0'),
+          byteLength: bytes.byteLength,
+        };
+      },
+    };
+    const manager = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'recovery'),
+      archive,
+      autosaveDelayMs: 0,
+    });
+    const created = await manager.createMainOnly();
+    await manager.saveAsMainOnly(created.sessionId, {
+      targetPath: target,
+      expectedFingerprint: null,
+    });
+    const base = manager.getSnapshot(created.sessionId);
+
+    const queuedEdit = manager.execute(created.sessionId, {
+      expectedRevision: base.revision,
+      commands: [{ type: 'deck.rename', name: 'Queued before non-interactive Save' }],
+      metadata: {
+        transactionId: '66666666-6666-4666-8666-666666666666',
+        actorId: 'runtime-revision-fence-test',
+        origin: 'agent',
+        label: 'Advance the revision before Save',
+        timestamp: '2026-07-20T12:20:00.000Z',
+      },
+    });
+    const staleSave = manager.save(created.sessionId, {
+      expectedRevision: base.revision,
+      expectedTargetPath: target,
+    });
+
+    await expect(queuedEdit).resolves.toMatchObject({ dirty: true });
+    await expect(staleSave).rejects.toMatchObject({ code: 'REVISION_CONFLICT' });
+    expect(saveCount).toBe(1);
+    expect(manager.getSnapshot(created.sessionId)).toMatchObject({
+      dirty: true,
+      document: { name: 'Queued before non-interactive Save' },
+    });
+  });
+
   it('retains the committed target as authoritative when recovery rotation fails afterward', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-runtime-postcommit-'));
     directories.push(directory);

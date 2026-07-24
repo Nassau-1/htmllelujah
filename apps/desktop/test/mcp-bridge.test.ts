@@ -67,6 +67,7 @@ describe('DesktopMcpBridge', () => {
         connectedPeers: collaborationMode === 'offline' ? 0 : 1,
         discoveryEnabled: false,
       }),
+      saveDocument: (sessionId, expectedRevision) => runtime.save(sessionId, { expectedRevision }),
       importAsset,
       exportDocument,
       now: () => now,
@@ -348,6 +349,98 @@ describe('DesktopMcpBridge', () => {
     await expect(bridge.canEdit(source.documentId, trustedClient)).resolves.toBe(false);
   });
 
+  it('saves an exact revision only to an existing target without an approval', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-mcp-save-'));
+    const now = new Date('2026-07-15T12:00:00.000Z');
+    const runtime = new DocumentSessionManager({
+      recoveryDirectory: path.join(directory, 'recovery'),
+      autosaveDelayMs: 0,
+      now: () => now.toISOString(),
+    });
+    const source = await runtime.createMainOnly();
+    const saveDocument = vi.fn((sessionId: string, expectedRevision: string) =>
+      runtime.save(sessionId, { expectedRevision }),
+    );
+    const bridge = new DesktopMcpBridge({
+      runtime,
+      appVersion: () => '1.0.0',
+      visibleSessionIds: () => [source.sessionId],
+      collaborationStatus: () => ({
+        mode: 'offline',
+        connectedPeers: 0,
+        discoveryEnabled: false,
+      }),
+      saveDocument,
+      importAsset: vi.fn(async () => ({ assetId: 'approved-asset' })),
+      exportDocument: vi.fn(async () => ({ format: 'pdf', pageCount: 1 })),
+      now: () => now,
+    });
+    cleanup.push(async () => rm(directory, { recursive: true, force: true }));
+    cleanup.push(async () => {
+      await Promise.all(
+        runtime
+          .listSessions()
+          .map((session) => runtime.close(session.sessionId, { discardUnsaved: true })),
+      );
+    });
+
+    await expect(
+      bridge.saveDocument(
+        { documentId: source.documentId, expectedRevision: source.revision },
+        trustedClient,
+      ),
+    ).rejects.toMatchObject({
+      code: 'INVALID_REQUEST',
+      message: expect.stringContaining('Save As'),
+    });
+    expect(saveDocument).not.toHaveBeenCalled();
+
+    await runtime.saveAsMainOnly(source.sessionId, {
+      targetPath: path.join(directory, 'authorized-target.hdeck'),
+      expectedFingerprint: null,
+    });
+    const savedBase = runtime.getSnapshot(source.sessionId);
+    const edited = await runtime.execute(source.sessionId, {
+      expectedRevision: savedBase.revision,
+      commands: [{ type: 'deck.rename', name: 'Ready for MCP save' }],
+      metadata: {
+        transactionId: randomUUID(),
+        actorId: 'desktop-test',
+        origin: 'user',
+        label: 'Create dirty state',
+        timestamp: now.toISOString(),
+      },
+    });
+
+    await expect(
+      bridge.saveDocument(
+        { documentId: source.documentId, expectedRevision: savedBase.revision },
+        trustedClient,
+      ),
+    ).rejects.toMatchObject({ code: 'REVISION_CONFLICT' });
+    expect(saveDocument).not.toHaveBeenCalled();
+
+    await expect(
+      bridge.saveDocument(
+        { documentId: source.documentId, expectedRevision: edited.revision },
+        trustedClient,
+      ),
+    ).resolves.toEqual({
+      documentId: source.documentId,
+      revision: edited.revision,
+      saved: true,
+      dirty: false,
+      durability: 'clean',
+      target: 'existing-authorized-target',
+    });
+    expect(saveDocument).toHaveBeenCalledWith(source.sessionId, edited.revision);
+    expect(runtime.getSnapshot(source.sessionId)).toMatchObject({
+      revision: edited.revision,
+      dirty: false,
+      durability: 'clean',
+    });
+  });
+
   it('maps atomic command rejections safely without mutating or disabling the bridge', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'htmllelujah-desktop-mcp-atomic-'));
     const now = new Date('2026-07-15T12:00:00.000Z');
@@ -366,6 +459,7 @@ describe('DesktopMcpBridge', () => {
         connectedPeers: 0,
         discoveryEnabled: false,
       }),
+      saveDocument: (sessionId, expectedRevision) => runtime.save(sessionId, { expectedRevision }),
       importAsset: vi.fn(async () => ({ assetId: 'approved-asset' })),
       exportDocument: vi.fn(async () => ({ format: 'pdf', pageCount: 1 })),
       now: () => now,
@@ -464,6 +558,7 @@ describe('DesktopMcpBridge', () => {
         connectedPeers: 0,
         discoveryEnabled: false,
       }),
+      saveDocument: (sessionId, expectedRevision) => runtime.save(sessionId, { expectedRevision }),
       importAsset: vi.fn(async () => ({ assetId: 'approved-asset' })),
       exportDocument: vi.fn(async () => ({ format: 'pdf', pageCount: 1 })),
       now: () => now,

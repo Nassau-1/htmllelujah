@@ -31,6 +31,7 @@ import {
   type ProposalResult,
   type ProposeCommandsInput,
   type ProposeDesignOperationsInput,
+  type SaveDocumentInput,
   type TransactionTargetInput,
 } from '../src/index.js';
 
@@ -273,6 +274,14 @@ const createService = (): HtmllelujahMcpService => ({
     revision: 'rev-3',
     acceptedCommandCount: 1,
   })),
+  saveDocument: vi.fn<HtmllelujahMcpService['saveDocument']>(async (input: SaveDocumentInput) => ({
+    documentId: input.documentId,
+    revision: input.expectedRevision,
+    saved: true,
+    dirty: false,
+    durability: 'clean',
+    target: 'existing-authorized-target',
+  })),
   importAsset: vi.fn(async (_input: ImportAssetInput) => ({
     assetId: slideId,
     mediaType: 'image/png',
@@ -326,6 +335,7 @@ describe('MCP tools', () => {
       expect(tools.tools.map((tool) => tool.name)).toContain('documents_get_outline');
       expect(tools.tools.map((tool) => tool.name)).toContain('documents_get_design_context');
       expect(tools.tools.map((tool) => tool.name)).toContain('documents_propose_design_operations');
+      expect(tools.tools.map((tool) => tool.name)).toContain('documents_save');
       const result = await client.callTool({
         name: 'documents_get_outline',
         arguments: { documentId },
@@ -349,6 +359,51 @@ describe('MCP tools', () => {
           elementLimit: 250,
         }),
       );
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+    }
+  });
+
+  it('saves only an exact revision to an existing target without a one-time approval', async () => {
+    const service = createService();
+    const permissions = createPermissions();
+    permissions.canRead = vi.fn(() => true);
+    permissions.canEdit = vi.fn(() => true);
+    permissions.consumeApproval = vi.fn(() => {
+      throw new Error('Save must not consume an approval.');
+    });
+    const { server, client } = await connectMcp(service, permissions);
+    try {
+      const result = await client.callTool({
+        name: 'documents_save',
+        arguments: { documentId, expectedRevision: 'rev-1' },
+      });
+      expect(textResult(result)).toEqual({
+        documentId,
+        revision: 'rev-1',
+        saved: true,
+        dirty: false,
+        durability: 'clean',
+        target: 'existing-authorized-target',
+      });
+      expect(service.saveDocument).toHaveBeenCalledWith({
+        documentId,
+        expectedRevision: 'rev-1',
+      });
+      expect(permissions.canRead).toHaveBeenCalledWith(documentId);
+      expect(permissions.canEdit).toHaveBeenCalledWith(documentId);
+      expect(permissions.consumeApproval).not.toHaveBeenCalled();
+
+      const rejectedPath = await client.callTool({
+        name: 'documents_save',
+        arguments: {
+          documentId,
+          expectedRevision: 'rev-1',
+          path: 'C:\\private\\replacement.hdeck',
+        },
+      });
+      expect(rejectedPath.isError).toBe(true);
+      expect(service.saveDocument).toHaveBeenCalledTimes(1);
     } finally {
       await Promise.all([client.close(), server.close()]);
     }
@@ -1122,6 +1177,24 @@ describe('authenticated local RPC', () => {
     const rpcClient = createRpcClient(descriptorPath);
     const { server, client } = await connectMcp(rpcClient, rpcClient);
     try {
+      const saved = await client.callTool({
+        name: 'documents_save',
+        arguments: { documentId, expectedRevision: 'rev-1' },
+      });
+      expect(saved.isError).not.toBe(true);
+      expect(textResult(saved)).toMatchObject({
+        documentId,
+        revision: 'rev-1',
+        target: 'existing-authorized-target',
+      });
+      expect(service.saveDocument).toHaveBeenCalledWith(
+        { documentId, expectedRevision: 'rev-1' },
+        expect.objectContaining({
+          clientId: trustedClient.profile.clientId,
+          actorId: `mcp-client:${trustedClient.profile.clientId}`,
+        }),
+      );
+
       const first = await client.callTool({
         name: 'assets_request_import',
         arguments: { documentId, approvalId },

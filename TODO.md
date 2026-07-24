@@ -140,49 +140,51 @@ Authoritative scope, non-goals, current-product matrix, risks, and verification:
 
 ### P0 — Catalog completeness and truthful editor chrome
 
-- [ ] Replace the visual catalog's fixed `RESULT_LIMIT = 72` and the search API's
+- [x] Replace the visual catalog's fixed `RESULT_LIMIT = 72` and the search API's
       200-result ceiling with bounded pagination, incremental loading, or virtualization.
       The 3,720 bundled Twemoji and 265 bundled circular flags already exist; the bug is
       that only the first 72 matches are browseable and the UI reports that truncated
       count as if it were the total.
-- [ ] Make broad and exact search exhaustive across stable ID, Unicode, English/French
+- [x] Make broad and exact search exhaustive across stable ID, Unicode, English/French
       label, keywords, category, country name, and two-letter country code. Show
       the logical result range and exact total, keep at most 144 result cards mounted in
       the active picker including overscan, and preserve keyboard/focus navigation
       through the final result.
-- [ ] Default emoji browsing to a reviewed `Business` collection: people and teams,
-      communication, finance, data and technology, documents and tools, status and
-      alerts, travel and locations, and common symbols. `Business` and `All` are explicit
-      browse-and-search scopes; `All` exposes every one of the 3,720 bundled vectors.
-- [ ] Group circular flags by region and make all 265 entries browseable and searchable,
+- [x] Default emoji browsing to a reviewed `Business` collection: transport, places and
+      buildings, office objects, documents, tools, cameras, finance, data and technology,
+      clocks, status and alerts, arrows, operators, geometric markers, and common symbols.
+      Faces, animals, food, and sport stay out of the default scope. `Business` and `All`
+      are explicit browse-and-search scopes; `All` exposes every one of the 3,720 bundled
+      vectors.
+- [x] Group circular flags by region and make all 265 entries browseable and searchable,
       including countries positioned after the current 72nd result.
-- [ ] Return a stable paged catalog result contract with `items`, exact `total`,
+- [x] Return a stable paged catalog result contract with `items`, exact `total`,
       cursor/offset, and `hasMore`; normalize case, accents, Unicode, and multi-term
       queries; benchmark opening, broad search, and keyboard navigation without relying
       only on a DOM-count proxy.
-- [ ] Remove the static `AI-NATIVE · LOCAL` badge from the working toolbar or move a
+- [x] Remove the static `AI-NATIVE · LOCAL` badge from the working toolbar or move a
       factual local-first explanation into Help/About. A separate agent indicator must
       derive from real MCP availability and connection state.
-- [ ] Replace raw `journaled`/`clean`/`recovered` durability labels with user language:
+- [x] Replace raw `journaled`/`clean`/`recovered` durability labels with user language:
       `Not saved yet · Recovery protected`, `Unsaved changes · Recovery protected`,
       `Saving…`, `Saved`, `Recovered copy · Save As required`, or a clear error.
-- [ ] Fix the inverted `Recovered locally` condition. Normal dirty journaled edits are
+- [x] Fix the inverted `Recovered locally` condition. Normal dirty journaled edits are
       not recovered work; recovery wording appears only for a genuinely recovered
       session and provides a Save As action.
-- [ ] Replace the prompt-based modal title editor and decorative chevron with inline
+- [x] Replace the prompt-based modal title editor and decorative chevron with inline
       deck-name editing and explicit Save/Save As behavior. Initialize the deck name as
       `Untitled presentation` but leave the first slide title empty or show
       `Click to add title`; renaming the document never edits slide content.
-- [ ] Rename `Codex` to `MCP` or `Agent access`. Show `Unavailable`,
+- [x] Rename `Codex` to `MCP` or `Agent access`. Show `Unavailable`,
       `Ready — no agent connected`, or `Connected`, plus copyable onboarding and
       persistent-client listing/revocation.
-- [ ] Rename `Share` to `Collaborate (LAN)` and explain before action that collaborators
+- [x] Rename `Share` to `Collaborate (LAN)` and explain before action that collaborators
       open the same `.hdeck` on the same private network, one person hosts, and only the
       host writes the shared file. Show `Hosting · N` or `Joined · N` while active.
 
 ### P1 — Lines, connectors, business shapes, and images
 
-- [ ] Expand the seven-shape palette with a deliberately small business set:
+- [x] Expand the seven-shape palette with a deliberately small business set:
       parallelogram, trapezoid, pentagon/hexagon, chevron, brackets, and simple arcs.
       Do not add novelty shapes, stars/banners, callouts, equations, action buttons, or
       the complete PowerPoint catalog.
@@ -234,32 +236,32 @@ Authoritative scope, non-goals, current-product matrix, risks, and verification:
 
 ### P1 — Agent-native presentation skill
 
-- [ ] Add a repository-owned, vendor-neutral `htmllelujah-presentations` skill for Codex,
+- [x] Add a repository-owned, vendor-neutral `htmllelujah-presentations` skill for Codex,
       Claude, and compatible local MCP clients.
-- [ ] Teach the skill to discover the visible document and authoritative design context,
+- [x] Teach the skill to discover the visible document and authoritative design context,
       respect theme/master/layout/placeholder/lock authority, use semantic typed
       operations, group coherent edits into one transaction, handle revision conflicts,
       validate, preview, commit, undo, and request approved exports.
-- [ ] Decide and implement a bounded `documents_save` operation for an already-authorized
+- [x] Decide and implement a bounded `documents_save` operation for an already-authorized
       current target, or require the human to save explicitly. Save As, import, export,
       trust changes, and destructive operations retain their desktop approval; the skill
       must never promise to bypass it.
-- [ ] Route attributed typed agent transactions through the authoritative host during a
+- [x] Route attributed typed agent transactions through the authoritative host during a
       LAN session with the same revision/undo guarantees, or state clearly that agent
       mutation is unavailable while LAN collaboration is active. Silent suspension does
       not satisfy the intended human-plus-agent workflow.
-- [ ] Include workflows for outline-to-deck, adding slides from existing layouts,
+- [x] Include workflows for outline-to-deck, adding slides from existing layouts,
       editing masters/layouts, enforcing a theme, adding page furniture, checking
       alignment/overflow, and preparing a deliverable.
-- [ ] Keep arbitrary HTML, shell execution, remote URLs, unbounded file access, and
+- [x] Keep arbitrary HTML, shell execution, remote URLs, unbounded file access, and
       vendor-specific hard-coding outside the skill and MCP contract.
 
 ### P2 — Review, spelling, and collaboration onboarding
 
-- [ ] Add slide- and object-anchored comment threads with author, timestamp, replies,
+- [x] Add slide- and object-anchored comment threads with author, timestamp, replies,
       resolve/reopen, unread state, and a review panel. A sticky-note affordance is a
       comment, not a visual slide object.
-- [ ] Synchronize comments through the authoritative LAN host and persist them in the
+- [x] Synchronize comments through the authoritative LAN host and persist them in the
       `.hdeck`, but exclude them from presentation, PDF, standalone HTML, and ordinary
       print unless a future explicit review export is requested.
 - [ ] Complete the partially enabled offline spellcheck UX. Chromium spellcheck and

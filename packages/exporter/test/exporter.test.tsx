@@ -147,6 +147,35 @@ const repeatedAssetFixture = (): Readonly<{
 };
 
 describe('createStandaloneHtml', () => {
+  it('excludes review comments from standalone and print projections', () => {
+    const fixture = createExportFixture();
+    const slide = fixture.deck.slides[0]!;
+    const withReviewMetadata: DeckDocument = {
+      ...fixture.deck,
+      comments: [
+        {
+          id: '44000000-0000-4000-8000-000000000001',
+          anchor: { slideId: slide.id },
+          messages: [
+            {
+              id: '44000000-0000-4000-8000-000000000002',
+              authorId: 'reviewer',
+              createdAt: '2026-07-24T08:00:00.000Z',
+              body: 'REVIEW_ONLY_SECRET',
+            },
+          ],
+          resolved: false,
+          readBy: ['reviewer'],
+        },
+      ],
+    };
+
+    expect(createStandaloneHtml(withReviewMetadata, fixture.assets)).not.toContain(
+      'REVIEW_ONLY_SECRET',
+    );
+    expect(createPrintHtml(withReviewMetadata, fixture.assets)).not.toContain('REVIEW_ONLY_SECRET');
+  });
+
   it('is deterministic, single-file, offline and contains working static controls', () => {
     const fixture = createExportFixture();
     const first = createStandaloneHtml(fixture.deck, fixture.assets);

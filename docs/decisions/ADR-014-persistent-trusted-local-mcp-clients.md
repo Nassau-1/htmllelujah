@@ -49,6 +49,13 @@ placeholder binding. Deletes, page geometry changes, layout/reset remapping, und
 import, and export retain client-, document-, action-, revision-, expiry-, and
 single-use approval checks.
 
+`documents_save` is an ordinary persistent-client operation with an intentionally
+narrower authority than desktop Save. It accepts only a visible `documentId` and exact
+`expectedRevision`; it can write only to the target already attached by desktop Open
+or Save As. It accepts no path, never falls back to Save As, never takes over an
+expired writer reservation without human confirmation, and returns no target path.
+The revision fence is checked inside the serialized runtime queue before persistence.
+
 The first implementation checkpoint creates one persistent compatibility profile for
 the packaged launcher so existing local MCP setup remains usable. Explicit UI
 enrollment, read-only profile selection, multiple named clients, and in-app
@@ -59,6 +66,8 @@ already controlling the same Windows account.
 ## Consequences
 
 - Ordinary deck and non-removing design edits no longer require per-edit approval.
+- A trusted client can durably save the exact current revision without a one-time
+  approval after a human has established the target once.
 - Audit and undo records identify the persistent local client instead of a generic
   agent.
 - Descriptor possession alone no longer authorizes local-RPC document operations.
@@ -81,6 +90,8 @@ already controlling the same Windows account.
   the registry.
 - **Approve all trusted-client operations permanently**: would turn import, export,
   destructive replacement, and external targets into ambient capabilities.
+- **Expose Save As or a target path through MCP**: would turn ordinary authoring
+  authority into ambient filesystem-write authority.
 - **Classify every full replacement as destructive forever**: blocks ordinary theme,
   master, and layout maintenance even when simulation proves identity preservation.
 
@@ -92,4 +103,6 @@ active sockets. A stale revision, invalid command, cross-client proposal, mismat
 approval, or destructive unapproved batch fails before mutation. The desktop remains
 usable if trusted-client state cannot be loaded; the MCP bridge reports unavailable
 without logging paths, keys, descriptors, signatures, document content, or approval
-values.
+values. A missing target, stale revision, collaboration mode, changed target,
+external file change, or unavailable writer reservation rejects MCP save without
+opening a dialog or changing the authorized target.

@@ -428,6 +428,7 @@ collaboration_status
 documents_propose_commands
 documents_propose_design_operations
 documents_commit_proposal
+documents_save
 documents_undo_agent_transaction
 assets_request_import
 documents_request_export
@@ -452,8 +453,13 @@ Deck-wide enforcement maps to exactly one strict `theme.enforce-deck` command. T
 command requires an existing theme, preserves resource and element identity without
 deletion or remapping, and remains an ordinary reversible transaction regardless of
 the number of styled objects.
-V1 exposes no MCP save tool. Tool results return IDs, revisions, counts, dimensions,
-warnings, and safe error codes, not paths or complete asset bytes.
+`documents_save` accepts only a visible document ID and exact revision. It persists
+only to the target already attached by desktop Open or Save As, never accepts or
+returns a path, never falls back to Save As, and requires no one-time approval. A
+missing target, stale revision, active collaboration session, changed target, or
+unavailable writer reservation fails closed. Other tool results return IDs,
+revisions, counts, dimensions, warnings, and safe error codes, not paths or complete
+asset bytes.
 
 Frames and encoded results are capped at 2 MiB. The desktop default proposal lifetime
 is one minute and at most 64 proposals may be pending. At most 32 unconsumed desktop

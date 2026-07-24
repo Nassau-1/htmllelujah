@@ -205,6 +205,19 @@ export const transactionTargetSchema = z
   })
   .strict();
 
+/**
+ * Saving through MCP is deliberately narrower than the desktop Save command:
+ * the caller can only persist the exact visible revision to the document's
+ * already-attached target. No path, overwrite choice, or Save As fallback is
+ * accepted on this surface.
+ */
+export const saveDocumentSchema = z
+  .object({
+    documentId: identifierSchema,
+    expectedRevision: revisionSchema,
+  })
+  .strict();
+
 export const importAssetSchema = z
   .object({ documentId: identifierSchema, approvalId: approvalIdSchema })
   .strict();
@@ -225,6 +238,7 @@ export type DesignOperation = z.infer<typeof designOperationSchema>;
 export type ProposeDesignOperationsInput = z.infer<typeof proposeDesignOperationsSchema>;
 export type CommitProposalInput = z.infer<typeof commitProposalSchema>;
 export type TransactionTargetInput = z.infer<typeof transactionTargetSchema>;
+export type SaveDocumentInput = z.infer<typeof saveDocumentSchema>;
 export type ImportAssetInput = z.infer<typeof importAssetSchema>;
 export type ExportDocumentInput = z.infer<typeof exportDocumentSchema>;
 
@@ -246,6 +260,15 @@ export interface CommitProposalResult {
   readonly previousRevision: string;
   readonly revision: string;
   readonly acceptedCommandCount: number;
+}
+
+export interface SaveDocumentResult {
+  readonly documentId: string;
+  readonly revision: string;
+  readonly saved: true;
+  readonly dirty: false;
+  readonly durability: 'clean';
+  readonly target: 'existing-authorized-target';
 }
 
 const ALWAYS_APPROVAL_REQUIRED_COMMANDS = new Set<DocumentCommand['type']>([

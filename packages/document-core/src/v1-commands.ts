@@ -4,6 +4,8 @@ import { DOCUMENT_LIMITS } from './limits.js';
 import type {
   AssetRef,
   BackgroundStyle,
+  CommentAnchor,
+  CommentMessage,
   ConnectorEndpoint,
   ElementStylePatch,
   Layout,
@@ -20,6 +22,8 @@ import type {
 import {
   assetSchema,
   backgroundStyleSchema,
+  commentAnchorSchema,
+  commentMessageSchema,
   identifierSchema,
   layoutSchema,
   masterSchema,
@@ -247,6 +251,33 @@ export interface UpdateConnectorEndpointCommand extends ContainerTarget {
   readonly value: ConnectorEndpoint;
 }
 
+export interface CreateCommentThreadCommand {
+  readonly type: 'comment.create';
+  readonly threadId: string;
+  readonly anchor: CommentAnchor;
+  readonly message: CommentMessage;
+}
+
+export interface ReplyToCommentThreadCommand {
+  readonly type: 'comment.reply';
+  readonly threadId: string;
+  readonly message: CommentMessage;
+}
+
+export interface SetCommentThreadResolvedCommand {
+  readonly type: 'comment.set-resolved';
+  readonly threadId: string;
+  readonly resolved: boolean;
+  readonly actorId: string;
+  readonly timestamp: string;
+}
+
+export interface MarkCommentThreadReadCommand {
+  readonly type: 'comment.mark-read';
+  readonly threadId: string;
+  readonly actorId: string;
+}
+
 export type V1DocumentCommand =
   | RenameDeckCommand
   | SetDeckPageCommand
@@ -280,7 +311,11 @@ export type V1DocumentCommand =
   | PasteTableTsvCommand
   | RegisterAssetCommand
   | RemoveAssetCommand
-  | UpdateConnectorEndpointCommand;
+  | UpdateConnectorEndpointCommand
+  | CreateCommentThreadCommand
+  | ReplyToCommentThreadCommand
+  | SetCommentThreadResolvedCommand
+  | MarkCommentThreadReadCommand;
 
 const id = identifierSchema;
 const name = z.string().trim().min(1).max(DOCUMENT_LIMITS.maxNameLength);
@@ -288,6 +323,7 @@ const index = z.number().int().min(0);
 const positivePt = z.number().finite().positive().max(DOCUMENT_LIMITS.maxFrameDimensionPt);
 const container = { containerId: id.optional() } as const;
 const tableTarget = { ...container, slideId: id, tableId: id } as const;
+const commentActor = z.string().trim().min(1).max(DOCUMENT_LIMITS.maxCommentActorLength);
 
 const pageSchema = z
   .object({
@@ -361,6 +397,16 @@ const stylePatch = z.discriminatedUnion('kind', [
       fill: color.nullable().optional(),
       stroke: stroke.optional(),
       cornerRadiusPt: z.number().finite().min(0).optional(),
+      shadow: shadow.nullable().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('path'),
+      opacity: z.number().finite().min(0).max(1).optional(),
+      fill: color.nullable().optional(),
+      stroke: stroke.optional(),
+      fillRule: z.enum(['nonzero', 'evenodd']).optional(),
       shadow: shadow.nullable().optional(),
     })
     .strict(),
@@ -538,6 +584,37 @@ export const v1DocumentCommandSchema: z.ZodType<V1DocumentCommand> = z.union([
       connectorId: id,
       endpoint: z.enum(['start', 'end']),
       value: connectorEndpoint,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('comment.create'),
+      threadId: id,
+      anchor: commentAnchorSchema,
+      message: commentMessageSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('comment.reply'),
+      threadId: id,
+      message: commentMessageSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('comment.set-resolved'),
+      threadId: id,
+      resolved: z.boolean(),
+      actorId: commentActor,
+      timestamp: z.string().datetime({ offset: true }),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('comment.mark-read'),
+      threadId: id,
+      actorId: commentActor,
     })
     .strict(),
 ]);

@@ -65,6 +65,7 @@ describe('ContentCatalogPicker', () => {
       <ContentCatalogPicker
         catalogs={['twemoji']}
         initialCatalog="twemoji"
+        initialEmojiScope="all"
         initialQuery="1f600"
         onDismiss={vi.fn()}
         onSelect={vi.fn()}
@@ -83,6 +84,109 @@ describe('ContentCatalogPicker', () => {
     expect(twemojiMarkup).toContain('data-catalog-icon="twemoji:1f600"');
     expect(flagMarkup).toContain('data-catalog-icon="circle-flags:fr"');
     expect(`${twemojiMarkup}${flagMarkup}`).not.toMatch(/(?:href|src)="https?:\/\//u);
+  });
+
+  it('offers a region filter while keeping the complete circular-flag catalog available', () => {
+    const allMarkup = renderToStaticMarkup(
+      <ContentCatalogPicker
+        catalogs={['circle-flags']}
+        initialCatalog="circle-flags"
+        onDismiss={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+    const europeMarkup = renderToStaticMarkup(
+      <ContentCatalogPicker
+        catalogs={['circle-flags']}
+        initialCatalog="circle-flags"
+        initialFlagRegion="europe"
+        onDismiss={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(allMarkup).toContain('Flag region');
+    expect(allMarkup).toContain('All regions');
+    expect(allMarkup).toContain('1–72 of 265 results');
+    expect(europeMarkup).toContain('<option value="europe" selected="">Europe</option>');
+    expect(europeMarkup).toContain('of ');
+    expect(europeMarkup).toContain('results');
+  });
+
+  it('defaults emoji browsing to Business and exposes an exhaustive All scope', () => {
+    const businessMarkup = renderToStaticMarkup(
+      <ContentCatalogPicker
+        catalogs={['twemoji']}
+        initialCatalog="twemoji"
+        onDismiss={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+    const allMarkup = renderToStaticMarkup(
+      <ContentCatalogPicker
+        catalogs={['twemoji']}
+        initialCatalog="twemoji"
+        initialEmojiScope="all"
+        onDismiss={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(businessMarkup).toMatch(/aria-pressed="true"[^>]*>Business/u);
+    expect(businessMarkup).toContain('Business category');
+    expect(businessMarkup).not.toContain('aria-label="grinning face"');
+    expect(allMarkup).toMatch(/aria-pressed="true"[^>]*>All/u);
+    expect(allMarkup).toContain('1–72 of 3,720 results');
+    expect(allMarkup).toContain('aria-label="grinning face"');
+  });
+
+  it('renders exact bounded ranges and makes the final emoji and flag pages reachable', () => {
+    const lastEmojiPage = renderToStaticMarkup(
+      <ContentCatalogPicker
+        catalogs={['twemoji']}
+        initialCatalog="twemoji"
+        initialEmojiScope="all"
+        initialOffset={3672}
+        onDismiss={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+    const lastFlagPage = renderToStaticMarkup(
+      <ContentCatalogPicker
+        catalogs={['circle-flags']}
+        initialCatalog="circle-flags"
+        initialOffset={216}
+        onDismiss={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(lastEmojiPage).toContain('3,673–3,720 of 3,720 results');
+    expect(lastEmojiPage.match(/class="content-catalog-item"/gu)).toHaveLength(48);
+    expect(lastEmojiPage).toContain('aria-posinset="3720"');
+    expect(lastEmojiPage).toContain('aria-setsize="3720"');
+    expect(lastFlagPage).toContain('217–265 of 265 results');
+    expect(lastFlagPage.match(/class="content-catalog-item"/gu)).toHaveLength(49);
+    expect(lastFlagPage).toContain('aria-posinset="265"');
+    expect(lastFlagPage).toContain('aria-setsize="265"');
+  });
+
+  it('keeps each rendered page below the 144-card DOM ceiling with accessible pagination', () => {
+    const markup = renderToStaticMarkup(
+      <ContentCatalogPicker
+        catalogs={['twemoji']}
+        initialCatalog="twemoji"
+        initialEmojiScope="all"
+        onDismiss={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(markup.match(/class="content-catalog-item"/gu)).toHaveLength(72);
+    expect(markup).toContain('aria-label="Catalog pagination"');
+    expect(markup).toContain('aria-label="Previous page"');
+    expect(markup).toContain('aria-label="Next page"');
+    expect(markup).toContain('Page 1 of 52');
   });
 });
 

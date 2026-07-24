@@ -273,6 +273,11 @@ they preserve resources, nested elements, table structure, and placeholder bindi
 Destructive commit, undo, import, and export retain a single-use desktop approval
 bound to client, action, document, and revision. MCP edits are paused during a live
 LAN session in V1; reads and redacted collaboration status remain available.
+`documents_save` is the only non-proposal persistence operation: it is fenced by
+trusted-client edit capability, visible document ID, exact revision, offline mode,
+and the already-attached target. It accepts and returns no path, never performs Save
+As, and uses the same target-fingerprint and writer-reservation protections as
+desktop persistence without unattended stale-reservation takeover.
 
 The V1 MCP boundary accepts at most 100 commands per proposal and 2 MiB frames/results.
 Desktop proposals expire after one minute and are capped at 64; desktop approvals

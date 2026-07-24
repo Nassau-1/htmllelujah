@@ -1,6 +1,15 @@
 import { z } from 'zod';
 
-import type { DeckDocument, DeckDocumentV1, Element, Frame, Slide } from './model.js';
+import type {
+  CommentAnchor,
+  CommentMessage,
+  CommentThread,
+  DeckDocument,
+  DeckDocumentV1,
+  Element,
+  Frame,
+  Slide,
+} from './model.js';
 import { DOCUMENT_LIMITS } from './limits.js';
 
 const identifierSchema = z.string().uuid();
@@ -167,6 +176,13 @@ const imageElementSchema = z
       .refine((crop) => crop.top + crop.bottom < 1, {
         message: 'Vertical crop must leave visible content.',
       }),
+    colorKey: z
+      .object({
+        color: colorSchema,
+        tolerance: z.number().finite().min(0).max(255),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -197,6 +213,16 @@ const strokeStyleSchema = z
     color: colorSchema,
     widthPt: nonNegativeFiniteSchema,
     dash: z.enum(['solid', 'dash', 'dot']),
+  })
+  .strict();
+
+const shadowStyleSchema = z
+  .object({
+    color: colorSchema,
+    blurPt: nonNegativeFiniteSchema.max(1_000),
+    offsetXPt: z.number().finite().min(-10_000).max(10_000),
+    offsetYPt: z.number().finite().min(-10_000).max(10_000),
+    opacity: z.number().finite().min(0).max(1),
   })
   .strict();
 
@@ -242,23 +268,103 @@ const shapeElementSchema = z
       'rounded-rectangle',
       'ellipse',
       'triangle',
+      'right-triangle',
       'diamond',
+      'parallelogram',
+      'trapezoid',
+      'pentagon',
+      'hexagon',
+      'octagon',
+      'chevron',
+      'cross',
+      'donut',
+      'left-bracket',
+      'right-bracket',
+      'arc',
       'line',
       'arrow',
     ]),
     fill: colorSchema.nullable(),
     stroke: strokeStyleSchema,
     cornerRadiusPt: nonNegativeFiniteSchema,
-    shadow: z
-      .object({
-        color: colorSchema,
-        blurPt: nonNegativeFiniteSchema.max(1_000),
-        offsetXPt: z.number().finite().min(-10_000).max(10_000),
-        offsetYPt: z.number().finite().min(-10_000).max(10_000),
-        opacity: z.number().finite().min(0).max(1),
-      })
-      .strict()
-      .optional(),
+    shadow: shadowStyleSchema.optional(),
+  })
+  .strict();
+
+const pathCoordinateSchema = z.number().finite().min(0).max(DOCUMENT_LIMITS.maxPathCoordinatePt);
+
+const pathCommandSchema = z.discriminatedUnion('type', [
+  z
+    .object({
+      type: z.literal('move'),
+      xPt: pathCoordinateSchema,
+      yPt: pathCoordinateSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('line'),
+      xPt: pathCoordinateSchema,
+      yPt: pathCoordinateSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('cubic'),
+      control1XPt: pathCoordinateSchema,
+      control1YPt: pathCoordinateSchema,
+      control2XPt: pathCoordinateSchema,
+      control2YPt: pathCoordinateSchema,
+      xPt: pathCoordinateSchema,
+      yPt: pathCoordinateSchema,
+    })
+    .strict(),
+  z.object({ type: z.literal('close') }).strict(),
+]);
+
+const pathElementSchema = z
+  .object({
+    ...baseElementShape,
+    type: z.literal('path'),
+    commands: z
+      .array(pathCommandSchema)
+      .min(2)
+      .max(DOCUMENT_LIMITS.maxPathCommands)
+      .superRefine((commands, context) => {
+        if (commands[0]?.type !== 'move') {
+          context.addIssue({
+            code: 'custom',
+            path: [0],
+            message: 'A path must start with a move command.',
+          });
+        }
+        if (!commands.some((command) => command.type === 'line' || command.type === 'cubic')) {
+          context.addIssue({
+            code: 'custom',
+            message: 'A path needs at least one line or cubic segment.',
+          });
+        }
+        commands.forEach((command, index) => {
+          if (index > 0 && command.type === 'move') {
+            context.addIssue({
+              code: 'custom',
+              path: [index],
+              message: 'A path can contain only its initial move command.',
+            });
+          }
+          if (command.type === 'close' && index !== commands.length - 1) {
+            context.addIssue({
+              code: 'custom',
+              path: [index],
+              message: 'A close command must be the final path command.',
+            });
+          }
+        });
+      }),
+    fill: colorSchema.nullable(),
+    stroke: strokeStyleSchema,
+    fillRule: z.enum(['nonzero', 'evenodd']),
+    shadow: shadowStyleSchema.optional(),
   })
   .strict();
 
@@ -306,7 +412,7 @@ const placeholderElementSchema = z
     ...baseElementShape,
     type: z.literal('placeholder'),
     role: z.enum(['title', 'subtitle', 'body', 'media', 'table', 'footer', 'slide-number']),
-    accepts: z.array(z.enum(['text', 'image', 'table', 'shape', 'icon'])).min(1),
+    accepts: z.array(z.enum(['text', 'image', 'table', 'shape', 'path', 'icon'])).min(1),
     prompt: z.string().max(DOCUMENT_LIMITS.maxTextRunLength),
     defaultTextStyle: textStyleOverridesSchema.optional(),
   })
@@ -318,6 +424,7 @@ export const elementSchema: z.ZodType<Element> = z.lazy(() =>
     imageElementSchema,
     tableElementSchema,
     shapeElementSchema,
+    pathElementSchema,
     connectorElementSchema,
     iconElementSchema,
     placeholderElementSchema,
@@ -455,6 +562,60 @@ const pageSchema = z
   })
   .strict();
 
+const commentActorSchema = z.string().trim().min(1).max(DOCUMENT_LIMITS.maxCommentActorLength);
+
+export const commentAnchorSchema: z.ZodType<CommentAnchor> = z
+  .object({
+    slideId: identifierSchema,
+    elementId: identifierSchema.optional(),
+  })
+  .strict();
+
+export const commentMessageSchema: z.ZodType<CommentMessage> = z
+  .object({
+    id: identifierSchema,
+    authorId: commentActorSchema,
+    authorName: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxCommentActorLength).optional(),
+    createdAt: z.string().datetime({ offset: true }),
+    body: z.string().trim().min(1).max(DOCUMENT_LIMITS.maxCommentBodyLength),
+  })
+  .strict();
+
+const commentThreadSchema: z.ZodType<CommentThread> = z
+  .object({
+    id: identifierSchema,
+    anchor: commentAnchorSchema,
+    messages: z.array(commentMessageSchema).min(1).max(DOCUMENT_LIMITS.maxCommentMessagesPerThread),
+    resolved: z.boolean(),
+    resolvedAt: z.string().datetime({ offset: true }).optional(),
+    resolvedBy: commentActorSchema.optional(),
+    readBy: z
+      .array(commentActorSchema)
+      .max(DOCUMENT_LIMITS.maxCommentReadersPerThread)
+      .refine((actors) => new Set(actors).size === actors.length, {
+        message: 'Comment reader identifiers must be unique.',
+      }),
+  })
+  .strict()
+  .superRefine((thread, context) => {
+    const hasResolutionMetadata =
+      thread.resolvedAt !== undefined || thread.resolvedBy !== undefined;
+    if (thread.resolved !== hasResolutionMetadata) {
+      context.addIssue({
+        code: 'custom',
+        message: thread.resolved
+          ? 'Resolved comments require resolvedAt and resolvedBy.'
+          : 'Open comments cannot retain resolution metadata.',
+      });
+    }
+    if ((thread.resolvedAt === undefined) !== (thread.resolvedBy === undefined)) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Comment resolution metadata must be complete.',
+      });
+    }
+  });
+
 const deckBaseShape = {
   id: identifierSchema,
   name: nonEmptyStringSchema,
@@ -464,6 +625,7 @@ const deckBaseShape = {
   layouts: z.array(layoutSchema).min(1).max(DOCUMENT_LIMITS.maxLayouts),
   slides: z.array(slideSchema).min(1).max(DOCUMENT_LIMITS.maxSlides),
   assets: z.array(assetSchema).max(DOCUMENT_LIMITS.maxAssets),
+  comments: z.array(commentThreadSchema).max(DOCUMENT_LIMITS.maxCommentThreads).optional(),
 } as const;
 
 export const deckDocumentV1Schema: z.ZodType<DeckDocumentV1> = z

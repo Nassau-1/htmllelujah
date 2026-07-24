@@ -40,6 +40,7 @@ export const migrateDeckV1ToV2 = (
       defaultBackground: { type: 'theme' },
       includeHiddenSlidesInExport: false,
     },
+    comments: [],
   };
 };
 

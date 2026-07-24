@@ -125,6 +125,9 @@ describe('SlideSurface', () => {
     expect(html).toContain('data-element-id="nested-shape"');
     expect(html).toContain('data-catalog-icon="circle-flags:fr"');
     expect(html).toContain('data-render-warning="ICON_UNKNOWN"');
+    expect(html).toContain('<filter id="hl-color-key-image-safe"');
+    expect(html).toContain('flood-color="#ffffff"');
+    expect(html).toContain('filter:url(#hl-color-key-image-safe)');
   });
 
   it('resolves multiple connector identities in one shared geometry index', () => {

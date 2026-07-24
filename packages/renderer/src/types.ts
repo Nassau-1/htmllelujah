@@ -148,6 +148,12 @@ export interface ImageElement extends BaseElement {
     readonly bottom: number;
     readonly left: number;
   };
+  readonly colorKey?:
+    | {
+        readonly color: string;
+        readonly tolerance: number;
+      }
+    | undefined;
 }
 
 export interface TableCell {
@@ -185,12 +191,38 @@ export interface TableElement extends BaseElement {
 }
 
 export type ShapeKind =
-  'rectangle' | 'rounded-rectangle' | 'ellipse' | 'triangle' | 'diamond' | 'line' | 'arrow';
+  | 'rectangle'
+  | 'rounded-rectangle'
+  | 'ellipse'
+  | 'triangle'
+  | 'right-triangle'
+  | 'diamond'
+  | 'parallelogram'
+  | 'trapezoid'
+  | 'pentagon'
+  | 'hexagon'
+  | 'octagon'
+  | 'chevron'
+  | 'cross'
+  | 'donut'
+  | 'left-bracket'
+  | 'right-bracket'
+  | 'arc'
+  | 'line'
+  | 'arrow';
 
 export interface StrokeStyle {
   readonly color: string;
   readonly widthPt: number;
   readonly dash: 'solid' | 'dash' | 'dot';
+}
+
+export interface ShadowStyle {
+  readonly color: string;
+  readonly blurPt: number;
+  readonly offsetXPt: number;
+  readonly offsetYPt: number;
+  readonly opacity: number;
 }
 
 export interface ShapeElement extends BaseElement {
@@ -199,15 +231,30 @@ export interface ShapeElement extends BaseElement {
   readonly fill: string | null;
   readonly stroke: StrokeStyle;
   readonly cornerRadiusPt: number;
-  readonly shadow?:
-    | {
-        readonly color: string;
-        readonly blurPt: number;
-        readonly offsetXPt: number;
-        readonly offsetYPt: number;
-        readonly opacity: number;
-      }
-    | undefined;
+  readonly shadow?: ShadowStyle | undefined;
+}
+
+export type PathCommand =
+  | Readonly<{ type: 'move'; xPt: number; yPt: number }>
+  | Readonly<{ type: 'line'; xPt: number; yPt: number }>
+  | Readonly<{
+      type: 'cubic';
+      control1XPt: number;
+      control1YPt: number;
+      control2XPt: number;
+      control2YPt: number;
+      xPt: number;
+      yPt: number;
+    }>
+  | Readonly<{ type: 'close' }>;
+
+export interface PathElement extends BaseElement {
+  readonly type: 'path';
+  readonly commands: readonly PathCommand[];
+  readonly fill: string | null;
+  readonly stroke: StrokeStyle;
+  readonly fillRule: 'nonzero' | 'evenodd';
+  readonly shadow?: ShadowStyle | undefined;
 }
 
 export interface ConnectorElement extends BaseElement {
@@ -246,7 +293,7 @@ export interface IconElement extends BaseElement {
 export interface PlaceholderElement extends BaseElement {
   readonly type: 'placeholder';
   readonly role: 'title' | 'subtitle' | 'body' | 'media' | 'table' | 'footer' | 'slide-number';
-  readonly accepts: readonly ('text' | 'image' | 'table' | 'shape' | 'icon')[];
+  readonly accepts: readonly ('text' | 'image' | 'table' | 'shape' | 'path' | 'icon')[];
   readonly prompt: string;
   readonly defaultTextStyle?: TextStyleOverrides | undefined;
 }
@@ -262,6 +309,7 @@ export type RenderElement =
   | ImageElement
   | TableElement
   | ShapeElement
+  | PathElement
   | ConnectorElement
   | IconElement
   | PlaceholderElement

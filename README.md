@@ -71,6 +71,10 @@ per-edit approval. Sensitive external or destructive operations remain desktop
 controlled and require a separately scoped, short-lived authorization; ordinary
 presentation authoring never asks for a one-time token.
 
+After desktop Open or Save As has established a target, `documents_save` can persist
+the exact current revision without another approval. It accepts no path and never
+performs Save As, so an agent cannot select a new filesystem destination.
+
 Before changing design infrastructure, an agent can call
 `documents_get_design_context` to inspect the authoritative theme → master → layout →
 slide chain, semantic styles, placeholders, effective locks, provenance, constraints,

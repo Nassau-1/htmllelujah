@@ -74,6 +74,7 @@ const cloneElement = (
       };
     case 'image':
     case 'shape':
+    case 'path':
     case 'icon':
     case 'placeholder':
       return { ...element, id };

@@ -116,6 +116,7 @@ const safeImage: ImageElement = {
   altText: 'A quote: " onerror="globalThis.compromised=true',
   fit: 'cover',
   crop: { top: 0.1, right: 0.2, bottom: 0.1, left: 0.2 },
+  colorKey: { color: '#ffffff', tolerance: 24 },
 };
 
 const blockedImage: ImageElement = {

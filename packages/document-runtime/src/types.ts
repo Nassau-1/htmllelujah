@@ -66,6 +66,11 @@ export interface CloseSessionOptions {
 }
 
 export interface SaveCommitOptions {
+  /**
+   * Optional optimistic concurrency boundary for non-interactive saves. The
+   * check runs inside the session queue, immediately before any persistence.
+   */
+  readonly expectedRevision?: string | undefined;
   /** Main-process reservation target. Save rejects if the queued session now points elsewhere. */
   readonly expectedTargetPath?: string | undefined;
   /** Main-process authority check forwarded to the atomic persistence commit boundary. */

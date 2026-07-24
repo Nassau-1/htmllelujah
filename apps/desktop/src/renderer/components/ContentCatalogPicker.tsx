@@ -1,12 +1,17 @@
 import {
+  BUSINESS_EMOJI_CATEGORIES,
+  FLAG_REGIONS,
   LocalIcon,
-  searchContentCatalog,
+  queryContentCatalog,
+  type BusinessEmojiCategory,
   type CatalogId,
   type CatalogLocale,
   type ContentCatalogEntry,
+  type EmojiCatalogScope,
+  type FlagRegion,
   type ShapeKind,
 } from '@htmllelujah/renderer';
-import { Search, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Search, X } from 'lucide-react';
 import {
   useEffect,
   useId,
@@ -17,7 +22,7 @@ import {
   type ReactElement,
 } from 'react';
 
-const RESULT_LIMIT = 72;
+const RESULT_PAGE_LIMIT = 72;
 const RESULT_COLUMNS = 6;
 
 const CATALOG_TABS: readonly {
@@ -30,18 +35,70 @@ const CATALOG_TABS: readonly {
   { id: 'circle-flags', label: { en: 'Circle flags', fr: 'Drapeaux ronds' } },
 ];
 
+const BUSINESS_CATEGORY_LABELS: Readonly<
+  Record<BusinessEmojiCategory, Readonly<Record<CatalogLocale, string>>>
+> = {
+  'people-teams': { en: 'People & teams', fr: 'Personnes et équipes' },
+  communication: { en: 'Communication', fr: 'Communication' },
+  'status-alerts': { en: 'Status & alerts', fr: 'Statuts et alertes' },
+  'documents-tools': { en: 'Documents & tools', fr: 'Documents et outils' },
+  'data-technology': { en: 'Data & technology', fr: 'Données et technologie' },
+  finance: { en: 'Finance', fr: 'Finance' },
+  'travel-locations': { en: 'Travel & locations', fr: 'Voyages et lieux' },
+  'common-symbols': { en: 'Common symbols', fr: 'Symboles courants' },
+};
+
+const FLAG_REGION_LABELS: Readonly<Record<FlagRegion, Readonly<Record<CatalogLocale, string>>>> = {
+  africa: { en: 'Africa', fr: 'Afrique' },
+  americas: { en: 'Americas', fr: 'Amériques' },
+  asia: { en: 'Asia', fr: 'Asie' },
+  europe: { en: 'Europe', fr: 'Europe' },
+  oceania: { en: 'Oceania', fr: 'Océanie' },
+  international: { en: 'International & other', fr: 'International et autres' },
+};
+
 const COPY = {
   en: {
+    allBusinessCategories: 'All business categories',
+    allEmoji: 'All',
+    businessEmoji: 'Business',
     close: 'Close content picker',
-    count: (count: number): string => `${count} result${count === 1 ? '' : 's'}`,
+    count: (start: number, end: number, total: number): string =>
+      total === 0
+        ? '0 results'
+        : `${start.toLocaleString('en')}–${end.toLocaleString('en')} of ${total.toLocaleString('en')} results`,
+    emojiCategory: 'Business category',
+    emojiScope: 'Emoji scope',
     empty: 'No content matches this search.',
+    flagRegion: 'Flag region',
+    allFlagRegions: 'All regions',
+    next: 'Next page',
+    page: (current: number, total: number): string => `Page ${current} of ${total}`,
+    pagination: 'Catalog pagination',
+    previous: 'Previous page',
+    results: 'Catalog results',
     search: 'Search shapes, icons, emoji, and flags',
     title: 'Insert visual',
   },
   fr: {
+    allBusinessCategories: 'Toutes les catégories professionnelles',
+    allEmoji: 'Tout',
+    businessEmoji: 'Professionnel',
     close: 'Fermer le sélecteur de contenu',
-    count: (count: number): string => `${count} résultat${count === 1 ? '' : 's'}`,
+    count: (start: number, end: number, total: number): string =>
+      total === 0
+        ? '0 résultat'
+        : `${start.toLocaleString('fr')}–${end.toLocaleString('fr')} sur ${total.toLocaleString('fr')} résultats`,
+    emojiCategory: 'Catégorie professionnelle',
+    emojiScope: 'Périmètre des emoji',
     empty: 'Aucun contenu ne correspond à cette recherche.',
+    flagRegion: 'Région des drapeaux',
+    allFlagRegions: 'Toutes les régions',
+    next: 'Page suivante',
+    page: (current: number, total: number): string => `Page ${current} sur ${total}`,
+    pagination: 'Pagination du catalogue',
+    previous: 'Page précédente',
+    results: 'Résultats du catalogue',
     search: 'Rechercher des formes, icônes, emoji et drapeaux',
     title: 'Insérer un visuel',
   },
@@ -49,7 +106,11 @@ const COPY = {
 
 export interface ContentCatalogPickerProps {
   readonly catalogs?: readonly CatalogId[];
+  readonly initialBusinessCategory?: BusinessEmojiCategory;
   readonly initialCatalog?: CatalogId;
+  readonly initialEmojiScope?: EmojiCatalogScope;
+  readonly initialFlagRegion?: FlagRegion;
+  readonly initialOffset?: number;
   readonly initialQuery?: string;
   readonly locale?: CatalogLocale;
   readonly onDismiss: () => void;
@@ -119,8 +180,50 @@ const ShapeCatalogPreview = ({ shape }: { readonly shape: ShapeKind }): ReactEle
     case 'triangle':
       content = <path {...commonProps} d="M24 5 43 30H5Z" />;
       break;
+    case 'right-triangle':
+      content = <path {...commonProps} d="M7 6 41 30H7Z" />;
+      break;
     case 'diamond':
       content = <path {...commonProps} d="m24 4 19 14-19 14L5 18Z" />;
+      break;
+    case 'parallelogram':
+      content = <path {...commonProps} d="M14 6h29l-9 24H5Z" />;
+      break;
+    case 'trapezoid':
+      content = <path {...commonProps} d="M14 6h20l9 24H5Z" />;
+      break;
+    case 'pentagon':
+      content = <path {...commonProps} d="m24 4 19 13-7 15H12L5 17Z" />;
+      break;
+    case 'hexagon':
+      content = <path {...commonProps} d="M14 5h20l10 13-10 13H14L4 18Z" />;
+      break;
+    case 'octagon':
+      content = <path {...commonProps} d="m14 4 20 0 10 9v10l-10 9H14L4 23V13Z" />;
+      break;
+    case 'chevron':
+      content = <path {...commonProps} d="M5 5h24l14 13-14 13H5l14-13Z" />;
+      break;
+    case 'cross':
+      content = <path {...commonProps} d="M18 4h12v8h9v12h-9v8H18v-8H9V12h9Z" />;
+      break;
+    case 'donut':
+      content = (
+        <path
+          {...commonProps}
+          d="M24 4a14 14 0 1 1 0 28 14 14 0 0 1 0-28Zm0 8a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z"
+          fillRule="evenodd"
+        />
+      );
+      break;
+    case 'left-bracket':
+      content = <path {...strokeProps} d="M30 5H16v26h14" fill="none" />;
+      break;
+    case 'right-bracket':
+      content = <path {...strokeProps} d="M18 5h14v26H18" fill="none" />;
+      break;
+    case 'arc':
+      content = <path {...strokeProps} d="M7 28A18 18 0 0 1 41 8" fill="none" />;
       break;
     case 'line':
       content = <path {...strokeProps} d="M7 28 41 8" />;
@@ -156,7 +259,11 @@ const CatalogEntryPreview = ({ entry }: { readonly entry: ContentCatalogEntry })
 
 export function ContentCatalogPicker({
   catalogs,
+  initialBusinessCategory,
   initialCatalog = 'shapes',
+  initialEmojiScope = 'business',
+  initialFlagRegion,
+  initialOffset = 0,
   initialQuery = '',
   locale = 'en',
   onDismiss,
@@ -171,6 +278,7 @@ export function ContentCatalogPicker({
   const searchRef = useRef<HTMLInputElement>(null);
   const resultRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const pendingResultFocusRef = useRef<number | null>(null);
   const availableTabs = useMemo(() => {
     if (catalogs === undefined || catalogs.length === 0) return CATALOG_TABS;
     const allowedCatalogs = new Set(catalogs);
@@ -183,17 +291,34 @@ export function ContentCatalogPicker({
       : (availableTabs[0]?.id ?? 'shapes'),
   );
   const [query, setQuery] = useState(initialQuery);
+  const [emojiScope, setEmojiScope] = useState<EmojiCatalogScope>(initialEmojiScope);
+  const [businessCategory, setBusinessCategory] = useState<BusinessEmojiCategory | undefined>(
+    initialBusinessCategory,
+  );
+  const [flagRegion, setFlagRegion] = useState<FlagRegion | undefined>(initialFlagRegion);
+  const [offset, setOffset] = useState(() =>
+    Number.isFinite(initialOffset) ? Math.max(0, Math.trunc(initialOffset)) : 0,
+  );
   const [activeResultIndex, setActiveResultIndex] = useState(0);
 
-  const entries = useMemo(
+  const page = useMemo(
     () =>
-      searchContentCatalog(query, {
+      queryContentCatalog(query, {
+        businessCategory: emojiScope === 'business' ? businessCategory : undefined,
         catalogs: [activeCatalog],
-        limit: RESULT_LIMIT,
+        flagRegion: activeCatalog === 'circle-flags' ? flagRegion : undefined,
+        limit: RESULT_PAGE_LIMIT,
         locale,
+        offset,
+        scope: activeCatalog === 'twemoji' ? emojiScope : 'all',
       }),
-    [activeCatalog, locale, query],
+    [activeCatalog, businessCategory, emojiScope, flagRegion, locale, offset, query],
   );
+  const entries = page.items;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const currentPage = page.total === 0 ? 1 : Math.floor(page.offset / page.limit) + 1;
+  const rangeStart = page.total === 0 ? 0 : page.offset + 1;
+  const rangeEnd = page.offset + entries.length;
 
   useEffect(() => {
     searchRef.current?.focus();
@@ -201,12 +326,24 @@ export function ContentCatalogPicker({
 
   useEffect(() => {
     setActiveResultIndex(0);
-    resultRefs.current = [];
-  }, [activeCatalog, query]);
+  }, [activeCatalog, businessCategory, emojiScope, page.offset, query]);
+
+  useEffect(() => {
+    const requestedIndex = pendingResultFocusRef.current;
+    if (requestedIndex === null || entries.length === 0) return;
+    pendingResultFocusRef.current = null;
+    const boundedIndex = Math.min(requestedIndex, entries.length - 1);
+    const frame = window.requestAnimationFrame(() => {
+      setActiveResultIndex(boundedIndex);
+      resultRefs.current[boundedIndex]?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [entries.length, page.offset]);
 
   useEffect(() => {
     if (availableTabs.some((tab) => tab.id === activeCatalog)) return;
     setActiveCatalog(availableTabs[0]?.id ?? 'shapes');
+    setOffset(0);
   }, [activeCatalog, availableTabs]);
 
   useEffect(() => {
@@ -222,7 +359,15 @@ export function ContentCatalogPicker({
 
   const selectCatalog = (catalogId: CatalogId, tabIndex: number): void => {
     setActiveCatalog(catalogId);
+    setOffset(0);
     tabRefs.current[tabIndex]?.focus();
+  };
+
+  const moveToOffset = (nextOffset: number, focusIndex = 0): void => {
+    pendingResultFocusRef.current = focusIndex;
+    resultRefs.current = [];
+    setActiveResultIndex(focusIndex);
+    setOffset(Math.max(0, nextOffset));
   };
 
   const handleTabKeyDown = (
@@ -249,6 +394,16 @@ export function ContentCatalogPicker({
     event: ReactKeyboardEvent<HTMLButtonElement>,
     currentIndex: number,
   ): void => {
+    if (event.key === 'PageDown' && page.hasMore) {
+      event.preventDefault();
+      moveToOffset(page.offset + page.limit);
+      return;
+    }
+    if (event.key === 'PageUp' && page.offset > 0) {
+      event.preventDefault();
+      moveToOffset(Math.max(0, page.offset - page.limit));
+      return;
+    }
     if (!isCatalogResultNavigationKey(event.key)) return;
     event.preventDefault();
     const nextIndex = getNextCatalogResultIndex(currentIndex, event.key, entries.length);
@@ -261,7 +416,7 @@ export function ContentCatalogPicker({
     if (event.key !== 'Tab') return;
     const focusable = Array.from(
       dialogRef.current?.querySelectorAll<HTMLElement>(
-        'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
       ) ?? [],
     ).filter((element) => !element.hasAttribute('hidden'));
     if (focusable.length === 0) return;
@@ -318,7 +473,10 @@ export function ContentCatalogPicker({
             placeholder={copy.search}
             autoComplete="off"
             aria-controls={resultsId}
-            onChange={(event) => setQuery(event.currentTarget.value)}
+            onChange={(event) => {
+              setQuery(event.currentTarget.value);
+              setOffset(0);
+            }}
           />
         </label>
 
@@ -335,7 +493,7 @@ export function ContentCatalogPicker({
               aria-controls={resultsId}
               aria-selected={activeCatalog === tab.id}
               tabIndex={activeCatalog === tab.id ? 0 : -1}
-              onClick={() => setActiveCatalog(tab.id)}
+              onClick={() => selectCatalog(tab.id, tabIndex)}
               onKeyDown={(event) => handleTabKeyDown(event, tabIndex)}
             >
               {tab.label[locale]}
@@ -343,8 +501,72 @@ export function ContentCatalogPicker({
           ))}
         </div>
 
+        <div className="content-catalog-controls">
+          {activeCatalog === 'twemoji' ? (
+            <>
+              <div className="content-catalog-scope" role="group" aria-label={copy.emojiScope}>
+                {(['business', 'all'] as const).map((scope) => (
+                  <button
+                    key={scope}
+                    type="button"
+                    aria-pressed={emojiScope === scope}
+                    onClick={() => {
+                      setEmojiScope(scope);
+                      setOffset(0);
+                    }}
+                  >
+                    {scope === 'business' ? copy.businessEmoji : copy.allEmoji}
+                  </button>
+                ))}
+              </div>
+              {emojiScope === 'business' ? (
+                <label className="content-catalog-category">
+                  <span>{copy.emojiCategory}</span>
+                  <select
+                    value={businessCategory ?? ''}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value;
+                      setBusinessCategory(
+                        value === '' ? undefined : (value as BusinessEmojiCategory),
+                      );
+                      setOffset(0);
+                    }}
+                  >
+                    <option value="">{copy.allBusinessCategories}</option>
+                    {BUSINESS_EMOJI_CATEGORIES.map((category) => (
+                      <option key={category} value={category}>
+                        {BUSINESS_CATEGORY_LABELS[category][locale]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+            </>
+          ) : null}
+          {activeCatalog === 'circle-flags' ? (
+            <label className="content-catalog-category">
+              <span>{copy.flagRegion}</span>
+              <select
+                value={flagRegion ?? ''}
+                onChange={(event) => {
+                  const value = event.currentTarget.value;
+                  setFlagRegion(value === '' ? undefined : (value as FlagRegion));
+                  setOffset(0);
+                }}
+              >
+                <option value="">{copy.allFlagRegions}</option>
+                {FLAG_REGIONS.map((region) => (
+                  <option key={region} value={region}>
+                    {FLAG_REGION_LABELS[region][locale]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+        </div>
+
         <div className="content-catalog-result-summary" role="status" aria-live="polite">
-          {copy.count(entries.length)}
+          {copy.count(rangeStart, rangeEnd, page.total)}
         </div>
 
         <div
@@ -352,6 +574,7 @@ export function ContentCatalogPicker({
           className="content-catalog-results"
           role="tabpanel"
           aria-labelledby={`${resultsId}-${activeCatalog}-tab`}
+          aria-label={copy.results}
           tabIndex={entries.length === 0 ? 0 : -1}
         >
           {entries.length === 0 ? (
@@ -361,7 +584,11 @@ export function ContentCatalogPicker({
               {entries.map((entry, index) => {
                 const label = catalogEntryLabel(entry, locale);
                 return (
-                  <li key={entry.id}>
+                  <li
+                    key={entry.id}
+                    aria-posinset={page.offset + index + 1}
+                    aria-setsize={page.total}
+                  >
                     <button
                       ref={(element) => {
                         resultRefs.current[index] = element;
@@ -386,6 +613,30 @@ export function ContentCatalogPicker({
             </ul>
           )}
         </div>
+
+        <nav className="content-catalog-pagination" aria-label={copy.pagination}>
+          <button
+            type="button"
+            disabled={page.offset === 0}
+            aria-label={copy.previous}
+            title={copy.previous}
+            onClick={() => moveToOffset(Math.max(0, page.offset - page.limit))}
+          >
+            <ChevronLeft aria-hidden="true" size={16} />
+            <span>{copy.previous}</span>
+          </button>
+          <span className="content-catalog-page-position">{copy.page(currentPage, pageCount)}</span>
+          <button
+            type="button"
+            disabled={!page.hasMore}
+            aria-label={copy.next}
+            title={copy.next}
+            onClick={() => moveToOffset(page.offset + page.limit)}
+          >
+            <span>{copy.next}</span>
+            <ChevronRight aria-hidden="true" size={16} />
+          </button>
+        </nav>
       </div>
     </div>
   );

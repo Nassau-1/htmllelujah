@@ -388,6 +388,12 @@ application; no token is required for ordinary authoring. Approval IDs, private 
 credentials, signatures, and the endpoint descriptor are secrets: do not paste them
 into logs, configuration examples, or issue reports.
 
+Use `documents_save` only after `documents_list` reports `hasSaveTarget: true`. Pass
+the exact latest revision. The operation requires no one-time approval but can write
+only to that existing desktop-authorized target; it accepts no path and never falls
+back to Save As. A missing target, collaboration session, stale revision, external
+file change, or unavailable writer reservation must be resolved in the desktop.
+
 Use `documents_get_design_context` before design edits. Its default page describes
 the selected slide projection and identifies the authoritative theme, master, layout,
 and slide source for every returned element. Use `elementScope: all-authoritative`

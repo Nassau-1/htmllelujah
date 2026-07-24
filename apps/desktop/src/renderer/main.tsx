@@ -6,6 +6,7 @@ import { App } from './App';
 import '../styles/tokens.css';
 import '../styles/global.css';
 import '../styles/editor.css';
+import '../styles/review-panel.css';
 
 const root = document.querySelector<HTMLDivElement>('#root');
 

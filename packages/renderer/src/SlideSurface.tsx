@@ -7,6 +7,7 @@ import type {
   ConnectorElement,
   GroupElement,
   ImageElement,
+  PathElement,
   RenderElement,
   RenderMode,
   RenderTheme,
@@ -437,22 +438,87 @@ const ImageContent = ({
   };
   const horizontalCrop = normalizeCropAxis(element.crop.left, element.crop.right);
   const verticalCrop = normalizeCropAxis(element.crop.top, element.crop.bottom);
+  const colorKeyFilterId =
+    element.colorKey === undefined ? undefined : `hl-color-key-${safeDomId(element.id)}`;
+  const tolerance =
+    element.colorKey === undefined
+      ? 0
+      : Math.min(255, Math.max(0, finiteOr(element.colorKey.tolerance, 0))) / 255;
+  const maskSlope = 255 / 4;
+  const maskIntercept = -tolerance * maskSlope;
   return (
-    <img
-      src={source}
-      alt={element.altText}
-      draggable={false}
-      decoding="async"
-      style={{
-        position: 'absolute',
-        left: `${formatNumber((-horizontalCrop.start / horizontalCrop.remaining) * 100)}%`,
-        top: `${formatNumber((-verticalCrop.start / verticalCrop.remaining) * 100)}%`,
-        width: `${formatNumber(100 / horizontalCrop.remaining)}%`,
-        height: `${formatNumber(100 / verticalCrop.remaining)}%`,
-        objectFit: element.fit,
-        objectPosition: 'center center',
-      }}
-    />
+    <>
+      {element.colorKey === undefined || colorKeyFilterId === undefined ? null : (
+        <svg
+          width="0"
+          height="0"
+          aria-hidden="true"
+          focusable="false"
+          style={{ position: 'absolute' }}
+        >
+          <defs>
+            <filter id={colorKeyFilterId} colorInterpolationFilters="sRGB">
+              <feFlood
+                floodColor={safeColor(element.colorKey.color, '#ffffff')}
+                result="key-color"
+              />
+              <feComposite
+                in="SourceGraphic"
+                in2="key-color"
+                operator="arithmetic"
+                k2="1"
+                k3="-1"
+                result="positive-difference"
+              />
+              <feComposite
+                in="key-color"
+                in2="SourceGraphic"
+                operator="arithmetic"
+                k2="1"
+                k3="-1"
+                result="negative-difference"
+              />
+              <feBlend
+                in="positive-difference"
+                in2="negative-difference"
+                mode="lighten"
+                result="absolute-difference"
+              />
+              <feColorMatrix
+                in="absolute-difference"
+                type="matrix"
+                values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0.333333 0.333333 0.333333 0 0"
+                result="distance-mask"
+              />
+              <feComponentTransfer in="distance-mask" result="threshold-mask">
+                <feFuncA
+                  type="linear"
+                  slope={formatNumber(maskSlope)}
+                  intercept={formatNumber(maskIntercept)}
+                />
+              </feComponentTransfer>
+              <feComposite in="SourceGraphic" in2="threshold-mask" operator="in" />
+            </filter>
+          </defs>
+        </svg>
+      )}
+      <img
+        src={source}
+        alt={element.altText}
+        draggable={false}
+        decoding="async"
+        style={{
+          position: 'absolute',
+          left: `${formatNumber((-horizontalCrop.start / horizontalCrop.remaining) * 100)}%`,
+          top: `${formatNumber((-verticalCrop.start / verticalCrop.remaining) * 100)}%`,
+          width: `${formatNumber(100 / horizontalCrop.remaining)}%`,
+          height: `${formatNumber(100 / verticalCrop.remaining)}%`,
+          objectFit: element.fit,
+          objectPosition: 'center center',
+          filter: colorKeyFilterId === undefined ? undefined : `url(#${colorKeyFilterId})`,
+        }}
+      />
+    </>
   );
 };
 
@@ -550,10 +616,30 @@ const marker = (id: string, color: string, reverse: boolean): ReactElement => (
   </marker>
 );
 
-const shadowFilter = (element: ShapeElement): string | undefined => {
-  if (element.shadow === undefined || safeOpacity(element.shadow.opacity) === 0) return undefined;
-  return `drop-shadow(${formatPoint(element.shadow.offsetXPt)} ${formatPoint(element.shadow.offsetYPt)} ${formatPoint(Math.max(0, element.shadow.blurPt))} ${safeColor(element.shadow.color, '#000000')})`;
+const colorWithOpacity = (value: string, opacity: number): string => {
+  const color = safeColor(value, '#000000');
+  const alpha = safeOpacity(opacity);
+  if (/^#[0-9a-f]{6}$/i.test(color)) {
+    return `${color}${Math.round(alpha * 255)
+      .toString(16)
+      .padStart(2, '0')}`;
+  }
+  if (/^#[0-9a-f]{8}$/i.test(color)) {
+    const existing = Number.parseInt(color.slice(7, 9), 16) / 255;
+    return `${color.slice(0, 7)}${Math.round(existing * alpha * 255)
+      .toString(16)
+      .padStart(2, '0')}`;
+  }
+  return color;
 };
+
+const shadowFilter = (element: ShapeElement | PathElement): string | undefined => {
+  if (element.shadow === undefined || safeOpacity(element.shadow.opacity) === 0) return undefined;
+  return `drop-shadow(${formatPoint(element.shadow.offsetXPt)} ${formatPoint(element.shadow.offsetYPt)} ${formatPoint(Math.max(0, element.shadow.blurPt))} ${colorWithOpacity(element.shadow.color, element.shadow.opacity)})`;
+};
+
+const polygonPoints = (points: readonly (readonly [number, number])[]): string =>
+  points.map(([xPt, yPt]) => `${formatNumber(xPt)},${formatNumber(yPt)}`).join(' ');
 
 const ShapeContent = ({ element }: { element: ShapeElement }): ReactElement => {
   const width = Math.max(0.001, finiteOr(element.frame.widthPt, 0.001));
@@ -570,40 +656,230 @@ const ShapeContent = ({ element }: { element: ShapeElement }): ReactElement => {
   };
   const markerId = `hl-arrow-${safeDomId(element.id)}`;
   let shape: ReactElement;
-  if (element.shape === 'ellipse') {
-    shape = <ellipse cx={width / 2} cy={height / 2} rx={width / 2} ry={height / 2} {...common} />;
-  } else if (element.shape === 'triangle') {
-    shape = <polygon points={`${width / 2},0 ${width},${height} 0,${height}`} {...common} />;
-  } else if (element.shape === 'diamond') {
-    shape = (
-      <polygon
-        points={`${width / 2},0 ${width},${height / 2} ${width / 2},${height} 0,${height / 2}`}
-        {...common}
-      />
-    );
-  } else if (element.shape === 'line' || element.shape === 'arrow') {
-    shape = (
-      <line
-        x1="0"
-        y1={height / 2}
-        x2={width}
-        y2={height / 2}
-        {...common}
-        fill="none"
-        markerEnd={element.shape === 'arrow' ? `url(#${markerId})` : undefined}
-      />
-    );
-  } else {
-    shape = (
-      <rect
-        x="0"
-        y="0"
-        width={width}
-        height={height}
-        rx={element.shape === 'rounded-rectangle' ? Math.max(0, element.cornerRadiusPt) : 0}
-        {...common}
-      />
-    );
+  switch (element.shape) {
+    case 'rectangle':
+    case 'rounded-rectangle':
+      shape = (
+        <rect
+          x="0"
+          y="0"
+          width={width}
+          height={height}
+          rx={element.shape === 'rounded-rectangle' ? Math.max(0, element.cornerRadiusPt) : 0}
+          {...common}
+        />
+      );
+      break;
+    case 'ellipse':
+      shape = <ellipse cx={width / 2} cy={height / 2} rx={width / 2} ry={height / 2} {...common} />;
+      break;
+    case 'triangle':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [width / 2, 0],
+            [width, height],
+            [0, height],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'right-triangle':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [0, 0],
+            [width, height],
+            [0, height],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'diamond':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [width / 2, 0],
+            [width, height / 2],
+            [width / 2, height],
+            [0, height / 2],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'parallelogram':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [width * 0.2, 0],
+            [width, 0],
+            [width * 0.8, height],
+            [0, height],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'trapezoid':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [width * 0.2, 0],
+            [width * 0.8, 0],
+            [width, height],
+            [0, height],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'pentagon':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [width * 0.5, 0],
+            [width, height * 0.38],
+            [width * 0.82, height],
+            [width * 0.18, height],
+            [0, height * 0.38],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'hexagon':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [width * 0.25, 0],
+            [width * 0.75, 0],
+            [width, height * 0.5],
+            [width * 0.75, height],
+            [width * 0.25, height],
+            [0, height * 0.5],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'octagon':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [width * 0.292893, 0],
+            [width * 0.707107, 0],
+            [width, height * 0.292893],
+            [width, height * 0.707107],
+            [width * 0.707107, height],
+            [width * 0.292893, height],
+            [0, height * 0.707107],
+            [0, height * 0.292893],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'chevron':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [0, 0],
+            [width * 0.65, 0],
+            [width, height * 0.5],
+            [width * 0.65, height],
+            [0, height],
+            [width * 0.35, height * 0.5],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'cross':
+      shape = (
+        <polygon
+          points={polygonPoints([
+            [width / 3, 0],
+            [(width * 2) / 3, 0],
+            [(width * 2) / 3, height / 3],
+            [width, height / 3],
+            [width, (height * 2) / 3],
+            [(width * 2) / 3, (height * 2) / 3],
+            [(width * 2) / 3, height],
+            [width / 3, height],
+            [width / 3, (height * 2) / 3],
+            [0, (height * 2) / 3],
+            [0, height / 3],
+            [width / 3, height / 3],
+          ])}
+          {...common}
+        />
+      );
+      break;
+    case 'donut': {
+      const outer = [
+        `M ${formatNumber(width)} ${formatNumber(height / 2)}`,
+        `A ${formatNumber(width / 2)} ${formatNumber(height / 2)} 0 1 1 0 ${formatNumber(height / 2)}`,
+        `A ${formatNumber(width / 2)} ${formatNumber(height / 2)} 0 1 1 ${formatNumber(width)} ${formatNumber(height / 2)}`,
+        'Z',
+      ];
+      const inner = [
+        `M ${formatNumber(width * 0.75)} ${formatNumber(height / 2)}`,
+        `A ${formatNumber(width / 4)} ${formatNumber(height / 4)} 0 1 0 ${formatNumber(width * 0.25)} ${formatNumber(height / 2)}`,
+        `A ${formatNumber(width / 4)} ${formatNumber(height / 4)} 0 1 0 ${formatNumber(width * 0.75)} ${formatNumber(height / 2)}`,
+        'Z',
+      ];
+      shape = <path d={[...outer, ...inner].join(' ')} fillRule="evenodd" {...common} />;
+      break;
+    }
+    case 'left-bracket':
+      shape = (
+        <path
+          d={`M ${formatNumber(width)} 0 L 0 0 L 0 ${formatNumber(height)} L ${formatNumber(width)} ${formatNumber(height)}`}
+          {...common}
+          fill="none"
+          strokeLinecap="square"
+          strokeLinejoin="miter"
+        />
+      );
+      break;
+    case 'right-bracket':
+      shape = (
+        <path
+          d={`M 0 0 L ${formatNumber(width)} 0 L ${formatNumber(width)} ${formatNumber(height)} L 0 ${formatNumber(height)}`}
+          {...common}
+          fill="none"
+          strokeLinecap="square"
+          strokeLinejoin="miter"
+        />
+      );
+      break;
+    case 'arc':
+      shape = (
+        <path
+          d={`M 0 ${formatNumber(height)} A ${formatNumber(width / 2)} ${formatNumber(height)} 0 0 1 ${formatNumber(width)} ${formatNumber(height)}`}
+          {...common}
+          fill="none"
+          strokeLinecap="round"
+        />
+      );
+      break;
+    case 'line':
+    case 'arrow':
+      shape = (
+        <line
+          x1="0"
+          y1={height / 2}
+          x2={width}
+          y2={height / 2}
+          {...common}
+          fill="none"
+          markerEnd={element.shape === 'arrow' ? `url(#${markerId})` : undefined}
+        />
+      );
+      break;
   }
   return (
     <svg
@@ -617,6 +893,54 @@ const ShapeContent = ({ element }: { element: ShapeElement }): ReactElement => {
     >
       {element.shape === 'arrow' ? <defs>{marker(markerId, stroke, false)}</defs> : null}
       {shape}
+    </svg>
+  );
+};
+
+const MAX_RENDERED_PATH_COMMANDS = 4_096;
+
+const PathContent = ({ element }: { element: PathElement }): ReactElement => {
+  const width = Math.max(0.001, finiteOr(element.frame.widthPt, 0.001));
+  const height = Math.max(0.001, finiteOr(element.frame.heightPt, 0.001));
+  const coordinate = (value: number, maximum: number): string =>
+    formatNumber(Math.min(maximum, Math.max(0, finiteOr(value, 0))));
+  const commands = element.commands.slice(0, MAX_RENDERED_PATH_COMMANDS);
+  const data = commands
+    .map((command): string => {
+      switch (command.type) {
+        case 'move':
+          return `M ${coordinate(command.xPt, width)} ${coordinate(command.yPt, height)}`;
+        case 'line':
+          return `L ${coordinate(command.xPt, width)} ${coordinate(command.yPt, height)}`;
+        case 'cubic':
+          return `C ${coordinate(command.control1XPt, width)} ${coordinate(command.control1YPt, height)} ${coordinate(command.control2XPt, width)} ${coordinate(command.control2YPt, height)} ${coordinate(command.xPt, width)} ${coordinate(command.yPt, height)}`;
+        case 'close':
+          return 'Z';
+      }
+    })
+    .join(' ');
+  const strokeWidth = Math.max(0, finiteOr(element.stroke.widthPt, 0));
+  return (
+    <svg
+      className="hl-vector"
+      viewBox={`0 0 ${formatNumber(width)} ${formatNumber(height)}`}
+      width="100%"
+      height="100%"
+      aria-label={element.name}
+      role="img"
+      style={{ filter: shadowFilter(element) }}
+    >
+      <path
+        d={data}
+        fill={element.fill === null ? 'none' : safeColor(element.fill)}
+        fillRule={element.fillRule}
+        stroke={safeColor(element.stroke.color, '#000000')}
+        strokeWidth={strokeWidth}
+        strokeDasharray={strokeDashArray(element.stroke.dash, strokeWidth)}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        vectorEffect="non-scaling-stroke"
+      />
     </svg>
   );
 };
@@ -760,7 +1084,7 @@ const ElementRenderer = ({
     );
   }
   const classNames = ['hl-element', `hl-${element.type}`];
-  if (element.type === 'shape') classNames.push('hl-vector-element');
+  if (element.type === 'shape' || element.type === 'path') classNames.push('hl-vector-element');
   const style = elementFrameStyle(element.frame, element.opacity, zIndex);
   let content: ReactNode;
   if (element.type === 'text') content = <TextContent element={element} theme={theme} />;
@@ -769,6 +1093,7 @@ const ElementRenderer = ({
   } else if (element.type === 'table') {
     content = <TableContent element={element} theme={theme} />;
   } else if (element.type === 'shape') content = <ShapeContent element={element} />;
+  else if (element.type === 'path') content = <PathContent element={element} />;
   else if (element.type === 'icon') {
     content = (
       <LocalIcon iconSet={element.iconSet} iconName={element.iconName} color={element.color} />

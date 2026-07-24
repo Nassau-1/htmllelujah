@@ -53,6 +53,7 @@ import {
   StandaloneSaveQueue,
   StandaloneWriterReservationAggregateError,
   withExplicitStandaloneWriterRecovery,
+  withStandaloneWriterReservation,
 } from './standalone-writer-reservation.js';
 import {
   cleanupSessionIfUnowned,
@@ -63,6 +64,7 @@ import {
   runAuthorizedWindowClose,
 } from './window-lifecycle.js';
 import {
+  actorIdForWebContents,
   DESKTOP_API_VERSION,
   DESKTOP_IPC,
   type AppInfo,
@@ -384,6 +386,7 @@ const sessionView = (webContentsId: number, snapshot: DocumentSessionSnapshot): 
   const token = mintAssetToken(webContentsId, snapshot.sessionId);
   return {
     snapshot,
+    actorId: actorIdForWebContents(webContentsId),
     assetUrls: Object.fromEntries(
       snapshot.document.assets.map((asset) => [
         asset.id,
@@ -504,7 +507,7 @@ const mcpApprovalInputSchema = sessionInputSchema
 
 const metadataFor = (event: IpcMainInvokeEvent, label: string): TransactionMetadata => ({
   transactionId: randomUUID(),
-  actorId: `desktop-${event.sender.id}`,
+  actorId: actorIdForWebContents(event.sender.id),
   origin: 'user',
   label,
   timestamp: new Date().toISOString(),
@@ -1114,6 +1117,43 @@ const saveWithTargetFallback = async (
   );
 };
 
+/**
+ * Non-interactive MCP save boundary. It can only persist the exact requested
+ * revision to the target already attached by a prior desktop Open/Save As.
+ * A stale writer reservation fails closed instead of prompting or taking over.
+ */
+const saveExistingTargetForMcp = (
+  sessionId: string,
+  expectedRevision: string,
+): Promise<DocumentSessionSnapshot> =>
+  standaloneSaveQueue.run(sessionId, async () => {
+    collaboration.assertStandaloneOperation(sessionId, 'MCP save');
+    const snapshot = runtime.getSnapshot(sessionId);
+    if (snapshot.revision !== expectedRevision) {
+      throw new DocumentRuntimeError('REVISION_CONFLICT', 'Expected revision does not match.');
+    }
+    if (!snapshot.hasSaveTarget) {
+      throw new DocumentRuntimeError('NO_SAVE_TARGET', 'Document has no save target.');
+    }
+    const targetPath = await runtime.getSaveTargetMainOnly(sessionId);
+    if (targetPath === undefined) {
+      throw new DocumentRuntimeError('NO_SAVE_TARGET', 'Document has no save target.');
+    }
+    return withStandaloneWriterReservation(
+      {
+        targetPath,
+        documentId: snapshot.documentId,
+        sessionId,
+      },
+      (guard) =>
+        runtime.save(sessionId, {
+          expectedRevision,
+          expectedTargetPath: targetPath,
+          beforeCommit: guard.beforeCommit,
+        }),
+    );
+  });
+
 const confirmReplace = async (event: IpcMainInvokeEvent): Promise<ReplaceAuthorization | null> => {
   const currentId = windowSessions.get(event.sender.id);
   if (currentId === undefined) return {};
@@ -1440,6 +1480,7 @@ const mcpBridge = new DesktopMcpBridge({
   appVersion: () => app.getVersion(),
   visibleSessionIds: visibleEditorSessionIds,
   collaborationStatus: (sessionId) => collaboration.status(sessionId),
+  saveDocument: saveExistingTargetForMcp,
   importAsset: async (sessionId, expectedRevision, client) => {
     const imported = await importImageAssetForSession({
       sessionId,
