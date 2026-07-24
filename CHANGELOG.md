@@ -11,6 +11,12 @@ and releases use semantic versions.
   Windows feedback builds while public-distribution legal/compliance approval remains
   pending. Dependency SBOM and release-evidence integrity checks stay mandatory; the
   public finalizer remains strictly gated on a release-ready compliance record.
+- Hardened Windows test-process cleanup against stale parent PIDs, protected system
+  processes, PID reuse, reparented descendants, and root-exit races. Exact process
+  identity now includes creation time, session, and name; cleanup never delegates an
+  unbounded tree kill to the operating system.
+- Refreshed installed-app smoke contracts for the business-symbol picker, MCP and LAN
+  collaboration labels, save-state tones, and current Save As success notification.
 
 ### 2026-07-24 — Useful authoring parity checkpoint
 

@@ -68,6 +68,8 @@ export const drainChildProcess = async ({
   terminateTree = terminateProcessTree,
   processDrainTimeoutMs = 90_000,
   eventGraceMs = 3_000,
+  rootAuthority,
+  capturedDescendantAuthorities,
 }) => {
   const alreadyExited = hasExited(child);
   let result;
@@ -77,15 +79,23 @@ export const drainChildProcess = async ({
     if (!Number.isSafeInteger(child.pid) || child.pid < 1) {
       throw new Error(`${label} has no valid process-tree root PID.`);
     }
-    try {
-      result = await terminateTree({
-        pid: child.pid,
-        drainTimeoutMs: processDrainTimeoutMs,
-        pollIntervalMs: 100,
-        rootKnownExited: alreadyExited,
-      });
-    } catch (error) {
-      throw new Error(`${label} process tree could not be drained.`, { cause: error });
+    if (alreadyExited && rootAuthority === undefined) {
+      throw new Error(
+        `${label} root exited before process-tree authority was captured; descendant cleanup is unverified.`,
+      );
+    } else {
+      try {
+        result = await terminateTree({
+          pid: child.pid,
+          drainTimeoutMs: processDrainTimeoutMs,
+          pollIntervalMs: 100,
+          rootKnownExited: alreadyExited,
+          ...(rootAuthority === undefined ? {} : { rootAuthority }),
+          ...(capturedDescendantAuthorities === undefined ? {} : { capturedDescendantAuthorities }),
+        });
+      } catch (error) {
+        throw new Error(`${label} process tree could not be drained.`, { cause: error });
+      }
     }
   } catch (error) {
     authorityError = error;

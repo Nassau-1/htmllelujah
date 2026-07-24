@@ -996,7 +996,7 @@ try {
     menuPrefix: 'Save as',
     dialogTitle: 'Save presentation',
     targetPath: savedPath,
-    successText: 'Saved locally.',
+    successText: 'Saved as a local presentation.',
   });
 
   const runtimeBaseline = await waitForStableRuntime(

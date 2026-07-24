@@ -1,19 +1,19 @@
 # Roadmap and TODO
 
-Status: **Useful-authoring source checkpoint implemented; installed feedback build
-`ec1f83c` remains available while the refreshed Windows candidate, final opened-app
-campaign, and durable reinstall remain pending**, last reviewed 2026-07-24.
+Status: **Useful-authoring V1 implemented, integrity-attested Windows feedback candidate
+`aa608df` built and durably installed**, last reviewed 2026-07-24.
 
-The durable per-user installation is bound to clean source commit `ec1f83c` and includes
-the active-surface selection reconciliation. Its packaged MCP smoke passed MCP-001 through
-MCP-009 with 52 protocol frames across five launcher processes. One explicit
-non-performance-gated opened-Electron run then passed all reported authoring flows,
-native-dialog checks, presentation rendering, and residue-free shutdown. The separate
-strict startup run observed a 4,161.951 ms median against the 4,000 ms ceiling, so this is
-an installed feedback build rather than a sealed public-release candidate. No 30-minute
-LAN soak was repeated in this campaign. The next hands-on feedback cycle is specified in
-[`specs/004-useful-powerpoint-parity/`](specs/004-useful-powerpoint-parity/spec.md); those
-items are planned and are not claimed by the installed build.
+The per-user installation is bound to clean source commit `aa608df`, and its executable,
+`app.asar`, and persistent MCP launcher match the promoted unpacked candidate byte for
+byte. The candidate contains the business-first 3,720-item Twemoji catalog (695 entries
+in the default reviewed scope), all 265 circular flags, and the useful PowerPoint-parity
+batch described below. Existing AppData remained present across the silent upgrade.
+This is deliberately a local feedback candidate: public-distribution compliance remains
+pending and the evidence record is not release-ready. The installed functional smoke
+traversed the authoring, design, review, presentation, native-save, and close-handshake
+surfaces; obsolete smoke selectors and Windows PID-reuse cleanup were corrected
+afterward with targeted tests. No fresh canonical functional manifest, full export
+matrix, MCP campaign, or 30-minute LAN soak is claimed for this candidate.
 
 ## Hands-on authoring and agent remediation
 
@@ -331,10 +331,15 @@ Authoritative scope, non-goals, current-product matrix, risks, and verification:
       save/close interactions, presentation rendering, and residue-free cleanup. This
       does not replace the default three-sample release performance gate.
 - [ ] Run one final complete `pnpm verify` after the implementation has converged.
-- [ ] Build the refreshed Windows x64 candidate and durably install it on this machine
+      The complete product source gate passed once before the local-candidate pipeline
+      split; the later release-harness-only delta has targeted green coverage but was
+      not used to justify another multi-minute full run.
+- [x] Build the refreshed Windows x64 candidate and durably install it on this machine
       after the opened-app smoke and final verification pass.
-      A durable per-user feedback installation of `ec1f83c` is present; final candidate
-      packaging and reinstall remain gated on the repository and release passes.
+      Candidate `aa608df` was built from a clean detached worktree, promoted with
+      verified provenance/SBOM/evidence integrity, silently installed per-user, and
+      checked against the unpacked payload. The separate public-release compliance
+      record remains pending by design.
 - [x] Do not repeat the 30-minute LAN or complete Windows candidate campaign between
       individual fixes; run them once on the final candidate. No 30-minute run was
       performed during this remediation campaign.
@@ -410,7 +415,9 @@ Authoritative scope, non-goals, current-product matrix, risks, and verification:
 ### Final evidence gates
 
 - [ ] Run the complete clean-checkout `pnpm verify` gate and record the exact commit,
-      environment, command, and result.
+      environment, command, and result. A complete product-source pass exists before
+      the release-harness-only cleanup delta; exact current-HEAD release evidence
+      remains open.
 - [ ] Run `pnpm validate:candidate` against the promoted Windows x64 candidate and
       retain its canonical functional manifest plus public evidence ZIP.
 - [ ] Complete unit, integration, adversarial archive/recovery, IPC, MCP, and LAN
@@ -418,8 +425,9 @@ Authoritative scope, non-goals, current-product matrix, risks, and verification:
       functional subset passed; the complete final-candidate matrix remains open.
 - [ ] Open the unpacked and installed application and complete create, edit, save,
       close, reopen, recover, present, HTML export, and PDF export flows. The installed
-      functional authoring/presentation/native-close subset passed; the sealed
-      final-candidate export/recovery campaign remains open.
+      `aa608df` authoring/design/review/presentation/native-save/close content ran;
+      obsolete test selectors and cleanup receipts prevented a canonical pass, and
+      the fresh export/recovery campaign remains open rather than being overstated.
 - [ ] Review editor, presentation, standalone HTML, and rasterized PDF visual evidence
       at supported page formats and display scales.
 - [ ] Complete keyboard, focus, reduced-motion, contrast, and screen-reader smoke

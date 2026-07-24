@@ -1683,9 +1683,9 @@ try {
     'Native icon insertion',
   );
   const insertedEmojiVisual = await openCatalogAndSelect(
-    '[aria-label="Add emoji"]',
+    '[aria-label="Add business symbol"]',
     'twemoji',
-    'Add Twemoji',
+    'Add business symbol',
   );
   await waitForRenderer(
     `document.querySelectorAll('[data-canvas-element-id]').length === ${initial.elementCount + 5}`,
@@ -1717,31 +1717,41 @@ try {
     'File menu closing',
   );
 
-  await clickButtonWithText('Codex', 'Codex dialog');
-  await waitForRenderer(`document.querySelector('#mcp-title') !== null`, 'Codex dialog opening');
+  await clickButtonWithText('MCP', 'MCP dialog');
+  await waitForRenderer(`document.querySelector('#mcp-title') !== null`, 'MCP dialog opening');
   await waitForRenderer(
     `(() => {
       const dialog = document.querySelector('[aria-labelledby="mcp-title"]');
       const text = dialog?.textContent?.replace(/\\s+/gu, ' ') ?? '';
-      return document.querySelector('#mcp-title')?.textContent === 'Work with Codex through MCP' &&
-        text.includes('persistent, revocable identity') &&
+      return document.querySelector('#mcp-title')?.textContent === 'Connect an agent through MCP' &&
+        text.includes('authenticated local MCP client') &&
+        text.includes('authoritative theme, masters, layouts and slides') &&
         text.includes('without a new approval for every action') &&
         text.includes('HTMLlelujah-MCP.cmd') &&
-        text.includes('Ordinary presentation authoring does not require a one-time token');
+        text.includes('Trusted clients');
     })()`,
-    'Persistent Codex MCP dialog content',
+    'Persistent MCP dialog content',
   );
-  await click('[aria-labelledby="mcp-title"] button[aria-label="Close"]', 'Codex dialog close');
-  await waitForRenderer(`document.querySelector('#mcp-title') === null`, 'Codex dialog closing');
+  await click('[aria-labelledby="mcp-title"] button[aria-label="Close"]', 'MCP dialog close');
+  await waitForRenderer(`document.querySelector('#mcp-title') === null`, 'MCP dialog closing');
 
-  await clickButtonWithText('Share', 'Share dialog');
-  await waitForRenderer(`document.querySelector('#share-title') !== null`, 'Share dialog opening');
+  await clickButtonWithText('Collaborate', 'Collaborate dialog');
   await waitForRenderer(
-    `document.querySelector('#share-title')?.textContent === 'Edit together on your LAN'`,
-    'Share dialog content',
+    `document.querySelector('#share-title') !== null`,
+    'Collaborate dialog opening',
   );
-  await click('[aria-labelledby="share-title"] button[aria-label="Close"]', 'Share dialog close');
-  await waitForRenderer(`document.querySelector('#share-title') === null`, 'Share dialog closing');
+  await waitForRenderer(
+    `document.querySelector('#share-title')?.textContent === 'Collaborate on the same LAN'`,
+    'Collaborate dialog content',
+  );
+  await click(
+    '[aria-labelledby="share-title"] button[aria-label="Close"]',
+    'Collaborate dialog close',
+  );
+  await waitForRenderer(
+    `document.querySelector('#share-title') === null`,
+    'Collaborate dialog closing',
+  );
 
   await clickButtonWithText('Present', 'Presentation window');
   const presentationTarget = await waitFor(
@@ -2516,7 +2526,7 @@ try {
     throw error;
   }
   await waitForRenderer(
-    `document.querySelector('.save-state.is-saved') !== null`,
+    `document.querySelector('.save-state.tone-safe') !== null`,
     'Clean close-handshake baseline',
   );
   await click('[role="tab"]:not(.is-active)', 'Design tab before rejected close commit');
@@ -2881,7 +2891,7 @@ try {
   }
   await waitForRenderer(
     `document.querySelector('.app-shell') !== null &&
-      document.querySelector('.save-state:not(.is-saved)') !== null &&
+      document.querySelector('.save-state:not(.tone-safe)') !== null &&
       document.querySelector('.canonical-slide-surface')?.textContent?.includes(${JSON.stringify(closeHandshakeCellValue)})`,
     'Native close handshake committed the focused table cell before Cancel',
     10_000,
@@ -2938,7 +2948,7 @@ try {
   }
   await waitForRenderer(
     `document.querySelector('.app-shell') !== null &&
-      document.querySelector('.save-state:not(.is-saved)') !== null &&
+      document.querySelector('.save-state:not(.tone-safe)') !== null &&
       document.querySelector('.canonical-slide-surface')?.textContent?.includes(${JSON.stringify(closeHandshakeDraft)})`,
     'Native close handshake flushed the draft before Cancel',
     10_000,
@@ -3018,7 +3028,7 @@ try {
   closeRaceRpc = undefined;
   await waitForRenderer(
     `document.querySelector('.app-shell') !== null &&
-      document.querySelector('.save-state:not(.is-saved)') !== null`,
+      document.querySelector('.save-state:not(.tone-safe)') !== null`,
     'Concurrent close mutation retained after stale Discard',
     10_000,
   );

@@ -104,22 +104,84 @@ describe('child process cleanup', () => {
     assert.equal(child.unrefCalled, true);
   });
 
-  it('still requires OS process-tree authority after the root has already exited', async () => {
+  it('fails without targeting a PID after an unauthorised root exit', async () => {
     const child = fakeChild();
     child.exitCode = 0;
+    let terminationInvoked = false;
+
+    await assert.rejects(
+      drainChildProcess({
+        child,
+        label: 'Packaged editor',
+        eventGraceMs: 1,
+        terminateTree: async () => {
+          terminationInvoked = true;
+          throw new Error('must not run');
+        },
+      }),
+      /root exited before process-tree authority was captured; descendant cleanup is unverified/u,
+    );
+
+    assert.equal(terminationInvoked, false);
+    assert.equal(child.stdout.destroyed, true);
+    assert.equal(child.stderr.destroyed, true);
+    assert.equal(child.unrefCalled, true);
+  });
+
+  it('fails closed when the root exits during initial authority discovery', async () => {
+    const child = fakeChild();
+    let terminationInvoked = false;
+
+    await assert.rejects(
+      drainChildProcess({
+        child,
+        label: 'Native dialog automation',
+        eventGraceMs: 1,
+        terminateTree: async () => {
+          terminationInvoked = true;
+          child.exitCode = 0;
+          throw new Error('Windows process-tree root identity is unavailable.');
+        },
+      }),
+      (error) =>
+        error.message === 'Native dialog automation process tree could not be drained.' &&
+        error.cause?.message === 'Windows process-tree root identity is unavailable.',
+    );
+
+    assert.equal(terminationInvoked, true);
+    assert.equal(child.stdout.destroyed, true);
+    assert.equal(child.stderr.destroyed, true);
+    assert.equal(child.unrefCalled, true);
+  });
+
+  it('uses pre-captured authority to drain descendants after the root exits', async () => {
+    const child = fakeChild();
+    child.exitCode = 0;
+    const rootAuthority = {
+      processId: 4242,
+      creationTime: '10000000',
+      sessionId: 1,
+      name: 'electron.exe',
+    };
+    const capturedDescendantAuthorities = [
+      {
+        processId: 4343,
+        creationTime: '10000001',
+        sessionId: 1,
+        name: 'electron.exe',
+      },
+    ];
     let terminationOptions;
 
     const result = await drainChildProcess({
       child,
       label: 'Packaged editor',
       eventGraceMs: 1,
+      rootAuthority,
+      capturedDescendantAuthorities,
       terminateTree: async (options) => {
         terminationOptions = options;
-        return {
-          processIds: [],
-          killerStatus: null,
-          descendantKillerStatuses: [],
-        };
+        return { processIds: [4343], killerStatus: null };
       },
     });
 
@@ -128,16 +190,14 @@ describe('child process cleanup', () => {
       drainTimeoutMs: 90_000,
       pollIntervalMs: 100,
       rootKnownExited: true,
+      rootAuthority,
+      capturedDescendantAuthorities,
     });
     assert.deepEqual(result, {
-      processIds: [],
+      processIds: [4343],
       killerStatus: null,
-      descendantKillerStatuses: [],
       alreadyExited: true,
     });
-    assert.equal(child.stdout.destroyed, true);
-    assert.equal(child.stderr.destroyed, true);
-    assert.equal(child.unrefCalled, true);
   });
 
   it('releases handles even when the process-tree PID is invalid', async () => {

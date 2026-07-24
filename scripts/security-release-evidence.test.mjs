@@ -10,6 +10,7 @@ import test from 'node:test';
 
 import { drainChildProcess } from '../apps/desktop/scripts/child-process-cleanup.mjs';
 import { defaultRunCommand, terminateProcessTree } from './generate-security-release-evidence.mjs';
+import { validateWindowsProcessSnapshot } from './process-tree-support.mjs';
 import {
   auditEvidenceFromResult,
   buildCodeqlEvidence,
@@ -46,6 +47,47 @@ const defenderLogs = new Map([
   ['private-security/installer-defender-scan.log', Buffer.from('clean installer scan\n')],
   ['private-security/win-unpacked-defender-scan.log', Buffer.from('clean directory scan\n')],
 ]);
+const testWindowsRootAuthority = (processId) => ({
+  processId,
+  creationTime: '10000000',
+  sessionId: 1,
+  name: 'electron.exe',
+});
+const testWindowsDescendantAuthority = (processId, index = 0) => ({
+  processId,
+  creationTime: String(10000001 + index),
+  sessionId: 1,
+  name: 'electron.exe',
+});
+const testWindowsDiscovery = (
+  rootPid,
+  descendantPids,
+  authority,
+  { includeCapturedRoot = authority === undefined } = {},
+) => {
+  const root = authority ?? testWindowsRootAuthority(rootPid);
+  return validateWindowsProcessSnapshot({
+    rootPid,
+    authority,
+    snapshot: [
+      ...(includeCapturedRoot
+        ? [
+            {
+              ...root,
+              parentProcessId: 100,
+            },
+          ]
+        : []),
+      ...descendantPids.map((processId, index) => ({
+        processId,
+        parentProcessId: rootPid,
+        creationTime: String(10000001 + index),
+        sessionId: root.sessionId,
+        name: 'electron.exe',
+      })),
+    ],
+  });
+};
 const inspectWindowsProcessCommandLines = (processIds) => {
   const uniqueProcessIds = [...new Set(processIds)];
   assert.ok(uniqueProcessIds.length > 0);
@@ -91,6 +133,16 @@ const assertWindowsProcessNonceAbsent = (processIds, nonce) => {
       false,
       `Timed-out test process ${String(process.ProcessId)} is still running.`,
     );
+  }
+};
+
+const removeTemporaryTestDirectory = async (directory) => {
+  try {
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    // Windows can retain the terminated process' current-directory handle briefly after CIM no
+    // longer reports the process. The process absence assertions above remain authoritative.
+    if (process.platform !== 'win32' || error?.code !== 'EBUSY') throw error;
   }
 };
 
@@ -742,7 +794,7 @@ test(
       const pids = JSON.parse(await readFile(pidPath, 'utf8'));
       assertWindowsProcessNonceAbsent([pids.root, pids.child], nonce);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await removeTemporaryTestDirectory(root);
     }
   },
 );
@@ -781,7 +833,7 @@ test(
       const pid = Number(await readFile(pidPath, 'utf8'));
       assertWindowsProcessNonceAbsent([pid], nonce);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await removeTemporaryTestDirectory(root);
     }
   },
 );
@@ -814,11 +866,129 @@ test('default command captures pipe bytes delivered between child exit and close
   assert.equal(result.stderr, '');
 });
 
+test('Windows process discovery rejects stale system descendants after root PID reuse', () => {
+  const result = validateWindowsProcessSnapshot({
+    rootPid: 1380,
+    snapshot: [
+      {
+        processId: 0,
+        parentProcessId: 0,
+        creationTime: null,
+        sessionId: 0,
+        name: 'System Idle Process',
+      },
+      {
+        processId: 1380,
+        parentProcessId: 7000,
+        creationTime: '5000',
+        sessionId: 1,
+        name: 'electron.exe',
+      },
+      {
+        processId: 916,
+        parentProcessId: 1380,
+        creationTime: '1000',
+        sessionId: 1,
+        name: 'dwm.exe',
+      },
+      {
+        processId: 1456,
+        parentProcessId: 916,
+        creationTime: '1100',
+        sessionId: 1,
+        name: 'winlogon.exe',
+      },
+      {
+        processId: 1396,
+        parentProcessId: 1456,
+        creationTime: '1200',
+        sessionId: 1,
+        name: 'csrss.exe',
+      },
+      {
+        processId: 1748,
+        parentProcessId: 1396,
+        creationTime: '1300',
+        sessionId: 1,
+        name: 'fontdrvhost.exe',
+      },
+      {
+        processId: 8200,
+        parentProcessId: 1380,
+        creationTime: '5100',
+        sessionId: 1,
+        name: 'electron.exe',
+      },
+    ],
+  });
+
+  assert.deepEqual(result.processIds, [1380, 8200]);
+});
+
+test('Windows process discovery refuses a protected process as root', () => {
+  assert.throws(
+    () =>
+      validateWindowsProcessSnapshot({
+        rootPid: 1456,
+        snapshot: [
+          {
+            processId: 1456,
+            parentProcessId: 916,
+            creationTime: '1000',
+            sessionId: 1,
+            name: 'winlogon.exe',
+          },
+        ],
+      }),
+    /protected Windows process/u,
+  );
+});
+
+test('Windows process discovery rejects a reused root PID against captured authority', () => {
+  assert.throws(
+    () =>
+      validateWindowsProcessSnapshot({
+        rootPid: 4242,
+        authority: testWindowsRootAuthority(4242),
+        snapshot: [
+          {
+            processId: 4242,
+            parentProcessId: 100,
+            creationTime: '20000000',
+            sessionId: 1,
+            name: 'unrelated.exe',
+          },
+        ],
+      }),
+    /root PID was reused/u,
+  );
+});
+
+test('Windows process discovery does not adopt new PPID matches after root exit', () => {
+  const root = testWindowsRootAuthority(4242);
+  const result = validateWindowsProcessSnapshot({
+    rootPid: root.processId,
+    authority: root,
+    snapshot: [
+      {
+        processId: 4343,
+        parentProcessId: root.processId,
+        creationTime: '10000001',
+        sessionId: root.sessionId,
+        name: 'electron.exe',
+      },
+    ],
+  });
+
+  assert.equal(result.rootPresent, false);
+  assert.deepEqual(result.processIds, [root.processId]);
+});
+
 test('process-tree termination accepts a raced nonzero killer status after every PID is dead', async () => {
   const result = await terminateProcessTree({
     pid: 4242,
     platform: 'win32',
-    discoverTree: () => [4242, 4343],
+    discoverTree: (_pid, _timeout, authority) => testWindowsDiscovery(4242, [4343], authority),
     killWindowsTree: () => ({ status: 1, signal: null, error: undefined }),
     isAlive: () => false,
     drainTimeoutMs: 1,
@@ -835,7 +1005,8 @@ test('Windows termination retargets once an initially captured descendant omitte
   const result = await terminateProcessTree({
     pid: rootPid,
     platform: 'win32',
-    discoverTree: () => [rootPid, omittedDescendantPid],
+    discoverTree: (_pid, _timeout, authority) =>
+      testWindowsDiscovery(rootPid, [omittedDescendantPid], authority),
     killWindowsTree: (processId) => {
       killedProcessIds.push(processId);
       liveProcessIds.delete(processId);
@@ -854,7 +1025,50 @@ test('Windows termination retargets once an initially captured descendant omitte
   });
 });
 
-test('Windows termination captures and drains a descendant first appearing on the second post-kill inventory', async () => {
+test('Windows termination drains an identity-validated descendant after it is reparented', async () => {
+  const rootPid = 4242;
+  const childPid = 4343;
+  const liveProcessIds = new Set([rootPid, childPid]);
+  const killedProcessIds = [];
+  const root = testWindowsRootAuthority(rootPid);
+  const child = {
+    processId: childPid,
+    parentProcessId: rootPid,
+    creationTime: '10000001',
+    sessionId: root.sessionId,
+    name: 'electron.exe',
+  };
+  const result = await terminateProcessTree({
+    pid: rootPid,
+    platform: 'win32',
+    discoverTree: (_pid, _timeout, authority) =>
+      validateWindowsProcessSnapshot({
+        rootPid,
+        authority,
+        snapshot:
+          authority === undefined
+            ? [{ ...root, parentProcessId: 100 }, child]
+            : [{ ...child, parentProcessId: 9999 }],
+      }),
+    killWindowsTree: (processId) => {
+      killedProcessIds.push(processId);
+      liveProcessIds.delete(processId);
+      return { status: 0, signal: null, error: undefined };
+    },
+    isAlive: (processId) => liveProcessIds.has(processId),
+    drainTimeoutMs: 100,
+    pollIntervalMs: 1,
+  });
+
+  assert.deepEqual(killedProcessIds, [rootPid, childPid]);
+  assert.deepEqual(result, {
+    processIds: [rootPid, childPid],
+    killerStatus: 0,
+    descendantKillerStatuses: [{ processId: childPid, status: 0 }],
+  });
+});
+
+test('Windows termination does not adopt a PPID match first appearing after root exit', async () => {
   const rootPid = 4242;
   const lateDescendantPid = 4343;
   const liveProcessIds = new Set([rootPid]);
@@ -863,10 +1077,14 @@ test('Windows termination captures and drains a descendant first appearing on th
   const result = await terminateProcessTree({
     pid: rootPid,
     platform: 'win32',
-    discoverTree: () => {
+    discoverTree: (_pid, _timeout, authority) => {
       discoveryCalls += 1;
       if (discoveryCalls === 3) liveProcessIds.add(lateDescendantPid);
-      return discoveryCalls < 3 ? [rootPid] : [rootPid, lateDescendantPid];
+      return testWindowsDiscovery(
+        rootPid,
+        discoveryCalls < 3 ? [] : [lateDescendantPid],
+        authority,
+      );
     },
     killWindowsTree: (processId) => {
       killedProcessIds.push(processId);
@@ -877,13 +1095,13 @@ test('Windows termination captures and drains a descendant first appearing on th
     drainTimeoutMs: 100,
     pollIntervalMs: 1,
   });
-  assert.equal(discoveryCalls >= 5, true);
-  assert.deepEqual(killedProcessIds, [rootPid, lateDescendantPid]);
+  assert.equal(discoveryCalls >= 4, true);
+  assert.deepEqual(killedProcessIds, [rootPid]);
   assert.equal(killedProcessIds.filter((processId) => processId === rootPid).length, 1);
+  assert.equal(liveProcessIds.has(lateDescendantPid), true);
   assert.deepEqual(result, {
-    processIds: [rootPid, lateDescendantPid],
+    processIds: [rootPid],
     killerStatus: 0,
-    descendantKillerStatuses: [{ processId: lateDescendantPid, status: 0 }],
   });
 });
 
@@ -892,10 +1110,10 @@ test('Windows termination retries a transient post-kill inventory error and reco
   const result = await terminateProcessTree({
     pid: 4242,
     platform: 'win32',
-    discoverTree: () => {
+    discoverTree: (_pid, _timeout, authority) => {
       discoveryCalls += 1;
       if (discoveryCalls === 2) throw new Error('transient CIM timeout');
-      return [4242];
+      return testWindowsDiscovery(4242, [], authority);
     },
     killWindowsTree: () => ({ status: 0, signal: null, error: undefined }),
     isAlive: () => false,
@@ -917,9 +1135,9 @@ test('Windows termination fails closed when every post-kill inventory attempt fa
     terminateProcessTree({
       pid: 4242,
       platform: 'win32',
-      discoverTree: () => {
+      discoverTree: (_pid, _timeout, authority) => {
         discoveryCalls += 1;
-        if (discoveryCalls === 1) return [4242];
+        if (discoveryCalls === 1) return testWindowsDiscovery(4242, [], authority);
         throw new Error('post-kill inventory unavailable');
       },
       killWindowsTree: (processId) => {
@@ -930,44 +1148,33 @@ test('Windows termination fails closed when every post-kill inventory attempt fa
       drainTimeoutMs: 100,
       pollIntervalMs: 1,
     }),
-    /killer status 0; descendant killers none; post-kill discovery errors .*post-kill inventory unavailable.*; stable passes 0; live PIDs: none/u,
+    /killer status 0; descendant killers none; post-kill discovery errors .*post-kill inventory unavailable.*; stable passes 0; live PIDs: 4242/u,
   );
   assert.deepEqual(killedProcessIds, [4242]);
 });
 
-test('Windows termination preserves discovery, root-killer, and post-discovery errors in causal order', async () => {
+test('Windows termination fails before invoking the killer when initial discovery lacks authority', async () => {
   const initialDiscoveryError = new Error('initial CIM failure');
-  const rootKillerError = new Error('taskkill timed out');
-  const postDiscoveryErrors = [];
-  let discoveryCalls = 0;
+  let killerInvoked = false;
 
   await assert.rejects(
     terminateProcessTree({
       pid: 4242,
       platform: 'win32',
       discoverTree: () => {
-        discoveryCalls += 1;
-        if (discoveryCalls === 1) throw initialDiscoveryError;
-        const error = new Error(`post-kill CIM failure ${discoveryCalls - 1}`);
-        postDiscoveryErrors.push(error);
-        throw error;
+        throw initialDiscoveryError;
       },
-      killWindowsTree: () => ({ status: null, signal: null, error: rootKillerError }),
+      killWindowsTree: () => {
+        killerInvoked = true;
+        return { status: 0, signal: null, error: undefined };
+      },
       isAlive: () => false,
       drainTimeoutMs: 25,
       pollIntervalMs: 1,
     }),
-    (error) => {
-      assert.ok(error instanceof AggregateError);
-      assert.equal(postDiscoveryErrors.length > 0, true);
-      assert.deepEqual(error.errors, [
-        initialDiscoveryError,
-        rootKillerError,
-        ...postDiscoveryErrors,
-      ]);
-      return true;
-    },
+    initialDiscoveryError,
   );
+  assert.equal(killerInvoked, false);
 });
 
 test('Windows termination rejects a nonzero killer status while the root remains alive', async () => {
@@ -975,7 +1182,8 @@ test('Windows termination rejects a nonzero killer status while the root remains
     terminateProcessTree({
       pid: 4242,
       platform: 'win32',
-      discoverTree: () => [4242],
+      discoverTree: (_pid, _timeout, authority) =>
+        testWindowsDiscovery(4242, [], authority, { includeCapturedRoot: true }),
       killWindowsTree: () => ({ status: 1, signal: null, error: undefined }),
       isAlive: (processId) => processId === 4242,
       drainTimeoutMs: 5,
@@ -985,27 +1193,48 @@ test('Windows termination rejects a nonzero killer status while the root remains
   );
 });
 
-test('known-exited Windows root with no descendants never targets the reusable root PID', async () => {
+test('known-exited Windows root without captured authority fails before discovery or killing', async () => {
   const killedProcessIds = [];
-  const result = await terminateProcessTree({
-    pid: 4242,
-    platform: 'win32',
-    rootKnownExited: true,
-    discoverTree: () => [4242],
-    killWindowsTree: (processId) => {
-      killedProcessIds.push(processId);
-      return { status: 0, signal: null, error: undefined };
-    },
-    isAlive: () => false,
-    drainTimeoutMs: 100,
-    pollIntervalMs: 1,
-  });
+  let discoveryInvoked = false;
+  await assert.rejects(
+    terminateProcessTree({
+      pid: 4242,
+      platform: 'win32',
+      rootKnownExited: true,
+      discoverTree: () => {
+        discoveryInvoked = true;
+        throw new Error('must not run');
+      },
+      killWindowsTree: (processId) => {
+        killedProcessIds.push(processId);
+        return { status: 0, signal: null, error: undefined };
+      },
+      isAlive: () => false,
+      drainTimeoutMs: 100,
+      pollIntervalMs: 1,
+    }),
+    /known-exited Windows root without captured root authority/u,
+  );
+  assert.equal(discoveryInvoked, false);
   assert.deepEqual(killedProcessIds, []);
-  assert.deepEqual(result, {
-    processIds: [],
-    killerStatus: null,
-    descendantKillerStatuses: [],
-  });
+});
+
+test('known-exited Windows root rejects missing descendant authority before discovery', async () => {
+  let discoveryInvoked = false;
+  await assert.rejects(
+    terminateProcessTree({
+      pid: 4242,
+      platform: 'win32',
+      rootKnownExited: true,
+      rootAuthority: testWindowsRootAuthority(4242),
+      discoverTree: () => {
+        discoveryInvoked = true;
+        throw new Error('must not run');
+      },
+    }),
+    /known-exited Windows root without a captured descendant-authority list/u,
+  );
+  assert.equal(discoveryInvoked, false);
 });
 
 test('known-exited Windows root targets only captured descendants and verifies their death', async () => {
@@ -1015,7 +1244,13 @@ test('known-exited Windows root targets only captured descendants and verifies t
     pid: 4242,
     platform: 'win32',
     rootKnownExited: true,
-    discoverTree: () => [4242, 4343, 4444],
+    rootAuthority: testWindowsRootAuthority(4242),
+    capturedDescendantAuthorities: [
+      testWindowsDescendantAuthority(4343),
+      testWindowsDescendantAuthority(4444, 1),
+    ],
+    discoverTree: (_pid, _timeout, authority) =>
+      testWindowsDiscovery(4242, [4343, 4444], authority),
     killWindowsTree: (processId) => {
       killedProcessIds.push(processId);
       liveProcessIds.delete(processId);
@@ -1044,7 +1279,9 @@ test('known-exited Windows root fails closed when a captured descendant survives
       pid: 4242,
       platform: 'win32',
       rootKnownExited: true,
-      discoverTree: () => [4242, 4343],
+      rootAuthority: testWindowsRootAuthority(4242),
+      capturedDescendantAuthorities: [testWindowsDescendantAuthority(4343)],
+      discoverTree: (_pid, _timeout, authority) => testWindowsDiscovery(4242, [4343], authority),
       killWindowsTree: (processId) => {
         killedProcessIds.push(processId);
         return { status: 0, signal: null, error: undefined };
@@ -1066,6 +1303,8 @@ test('known-exited Windows root fails without killing when descendant discovery 
       pid: 4242,
       platform: 'win32',
       rootKnownExited: true,
+      rootAuthority: testWindowsRootAuthority(4242),
+      capturedDescendantAuthorities: [],
       discoverTree: () => {
         throw new Error('CIM unavailable');
       },
@@ -1082,7 +1321,7 @@ test('known-exited Windows root fails without killing when descendant discovery 
   assert.deepEqual(killedProcessIds, []);
 });
 
-test('process-tree termination still invokes the killer when discovery fails', async () => {
+test('process-tree termination does not invoke the killer when discovery fails', async () => {
   let killerInvoked = false;
   await assert.rejects(
     terminateProcessTree({
@@ -1099,9 +1338,9 @@ test('process-tree termination still invokes the killer when discovery fails', a
       drainTimeoutMs: 1,
       pollIntervalMs: 1,
     }),
-    /discovery CIM unavailable; killer status 0/u,
+    /CIM unavailable/u,
   );
-  assert.equal(killerInvoked, true);
+  assert.equal(killerInvoked, false);
 });
 
 test('process-tree termination fails closed when any captured descendant survives', async () => {
@@ -1109,7 +1348,7 @@ test('process-tree termination fails closed when any captured descendant survive
     terminateProcessTree({
       pid: 4242,
       platform: 'win32',
-      discoverTree: () => [4242, 4343],
+      discoverTree: (_pid, _timeout, authority) => testWindowsDiscovery(4242, [4343], authority),
       killWindowsTree: () => ({ status: 0, signal: null, error: undefined }),
       isAlive: (pid) => pid === 4343,
       drainTimeoutMs: 1,
