@@ -11,7 +11,9 @@ non-performance-gated opened-Electron run then passed all reported authoring flo
 native-dialog checks, presentation rendering, and residue-free shutdown. The separate
 strict startup run observed a 4,161.951 ms median against the 4,000 ms ceiling, so this is
 an installed feedback build rather than a sealed public-release candidate. No 30-minute
-LAN soak was repeated in this campaign.
+LAN soak was repeated in this campaign. The next hands-on feedback cycle is specified in
+[`specs/004-useful-powerpoint-parity/`](specs/004-useful-powerpoint-parity/spec.md); those
+items are planned and are not claimed by the installed build.
 
 ## Hands-on authoring and agent remediation
 
@@ -130,6 +132,168 @@ Authoritative scope, sequencing, and acceptance evidence:
 - [ ] Show and revoke trusted clients and retain attributable transaction-level undo.
       Persistent backend revocation and `mcp-client:<uuid>` attribution are complete;
       visible management and audit history remain.
+
+## Hands-on feedback: useful PowerPoint parity
+
+Authoritative scope, non-goals, current-product matrix, risks, and verification:
+[`specs/004-useful-powerpoint-parity/`](specs/004-useful-powerpoint-parity/spec.md).
+
+### P0 — Catalog completeness and truthful editor chrome
+
+- [ ] Replace the visual catalog's fixed `RESULT_LIMIT = 72` and the search API's
+      200-result ceiling with bounded pagination, incremental loading, or virtualization.
+      The 3,720 bundled Twemoji and 265 bundled circular flags already exist; the bug is
+      that only the first 72 matches are browseable and the UI reports that truncated
+      count as if it were the total.
+- [ ] Make broad and exact search exhaustive across stable ID, Unicode, English/French
+      label, keywords, category, country name, and two-letter country code. Show
+      the logical result range and exact total, keep at most 144 result cards mounted in
+      the active picker including overscan, and preserve keyboard/focus navigation
+      through the final result.
+- [ ] Default emoji browsing to a reviewed `Business` collection: people and teams,
+      communication, finance, data and technology, documents and tools, status and
+      alerts, travel and locations, and common symbols. `Business` and `All` are explicit
+      browse-and-search scopes; `All` exposes every one of the 3,720 bundled vectors.
+- [ ] Group circular flags by region and make all 265 entries browseable and searchable,
+      including countries positioned after the current 72nd result.
+- [ ] Return a stable paged catalog result contract with `items`, exact `total`,
+      cursor/offset, and `hasMore`; normalize case, accents, Unicode, and multi-term
+      queries; benchmark opening, broad search, and keyboard navigation without relying
+      only on a DOM-count proxy.
+- [ ] Remove the static `AI-NATIVE · LOCAL` badge from the working toolbar or move a
+      factual local-first explanation into Help/About. A separate agent indicator must
+      derive from real MCP availability and connection state.
+- [ ] Replace raw `journaled`/`clean`/`recovered` durability labels with user language:
+      `Not saved yet · Recovery protected`, `Unsaved changes · Recovery protected`,
+      `Saving…`, `Saved`, `Recovered copy · Save As required`, or a clear error.
+- [ ] Fix the inverted `Recovered locally` condition. Normal dirty journaled edits are
+      not recovered work; recovery wording appears only for a genuinely recovered
+      session and provides a Save As action.
+- [ ] Replace the prompt-based modal title editor and decorative chevron with inline
+      deck-name editing and explicit Save/Save As behavior. Initialize the deck name as
+      `Untitled presentation` but leave the first slide title empty or show
+      `Click to add title`; renaming the document never edits slide content.
+- [ ] Rename `Codex` to `MCP` or `Agent access`. Show `Unavailable`,
+      `Ready — no agent connected`, or `Connected`, plus copyable onboarding and
+      persistent-client listing/revocation.
+- [ ] Rename `Share` to `Collaborate (LAN)` and explain before action that collaborators
+      open the same `.hdeck` on the same private network, one person hosts, and only the
+      host writes the shared file. Show `Hosting · N` or `Joined · N` while active.
+
+### P1 — Lines, connectors, business shapes, and images
+
+- [ ] Expand the seven-shape palette with a deliberately small business set:
+      parallelogram, trapezoid, pentagon/hexagon, chevron, brackets, and simple arcs.
+      Do not add novelty shapes, stars/banners, callouts, equations, action buttons, or
+      the complete PowerPoint catalog.
+- [ ] Allow double-click typing inside a compatible basic shape with theme-managed text,
+      margins, horizontal/vertical alignment, save/reopen, and export parity; avoid
+      forcing users to manually overlay and group a separate text box.
+- [ ] Close the scoped classic-editing baseline without rebuilding commands that already
+      work: multi-select, nudge, resize, rotate, flip, group/ungroup, align/distribute,
+      layer, lock/hide, copy/cut/paste, duplicate, match size, format painter, and
+      precise numeric geometry. Add `Swap positions` for exactly two selected objects as
+      one undoable transaction while preserving their content and styles.
+- [ ] Unify the line/arrow workflow: draw between two points, drag either endpoint, and
+      expose independent start/end cap, line width, dash, and color. Converting a line
+      to an arrow must not require deleting and reinserting it.
+- [ ] Expose the connector model's existing straight/elbow routing, start/end arrow
+      caps, and top/right/bottom/left/center bindings directly on the canvas. Endpoint
+      dragging must reveal and snap to connection points; moving, resizing, or rotating
+      the target must preserve the core's existing connection invariant; dragging away
+      detaches it. The model/renderer already support both caps, while the current
+      inspector exposes only the end-cap control.
+- [ ] Add curved connector routing after direct straight/elbow manipulation is stable.
+- [ ] Add open/closed freeform paths, bounded polyline/Bézier creation, finish/cancel,
+      and post-creation edit-points mode. Keep path geometry identical across editor,
+      thumbnail, presentation, HTML, PDF, save/reopen, collaboration, and MCP.
+- [ ] Add Union, Combine, Fragment, Intersect, and Subtract for compatible closed paths.
+      Preview before one atomic commit; Undo restores every original object exactly.
+- [ ] Evaluate a lower-priority deterministic 2.5D extrusion with depth, direction, and
+      side color. Do not introduce a full 3D engine, camera, mesh, or lighting model.
+- [ ] Add direct image crop handles while retaining numeric contain/cover/fill controls.
+- [ ] Add a proposed phase-one offline `Remove background color`: white/black presets or
+      eyedropper, bounded tolerance, live transparency preview, non-destructive
+      apply/reset, and identical output in editor, presentation, standalone HTML, and
+      PDF. Review hands-on quality before considering broader segmentation; cloud
+      processing remains out of scope.
+- [ ] Complete safe external clipboard image routing so an Excel range or chart can be
+      pasted as a deterministic embedded image. Do not create a native or linked chart,
+      preserve formulas, or depend on Excel after paste.
+
+### P1 — Design workspace and semantic authoring
+
+- [ ] Reframe the `Design` tab as the primary workspace for theme gallery, theme
+      creation/enforcement, semantic colors, fonts, page format, masters, layouts,
+      placeholders, page numbers, watermarks, and other page furniture.
+- [ ] Make every newly created text box visibly adopt a semantic style role: Title,
+      Subtitle, Body, Caption, or Free text. Changing the active theme updates every
+      managed role while preserving explicit local overrides.
+- [ ] Keep masters and layouts authoritative and visibly distinguish inherited, locked,
+      theme-managed, and local objects throughout the Design workspace.
+
+### P1 — Agent-native presentation skill
+
+- [ ] Add a repository-owned, vendor-neutral `htmllelujah-presentations` skill for Codex,
+      Claude, and compatible local MCP clients.
+- [ ] Teach the skill to discover the visible document and authoritative design context,
+      respect theme/master/layout/placeholder/lock authority, use semantic typed
+      operations, group coherent edits into one transaction, handle revision conflicts,
+      validate, preview, commit, undo, and request approved exports.
+- [ ] Decide and implement a bounded `documents_save` operation for an already-authorized
+      current target, or require the human to save explicitly. Save As, import, export,
+      trust changes, and destructive operations retain their desktop approval; the skill
+      must never promise to bypass it.
+- [ ] Route attributed typed agent transactions through the authoritative host during a
+      LAN session with the same revision/undo guarantees, or state clearly that agent
+      mutation is unavailable while LAN collaboration is active. Silent suspension does
+      not satisfy the intended human-plus-agent workflow.
+- [ ] Include workflows for outline-to-deck, adding slides from existing layouts,
+      editing masters/layouts, enforcing a theme, adding page furniture, checking
+      alignment/overflow, and preparing a deliverable.
+- [ ] Keep arbitrary HTML, shell execution, remote URLs, unbounded file access, and
+      vendor-specific hard-coding outside the skill and MCP contract.
+
+### P2 — Review, spelling, and collaboration onboarding
+
+- [ ] Add slide- and object-anchored comment threads with author, timestamp, replies,
+      resolve/reopen, unread state, and a review panel. A sticky-note affordance is a
+      comment, not a visual slide object.
+- [ ] Synchronize comments through the authoritative LAN host and persist them in the
+      `.hdeck`, but exclude them from presentation, PDF, standalone HTML, and ordinary
+      print unless a future explicit review export is requested.
+- [ ] Complete the partially enabled offline spellcheck UX. Chromium spellcheck and
+      `spellCheck` text areas already exist; add deck/text language, underlines, and a
+      text-editing context menu with suggestions, replace, ignore, and add-to-dictionary.
+      Canonical deck language and optional text overrides migrate, collaborate, and
+      appear through MCP; personal dictionary additions remain local user preferences.
+      The object context menu remains active outside text editing.
+- [ ] Simplify LAN joining with copyable invitation data and clear host approval.
+      Evaluate opt-in discovery by shared-file identity so two users opening the same
+      `.hdeck` can find the authoritative host, without ever permitting two file writers
+      or silently claiming cloud collaboration. OneDrive/Google Drive synchronized
+      replicas are not a coherent shared filesystem and must not auto-join by path alone.
+
+### P2 — PowerPoint template import
+
+- [ ] Add a preview-first, standalone `.pptx` import path using bounded ZIP/XML parsing,
+      with an independent `Import design only` choice; evaluate `.potx` under the same
+      contract. Never automate PowerPoint, execute macros, fetch external relationships,
+      modify the source file, or silently omit unsupported content.
+- [ ] Phase 1: import page size, theme colors/fonts, slide masters, layouts,
+      placeholders, backgrounds, page numbers, and supported header/footer furniture.
+      The result becomes native authoritative HTMLlelujah design context for humans and
+      MCP clients.
+- [ ] Phase 2: import the supported slide subset — styled text/lists, basic
+      shapes/lines/connectors, images, tables, groups, and z-order.
+- [ ] Produce a structured fidelity report listing imported, substituted, rasterized,
+      and unsupported items. The user can cancel, accept substitutions, or choose a
+      bounded raster fallback; no source mutation or silent loss.
+- [ ] Build a public synthetic PPTX fixture corpus covering multiple masters/layouts,
+      theme tokens, unsupported effects, malicious/oversized XML/ZIP inputs, and
+      cancellation without document mutation.
+- [ ] Keep `.pptx`/`.potx` export and round-trip editing explicitly out of this cycle;
+      imported content becomes a native `.hdeck`.
 
 ### Verification discipline
 
@@ -316,9 +480,13 @@ Authoritative scope, sequencing, and acceptance evidence:
 
 ## Explicitly deferred
 
-- Third-party presentation-file interchange.
-- Advanced freeform paths and boolean vector operations.
 - Simultaneous editing of one text range and disconnected text merge.
 - Linked charts, formulas, and live spreadsheet links.
-- Transitions, animations, speaker notes, comments, and presenter coaching.
-- Cloud accounts, hosted templates, internet relay, and embedded model inference.
+- `.pptx`/`.potx` export or round-trip editing.
+- Transitions, animations, recording, speaker notes, presenter coaching, and a complete
+  slideshow-production suite.
+- Complete flowchart/diagram catalogs, equations, action buttons, decorative
+  stars/banners/callouts, WordArt, and a full 3D engine.
+- AI subject segmentation and cloud background-removal services.
+- Cloud accounts, hosted templates, internet relay, embedded model inference, and an
+  integrated chatbot/subscription-account bridge.

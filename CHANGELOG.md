@@ -7,6 +7,12 @@ and releases use semantic versions.
 
 ### Changed
 
+- Added a planning-only specification and ordered TODO for the next hands-on feedback
+  cycle: complete business visual discovery, truthful editor chrome, useful vector/image
+  parity, design/review UX, PowerPoint design import, and vendor-neutral MCP authoring
+  guidance. These entries do not claim that the installed feedback build already
+  implements them.
+
 - Added familiar object copy/cut/paste and right-click actions, pre-insertion visual
   choosers, complete slide/layout/master authoring parity, authoritative template
   locks, blank theme creation, style provenance and reset controls, bounded custom
