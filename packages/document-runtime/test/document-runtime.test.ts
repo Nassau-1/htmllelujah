@@ -333,6 +333,26 @@ describe('document session authority', () => {
     expect(() => manager.getSnapshot(session.sessionId)).toThrow(DocumentRuntimeError);
   });
 
+  it('keeps the session queue usable when a stale discard is immediately retried', async () => {
+    const directory = await temporaryDirectory();
+    const manager = managerFor(directory);
+    const session = await manager.createMainOnly();
+
+    const staleClose = manager.close(session.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: 'stale-revision',
+    });
+    const validClose = manager.close(session.sessionId, {
+      discardUnsaved: true,
+      expectedRevision: session.revision,
+    });
+
+    await expect(staleClose).rejects.toMatchObject({ code: 'REVISION_CONFLICT' });
+    await expect(validClose).resolves.toBeUndefined();
+    expect(manager.listSessions()).toEqual([]);
+    expect(await manager.listRecoveryCandidatesMainOnly()).toEqual([]);
+  });
+
   it('retains a session when a queued mutation wins the close revision race', async () => {
     const directory = await temporaryDirectory();
     let releaseAppend: (() => void) | undefined;

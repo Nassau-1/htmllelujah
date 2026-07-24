@@ -15,6 +15,7 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { drainChildProcess } from './child-process-cleanup.mjs';
 import { createMcpResponseRouter } from './mcp-json-line-router.mjs';
 import {
   assertDocumentUnchanged,
@@ -77,24 +78,8 @@ const waitForExit = (child, timeoutMs) => {
 };
 
 const terminate = async (child, label) => {
-  if (hasExited(child) || child.pid === undefined) return;
-  try {
-    child.kill();
-  } catch {
-    // Continue to the bounded handle-based forceful attempt.
-  }
-  if (await waitForExit(child, 2_000)) return;
-  try {
-    child.kill('SIGKILL');
-  } catch {
-    // The verified exit check below remains authoritative.
-  }
-  if (await waitForExit(child, 3_000)) return;
-  child.stdin?.destroy();
-  child.stdout?.destroy();
-  child.stderr?.destroy();
-  child.unref();
-  throw new Error(`${label} did not exit within the termination deadline.`);
+  if (child.pid === undefined) return;
+  await drainChildProcess({ child, label });
 };
 
 const sha256 = (filePath) =>
@@ -195,6 +180,31 @@ class CdpSession {
 
   close() {
     this.#socket.close();
+  }
+
+  closeAndWait(timeoutMs = 2_000) {
+    if (this.#socket.readyState === WebSocket.CLOSED) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (closed) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.#socket.removeEventListener('close', onClose);
+        resolve(closed);
+      };
+      const onClose = () => finish(true);
+      const timer = setTimeout(
+        () => finish(this.#socket.readyState === WebSocket.CLOSED),
+        timeoutMs,
+      );
+      this.#socket.addEventListener('close', onClose, { once: true });
+      try {
+        this.#socket.close();
+      } catch {
+        finish(false);
+      }
+    });
   }
 }
 
@@ -422,6 +432,31 @@ const createMcpClient = ({ configuration, userData, label, metrics, forbiddenDia
 const requireToolValue = (outcome, label) => {
   if (outcome?.ok !== true) throw new Error(`${label} returned an MCP error.`);
   return outcome.value;
+};
+
+const assertNativeMcpRejection = (response) => {
+  if (isRecord(response?.error) && typeof response.error.code === 'number') {
+    if (typeof response.error.message !== 'string') {
+      throw new Error('Native MCP JSON-RPC rejection omitted its safe diagnostic.');
+    }
+    assertSafeDiagnostic(response.error.message);
+    if (response.error.data !== undefined) {
+      assertSafeProjection(response.error.data, 'Native MCP JSON-RPC error data');
+      assertSafeDiagnostic(JSON.stringify(response.error.data));
+    }
+    return;
+  }
+  const result = response?.result;
+  const textItems =
+    isRecord(result) && Array.isArray(result.content)
+      ? result.content.filter(
+          (item) => isRecord(item) && item.type === 'text' && typeof item.text === 'string',
+        )
+      : undefined;
+  if (result?.isError !== true || !Array.isArray(textItems) || textItems.length !== 1) {
+    throw new Error('Native MCP rejection did not return a bounded error response.');
+  }
+  assertSafeDiagnostic(textItems[0].text);
 };
 
 const readRendererSession = async (cdp) => {
@@ -739,16 +774,28 @@ const runDocumentScenario = async ({ client, cdp, setStage }) => {
   if (initialOutline.revision !== initialRevision) {
     throw new Error('MCP list and outline revisions diverged.');
   }
+  const slideId = initialOutline.slides[0]?.slideId;
+  if (typeof slideId !== 'string') throw new Error('MCP outline omitted the first slide ID.');
   const styles = requireToolValue(
     await client.callTool('documents_get_styles', { documentId }),
     'documents_get_styles',
+  );
+  const designContext = requireToolValue(
+    await client.callTool('documents_get_design_context', {
+      documentId,
+      slideId,
+      elementScope: 'selected-projection',
+      elementOffset: 0,
+      elementLimit: 250,
+      assetOffset: 0,
+      assetLimit: 100,
+    }),
+    'documents_get_design_context',
   );
   const validation = requireToolValue(
     await client.callTool('documents_validate', { documentId }),
     'documents_validate',
   );
-  const slideId = initialOutline.slides[0]?.slideId;
-  if (typeof slideId !== 'string') throw new Error('MCP outline omitted the first slide ID.');
   const slide = requireToolValue(
     await client.callTool('slides_get', { documentId, slideId }),
     'slides_get',
@@ -759,6 +806,7 @@ const runDocumentScenario = async ({ client, cdp, setStage }) => {
   );
   for (const [label, projection] of [
     ['MCP style catalog', styles],
+    ['MCP design context', designContext],
     ['MCP validation', validation],
     ['MCP slide', slide],
     ['MCP collaboration status', collaboration],
@@ -778,6 +826,53 @@ const runDocumentScenario = async ({ client, cdp, setStage }) => {
   if (!isRecord(collaboration) || collaboration.mode !== 'offline') {
     throw new Error('MCP smoke requires the isolated document to be offline.');
   }
+  const designTheme =
+    isRecord(designContext) && Array.isArray(designContext.themes)
+      ? designContext.themes[0]
+      : undefined;
+  if (
+    !isRecord(designContext) ||
+    designContext.revision !== initialRevision ||
+    !isRecord(designContext.inheritance) ||
+    designContext.inheritance.slideId !== slideId ||
+    !Array.isArray(designContext.masters) ||
+    designContext.masters.length === 0 ||
+    !Array.isArray(designContext.layouts) ||
+    designContext.layouts.length === 0 ||
+    !isRecord(designTheme) ||
+    typeof designTheme.id !== 'string' ||
+    typeof designTheme.name !== 'string' ||
+    !isRecord(designContext.constraints) ||
+    !isRecord(designContext.validation) ||
+    designContext.validation.valid !== true
+  ) {
+    throw new Error('MCP authoritative design context was incomplete or stale.');
+  }
+  const designPreview = requireToolValue(
+    await client.callTool('documents_propose_design_operations', {
+      documentId,
+      expectedRevision: initialRevision,
+      label: 'Packaged MCP semantic design preview',
+      operations: [
+        {
+          type: 'theme.update',
+          themeId: designTheme.id,
+          patch: { name: `${designTheme.name.slice(0, 100)} MCP preview` },
+        },
+      ],
+    }),
+    'documents_propose_design_operations',
+  );
+  if (
+    !isRecord(designPreview) ||
+    typeof designPreview.proposalId !== 'string' ||
+    designPreview.baseRevision !== initialRevision ||
+    designPreview.commandCount !== 1 ||
+    designPreview.requiresApproval !== false
+  ) {
+    throw new Error('MCP semantic design proposal metadata was invalid.');
+  }
+  assertDocumentUnchanged(initialOutline, await readOutline());
 
   setStage('MCP-005');
   const renameProposal = requireToolValue(
@@ -1030,15 +1125,30 @@ const runDocumentScenario = async ({ client, cdp, setStage }) => {
   assertDocumentUnchanged(afterHumanOutline, await readOutline());
 
   setStage('MCP-007');
-  const forbiddenTool = await client.callTool('shell_exec', { command: 'whoami' });
-  assertToolError(forbiddenTool, 'JSON_RPC_ERROR');
-  const rawHtmlCommand = await client.callTool('documents_propose_commands', {
-    documentId,
-    expectedRevision: human.revision,
-    label: 'Rejected raw HTML capability',
-    commands: [{ type: 'element.set-html', html: '<script>unsafe()</script>' }],
-  });
-  assertToolError(rawHtmlCommand, 'JSON_RPC_ERROR');
+  assertNativeMcpRejection(
+    await client.send('tools/call', {
+      name: 'shell_exec',
+      arguments: { command: 'whoami' },
+    }),
+  );
+  assertNativeMcpRejection(
+    await client.send('tools/call', {
+      name: 'documents_propose_design_operations',
+      arguments: {
+        documentId,
+        expectedRevision: human.revision,
+        label: 'Rejected raw HTML capability',
+        operations: [
+          {
+            type: 'theme.update',
+            themeId: designTheme.id,
+            patch: { name: 'Strict theme schema' },
+            html: '<script>unsafe()</script>',
+          },
+        ],
+      },
+    }),
+  );
   assertDocumentUnchanged(afterHumanOutline, await readOutline());
   const resources = await client.send('resources/list');
   if (!(
@@ -1072,7 +1182,7 @@ const runDocumentScenario = async ({ client, cdp, setStage }) => {
     documentId,
     revision: human.revision,
     version: applicationStatus.version,
-    pendingProposalCount: 2,
+    pendingProposalCount: 3,
   };
 };
 
@@ -1185,6 +1295,7 @@ const runSmoke = async () => {
   let applicationSpawnError;
   let applicationError = '';
   let cdp;
+  let primaryFailure;
 
   try {
     application = spawn(
@@ -1352,11 +1463,12 @@ const runSmoke = async () => {
       'the restored current descriptor authenticated a fresh launcher exactly once per connection',
     ]);
     recorder.pass('MCP-004', [
-      'status, document list, outline, slide, styles, validation and collaboration projections were bounded',
+      'status, document list, outline, slide, styles, authoritative design context, validation and collaboration projections were bounded',
       'all read projections agreed on the current canonical document revision',
     ]);
     recorder.pass('MCP-005', [
       'proposal preview did not mutate, one-batch commit converged and stale revisions failed atomically',
+      'semantic theme preview used the authoritative master-layout context without requiring per-edit approval',
       'an invalid mixed batch preserved the complete prior document state',
     ]);
     recorder.pass('MCP-006', [
@@ -1396,25 +1508,48 @@ const runSmoke = async () => {
         'Successful native file chooser import and export are covered by their system smokes; this MCP smoke verifies safe refusal before any chooser opens.',
       ],
     });
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
   } finally {
+    const cleanupErrors = [];
     await Promise.allSettled([...activeClients].map((client) => client.dispose()));
     activeClients.clear();
-    cdp?.close();
-    if (application !== undefined) await terminate(application, 'Desktop process');
-    await waitFor(
-      async () => {
-        try {
-          await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
-          return true;
-        } catch (error) {
-          if (error?.code === 'EBUSY' || error?.code === 'EPERM') return false;
-          throw error;
-        }
-      },
-      15_000,
-      'MCP smoke temporary state cleanup',
-      100,
-    );
+    try {
+      if (cdp !== undefined && !(await cdp.closeAndWait())) {
+        throw new Error('MCP smoke could not release its DevTools connection.');
+      }
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      if (application !== undefined) await terminate(application, 'Desktop process');
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      await waitFor(
+        async () => {
+          try {
+            await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+            return true;
+          } catch (error) {
+            if (error?.code === 'EBUSY' || error?.code === 'EPERM') return false;
+            throw error;
+          }
+        },
+        15_000,
+        'MCP smoke temporary state cleanup',
+        100,
+      );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (primaryFailure === undefined && cleanupErrors.length > 0) {
+      throw cleanupErrors.length === 1
+        ? cleanupErrors[0]
+        : new AggregateError(cleanupErrors, 'MCP smoke cleanup did not complete.');
+    }
   }
 };
 
@@ -1424,7 +1559,16 @@ try {
   process.stdout.write(
     `Packaged MCP V1 smoke passed: ${evidence.protocol.frameCount} protocol responses across ${evidence.protocol.processCount} MCP processes.\n`,
   );
-} catch {
+} catch (error) {
+  let safeFailureDetail = '';
+  if (error instanceof Error) {
+    try {
+      assertSafeDiagnostic(error.message);
+      safeFailureDetail = ` ${error.message}`;
+    } catch {
+      // Keep capability-bearing, local-path, or oversized diagnostics out of terminal output.
+    }
+  }
   const failure = createMcpFailureEvidence({
     generatedAt: new Date().toISOString(),
     mode: evidenceMode,
@@ -1437,6 +1581,8 @@ try {
   } catch {
     // The non-zero exit remains authoritative if even redacted failure evidence cannot be written.
   }
-  process.stderr.write(`Packaged MCP V1 smoke failed during ${failureStage}.\n`);
+  process.stderr.write(
+    `Packaged MCP V1 smoke failed during ${failureStage}.${safeFailureDetail}\n`,
+  );
   process.exitCode = 1;
 }

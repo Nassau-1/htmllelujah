@@ -51,6 +51,21 @@ and releases use semantic versions.
 
 ### Fixed
 
+- Hardened the opened-Electron and packaged-MCP harnesses by awaiting CDP socket
+  release before native close, reusing the bounded process-tree drain, and retaining
+  the primary failure when cleanup also fails.
+
+- Extended the packaged MCP smoke to validate authoritative design context,
+  non-mutating semantic design proposals, and bounded safe rejection of unknown tools
+  and schema-injected markup.
+
+- Preserved bounded MCP-safe errors at the desktop result boundary, classifying
+  authorization failures as terminal and revision conflicts as recoverable.
+
+- Added regression coverage proving that a rejected stale discard does not poison the
+  document-session queue and that an immediate valid close retry removes the session
+  without recovery residue.
+
 - Pinned patched transitive MCP dependencies for URI validation and the optional
   Node HTTP adapter; the production dependency audit now reports no known
   vulnerabilities while the desktop integration continues to use the local stdio

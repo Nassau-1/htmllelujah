@@ -1,12 +1,13 @@
 # Roadmap and TODO
 
-Status: **V1 source remediation converging; installed-candidate verification pending**,
-last reviewed 2026-07-23.
+Status: **V1 source hardening complete in the working tree; consolidated opened-app
+and refreshed installed-candidate verification pending**, last reviewed 2026-07-24.
 
 The current working tree contains the source checkpoints described below. The installed
-preview remains useful for feedback, but it does not represent these changes until the
-focused opened-app smoke, final repository verification, Windows packaging, and durable
-installation gates are complete.
+preview at source commit `63ad60d` remains useful for feedback, but it does not include
+the final close-harness and desktop MCP error-boundary hardening below. One consolidated
+opened-app smoke, refreshed Windows packaging, and durable reinstall remain before that
+local candidate represents the complete working tree.
 
 ## Hands-on authoring and agent remediation
 
@@ -107,6 +108,9 @@ Authoritative scope, sequencing, and acceptance evidence:
       context.
       `documents_get_design_context` now returns the canonical inheritance chain and
       paginated authoritative/projection element provenance with effective locks.
+- [x] Preserve bounded MCP-safe errors through the desktop result boundary, keeping
+      authorization failures terminal and revision conflicts recoverable without
+      exposing local capability or path details.
 - [x] Add design-aware typed operations for themes, masters, layouts, page furniture,
       and ordinary slide editing.
       Strict page/theme/master/layout/slide-layout and deck-wide theme-enforcement
@@ -124,6 +128,12 @@ Authoritative scope, sequencing, and acceptance evidence:
 
 - [x] Run focused code-level unit/integration checks for completed remediation
       checkpoints; these do not replace the final repository or opened-app gates.
+- [x] Extend the packaged MCP smoke contract to require authoritative design context,
+      a non-mutating semantic design proposal, and bounded safe rejection of unknown
+      tools or schema-injected markup.
+- [x] Close and await CDP WebSocket sessions before native-close probes, reuse the
+      bounded process-tree drain for packaged MCP cleanup, and preserve the primary
+      failure when cleanup also fails.
 - [ ] Run one consolidated opened-Electron smoke covering all reported flows.
 - [ ] Run one final complete `pnpm verify` after the implementation has converged.
 - [ ] Build the refreshed Windows x64 candidate and durably install it on this machine
@@ -160,6 +170,9 @@ Authoritative scope, sequencing, and acceptance evidence:
 
 ### Audit blockers closed in source (checkpoint 2026-07-16)
 
+- [x] Keep the document-session queue usable after a stale discard rejection so an
+      immediate revision-correct close retry succeeds without leaving a session or
+      recovery candidate.
 - [x] Preserve selected master/layout objects after accepted document revisions and
       cover drag/resize persistence in the opened-app smoke.
 - [x] Define one backward-compatible connector geometry invariant, then make

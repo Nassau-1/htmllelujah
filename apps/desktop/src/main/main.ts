@@ -40,6 +40,7 @@ import {
   prepareImageImportMutation,
 } from './image-import-target.js';
 import { DesktopMcpBridge, type McpApprovalAction } from './mcp-bridge.js';
+import { mcpSafeErrorToDesktopResult } from './mcp-desktop-result.js';
 import { TrustedMcpClientStore } from './mcp-trusted-clients.js';
 import { isTrustedRendererUrl, resolveRendererEntryUrl } from './renderer-entry.js';
 import {
@@ -155,6 +156,8 @@ const failure = (inputError: unknown): DesktopResult<never> => {
       error: { code: error.code, message: error.message, recoverable: error.recoverable },
     };
   }
+  const mcpFailure = mcpSafeErrorToDesktopResult(error);
+  if (mcpFailure !== undefined) return mcpFailure;
   if (error instanceof ExporterError) {
     const safeMessages: Partial<Record<ExporterError['code'], string>> = {
       INVALID_REQUEST: 'This presentation cannot be exported.',

@@ -435,6 +435,31 @@ class CdpSession {
   close() {
     this.#socket.close();
   }
+
+  closeAndWait(timeoutMs = 2_000) {
+    if (this.#socket.readyState === WebSocket.CLOSED) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (closed) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.#socket.removeEventListener('close', onClose);
+        resolve(closed);
+      };
+      const onClose = () => finish(true);
+      const timer = setTimeout(
+        () => finish(this.#socket.readyState === WebSocket.CLOSED),
+        timeoutMs,
+      );
+      this.#socket.addEventListener('close', onClose, { once: true });
+      try {
+        this.#socket.close();
+      } catch {
+        finish(false);
+      }
+    });
+  }
 }
 
 const waitForDebuggingPort = (child, userData, getStderr, getSpawnError, label) =>
@@ -596,8 +621,12 @@ const closeLaunchGracefully = async ({
     }
     if (closeOutcome.kind !== 'exit' || !closeOutcome.exited) {
       const automationDiagnostics = discard?.diagnostics() ?? '';
+      const remainingProcessIds = nativeClose.processIds.filter(processIsAlive);
       throw new Error(
         `${label} did not exit after its native close request.` +
+          ` Remaining scoped process IDs: ${
+            remainingProcessIds.length === 0 ? 'none' : remainingProcessIds.join(', ')
+          }.` +
           (automationDiagnostics === ''
             ? ''
             : ` Native message-box diagnostics: ${automationDiagnostics}`),
@@ -716,6 +745,10 @@ const runCleanLaunchProbe = async ({
         `${label} opened ${initialized.documentName} instead of ${expectedDeckName}.`,
       );
     }
+    if (!(await launchCdp.closeAndWait())) {
+      throw new Error(`${label} could not release its DevTools connection before native close.`);
+    }
+    launchCdp = undefined;
     const duration = (end, start) => Number((end - start).toFixed(3));
     const gracefulClose = await closeLaunchGracefully({
       child,
@@ -752,7 +785,7 @@ const runCleanLaunchProbe = async ({
     }
     throw error;
   } finally {
-    launchCdp?.close();
+    if (launchCdp !== undefined) await launchCdp.closeAndWait();
     if (!hasExited(child)) {
       try {
         await terminate(child, `${label} process`);
@@ -2967,13 +3000,41 @@ try {
   if (presentationScreenshotBytes === undefined) {
     throw new Error('Presentation visual evidence was not captured.');
   }
-  const finalGracefulClose = await closeLaunchGracefully({
-    child: application,
-    userData,
-    sessionId: measuredInitialization.sessionId,
-    label: 'Electron functional launch',
-    expectUnsavedPrompt: true,
-  });
+  if (!(await cdp.closeAndWait())) {
+    throw new Error('Electron functional launch could not release DevTools before native close.');
+  }
+  cdp = undefined;
+  evaluateRenderer = undefined;
+  let finalGracefulClose;
+  try {
+    finalGracefulClose = await closeLaunchGracefully({
+      child: application,
+      userData,
+      sessionId: measuredInitialization.sessionId,
+      label: 'Electron functional launch',
+      expectUnsavedPrompt: true,
+    });
+  } catch (error) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${debuggingPort}/json/list`);
+      const targets = response.ok ? await response.json() : [];
+      process.stderr.write(
+        `[post-close target diagnostic]\n${JSON.stringify(
+          targets.map((candidate) => ({
+            id: candidate.id,
+            type: candidate.type,
+            title: candidate.title,
+            url: candidate.url,
+          })),
+          null,
+          2,
+        )}\n`,
+      );
+    } catch (diagnosticError) {
+      process.stderr.write(`[post-close target diagnostic failed] ${String(diagnosticError)}\n`);
+    }
+    throw error;
+  }
   performanceReport = {
     ...performanceReport,
     samples: [
@@ -3077,9 +3138,10 @@ try {
   }
   let cdpClosed = cdp === undefined;
   try {
-    cdp?.close();
-    cdp = undefined;
-    cdpClosed = true;
+    if (cdp !== undefined) {
+      cdpClosed = await cdp.closeAndWait();
+      cdp = undefined;
+    }
   } catch (error) {
     cleanupErrors.push(error);
   }
