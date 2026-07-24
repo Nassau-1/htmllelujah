@@ -821,6 +821,7 @@ await writeFile(
 const executable = process.env.HTMLLELUJAH_EXECUTABLE;
 const openPath = process.env.HTMLLELUJAH_OPEN_PATH;
 const expectedDeckName = process.env.HTMLLELUJAH_EXPECTED_DECK_NAME;
+const functionalOnly = process.argv.includes('--functional-only');
 const launchEnvironment = {
   ...process.env,
   ...(executable === undefined
@@ -838,38 +839,39 @@ const createLaunchArguments = (includeOpenPath) => [
   '--force-device-scale-factor=1',
 ];
 let warmupEvidence;
-let measuredProbeEvidence;
-try {
-  warmupEvidence = await runCleanLaunchProbe({
-    launchCommand,
-    launchArguments: createLaunchArguments(true),
-    launchEnvironment,
-    userData,
-    label: 'Electron unmeasured warm-up',
-    role: 'warmup',
-    ordinal: 0,
-    expectedDeckName,
-    expectUnsavedPrompt: openPath === undefined,
-  });
-  measuredProbeEvidence = [];
-  for (const ordinal of [1, 2]) {
-    measuredProbeEvidence.push(
-      await runCleanLaunchProbe({
-        launchCommand,
-        launchArguments: createLaunchArguments(true),
-        launchEnvironment,
-        userData,
-        label: `Electron measured probe ${ordinal}`,
-        role: 'probe',
-        ordinal,
-        expectedDeckName,
-        expectUnsavedPrompt: openPath === undefined,
-      }),
-    );
+let measuredProbeEvidence = [];
+if (!functionalOnly) {
+  try {
+    warmupEvidence = await runCleanLaunchProbe({
+      launchCommand,
+      launchArguments: createLaunchArguments(true),
+      launchEnvironment,
+      userData,
+      label: 'Electron unmeasured warm-up',
+      role: 'warmup',
+      ordinal: 0,
+      expectedDeckName,
+      expectUnsavedPrompt: openPath === undefined,
+    });
+    for (const ordinal of [1, 2]) {
+      measuredProbeEvidence.push(
+        await runCleanLaunchProbe({
+          launchCommand,
+          launchArguments: createLaunchArguments(true),
+          launchEnvironment,
+          userData,
+          label: `Electron measured probe ${ordinal}`,
+          role: 'probe',
+          ordinal,
+          expectedDeckName,
+          expectUnsavedPrompt: openPath === undefined,
+        }),
+      );
+    }
+  } catch (error) {
+    await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+    throw error;
   }
-} catch (error) {
-  await rm(userData, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
-  throw error;
 }
 
 const launchStartedAt = performance.now();
@@ -1173,7 +1175,7 @@ try {
   const duration = (end, start) => Number((end - start).toFixed(3));
   const functionalPerformanceSample = {
     role: 'functional',
-    ordinal: 3,
+    ordinal: functionalOnly ? 1 : 3,
     interactiveReadyMs: duration(fontsReadyAt, launchStartedAt),
     milestonesMs: {
       debuggingPort: duration(debuggingPortReadyAt, launchStartedAt),
@@ -1188,40 +1190,53 @@ try {
       applicationShellToFontsReady: duration(fontsReadyAt, applicationShellReadyAt),
     },
     recoveryCandidatesAtReady: measuredInitialization.recoveryCandidates,
-    profileReusedForMeasuredLaunch: true,
+    profileReusedForMeasuredLaunch: !functionalOnly,
     documentName: measuredInitialization.documentName,
   };
-  const readiness = assessInteractiveReadinessSamples([
-    ...measuredProbeEvidence.map((sample) => sample.interactiveReadyMs),
-    functionalPerformanceSample.interactiveReadyMs,
-  ]);
-  let performanceReport = {
-    ...readiness,
-    measurement: 'median-of-three-clean-warm-starts-same-profile',
-    samples: [...measuredProbeEvidence, functionalPerformanceSample],
-    warnings: readiness.samplesAboveTarget.map(
-      (sample) =>
-        `Warm-start sample ${sample.sample} took ${sample.interactiveReadyMs} ms, above the ${WARM_START_TARGET_MS} ms optimization target; the blocking V1 ceiling is ${WARM_START_BUDGET_MS} ms.`,
-    ),
-    warmup: warmupEvidence,
-  };
-  try {
-    assertInteractiveReadiness(performanceReport);
-  } catch (error) {
-    const failureReport = {
-      passed: false,
-      testedAt: new Date().toISOString(),
-      launchMode: executable === undefined ? 'source-build' : 'packaged-executable',
-      failedPhase: 'interactive-readiness',
-      performance: performanceReport,
-      failure: {
-        code: error instanceof Error && 'code' in error ? error.code : 'UNKNOWN',
-        message: error instanceof Error ? error.message : String(error),
-      },
+  let performanceReport;
+  if (functionalOnly) {
+    performanceReport = {
+      measurement: 'single-functional-launch-not-performance-gated',
+      sampleCount: 1,
+      interactiveReadyMs: functionalPerformanceSample.interactiveReadyMs,
+      samples: [functionalPerformanceSample],
+      warnings: [
+        'Functional-only mode intentionally skips the warm-start acceptance gate; use the default mode for release performance evidence.',
+      ],
     };
-    await mkdir(evidenceDirectory, { recursive: true });
-    await writeFile(reportPath, `${JSON.stringify(failureReport, null, 2)}\n`, 'utf8');
-    throw error;
+  } else {
+    const readiness = assessInteractiveReadinessSamples([
+      ...measuredProbeEvidence.map((sample) => sample.interactiveReadyMs),
+      functionalPerformanceSample.interactiveReadyMs,
+    ]);
+    performanceReport = {
+      ...readiness,
+      measurement: 'median-of-three-clean-warm-starts-same-profile',
+      samples: [...measuredProbeEvidence, functionalPerformanceSample],
+      warnings: readiness.samplesAboveTarget.map(
+        (sample) =>
+          `Warm-start sample ${sample.sample} took ${sample.interactiveReadyMs} ms, above the ${WARM_START_TARGET_MS} ms optimization target; the blocking V1 ceiling is ${WARM_START_BUDGET_MS} ms.`,
+      ),
+      warmup: warmupEvidence,
+    };
+    try {
+      assertInteractiveReadiness(performanceReport);
+    } catch (error) {
+      const failureReport = {
+        passed: false,
+        testedAt: new Date().toISOString(),
+        launchMode: executable === undefined ? 'source-build' : 'packaged-executable',
+        failedPhase: 'interactive-readiness',
+        performance: performanceReport,
+        failure: {
+          code: error instanceof Error && 'code' in error ? error.code : 'UNKNOWN',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      };
+      await mkdir(evidenceDirectory, { recursive: true });
+      await writeFile(reportPath, `${JSON.stringify(failureReport, null, 2)}\n`, 'utf8');
+      throw error;
+    }
   }
 
   const initial = await evaluate(`(() => ({
@@ -2399,8 +2414,56 @@ try {
     'Properties inspector tab',
   );
 
+  const residualPickerDismissed = await evaluate(`(() => {
+    const picker = document.querySelector('.content-catalog-picker[role="dialog"]');
+    if (picker === null) return false;
+    const closeButton = picker.querySelector('.content-catalog-close');
+    if (!(closeButton instanceof HTMLButtonElement)) {
+      throw new Error('The residual content picker has no close button.');
+    }
+    closeButton.click();
+    return true;
+  })()`);
+  if (residualPickerDismissed) {
+    await waitForRenderer(
+      `document.querySelector('.content-catalog-picker[role="dialog"]') === null`,
+      'Residual content picker closing before final slide selection',
+    );
+  }
+
+  const finalSlideActivated = await evaluate(`(() => {
+    const thumbnail = [...document.querySelectorAll('.canonical-thumbnail')].find(
+      (candidate) =>
+        candidate.querySelector(
+          ${JSON.stringify(`[data-element-id="${insertedShapeId}"]`)},
+        ) !== null,
+    );
+    if (!(thumbnail instanceof HTMLButtonElement)) return false;
+    thumbnail.click();
+    return true;
+  })()`);
+  if (!finalSlideActivated) {
+    throw new Error('The slide containing the final local object could not be activated.');
+  }
+  await waitForRenderer(
+    `(() => {
+      const element = document.querySelector(
+        ${JSON.stringify(
+          `[data-testid="editor-canvas-root"] .canonical-hitbox[data-canvas-element-id="${insertedShapeId}"]:not(.is-locked)`,
+        )},
+      );
+      return document.querySelector('.canvas-context-badge')?.textContent?.includes('Slide:') === true &&
+        element instanceof HTMLElement;
+    })()`,
+    'Final active slide and local object',
+  );
+
   const finalReselected = await evaluate(`(() => {
-    const element = document.querySelector('.canonical-hitbox:not(.is-locked)');
+    const element = document.querySelector(
+      ${JSON.stringify(
+        `[data-testid="editor-canvas-root"] .canonical-hitbox[data-canvas-element-id="${insertedShapeId}"]:not(.is-locked)`,
+      )},
+    );
     if (!(element instanceof HTMLElement)) return false;
     element.focus();
     element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
@@ -2408,7 +2471,13 @@ try {
   })()`);
   if (!finalReselected) throw new Error('The final slide object could not be selected.');
   await waitForRenderer(
-    `document.querySelectorAll('.canonical-hitbox.is-selected').length === 1`,
+    `(() => {
+      const selected = document.querySelectorAll(
+        '[data-testid="editor-canvas-root"] .canonical-hitbox.is-selected',
+      );
+      return selected.length === 1 &&
+        selected[0]?.getAttribute('data-canvas-element-id') === ${JSON.stringify(insertedShapeId)};
+    })()`,
     'Final stable slide selection',
   );
 
@@ -3060,8 +3129,12 @@ try {
       ...(executable === undefined
         ? []
         : ['packaged application ignored a hostile development-renderer environment override']),
-      'one clean warm-up and three clean measured launches reused the same user-data profile',
-      'all measured launches started with zero recovery candidates and closed without residue',
+      ...(functionalOnly
+        ? ['functional-only launch started with zero recovery candidates']
+        : [
+            'one clean warm-up and three clean measured launches reused the same user-data profile',
+            'all measured launches started with zero recovery candidates and closed without residue',
+          ]),
       'essential editor surfaces rendered',
       'visual picker selection preceded shape insertion, undo, and redo',
       'right-click object menu exposed copy, cut, paste, duplicate, lock, and delete',

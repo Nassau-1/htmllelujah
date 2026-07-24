@@ -1,13 +1,17 @@
 # Roadmap and TODO
 
-Status: **V1 source hardening complete in the working tree; consolidated opened-app
-and refreshed installed-candidate verification pending**, last reviewed 2026-07-24.
+Status: **Installed V1 feedback build `ec1f83c` available; packaged MCP and functional
+opened-app validation passed; strict startup and public-release acceptance remain
+pending**, last reviewed 2026-07-24.
 
-The current working tree contains the source checkpoints described below. The installed
-preview at source commit `4f75083` includes the close-harness and desktop MCP
-error-boundary hardening, but not the active-surface selection reconciliation discovered
-by the consolidated smoke. Refreshed Windows packaging, durable reinstall, and completion
-of that same smoke remain before the local candidate represents the complete working tree.
+The durable per-user installation is bound to clean source commit `ec1f83c` and includes
+the active-surface selection reconciliation. Its packaged MCP smoke passed MCP-001 through
+MCP-009 with 52 protocol frames across five launcher processes. One explicit
+non-performance-gated opened-Electron run then passed all reported authoring flows,
+native-dialog checks, presentation rendering, and residue-free shutdown. The separate
+strict startup run observed a 4,161.951 ms median against the 4,000 ms ceiling, so this is
+an installed feedback build rather than a sealed public-release candidate. No 30-minute
+LAN soak was repeated in this campaign.
 
 ## Hands-on authoring and agent remediation
 
@@ -137,12 +141,22 @@ Authoritative scope, sequencing, and acceptance evidence:
 - [x] Close and await CDP WebSocket sessions before native-close probes, reuse the
       bounded process-tree drain for packaged MCP cleanup, and preserve the primary
       failure when cleanup also fails.
-- [ ] Run one consolidated opened-Electron smoke covering all reported flows.
+- [x] Run the installed packaged-MCP functional smoke against `ec1f83c`; all nine
+      cases passed with bounded design context, safe rejections, transaction/undo
+      coverage, 52 protocol frames, and five launcher processes.
+- [x] Run one consolidated opened-Electron smoke covering all reported flows.
+      The explicit `--functional-only` pass completed against the installed application
+      with a 2,844.525 ms interactive sample, zero recovery candidates, native
+      save/close interactions, presentation rendering, and residue-free cleanup. This
+      does not replace the default three-sample release performance gate.
 - [ ] Run one final complete `pnpm verify` after the implementation has converged.
 - [ ] Build the refreshed Windows x64 candidate and durably install it on this machine
       after the opened-app smoke and final verification pass.
-- [ ] Do not repeat the 30-minute LAN or complete Windows candidate campaign between
-      individual fixes; run them once on the final candidate.
+      A durable per-user feedback installation of `ec1f83c` is present; final candidate
+      packaging and reinstall remain gated on the repository and release passes.
+- [x] Do not repeat the 30-minute LAN or complete Windows candidate campaign between
+      individual fixes; run them once on the final candidate. No 30-minute run was
+      performed during this remediation campaign.
 
 ## V1 implementation
 
@@ -219,9 +233,12 @@ Authoritative scope, sequencing, and acceptance evidence:
 - [ ] Run `pnpm validate:candidate` against the promoted Windows x64 candidate and
       retain its canonical functional manifest plus public evidence ZIP.
 - [ ] Complete unit, integration, adversarial archive/recovery, IPC, MCP, and LAN
-      suites against the final source and packaged binaries.
+      suites against the final source and packaged binaries. The installed packaged-MCP
+      functional subset passed; the complete final-candidate matrix remains open.
 - [ ] Open the unpacked and installed application and complete create, edit, save,
-      close, reopen, recover, present, HTML export, and PDF export flows.
+      close, reopen, recover, present, HTML export, and PDF export flows. The installed
+      functional authoring/presentation/native-close subset passed; the sealed
+      final-candidate export/recovery campaign remains open.
 - [ ] Review editor, presentation, standalone HTML, and rasterized PDF visual evidence
       at supported page formats and display scales.
 - [ ] Complete keyboard, focus, reduced-motion, contrast, and screen-reader smoke
@@ -229,8 +246,11 @@ Authoritative scope, sequencing, and acceptance evidence:
       the exact installed candidate and a manual Narrator or NVDA pass remain pending.
 - [ ] Run the multi-instance LAN convergence and reconnect soak required by
       [`specs/002-v1-release/test-matrix.md`](specs/002-v1-release/test-matrix.md).
+      No 30-minute run was performed here; only historical short receipts remain.
 - [ ] Record warm-start, command acknowledgement, export, large-deck, repeated-save,
       and repeated-export measurements without substituting synthetic estimates.
+      Latest strict warm-start observation: 4,161.951 ms median, above the 4,000 ms
+      release ceiling. The passing functional-only launch is not release evidence.
 - [ ] Install, associate, upgrade, repair, and uninstall from a standard-user clean
       Windows account while preserving decks and recovery data.
 

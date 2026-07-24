@@ -51,6 +51,13 @@ and releases use semantic versions.
 
 ### Fixed
 
+- Separated installed UI authoring validation into an explicit `--functional-only`
+  mode while retaining the unchanged default startup gate, made packaged MCP quota
+  saturation opt-in through `--quota-stress` without weakening deterministic quota
+  coverage, shut down dirty packaged-MCP sessions through the real native Discard
+  path, and made the final UI selection assertion target one known object on the
+  active slide.
+
 - Hardened the opened-Electron and packaged-MCP harnesses by awaiting CDP socket
   release before native close, reusing the bounded process-tree drain, and retaining
   the primary failure when cleanup also fails.

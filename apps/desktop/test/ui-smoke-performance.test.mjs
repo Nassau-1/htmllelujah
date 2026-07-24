@@ -115,6 +115,9 @@ describe('Electron UI smoke interactive-readiness gate', () => {
     expect(staleEvidenceCleanup).toBeLessThan(warmup);
     expect(source).not.toContain('launchArguments: createLaunchArguments(false)');
     expect(source).toContain("measurement: 'median-of-three-clean-warm-starts-same-profile'");
+    expect(source).toContain("process.argv.includes('--functional-only')");
+    expect(source).toContain("measurement: 'single-functional-launch-not-performance-gated'");
+    expect(source).toContain('if (!functionalOnly)');
     expect(source).toContain('profileReusedForMeasuredLaunch: true');
     expect(source).toContain('for (const ordinal of [1, 2])');
     expect(source).toContain('await requestNativeWindowClose(child.pid)');
@@ -139,6 +142,31 @@ describe('Electron UI smoke interactive-readiness gate', () => {
     expect(source).toContain('gracefulClose: finalGracefulClose');
     expect(measuredClock).toBeGreaterThan(warmup);
     expect(measuredSpawn).toBeGreaterThan(measuredClock);
+  });
+
+  it('dismisses residual catalog UI before selecting a known object on the active slide', async () => {
+    const source = await readFile(
+      new URL('../scripts/smoke-ui-electron.mjs', import.meta.url),
+      'utf8',
+    );
+    const dismissPicker = source.indexOf('const residualPickerDismissed');
+    const activateSlide = source.indexOf('const finalSlideActivated');
+    const selectLocalObject = source.indexOf('const finalReselected');
+    const awaitStableSelection = source.indexOf("'Final stable slide selection'");
+    const finalSelectionFlow = source.slice(dismissPicker, awaitStableSelection);
+
+    expect(dismissPicker).toBeGreaterThan(-1);
+    expect(activateSlide).toBeGreaterThan(dismissPicker);
+    expect(selectLocalObject).toBeGreaterThan(activateSlide);
+    expect(awaitStableSelection).toBeGreaterThan(selectLocalObject);
+    expect(finalSelectionFlow).toContain("picker.querySelector('.content-catalog-close')");
+    expect(finalSelectionFlow).toContain('candidate.querySelector(');
+    expect(finalSelectionFlow).toContain('insertedShapeId');
+    expect(finalSelectionFlow).toContain('[data-testid="editor-canvas-root"]');
+    expect(finalSelectionFlow).toContain('data-canvas-element-id=');
+    expect(finalSelectionFlow).not.toContain(
+      "document.querySelector('.canonical-hitbox:not(.is-locked)')",
+    );
   });
 
   it('scopes native message-box automation to one exact owned Win32 dialog', async () => {
