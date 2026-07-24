@@ -41,17 +41,20 @@ Builds from a clean detached worktree, attests the exact candidate, then promote
 
 Options:
   --dry-run          print the detached-worktree command plan without executing it
+  --local-feedback   promote an integrity-checked local feedback candidate even when
+                     public-distribution legal/compliance approval is still pending
   --online-install   permit pnpm to use the network (default is --offline)
   --help             show this help`;
 
 const parseArgs = (argv) => {
-  const options = { dryRun: false, offline: true };
+  const options = { dryRun: false, localFeedback: false, offline: true };
   for (const argument of argv) {
     if (argument === '--help') {
       process.stdout.write(`${usage()}\n`);
       process.exit(0);
     }
     if (argument === '--dry-run') options.dryRun = true;
+    else if (argument === '--local-feedback') options.localFeedback = true;
     else if (argument === '--online-install') options.offline = false;
     else throw new Error(`Unknown option: ${argument}.`);
   }
@@ -135,6 +138,7 @@ const plan = buildCommandPlan({
   packageNames: packageBlueprint.map((entry) => entry.name),
   paths,
   offline: options.offline,
+  requirePublicDistributionReady: !options.localFeedback,
 });
 
 if (options.dryRun) {
@@ -169,17 +173,15 @@ if (configuredSigningKeys.length > 0) {
 
 assertSafeWorktree(worktreeRoot);
 const validateCandidatePair = async ({ requireReady }) => {
-  if (requireReady) {
-    await runProcess(
-      process.execPath,
-      [
-        'scripts/verify-dependency-sbom.mjs',
-        '--sbom',
-        path.join(finalEvidenceRoot, 'dependency-sbom.cdx.json'),
-      ],
-      repositoryRoot,
-    );
-  }
+  await runProcess(
+    process.execPath,
+    [
+      'scripts/verify-dependency-sbom.mjs',
+      '--sbom',
+      path.join(finalEvidenceRoot, 'dependency-sbom.cdx.json'),
+    ],
+    repositoryRoot,
+  );
   await runProcess(
     process.execPath,
     [
@@ -193,7 +195,8 @@ const validateCandidatePair = async ({ requireReady }) => {
     repositoryRoot,
   );
 };
-const validatePromotedCandidate = () => validateCandidatePair({ requireReady: true });
+const validatePromotedCandidate = () =>
+  validateCandidatePair({ requireReady: !options.localFeedback });
 
 const releaseLock = await acquireReleaseLock({
   transactionParent: promotionParent,
@@ -302,7 +305,9 @@ try {
     promoted = true;
     await assertNoPendingReleasePromotions({ transactionParent: promotionParent, releaseLock });
     process.stdout.write(
-      '\nRelease candidate and evidence promoted with durable crash recovery and post-promotion verification.\n',
+      options.localFeedback
+        ? '\nLocal feedback candidate and evidence promoted with durable crash recovery and post-promotion integrity verification. Public distribution remains blocked until its compliance record is ready.\n'
+        : '\nRelease candidate and evidence promoted with durable crash recovery and post-promotion verification.\n',
     );
   } finally {
     let transactionPending = false;

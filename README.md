@@ -212,8 +212,13 @@ pnpm build
 pnpm licenses:check
 pnpm package:win
 pnpm make:win
+pnpm make:win:local
 pnpm validate:candidate
 ```
+
+`make:win:local` builds and promotes the same integrity-attested Windows payload for
+local hands-on feedback while public-distribution approval is still pending. It does
+not mark the candidate release-ready and cannot satisfy the public release finalizer.
 
 `validate:candidate` is the Windows x64 release gate for the exact promoted binary.
 It opens the packaged and installed application, exercises exports and MCP, records

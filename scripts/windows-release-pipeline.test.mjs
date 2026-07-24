@@ -190,6 +190,32 @@ test('command plan rebuilds every package sequentially before desktop and packag
     'never',
   ]);
   assert.equal(plan.at(-1).name, 'verify-release-evidence');
+  assert.ok(plan.at(-1).args.includes('--require-ready'));
+});
+
+test('local feedback command plan keeps integrity checks without claiming public readiness', async () => {
+  const packageNames = (await discoverWorkspacePackages(repositoryRoot)).map((entry) => entry.name);
+  const paths = {
+    buildId: 'fixture-local-feedback-build',
+    session: 'session.json',
+    workspaceBuild: 'workspace.json',
+    artifactStaging: 'isolated/out',
+    evidenceStaging: 'isolated/evidence',
+    candidateManifest: 'isolated/evidence/release-candidate-v1.json',
+    dependencySbom: 'isolated/evidence/dependency-sbom.cdx.json',
+  };
+  const plan = buildCommandPlan({
+    packageNames,
+    paths,
+    offline: true,
+    requirePublicDistributionReady: false,
+  });
+  const sbomStep = plan.find((entry) => entry.name === 'verify-locked-production-sbom');
+  const evidenceStep = plan.find((entry) => entry.name === 'verify-release-evidence');
+
+  assert.ok(sbomStep);
+  assert.ok(evidenceStep);
+  assert.ok(!evidenceStep.args.includes('--require-ready'));
 });
 
 test('finalizer CLI loads the mandatory functional evidence contract', () => {

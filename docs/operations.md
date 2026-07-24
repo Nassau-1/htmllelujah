@@ -92,6 +92,20 @@ Build the per-user NSIS installer and its exact unpacked companion:
 pnpm make:win
 ```
 
+For a local feedback installation when public-distribution legal/compliance evidence
+is still pending, use the explicit non-public path:
+
+```powershell
+pnpm make:win:local
+```
+
+This path keeps the clean detached worktree, exact lockfile, package rebuild,
+provenance, candidate inventory, dependency SBOM, evidence integrity, crash-safe
+promotion, and post-promotion checks. It deliberately omits only the
+`--require-ready` assertion for the public-distribution compliance record. The
+generated evidence remains visibly not release-ready, and the release finalizer and
+publication workflow remain fail-closed.
+
 `pnpm package:win` is an alias for the same release-safe pipeline. The pipeline
 refuses a dirty index or worktree, checks out the exact commit into a detached
 temporary worktree, installs the locked dependencies offline, removes every

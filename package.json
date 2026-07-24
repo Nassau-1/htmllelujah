@@ -18,6 +18,7 @@
     "format:check": "prettier --check .",
     "licenses:check": "node scripts/check-licenses.mjs",
     "make:win": "node scripts/build-windows-release.mjs",
+    "make:win:local": "node scripts/build-windows-release.mjs --local-feedback",
     "package:win": "node scripts/build-windows-release.mjs",
     "sbom:generate": "node scripts/generate-sbom.mjs",
     "security:evidence": "node scripts/generate-security-release-evidence.mjs",

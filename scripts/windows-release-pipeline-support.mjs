@@ -267,7 +267,12 @@ export const assertWorkspacePackageOutputsStable = async (packages, buildTimes, 
   return current;
 };
 
-export const buildCommandPlan = ({ packageNames, paths, offline = true }) => [
+export const buildCommandPlan = ({
+  packageNames,
+  paths,
+  offline = true,
+  requirePublicDistributionReady = true,
+}) => [
   {
     name: 'capture-pre-build-provenance',
     command: process.execPath,
@@ -384,7 +389,7 @@ export const buildCommandPlan = ({ packageNames, paths, offline = true }) => [
       paths.artifactStaging,
       '--evidence-dir',
       paths.evidenceStaging,
-      '--require-ready',
+      ...(requirePublicDistributionReady ? ['--require-ready'] : []),
     ],
   },
 ];

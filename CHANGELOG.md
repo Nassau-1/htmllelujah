@@ -5,6 +5,13 @@ and releases use semantic versions.
 
 ## [Unreleased]
 
+### 2026-07-24 — Local feedback candidate path
+
+- Added an explicit `make:win:local` path for integrity-attested, crash-safe local
+  Windows feedback builds while public-distribution legal/compliance approval remains
+  pending. Dependency SBOM and release-evidence integrity checks stay mandatory; the
+  public finalizer remains strictly gated on a release-ready compliance record.
+
 ### 2026-07-24 — Useful authoring parity checkpoint
 
 - Made the complete offline visual libraries reachable: the default Twemoji view is a
