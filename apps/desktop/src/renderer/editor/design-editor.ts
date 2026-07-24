@@ -39,6 +39,14 @@ export const retainExistingCanvasSelection = (
   return selectedIds.filter((identifier) => existing.has(identifier));
 };
 
+export const retainActiveCanvasSelection = (
+  elements: readonly Element[],
+  selectedIds: readonly string[],
+): readonly string[] => {
+  const existing = new Set(elements.map((element) => element.id));
+  return selectedIds.filter((identifier) => existing.has(identifier));
+};
+
 export const duplicateThemeWithFreshIds = (source: Theme, id: () => string): Theme => ({
   ...source,
   id: id(),

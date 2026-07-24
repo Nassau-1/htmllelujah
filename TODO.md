@@ -4,10 +4,10 @@ Status: **V1 source hardening complete in the working tree; consolidated opened-
 and refreshed installed-candidate verification pending**, last reviewed 2026-07-24.
 
 The current working tree contains the source checkpoints described below. The installed
-preview at source commit `63ad60d` remains useful for feedback, but it does not include
-the final close-harness and desktop MCP error-boundary hardening below. One consolidated
-opened-app smoke, refreshed Windows packaging, and durable reinstall remain before that
-local candidate represents the complete working tree.
+preview at source commit `4f75083` includes the close-harness and desktop MCP
+error-boundary hardening, but not the active-surface selection reconciliation discovered
+by the consolidated smoke. Refreshed Windows packaging, durable reinstall, and completion
+of that same smoke remain before the local candidate represents the complete working tree.
 
 ## Hands-on authoring and agent remediation
 
@@ -37,6 +37,9 @@ Authoritative scope, sequencing, and acceptance evidence:
 - [x] Separate the application menu from the authoring toolbar so Edit, View, Insert,
       Arrange, and Help expose real command groups and shortcut discovery rather than
       repeating the same insertion buttons.
+- [x] Reconcile selection with the active slide, layout, or master after revisions and
+      undo so a removed or cross-surface element cannot leave commands enabled against
+      an invisible stale selection.
 
 ### Slides, layouts, and masters
 

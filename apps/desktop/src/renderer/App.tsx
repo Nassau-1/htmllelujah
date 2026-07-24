@@ -140,6 +140,7 @@ import {
   createDesignCanvasContext,
   duplicateThemeWithFreshIds,
   rebaseEntityReplacement,
+  retainActiveCanvasSelection,
   retainExistingCanvasSelection,
   replaceElementFrames,
   themeForSlide,
@@ -881,6 +882,12 @@ function EditorApp() {
           : (activeSlide?.elements ?? []),
     [activeAuthoringSurface, activeSlide?.elements, designLayout?.elements, designMaster?.elements],
   );
+  useEffect(() => {
+    setSelectedIds((current) => {
+      const retained = retainActiveCanvasSelection(activeSurfaceElements, current);
+      return sameCanvasSelection(retained, current) ? current : retained;
+    });
+  }, [activeSurfaceElements]);
   const selectedElements = useMemo(
     () => activeSurfaceElements.filter((element) => selectedIds.includes(element.id)),
     [activeSurfaceElements, selectedIds],

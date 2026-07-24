@@ -606,11 +606,10 @@ const closeLaunchGracefully = async ({
       if (!(await discard.ready)) await discard;
       await discard;
     }
+    const noRetainedWindow = new Promise(() => undefined);
     const closeOutcome = await Promise.race([
       waitForExit(child, 30_000).then((exited) => ({ kind: 'exit', exited })),
-      closeFailure.ready.then((ready) =>
-        ready ? { kind: 'retained' } : { kind: 'failure-automation-ended' },
-      ),
+      closeFailure.ready.then((ready) => (ready ? { kind: 'retained' } : noRetainedWindow)),
     ]);
     if (closeOutcome.kind === 'retained') {
       await closeFailure;
@@ -619,7 +618,7 @@ const closeLaunchGracefully = async ({
           ` Close-failure diagnostics: ${closeFailure.diagnostics()}`,
       );
     }
-    if (closeOutcome.kind !== 'exit' || !closeOutcome.exited) {
+    if (!closeOutcome.exited) {
       const automationDiagnostics = discard?.diagnostics() ?? '';
       const remainingProcessIds = nativeClose.processIds.filter(processIsAlive);
       throw new Error(
@@ -2401,7 +2400,7 @@ try {
   );
 
   const finalReselected = await evaluate(`(() => {
-    const element = [...document.querySelectorAll('.canonical-hitbox')].at(-1);
+    const element = document.querySelector('.canonical-hitbox:not(.is-locked)');
     if (!(element instanceof HTMLElement)) return false;
     element.focus();
     element.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));

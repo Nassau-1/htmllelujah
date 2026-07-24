@@ -123,6 +123,8 @@ describe('Electron UI smoke interactive-readiness gate', () => {
     expect(source).toContain("automateMessageBox(child.pid, 'Unsaved changes', 'Discard', 150)");
     expect(source).toContain("automateMessageBox(child.pid, 'Presentation remains open', 'OK')");
     expect(source).toContain("closeOutcome.kind === 'retained'");
+    expect(source).toContain("ready ? { kind: 'retained' } : noRetainedWindow");
+    expect(source).not.toContain('failure-automation-ended');
     expect(source).toContain('A detached TSV draft was allowed to close the presentation.');
     expect(source).toContain('window.htmllelujah.onWindowCloseReleased');
     expect(source).toContain('Exact correlated close release after Cancel');
