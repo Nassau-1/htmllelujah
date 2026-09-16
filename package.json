@@ -34,10 +34,10 @@
     "verify": "pnpm format:check && pnpm catalogs:check && pnpm typecheck && pnpm test && pnpm test:candidate-validation && pnpm test:release-evidence && pnpm test:release-pipeline && pnpm test:sbom-generate && pnpm test:security-release && pnpm build && pnpm licenses:check"
   },
   "devDependencies": {
-    "@types/node": "24.13.3",
-    "prettier": "3.9.5",
-    "tsx": "4.23.1",
+    "@types/node": "24.13.4",
+    "prettier": "3.9.6",
+    "tsx": "4.23.13",
     "typescript": "7.0.2",
-    "vitest": "4.1.10"
+    "vitest": "5.0.0"
   }
 }
